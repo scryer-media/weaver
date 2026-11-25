@@ -133,25 +133,65 @@ fn canonical(value: &Value, out: &mut String) {
     }
 }
 
-// `variables` for the operator to read, with secret-named values hidden.
+const REDACTED: &str = "<redacted>";
+
+// `variables` for the operator to read. Secret-named values are hidden, a
+// `value` beside `secret: true` is hidden, and URL-named values show only
+// scheme, host and port, since a URL can carry a key in its path or query.
 pub(crate) fn redacted(value: &Value) -> Value {
     match value {
-        Value::Object(fields) => Value::Object(
-            fields
-                .iter()
-                .map(|(key, field)| {
-                    let shown = if is_secret_name(key) && !field.is_null() {
-                        Value::String("<redacted>".into())
-                    } else {
-                        redacted(field)
-                    };
-                    (key.clone(), shown)
-                })
-                .collect(),
-        ),
+        Value::Object(fields) => {
+            let secret_value = fields.get("secret") == Some(&Value::Bool(true));
+            Value::Object(
+                fields
+                    .iter()
+                    .map(|(key, field)| {
+                        // A flag such as `secret: true` says what a value is,
+                        // not what it holds, so booleans stay visible.
+                        let shown = if field.is_null() || field.is_boolean() {
+                            field.clone()
+                        } else if is_secret_name(key) || (secret_value && key == "value") {
+                            Value::String(REDACTED.into())
+                        } else if is_url_name(key) {
+                            url_origins(field)
+                        } else {
+                            redacted(field)
+                        };
+                        (key.clone(), shown)
+                    })
+                    .collect(),
+            )
+        }
         Value::Array(items) => Value::Array(items.iter().map(redacted).collect()),
         scalar => scalar.clone(),
     }
+}
+
+// `url`, `urls`, and names ending in `Url`, `Urls`, `url` or `urls`.
+fn is_url_name(name: &str) -> bool {
+    ["Url", "Urls", "url", "urls"]
+        .iter()
+        .any(|suffix| name.ends_with(suffix))
+}
+
+// A URL-named value as `scheme://host:port`, element by element for a list.
+// Anything that is not a URL with a host is hidden whole.
+fn url_origins(value: &Value) -> Value {
+    match value {
+        Value::Null => Value::Null,
+        Value::Array(items) => Value::Array(items.iter().map(url_origins).collect()),
+        Value::String(text) => Value::String(url_origin(text).unwrap_or_else(|| REDACTED.into())),
+        _ => Value::String(REDACTED.into()),
+    }
+}
+
+fn url_origin(text: &str) -> Option<String> {
+    let url = reqwest::Url::parse(text).ok()?;
+    let host = url.host_str().filter(|host| !host.is_empty())?;
+    Some(match url.port_or_known_default() {
+        Some(port) => format!("{}://{host}:{port}", url.scheme()),
+        None => format!("{}://{host}", url.scheme()),
+    })
 }
 
 fn is_secret_name(name: &str) -> bool {
@@ -412,6 +452,66 @@ mod tests {
         assert_eq!(shown["input"]["autoBackupKey"], "<redacted>");
         assert_eq!(shown["input"]["passwordCandidates"], "<redacted>");
         assert_eq!(shown["input"]["apiKey"], Value::Null);
+    }
+
+    #[test]
+    fn summaries_show_only_the_origin_of_urls() {
+        let shown = redacted(&json!({
+            "url": "https://indexer.fixture.invalid/api?apikey=fixture-secret",
+            "urls": ["http://user:fixture-pass@feed.fixture.invalid:8080/rss", "not a url"],
+            "nzbUrl": "https://nzb.fixture.invalid/get/1?r=fixture-secret",
+            "feedUrls": ["https://[::1]/x?k=fixture-secret"],
+            "webhookurl": 42,
+            "input": {"iconUrl": "mailto:fixture-secret@fixture.invalid", "url": null},
+        }));
+        assert_eq!(shown["url"], "https://indexer.fixture.invalid:443");
+        assert_eq!(
+            shown["urls"],
+            json!(["http://feed.fixture.invalid:8080", "<redacted>"])
+        );
+        assert_eq!(shown["nzbUrl"], "https://nzb.fixture.invalid:443");
+        assert_eq!(shown["feedUrls"], json!(["https://[::1]:443"]));
+        assert_eq!(shown["webhookurl"], "<redacted>");
+        assert_eq!(shown["input"]["iconUrl"], "<redacted>");
+        assert_eq!(shown["input"]["url"], Value::Null);
+        assert!(!shown.to_string().contains("fixture-secret"));
+        assert!(!shown.to_string().contains("fixture-pass"));
+    }
+
+    #[test]
+    fn summaries_hide_a_value_marked_secret() {
+        let shown = redacted(&json!({"input": {"presets": [
+            {"name": "TOKEN", "value": "fixture-secret", "secret": true},
+            {"name": "MODE", "value": "fast", "secret": false},
+            {"name": "PLAIN", "value": "shown"},
+        ]}}));
+        let presets = &shown["input"]["presets"];
+        assert_eq!(presets[0]["value"], "<redacted>");
+        assert_eq!(presets[0]["name"], "TOKEN");
+        assert_eq!(presets[0]["secret"], true);
+        assert_eq!(presets[1]["value"], "fast");
+        assert_eq!(presets[2]["value"], "shown");
+    }
+
+    #[test]
+    fn summaries_keep_usernames_and_bind_real_values() {
+        let shown =
+            redacted(&json!({"input": {"username": "fixture-user", "url": "https://a.invalid/k"}}));
+        assert_eq!(shown["input"]["username"], "fixture-user");
+        let catalog = Catalog::build(
+            &[SkillOperationFile {
+                skill: "skill-a",
+                file: "Fixture.graphql",
+                text: "mutation Fixture($id: Int!) { pauseJob(id: $id) }\n",
+            }],
+            &[],
+        );
+        let operation = catalog.get("Fixture").expect("fixture");
+        // Two URLs that summarise alike still bind differently.
+        let a = json!({"url": "https://a.invalid/one"});
+        let b = json!({"url": "https://a.invalid/two"});
+        assert_eq!(redacted(&a), redacted(&b));
+        assert_ne!(binding(operation, Some(&a)), binding(operation, Some(&b)));
     }
 
     #[test]

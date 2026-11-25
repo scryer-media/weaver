@@ -36,5 +36,9 @@ pub(crate) fn scope_name(scope: CallerScope) -> &'static str {
 }
 
 fn run(context: ToolContext, _arguments: Arguments) -> ToolFuture {
-    Box::pin(async move { Ok(json_result(json!({"scope": scope_name(context.caller.scope)}))) })
+    Box::pin(async move {
+        Ok(json_result(
+            json!({"scope": scope_name(context.caller.scope)}),
+        ))
+    })
 }

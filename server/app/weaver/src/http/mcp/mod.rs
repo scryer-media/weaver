@@ -109,7 +109,12 @@ pub(super) async fn mcp_handler(
 ) -> Response {
     let peer = peer.map(|Extension(ConnectInfo(peer))| peer);
     let headers = request.headers();
-    if !super::graphql::upgrade_origin_allowed(&request_auth, peer, headers) {
+    if !super::graphql::upgrade_origin_allowed(
+        super::graphql::OriginSurface::Mcp,
+        &request_auth,
+        peer,
+        headers,
+    ) {
         return refusal_response(
             StatusCode::FORBIDDEN,
             refusal::MCP_ORIGIN_NOT_ALLOWED,
@@ -232,9 +237,10 @@ fn api_key_required(offered: bool) -> Response {
         )
     };
     let mut response = refusal_response(StatusCode::UNAUTHORIZED, code, message);
-    response
-        .headers_mut()
-        .insert(header::WWW_AUTHENTICATE, HeaderValue::from_static(challenge));
+    response.headers_mut().insert(
+        header::WWW_AUTHENTICATE,
+        HeaderValue::from_static(challenge),
+    );
     response
 }
 

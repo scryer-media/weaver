@@ -553,7 +553,14 @@ pub(super) async fn graphql_handler(
 // forge it; a request without one is a machine client, which carries its own
 // credential rather than riding on a browser's cookies. The MCP endpoint
 // admits the same origins.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum OriginSurface {
+    GraphqlSocket,
+    Mcp,
+}
+
 pub(super) fn upgrade_origin_allowed(
+    surface: OriginSurface,
     auth: &super::RequestAuthContext,
     peer: Option<SocketAddr>,
     headers: &HeaderMap,
@@ -576,11 +583,18 @@ pub(super) fn upgrade_origin_allowed(
         auth.security
             .is_websocket_origin_allowed(origin, request_host.as_ref(), peer, headers);
     if !allowed {
-        tracing::warn!(
-            origin,
-            "refused a GraphQL socket opened from another origin; name this \
-             server's public host in WEAVER_HTTP_ALLOWED_HOSTS if a proxy rewrites Host"
-        );
+        match surface {
+            OriginSurface::GraphqlSocket => tracing::warn!(
+                origin,
+                "refused a GraphQL socket opened from another origin; name this \
+                 server's public host in WEAVER_HTTP_ALLOWED_HOSTS if a proxy rewrites Host"
+            ),
+            OriginSurface::Mcp => tracing::warn!(
+                origin,
+                "refused an MCP request sent from another origin; name this \
+                 server's public host in WEAVER_HTTP_ALLOWED_HOSTS if a proxy rewrites Host"
+            ),
+        }
     }
     allowed
 }
@@ -623,7 +637,7 @@ pub(super) async fn ws_handler<E: Executor>(
     // Authenticated sessions bind an exact Origin and CSRF token at init.
     // Legacy browser sessions still need the upgrade Host/origin defense.
     if !request_auth.security.authenticated_access_mode()
-        && !upgrade_origin_allowed(&request_auth, peer, &headers)
+        && !upgrade_origin_allowed(OriginSurface::GraphqlSocket, &request_auth, peer, &headers)
     {
         return Err(StatusCode::FORBIDDEN);
     }

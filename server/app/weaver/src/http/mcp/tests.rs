@@ -138,9 +138,10 @@ fn rpc_request(bearer: Option<&str>, origin: Option<&str>, body: Value) -> Reque
         );
     }
     if let Some(origin) = origin {
-        request
-            .headers_mut()
-            .insert(header::ORIGIN, HeaderValue::from_str(origin).expect("origin"));
+        request.headers_mut().insert(
+            header::ORIGIN,
+            HeaderValue::from_str(origin).expect("origin"),
+        );
     }
     request
 }
@@ -251,7 +252,13 @@ fn protocol_error_reason(body: &Value) -> Value {
 }
 
 // An HTTP refusal: its status, `{code, error}` body and no-store.
-fn assert_refused(status: StatusCode, headers: &HeaderMap, body: &Value, want: StatusCode, code: &str) {
+fn assert_refused(
+    status: StatusCode,
+    headers: &HeaderMap,
+    body: &Value,
+    want: StatusCode,
+    code: &str,
+) {
     assert_eq!(status, want, "{body}");
     assert_eq!(body["code"], code, "{body}");
     assert!(body["error"].is_string(), "{body}");
@@ -501,7 +508,10 @@ async fn mcp_refuses_unknown_tools_and_bad_arguments_without_echoing_them() {
     let router = router();
     let body = call(&router, READ_KEY, "mcp-fixture-not-a-tool", json!({})).await;
     assert_eq!(protocol_error_reason(&body), refusal::MCP_TOOL_UNKNOWN);
-    assert!(!body.to_string().contains("mcp-fixture-not-a-tool"), "{body}");
+    assert!(
+        !body.to_string().contains("mcp-fixture-not-a-tool"),
+        "{body}"
+    );
 
     for (name, arguments, argument) in [
         (
@@ -537,7 +547,9 @@ async fn mcp_refuses_unknown_tools_and_bad_arguments_without_echoing_them() {
             "{name} {arguments}"
         );
         assert_eq!(
-            body["error"]["data"].get("argument").and_then(Value::as_str),
+            body["error"]["data"]
+                .get("argument")
+                .and_then(Value::as_str),
             argument,
             "{name} {arguments}"
         );
@@ -767,7 +779,11 @@ async fn a_lasting_mutation_runs_only_on_a_confirmed_second_call() {
     // A changed call spends the token without running.
     let body = call(&router, CONTROL_KEY, "run_mutation", with_token(&token, 8)).await;
     let error = tool_error("run_mutation", &body);
-    assert_eq!(error["reason"], refusal::MCP_CONFIRMATION_MISMATCH, "{body}");
+    assert_eq!(
+        error["reason"],
+        refusal::MCP_CONFIRMATION_MISMATCH,
+        "{body}"
+    );
     let body = call(&router, CONTROL_KEY, "run_mutation", with_token(&token, 7)).await;
     let error = tool_error("run_mutation", &body);
     assert_eq!(error["reason"], refusal::MCP_CONFIRMATION_UNKNOWN, "{body}");
