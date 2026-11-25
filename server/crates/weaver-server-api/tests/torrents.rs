@@ -2492,6 +2492,13 @@ async fn the_torrent_page_walks_the_list_by_its_next_cursor() {
     );
     assert_eq!(exact["torrentPage"]["items"].as_array().unwrap().len(), 5);
     assert!(exact["torrentPage"]["nextCursor"].is_null());
+    // A page with no items has no next, even with torrents still to come.
+    let empty = data(
+        rig.execute("{ torrentPage(first: 0) { items { id } nextCursor } }")
+            .await,
+    );
+    assert!(empty["torrentPage"]["items"].as_array().unwrap().is_empty());
+    assert!(empty["torrentPage"]["nextCursor"].is_null());
     let invalid = rig
         .execute("{ torrentPage(after: \"not-a-cursor\") { nextCursor } }")
         .await;

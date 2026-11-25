@@ -131,7 +131,10 @@ impl TorrentsQuery {
             limit + 1,
         )
         .await?;
-        let next_cursor = (items.len() > limit).then(|| encode_offset_cursor(offset + limit));
+        // A page with no items has no next page, so `first: 0` never hands
+        // back a cursor that does not advance.
+        let next_cursor =
+            (limit > 0 && items.len() > limit).then(|| encode_offset_cursor(offset + limit));
         items.truncate(limit);
         Ok(TorrentPage { items, next_cursor })
     }
