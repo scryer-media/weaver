@@ -161,7 +161,10 @@ impl SeedMode {
     // The pieces that passed their check, while seed mode lasts.
     pub(crate) fn verified(&self) -> Option<BF> {
         let unchecked = self.unchecked.lock();
-        let Phase::On(Unchecked { bits: unchecked, .. }) = &*unchecked else {
+        let Phase::On(Unchecked {
+            bits: unchecked, ..
+        }) = &*unchecked
+        else {
             return None;
         };
         let mut verified =
@@ -251,10 +254,7 @@ impl SeedMode {
     // Seed mode ends, or the failure it was left on: the check of every
     // piece takes the torrent over. True when seed mode was on.
     pub(crate) fn leave(&self) -> bool {
-        matches!(
-            std::mem::take(&mut *self.unchecked.lock()),
-            Phase::On(_)
-        )
+        matches!(std::mem::take(&mut *self.unchecked.lock()), Phase::On(_))
     }
 
     // A piece failed its check: seed mode is left, and no piece is served
@@ -356,7 +356,10 @@ mod tests {
         assert_eq!(seed.ask(piece(0)), Ask::Served);
         assert_eq!(seed.ask(piece(1)), Ask::Unchecked);
         assert!(seed.fail());
-        assert!(!seed.fail(), "one failure asks for the check of every piece");
+        assert!(
+            !seed.fail(),
+            "one failure asks for the check of every piece"
+        );
         assert!(!seed.on());
         assert_eq!(seed.verified(), None);
         assert_eq!(seed.while_on(|| ()), None);

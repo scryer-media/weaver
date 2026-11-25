@@ -1038,13 +1038,7 @@ async fn test_seed_mode_failed_check_serves_no_other_unchecked_piece() -> anyhow
         tokio::task::yield_now().await;
     }
     assert!(torrent.seed_mode());
-    assert!(
-        torrent
-            .shared()
-            .options
-            .seed
-            .unchecked(piece_of(OTHER)?)
-    );
+    assert!(torrent.shared().options.seed.unchecked(piece_of(OTHER)?));
 
     peer.send(Message::Interested).await;
     peer.send(Message::Request(Request::new(DAMAGED, 0, PIECE_LENGTH)))
@@ -1053,7 +1047,9 @@ async fn test_seed_mode_failed_check_serves_no_other_unchecked_piece() -> anyhow
         .await;
     // What the peer receives until the check of every piece lets it go.
     assert_eq!(
-        peer.next_block().await.map(|(piece, begin, _)| (piece, begin)),
+        peer.next_block()
+            .await
+            .map(|(piece, begin, _)| (piece, begin)),
         None,
         "a block was served after a piece failed its seed-mode check"
     );

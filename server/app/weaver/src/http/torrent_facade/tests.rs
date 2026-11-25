@@ -4645,7 +4645,10 @@ async fn a_metainfo_with_bytes_after_it_exports_them_unchanged() {
     let mut redacted = torrent(b"https://seed.invalid/files/");
     redacted.push(b'\n');
     assert_eq!(first.add_file(&added, &[]).await.status, StatusCode::OK);
-    let hash = first.torrents().await[0]["hash"].as_str().unwrap().to_owned();
+    let hash = first.torrents().await[0]["hash"]
+        .as_str()
+        .unwrap()
+        .to_owned();
     let exported = first
         .send(
             Request::get(format!("/api/v2/torrents/export?hash={hash}"))
