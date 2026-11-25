@@ -414,14 +414,19 @@ impl RarStore {
                     Run::Envelope | Run::Held => None,
                 })
                 .collect(),
-            None => self.parts_in(volume, below),
+            // A made entry's part is the envelope's, never a member's run.
+            None => self
+                .parts_in(volume, below)
+                .into_iter()
+                .filter(|&(id, _, _)| !self.entries[id].made)
+                .collect(),
         }
     }
 
     // The parts the entries hold in a volume range, in volume order: the
-    // member, the volume range and the packed-stream range it is. Only the
-    // volume's own pieces are looked at; parts starting at the same byte
-    // keep entry and piece order.
+    // member, the volume range and the packed-stream range it is, made
+    // entries' as well as stored ones'. Only the volume's own pieces are
+    // looked at; parts starting at the same byte keep entry and piece order.
     pub(super) fn parts_in(
         &self,
         volume: VolumeIndex,
@@ -433,8 +438,7 @@ impl RarStore {
             .into_iter()
             .flatten()
             .filter_map(|&(id, at)| {
-                let entry = self.entries.get(id).filter(|entry| !entry.made)?;
-                let piece = entry.pieces.get(at)?;
+                let piece = self.entries.get(id)?.pieces.get(at)?;
                 let part = piece.data.intersect(range)?;
                 let stream = ByteRange::at(piece.at + (part.start - piece.data.start), part.len());
                 Some((part.start, id, at, part, stream))
@@ -461,7 +465,6 @@ impl RarStore {
             .entries
             .iter()
             .enumerate()
-            .filter(|(_, entry)| !entry.made)
             .flat_map(|(id, entry)| {
                 entry
                     .pieces
@@ -501,7 +504,9 @@ impl RarStore {
             .collect()
     }
 
-    // A member's bytes, by what the store knows of its key.
+    // A member's bytes, by what the store knows of its key. The piece of a
+    // made entry is the envelope's, where capture put it, whether or not
+    // the layout holds its volume now: the run reads it there.
     fn place_member(
         &self,
         volume: VolumeIndex,
@@ -514,6 +519,15 @@ impl RarStore {
         let Some(entry) = self.entries.get(id) else {
             return push(out, Placement::Held { range: part });
         };
+        if entry.made {
+            return push(
+                out,
+                Placement::Envelope {
+                    envelope: volume.0,
+                    range: part,
+                },
+            );
+        }
         let member = MemberId(id as u32);
         // A condemned file is placed as it stood until its bytes are
         // posted again: what came out of them is uncovered where it lies.

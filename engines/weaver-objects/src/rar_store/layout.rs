@@ -720,17 +720,33 @@ impl RarStore {
         // layout laid afresh may reach less far than the one before, as when
         // a volume's length is said anew and the headers at its new end are
         // not in yet: what it does not list yet is unread, not refuted, and
-        // its bytes stay where they were placed. A member the run made that
-        // its headers no longer give the run, as a repaired header that
-        // says it is stored, is something else too: the store streams it.
+        // a stored entry's bytes stay where they were placed. A member the
+        // run made that its headers no longer give the run, as a repaired
+        // header that says it is stored, is something else too: the store
+        // streams it. A made entry stands only while the store holds every
+        // volume its pieces lie in: its bytes stayed in the envelope, so one
+        // with a piece in a volume the store gave back was made in an order
+        // no longer the set's, and is made again where the layout lays it.
+        // One whose volume the layout only dropped, held still, is compared
+        // again when the layout lays that volume once more.
         let keep = self.entries[start..]
             .iter()
-            .zip(members.iter().enumerate().skip(start))
-            .position(|(entry, (id, member))| {
+            .enumerate()
+            .position(|(at, entry)| {
+                let id = start + at;
+                let gone = entry.made
+                    && entry
+                        .pieces
+                        .iter()
+                        .any(|piece| !self.volumes.contains_key(&piece.volume));
+                let Some(member) = members.get(id) else {
+                    return gone;
+                };
                 #[cfg(test)]
                 super::counts::bump(|counts| counts.compared += 1);
                 !same(entry, member)
                     || (entry.name != member.name && !renamed_in_place(entry, member))
+                    || gone
                     || (entry.made && !self.made_by_run(id, member, format))
             })
             .map_or(self.entries.len(), |at| start + at);
@@ -876,7 +892,12 @@ impl RarStore {
             let Some(at) = part.logical_offset else {
                 break;
             };
-            self.unmapped.remove(&VolumeIndex(part.volume));
+            // Only a stored member's part sends the volume's bytes to a
+            // member's file; a made one's stay in the envelope, as the
+            // engine's do, so its volume can still go back.
+            if !self.entries[id].made {
+                self.unmapped.remove(&VolumeIndex(part.volume));
+            }
             let at_piece = self.entries[id].pieces.len();
             self.pieces_in
                 .entry(VolumeIndex(part.volume))

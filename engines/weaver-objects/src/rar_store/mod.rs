@@ -462,8 +462,10 @@ pub struct RarStore {
     volumes: BTreeMap<VolumeIndex, Volume>,
     // Volumes said to be given back, until the tree takes them.
     giving: BTreeMap<VolumeIndex, Volume>,
-    // The volumes held, here or in `giving`, that no entry's piece lies in:
-    // the ones that can travel to another owner. Filed where a volume comes
+    // The volumes held, here or in `giving`, that no stored entry's piece
+    // lies in: none of their bytes went to a member's file, so they can go
+    // back to be claimed elsewhere. A made entry's pieces leave a volume
+    // here, since its bytes stay in the envelope. Filed where a volume comes
     // or goes and where pieces do, so no question about one scans pieces.
     unmapped: BTreeSet<VolumeIndex>,
     // The entries the store's run makes, filed as entries come and go, so
@@ -721,7 +723,12 @@ impl RarStore {
                     .push((id, at));
             }
         }
-        let mapped: BTreeSet<VolumeIndex> = self.pieces_in.keys().copied().collect();
+        let mapped: BTreeSet<VolumeIndex> = self
+            .entries
+            .iter()
+            .filter(|entry| !entry.made)
+            .flat_map(|entry| entry.pieces.iter().map(|piece| piece.volume))
+            .collect();
         self.unmapped = self
             .volumes
             .keys()
@@ -977,13 +984,30 @@ impl RarStore {
     }
 
     // Every volume the store gives back goes through here. One the layout
-    // already placed pieces in stays, whichever path asked: its bytes went
-    // to the store's members, its kept bytes no longer hold them, and the
-    // tree, handed it, would refuse its member with those bytes lost, the
-    // store founded again on the same bytes would give it back again, and
-    // nothing would change between the rounds. It is the store's, as any
-    // volume its members read is.
+    // already placed a stored member's pieces in stays, whichever path
+    // asked: its bytes went to that member's file, its kept bytes no longer
+    // hold them, and the tree, handed it, would refuse its member with those
+    // bytes lost, the store founded again on the same bytes would give it
+    // back again, and nothing would change between the rounds. It is the
+    // store's, as any volume its stored members read is. One only made
+    // members' pieces lie in stays too when the store's own reading of the
+    // headers asks, as at a misfit while a repair is half delivered: the
+    // run reads it where it is. Only a name that places it elsewhere sends
+    // it back (`give_back_named`).
     fn give_back_held(&mut self, going: Vec<VolumeIndex>, out: &mut Vec<Emit>) {
+        let going = going
+            .into_iter()
+            .filter(|index| !self.pieces_in.contains_key(index))
+            .collect();
+        self.give_back_named(going, out);
+    }
+
+    // A volume its name now places elsewhere goes back even when made
+    // members' pieces lie in it: they kept every byte in its envelope, as
+    // the engine's volumes do, and it goes back as they do. The look that
+    // follows finds it gone from the store and retracts what the run made
+    // of it. One a stored member's pieces lie in still stays.
+    fn give_back_named(&mut self, going: Vec<VolumeIndex>, out: &mut Vec<Emit>) {
         for index in going {
             if !self.unmapped.contains(&index) {
                 continue;
@@ -996,6 +1020,23 @@ impl RarStore {
             self.file_open(index);
             self.touch(index);
         }
+    }
+
+    // A volume the store can give back with what it parsed of it: none of
+    // its bytes went to a stored member's file, nothing ties it to a held
+    // neighbour at the place it states, unless the store already said it
+    // gives it back, and what it kept may travel.
+    fn giveable(&self, volume: VolumeIndex) -> Option<&(dyn std::any::Any + Send + Sync)> {
+        if !self.unmapped.contains(&volume)
+            || (!self.giving.contains_key(&volume) && claim::tied(volume, &self.volumes))
+        {
+            return None;
+        }
+        let held = self
+            .giving
+            .get(&volume)
+            .or_else(|| self.volumes.get(&volume))?;
+        (held.kept.len() <= claim::CARRIED).then_some(held)
     }
 
     // Everything bound has closed: nothing more will arrive.
@@ -1431,17 +1472,13 @@ impl Object for RarStore {
     // parse it owns. This is also the guard on a transfer the tree asks for.
     // A volume tied to a held neighbour at the place it states stays
     // with that neighbour: it is that set's, however its place was taken.
+    // One a made member's pieces lie in feeds the run, as an engine's volume
+    // does, and travels to no sibling; it can still go back.
     fn carried(&self, volume: VolumeIndex) -> Option<&(dyn std::any::Any + Send + Sync)> {
-        if !self.unmapped.contains(&volume)
-            || (!self.giving.contains_key(&volume) && claim::tied(volume, &self.volumes))
-        {
+        if self.pieces_in.contains_key(&volume) {
             return None;
         }
-        let held = self
-            .giving
-            .get(&volume)
-            .or_else(|| self.volumes.get(&volume))?;
-        (held.kept.len() <= claim::CARRIED).then_some(held)
+        self.giveable(volume)
     }
 
     fn carriable(&self, out: &mut Vec<VolumeIndex>) {
@@ -1454,7 +1491,12 @@ impl Object for RarStore {
     }
 
     fn give_back(&mut self, volume: VolumeIndex) -> Option<weaver_graph::Carried> {
-        self.carried(volume)?;
+        // One a made member's pieces lie in goes only once the store said
+        // it gives it back.
+        if !self.giving.contains_key(&volume) && self.pieces_in.contains_key(&volume) {
+            return None;
+        }
+        self.giveable(volume)?;
         let given = self
             .giving
             .remove(&volume)
@@ -1544,8 +1586,8 @@ impl Object for RarStore {
         // restore reads it again as said already.
         self.file_open(volume);
         self.touch(volume);
-        if misplaced && self.carried(volume).is_some() {
-            self.give_back_held(vec![volume], out);
+        if misplaced && self.giveable(volume).is_some() {
+            self.give_back_named(vec![volume], out);
         }
         self.settle(None, out);
     }
