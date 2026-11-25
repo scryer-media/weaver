@@ -163,3 +163,20 @@ Same result on a slow, loaded, shared runner as on an idle workstation. A test t
 
 - Before changing anything under `e2e/playwright-weaver`, read `.agents/skills/e2e-playwright/SKILL.md`. It is binding: durable ids, waits tied to the item, no sleeps or timeouts, isolated fixtures, assertions on product behaviour.
 - `npm run audit:selector-quality` (in `npm run audit`) enforces the locator rules. Fix the spec; never widen the audit.
+
+## Agents helping an operator
+
+- An agent reaches Weaver through `POST /mcp` with an API key. The key's scope (READ, CONTROL, ADMIN) is the agent's scope; the endpoint adds none.
+- The tool set is closed: `whoami`, `list_operations`, `describe_operation`, `run_query`, `run_mutation`, `read_diagnostics_section`, `search_service_logs`.
+- Everything an agent reads or changes is a skill operation run against the schema `/graphql` serves, under the same guards. No field, resolver, route or error code exists only for agents.
+- The two diagnostics tools are ADMIN only and return what the diagnostics bundle returns, through its collectors and its sanitizer. No second redaction path.
+- A mutation is applied only after the operator has seen its confirmation summary and the call is repeated with its `confirm_token`.
+- An agent decides on an error's `code` and `reason`, never its message.
+- The operator can turn the endpoint off (Settings > Security, or `WEAVER_MCP_ENABLED`). Off answers `MCP_DISABLED` before any other check.
+
+## Operator skills stay current
+
+- Every `skills/*/operations/*.graphql` file is embedded in the binary and must validate against the served schema (`http::mcp::operation_contract`). A schema change that breaks an operation fixes it in the same change.
+- A change to behaviour a skill describes (a code, a default, a label, a refusal) updates that skill in the same change.
+- One named query or mutation per file. Its first comment line is its purpose, at most 100 characters.
+- Skill text states only what the landed source does, and names no model, agent product or AI company.
