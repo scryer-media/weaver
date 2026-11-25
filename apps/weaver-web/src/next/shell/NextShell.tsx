@@ -664,8 +664,11 @@ export const NetworkBlock = memo(function NetworkBlock() {
     return null;
   }
   return (
-    // No label and no padding: the drawing is the whole block.
-    <div className="flex flex-none flex-col border-t border-wv-line-strong">
+    // No label and no padding: the drawing is the whole block. It grows with
+    // the servers and routes drawn, so it is held to a share of the rail and
+    // cut off below that: the screen links above it keep their room, and
+    // picking the drawing still shows all of it.
+    <div className="flex max-h-[30%] flex-none flex-col overflow-hidden border-t border-wv-line-strong">
       <FlowPreview
         workspace={{ ...workspace, data }}
         dns={flowDns}
