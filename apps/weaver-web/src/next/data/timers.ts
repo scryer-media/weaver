@@ -11,7 +11,8 @@ export interface Timers {
 
 const browserTimers: Timers = {
   setTimeout: (run, delayMs) => globalThis.setTimeout(run, delayMs),
-  clearTimeout: (handle) => globalThis.clearTimeout(handle as ReturnType<typeof setTimeout>),
+  clearTimeout: (handle) =>
+    globalThis.clearTimeout(handle as ReturnType<typeof setTimeout>),
 };
 
 export interface Debouncer<T> {
@@ -67,7 +68,8 @@ export interface PageVisibility {
 }
 
 export const documentVisibility: PageVisibility = {
-  visible: () => typeof document === "undefined" || document.visibilityState !== "hidden",
+  visible: () =>
+    typeof document === "undefined" || document.visibilityState !== "hidden",
   subscribe(onChange) {
     if (typeof document === "undefined") {
       return () => {};
@@ -79,7 +81,11 @@ export const documentVisibility: PageVisibility = {
 
 /** True while the page is showing; false while its tab is in the background. */
 export function usePageVisible(): boolean {
-  return useSyncExternalStore(documentVisibility.subscribe, documentVisibility.visible, () => true);
+  return useSyncExternalStore(
+    documentVisibility.subscribe,
+    documentVisibility.visible,
+    () => true,
+  );
 }
 
 /**
@@ -132,7 +138,10 @@ export function createVisibleInterval(
 }
 
 /** `createVisibleInterval` for a component; `periodMs` of null stops it. */
-export function useVisibleInterval(run: () => void, periodMs: number | null): void {
+export function useVisibleInterval(
+  run: () => void,
+  periodMs: number | null,
+): void {
   const latest = useRef(run);
   latest.current = run;
   useEffect(() => {

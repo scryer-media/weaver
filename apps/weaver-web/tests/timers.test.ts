@@ -40,7 +40,11 @@ function fakeTimers() {
 test("a debouncer settles once, on the last value, after pushes stop", () => {
   const clock = fakeTimers();
   const settled: string[] = [];
-  const debouncer = createDebouncer<string>(300, (value) => settled.push(value), clock.timers);
+  const debouncer = createDebouncer<string>(
+    300,
+    (value) => settled.push(value),
+    clock.timers,
+  );
 
   debouncer.push("u");
   clock.advance(100);
@@ -58,7 +62,11 @@ test("a debouncer settles once, on the last value, after pushes stop", () => {
 test("a cancelled debouncer settles nothing", () => {
   const clock = fakeTimers();
   const settled: string[] = [];
-  const debouncer = createDebouncer<string>(300, (value) => settled.push(value), clock.timers);
+  const debouncer = createDebouncer<string>(
+    300,
+    (value) => settled.push(value),
+    clock.timers,
+  );
 
   debouncer.push("ubuntu");
   debouncer.cancel();
@@ -134,7 +142,12 @@ test("a stopped interval runs no more and stops listening", () => {
   const clock = fakeTimers();
   const page = fakeVisibility(true);
   let runs = 0;
-  const stop = createVisibleInterval(() => runs++, 1_000, page.visibility, clock.timers);
+  const stop = createVisibleInterval(
+    () => runs++,
+    1_000,
+    page.visibility,
+    clock.timers,
+  );
 
   stop();
   clock.advance(5_000);

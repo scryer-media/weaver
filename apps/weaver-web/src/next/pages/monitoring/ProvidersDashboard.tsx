@@ -33,7 +33,16 @@ import { UsageRangeBar, useUsageRange } from "./RangeBar";
 import { useUsageHistory } from "./usage";
 
 // One colour per server line, in row order, wrapping after the last.
-const SERIES_COLORS = [WV.accent, WV.info, WV.violet, WV.gold, WV.green, WV.warn, WV.error, WV.slate];
+const SERIES_COLORS = [
+  WV.accent,
+  WV.info,
+  WV.violet,
+  WV.gold,
+  WV.green,
+  WV.warn,
+  WV.error,
+  WV.slate,
+];
 
 const COLUMNS =
   "minmax(180px, 2fr) repeat(5, minmax(76px, 1fr)) minmax(64px, 0.8fr) minmax(76px, 0.9fr) minmax(64px, 0.8fr) minmax(130px, 1.4fr) minmax(64px, 0.8fr)";
@@ -46,7 +55,11 @@ export function ProvidersDashboard() {
   const now = useNow(60_000);
   const today = dayKey(now);
   const rangeState = useUsageRange(now);
-  const { usage, isLoading, error } = useUsageHistory(PROVIDERS_USAGE_QUERY, rangeState.range, "SERVER");
+  const { usage, isLoading, error } = useUsageHistory(
+    PROVIDERS_USAGE_QUERY,
+    rangeState.range,
+    "SERVER",
+  );
 
   const rows = useMemo(
     () => providerRows(providers, usage?.consumers ?? []),
@@ -58,7 +71,11 @@ export function ProvidersDashboard() {
   const series: ChartSeries[] = rows
     .filter((row) => row.usage !== null)
     .map((row, index) => {
-      const values = averageDailySpeed(row.usage!.days, usage?.today ?? today, secondsIntoToday);
+      const values = averageDailySpeed(
+        row.usage!.days,
+        usage?.today ?? today,
+        secondsIntoToday,
+      );
       const last = values[values.length - 1] ?? 0;
       return {
         key: row.key,
@@ -79,7 +96,11 @@ export function ProvidersDashboard() {
     <>
       {error ? <DashboardSlot slot="status">{error}</DashboardSlot> : null}
       <div className="flex min-h-0 flex-1 flex-col overflow-y-auto bg-wv-list">
-        <UsageRangeBar state={rangeState} rangeStart={usage?.rangeStart} rangeEnd={usage?.rangeEnd} />
+        <UsageRangeBar
+          state={rangeState}
+          rangeStart={usage?.rangeStart}
+          rangeEnd={usage?.rangeEnd}
+        />
 
         <section className="flex flex-none flex-col">
           <SectionHeader label={t("next.rail.providers")} sticky={false} />
@@ -90,13 +111,21 @@ export function ProvidersDashboard() {
                 style={{ gridTemplateColumns: COLUMNS }}
               >
                 <span>{t("next.providers.server")}</span>
-                <span className="text-right">{t("next.usage.period.today")}</span>
-                <span className="text-right">{t("next.usage.period.week")}</span>
-                <span className="text-right">{t("next.usage.period.month")}</span>
+                <span className="text-right">
+                  {t("next.usage.period.today")}
+                </span>
+                <span className="text-right">
+                  {t("next.usage.period.week")}
+                </span>
+                <span className="text-right">
+                  {t("next.usage.period.month")}
+                </span>
                 <span className="text-right">{t("next.usage.allTime")}</span>
                 <span className="text-right">{t("next.usage.inRange")}</span>
                 <span className="text-right">{t("next.providers.found")}</span>
-                <span className="text-right">{t("next.monitoring.roundTrip")}</span>
+                <span className="text-right">
+                  {t("next.monitoring.roundTrip")}
+                </span>
                 <span className="text-right">{t("next.providers.inUse")}</span>
                 <span className="text-right">{t("next.providers.state")}</span>
                 <span className="text-right">{t("next.providers.down")}</span>
@@ -111,7 +140,10 @@ export function ProvidersDashboard() {
                   since === null
                     ? null
                     : t("next.providers.since", {
-                        time: since >= startOfDay(now) ? formatClock(since) : formatDayClock(since),
+                        time:
+                          since >= startOfDay(now)
+                            ? formatClock(since)
+                            : formatDayClock(since),
                       });
                 return (
                   <div
@@ -120,22 +152,44 @@ export function ProvidersDashboard() {
                     style={{ gridTemplateColumns: COLUMNS }}
                   >
                     <span className="flex min-w-0 items-center gap-[9px]">
-                      <Square color={provider === null ? WV.muted : up ? WV.accent : WV.warn} />
+                      <Square
+                        color={
+                          provider === null
+                            ? WV.muted
+                            : up
+                              ? WV.accent
+                              : WV.warn
+                        }
+                      />
                       <span
                         className={`truncate font-wv-mono text-[12.5px] ${provider === null ? "text-wv-muted" : "text-wv-fg"}`}
                       >
                         {providerRowName(row, removed)}
                       </span>
                     </span>
-                    <span className={cell}>{totals ? formatSize(totals.today.bytes) : EM_DASH}</span>
-                    <span className={cell}>{totals ? formatSize(totals.week.bytes) : EM_DASH}</span>
-                    <span className={cell}>{totals ? formatSize(totals.month.bytes) : EM_DASH}</span>
-                    <span className={cell}>{totals ? formatSize(totals.allTime.bytes) : EM_DASH}</span>
+                    <span className={cell}>
+                      {totals ? formatSize(totals.today.bytes) : EM_DASH}
+                    </span>
+                    <span className={cell}>
+                      {totals ? formatSize(totals.week.bytes) : EM_DASH}
+                    </span>
+                    <span className={cell}>
+                      {totals ? formatSize(totals.month.bytes) : EM_DASH}
+                    </span>
+                    <span className={cell}>
+                      {totals ? formatSize(totals.allTime.bytes) : EM_DASH}
+                    </span>
                     <span className={`${cell} text-wv-fg`}>
                       {totals ? formatSize(totals.range.bytes) : EM_DASH}
                     </span>
-                    <span className={cell}>{found === null ? EM_DASH : `${found.toFixed(1)}%`}</span>
-                    <span className={cell}>{provider ? formatLatency(provider.measuredLatencyMs) : EM_DASH}</span>
+                    <span className={cell}>
+                      {found === null ? EM_DASH : `${found.toFixed(1)}%`}
+                    </span>
+                    <span className={cell}>
+                      {provider
+                        ? formatLatency(provider.measuredLatencyMs)
+                        : EM_DASH}
+                    </span>
                     <span className={cell}>
                       {provider
                         ? `${provider.connectionsActive} / ${provider.connectionsConfigured}`
@@ -145,13 +199,19 @@ export function ProvidersDashboard() {
                       className={`${cell} ${provider && !up ? "text-wv-warn" : ""}`}
                       title={sinceText ?? undefined}
                     >
-                      {provider ? providerStateLabel(t, provider.state) : EM_DASH}
+                      {provider
+                        ? providerStateLabel(t, provider.state)
+                        : EM_DASH}
                       {sinceText ? (
-                        <span className="block text-[11px] text-wv-muted">{sinceText}</span>
+                        <span className="block text-[11px] text-wv-muted">
+                          {sinceText}
+                        </span>
                       ) : null}
                     </span>
                     <span className={cell}>
-                      {totals ? formatDuration(totals.range.downSeconds) : EM_DASH}
+                      {totals
+                        ? formatDuration(totals.range.downSeconds)
+                        : EM_DASH}
                     </span>
                   </div>
                 );

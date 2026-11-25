@@ -1430,7 +1430,8 @@ impl ManagedTorrent {
     /// paused: true when it passed, now or before, and the storage heard
     /// [`crate::storage::TorrentStorage::on_piece_checked`] when it passed
     /// now. One that fails ends seed mode and every piece is checked again
-    /// (libtorrent `torrent::leave_seed_mode` with `check_files`). None
+    /// (libtorrent `torrent::leave_seed_mode` with `check_files`); until
+    /// that check begins, every piece is answered false. None
     /// while the torrent neither runs nor is paused, or for no piece of it.
     ///
     /// Blocks its thread: it reads the piece from disk, and it waits for a
@@ -1439,6 +1440,7 @@ impl ManagedTorrent {
     /// [`tokio::task::spawn_blocking`], never on a runtime's worker or on a
     /// uTP thread.
     pub fn check_seeded(&self, piece: u32) -> Option<anyhow::Result<bool>> {
+        use seed_mode::Ask;
         crate::spawn_utils::no_block_on_utp_thread();
         let metadata = self.metadata.load();
         let piece = metadata.as_ref()?.lengths().validate_piece_index(piece)?;
@@ -1462,8 +1464,10 @@ impl ManagedTorrent {
             if !matches!(self.locked.read().state, ManagedTorrentState::Paused(_)) {
                 return None;
             }
-            if !seed.unchecked(piece) {
-                return Some(Ok(true));
+            match seed.ask(piece) {
+                Ask::Served => return Some(Ok(true)),
+                Ask::Refused => return Some(Ok(false)),
+                Ask::Unchecked => {}
             }
             // One read turn of the torrent's volume for the read, as a
             // running torrent's check of the piece holds. It is waited
@@ -1479,8 +1483,10 @@ impl ManagedTorrent {
             let ManagedTorrentState::Paused(paused) = &g.state else {
                 continue;
             };
-            if !seed.unchecked(piece) {
-                return Some(Ok(true));
+            match seed.ask(piece) {
+                Ask::Served => return Some(Ok(true)),
+                Ask::Refused => return Some(Ok(false)),
+                Ask::Unchecked => {}
             }
             let ops = crate::file_ops::FileOps::new(
                 &paused.metadata,
@@ -1495,9 +1501,9 @@ impl ManagedTorrent {
             if matches!(verdict, Ok(crate::file_ops::Verdict::Passed)) {
                 let checked = paused.files.on_piece_checked(piece);
                 seed.checked(piece);
-                return Some(checked.map(|()| true));
+                return Some(checked.map(|()| seed.ask(piece) != Ask::Refused));
             }
-            break seed.leave();
+            break seed.fail();
         };
         if left {
             warn!(

@@ -3,12 +3,21 @@
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { fileKind, isMagnet, maxBytes, NZB_MAX_BYTES, TORRENT_MAX_BYTES } from "../src/next/data/analyzer.ts";
+import {
+  fileKind,
+  isMagnet,
+  maxBytes,
+  NZB_MAX_BYTES,
+  TORRENT_MAX_BYTES,
+} from "../src/next/data/analyzer.ts";
 
 const bytes = (text: string) => new TextEncoder().encode(text);
 
 test("a bencoded dictionary is a torrent whatever its name", () => {
-  assert.equal(fileKind(bytes("d8:announce35:udp://tracker.example:6969/announce4:infod")), "torrent");
+  assert.equal(
+    fileKind(bytes("d8:announce35:udp://tracker.example:6969/announce4:infod")),
+    "torrent",
+  );
   assert.equal(fileKind(bytes("d4:infod6:lengthi1ee")), "torrent");
 });
 
@@ -23,7 +32,9 @@ test("xml, compressed and unknown bytes go to the nzb reader", () => {
 });
 
 test("a magnet link is told from other text", () => {
-  assert.ok(isMagnet("magnet:?xt=urn:btih:0000000000000000000000000000000000000000"));
+  assert.ok(
+    isMagnet("magnet:?xt=urn:btih:0000000000000000000000000000000000000000"),
+  );
   assert.ok(isMagnet("  MAGNET:?xt=urn:btih:00\n"));
   assert.ok(!isMagnet("https://tracker.example/file.torrent"));
   assert.ok(!isMagnet("magnet"));

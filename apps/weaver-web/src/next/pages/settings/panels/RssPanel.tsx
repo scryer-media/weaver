@@ -16,12 +16,19 @@ import {
   UPDATE_RSS_RULE_MUTATION,
 } from "@/graphql/queries";
 import { useTranslate, type Translate } from "@/lib/context/translate-context";
-import { blockedRouting, type RoutingPolicy, type RoutingStatus } from "@/lib/proxies";
+import {
+  blockedRouting,
+  type RoutingPolicy,
+  type RoutingStatus,
+} from "@/lib/proxies";
 import { refusalMessage } from "@/lib/refusal";
 import { settingsIds, testIds } from "@/next/testids";
 import { Square } from "../../../components/chrome";
 import { ConfirmDialog } from "../../../components/ConfirmDialog";
-import { RecordEditor, type EditorSection } from "../../../components/RecordEditor";
+import {
+  RecordEditor,
+  type EditorSection,
+} from "../../../components/RecordEditor";
 import { SecondaryButton, Select } from "../../../components/controls";
 import { Icon } from "../../../components/icons";
 import { RoutingState } from "../../../components/RoutingState";
@@ -116,7 +123,13 @@ interface RssData {
   rssSeenItems: SeenItem[];
   categories: { id: number; name: string }[];
   /** Every script instance; a feed can only run one whose trigger is the feed. */
-  scriptInstances?: { id: string; name: string; script: string; trigger: string; enabled: boolean }[];
+  scriptInstances?: {
+    id: string;
+    name: string;
+    script: string;
+    trigger: string;
+    enabled: boolean;
+  }[];
 }
 
 interface FeedForm {
@@ -205,7 +218,10 @@ function parseMetadata(text: string): MetadataEntry[] {
       const separator = line.indexOf("=");
       return separator === -1
         ? { key: line.trim(), value: "" }
-        : { key: line.slice(0, separator).trim(), value: line.slice(separator + 1).trim() };
+        : {
+            key: line.slice(0, separator).trim(),
+            value: line.slice(separator + 1).trim(),
+          };
     })
     .filter((entry) => entry.key !== "");
 }
@@ -250,7 +266,10 @@ function decisionLabel(t: Translate, decision: string): string {
   return DECISIONS.has(value) ? t(`next.rss.decision.${value}`) : value;
 }
 
-function feedState(t: Translate, feed: RssFeed): { color: string; text: string } {
+function feedState(
+  t: Translate,
+  feed: RssFeed,
+): { color: string; text: string } {
   if (!feed.enabled) {
     return { color: WV.inert, text: t("next.rss.paused") };
   }
@@ -260,7 +279,12 @@ function feedState(t: Translate, feed: RssFeed): { color: string; text: string }
       text: feed.lastError,
     };
   }
-  return { color: WV.accent, text: feed.lastSuccessAt ? formatDate(feed.lastSuccessAt) : t("next.rss.notPolled") };
+  return {
+    color: WV.accent,
+    text: feed.lastSuccessAt
+      ? formatDate(feed.lastSuccessAt)
+      : t("next.rss.notPolled"),
+  };
 }
 
 /** One count of a report line, the number set in its own element inside the phrase. */
@@ -270,7 +294,11 @@ function reportCount(
   count: number,
   id: Parameters<typeof settingsIds.rssReportCount>[0],
 ): ReactNode {
-  const [before, after] = aroundSlot(t, `${key}.${count === 1 ? "one" : "other"}`, "count");
+  const [before, after] = aroundSlot(
+    t,
+    `${key}.${count === 1 ? "one" : "other"}`,
+    "count",
+  );
   return (
     <>
       {before}
@@ -287,11 +315,15 @@ function reportLine(t: Translate, report: SyncReport): ReactNode {
     reportCount(t, "next.rss.itemsQueued", report.itemsSubmitted, "queued"),
   ];
   if (report.itemsIgnored > 0) {
-    parts.push(reportCount(t, "next.rss.itemsIgnored", report.itemsIgnored, "ignored"));
+    parts.push(
+      reportCount(t, "next.rss.itemsIgnored", report.itemsIgnored, "ignored"),
+    );
   }
   const firstError = report.errors[0];
   if (firstError) {
-    parts.push(<span data-testid={settingsIds.rssReportError}>{firstError}</span>);
+    parts.push(
+      <span data-testid={settingsIds.rssReportError}>{firstError}</span>,
+    );
   }
   return parts.map((part, index) => (
     <Fragment key={index}>
@@ -303,7 +335,9 @@ function reportLine(t: Translate, report: SyncReport): ReactNode {
 
 export function RssPanel() {
   const t = useTranslate();
-  const [{ data, fetching }, reexecute] = useQuery<RssData>({ query: RSS_SETTINGS_QUERY });
+  const [{ data, fetching }, reexecute] = useQuery<RssData>({
+    query: RSS_SETTINGS_QUERY,
+  });
   const [, addFeed] = useMutation(ADD_RSS_FEED_MUTATION);
   const [, updateFeed] = useMutation(UPDATE_RSS_FEED_MUTATION);
   const [, deleteFeed] = useMutation(DELETE_RSS_FEED_MUTATION);
@@ -317,7 +351,10 @@ export function RssPanel() {
   const [feedId, setFeedId] = useState<number | "new" | null>(null);
   const [feedForm, setFeedForm] = useState<FeedForm>(NEW_FEED);
   const [ruleId, setRuleId] = useState<number | "new" | null>(null);
-  const [ruleForm, setRuleForm] = useState<RuleForm>({ ...NEW_RULE, feedId: 0 });
+  const [ruleForm, setRuleForm] = useState<RuleForm>({
+    ...NEW_RULE,
+    feedId: 0,
+  });
   const [error, setError] = useState<string | null>(null);
   const [status, setStatus] = useState<ReactNode>(null);
   const [busy, setBusy] = useState(false);
@@ -326,11 +363,17 @@ export function RssPanel() {
   const [confirmSeen, setConfirmSeen] = useState<SeenItem | "all" | null>(null);
 
   const feeds = useMemo(
-    () => [...(data?.rssFeeds ?? [])].sort((left, right) => left.name.localeCompare(right.name)),
+    () =>
+      [...(data?.rssFeeds ?? [])].sort((left, right) =>
+        left.name.localeCompare(right.name),
+      ),
     [data?.rssFeeds],
   );
   const categories = useMemo(
-    () => [...(data?.categories ?? [])].sort((left, right) => left.name.localeCompare(right.name)),
+    () =>
+      [...(data?.categories ?? [])].sort((left, right) =>
+        left.name.localeCompare(right.name),
+      ),
     [data?.categories],
   );
   const rules = useMemo(
@@ -339,8 +382,8 @@ export function RssPanel() {
         .flatMap((feed) => feed.rules.map((rule) => ({ rule, feed })))
         .sort(
           (left, right) =>
-            left.feed.name.localeCompare(right.feed.name)
-            || left.rule.sortOrder - right.rule.sortOrder,
+            left.feed.name.localeCompare(right.feed.name) ||
+            left.rule.sortOrder - right.rule.sortOrder,
         ),
     [feeds],
   );
@@ -354,16 +397,29 @@ export function RssPanel() {
 
   const categoryOptions = [
     { value: NO_CATEGORY, label: t("next.rss.noCategory") },
-    ...categories.map((category) => ({ value: category.name, label: category.name })),
+    ...categories.map((category) => ({
+      value: category.name,
+      label: category.name,
+    })),
   ];
-  const feedOptions = feeds.map((feed) => ({ value: String(feed.id), label: feed.name }));
+  const feedOptions = feeds.map((feed) => ({
+    value: String(feed.id),
+    label: feed.name,
+  }));
 
-  const editingFeed = typeof feedId === "number" ? (feeds.find((f) => f.id === feedId) ?? null) : null;
+  const editingFeed =
+    typeof feedId === "number"
+      ? (feeds.find((f) => f.id === feedId) ?? null)
+      : null;
   const editingRule =
-    typeof ruleId === "number" ? (rules.find((entry) => entry.rule.id === ruleId)?.rule ?? null) : null;
+    typeof ruleId === "number"
+      ? (rules.find((entry) => entry.rule.id === ruleId)?.rule ?? null)
+      : null;
 
-  const patchFeed = (next: Partial<FeedForm>) => setFeedForm((current) => ({ ...current, ...next }));
-  const patchRule = (next: Partial<RuleForm>) => setRuleForm((current) => ({ ...current, ...next }));
+  const patchFeed = (next: Partial<FeedForm>) =>
+    setFeedForm((current) => ({ ...current, ...next }));
+  const patchRule = (next: Partial<RuleForm>) =>
+    setRuleForm((current) => ({ ...current, ...next }));
 
   const openFeed = (feed: RssFeed | null) => {
     setError(null);
@@ -400,15 +456,20 @@ export function RssPanel() {
             action: rule.action,
             titleRegex: rule.titleRegex ?? "",
             itemCategories: rule.itemCategories.join(", "),
-            minSizeBytes: rule.minSizeBytes == null ? "" : String(rule.minSizeBytes),
-            maxSizeBytes: rule.maxSizeBytes == null ? "" : String(rule.maxSizeBytes),
+            minSizeBytes:
+              rule.minSizeBytes == null ? "" : String(rule.minSizeBytes),
+            maxSizeBytes:
+              rule.maxSizeBytes == null ? "" : String(rule.maxSizeBytes),
             categoryOverride: rule.categoryOverride ?? NO_CATEGORY,
             metadata: metadataText(rule.metadata),
           }
         : {
             ...NEW_RULE,
             feedId: feeds[0]?.id ?? 0,
-            sortOrder: rules.length === 0 ? 0 : Math.max(...rules.map((e) => e.rule.sortOrder)) + 1,
+            sortOrder:
+              rules.length === 0
+                ? 0
+                : Math.max(...rules.map((e) => e.rule.sortOrder)) + 1,
           },
     );
     setRuleId(rule ? rule.id : "new");
@@ -430,7 +491,10 @@ export function RssPanel() {
       name: feedForm.name.trim(),
       url: feedForm.url.trim(),
       enabled: feedForm.enabled,
-      pollIntervalSecs: Math.max(30, Math.round(feedForm.pollIntervalSecs || 900)),
+      pollIntervalSecs: Math.max(
+        30,
+        Math.round(feedForm.pollIntervalSecs || 900),
+      ),
       scriptInstanceIds: feedForm.scriptInstanceIds,
       username: feedForm.username.trim(),
       // A blank password keeps the stored one; clearing it is explicit.
@@ -442,7 +506,9 @@ export function RssPanel() {
     const result =
       feedId === "new"
         ? await addFeed({
-            input: feedForm.killSwitch ? { ...input, enabled: false, routing: blockedRouting } : input,
+            input: feedForm.killSwitch
+              ? { ...input, enabled: false, routing: blockedRouting }
+              : input,
           })
         : await updateFeed({ id: feedId, input });
     setBusy(false);
@@ -488,7 +554,11 @@ export function RssPanel() {
 
   const sync = async (feed?: RssFeed) => {
     setError(null);
-    setStatus(feed ? t("next.rss.polling", { name: feed.name }) : t("next.rss.pollingAll"));
+    setStatus(
+      feed
+        ? t("next.rss.polling", { name: feed.name })
+        : t("next.rss.pollingAll"),
+    );
     const result = await runSync({ feedId: feed ? feed.id : null });
     if (result.error) {
       setStatus(null);
@@ -537,7 +607,13 @@ export function RssPanel() {
             <Cell key="interval" mono className="text-wv-secondary">
               {feed.pollIntervalSecs}s
             </Cell>,
-            <Cell key="state" mono className="text-wv-muted" title={state.text} testId={settingsIds.rssFeedState}>
+            <Cell
+              key="state"
+              mono
+              className="text-wv-muted"
+              title={state.text}
+              testId={settingsIds.rssFeedState}
+            >
               {state.text}
             </Cell>,
             <span key="sync" onClick={(event) => event.stopPropagation()}>
@@ -569,9 +645,15 @@ export function RssPanel() {
       ],
       empty: t("next.rss.rulesEmpty"),
       // A rule belongs to a feed, so there is nothing to add one to before a feed exists.
-      add: { label: t("next.rss.addRule"), onClick: () => openRule(null), disabled: feeds.length === 0 },
+      add: {
+        label: t("next.rss.addRule"),
+        onClick: () => openRule(null),
+        disabled: feeds.length === 0,
+      },
       onRowClick: (id) => {
-        const entry = rules.find((candidate) => String(candidate.rule.id) === id);
+        const entry = rules.find(
+          (candidate) => String(candidate.rule.id) === id,
+        );
         if (entry) {
           openRule(entry.rule);
         }
@@ -586,15 +668,26 @@ export function RssPanel() {
           </span>,
           <Cell
             key="action"
-            className={rule.action === "REJECT" ? "text-wv-error-text" : "text-wv-secondary"}
+            className={
+              rule.action === "REJECT"
+                ? "text-wv-error-text"
+                : "text-wv-secondary"
+            }
             testId={settingsIds.rssRuleAction(rule.action)}
           >
-            {rule.action === "REJECT" ? t("next.rss.reject") : t("next.rss.accept")}
+            {rule.action === "REJECT"
+              ? t("next.rss.reject")
+              : t("next.rss.accept")}
           </Cell>,
           <Cell key="order" mono className="text-wv-muted">
             {rule.sortOrder}
           </Cell>,
-          <Cell key="regex" mono className="text-wv-secondary" title={rule.titleRegex ?? ""}>
+          <Cell
+            key="regex"
+            mono
+            className="text-wv-secondary"
+            title={rule.titleRegex ?? ""}
+          >
             {rule.titleRegex || t("next.rss.anything")}
           </Cell>,
           <Cell key="category" className="text-wv-muted">
@@ -618,14 +711,20 @@ export function RssPanel() {
       ],
       empty: t("next.rss.seenEmpty"),
       onRowClick: (id) => {
-        const item = seenItems.find((entry) => `${entry.feedId}:${entry.itemId}` === id);
+        const item = seenItems.find(
+          (entry) => `${entry.feedId}:${entry.itemId}` === id,
+        );
         if (item) {
           setConfirmSeen(item);
         }
       },
       footer:
         seenItems.length > 0 ? (
-          <SecondaryButton icon="remove" onClick={() => setConfirmSeen("all")} testId={settingsIds.rssSeenClear}>
+          <SecondaryButton
+            icon="remove"
+            onClick={() => setConfirmSeen("all")}
+            testId={settingsIds.rssSeenClear}
+          >
             {t("next.rss.clearHistory")}
           </SecondaryButton>
         ) : undefined,
@@ -633,7 +732,11 @@ export function RssPanel() {
         id: `${item.feedId}:${item.itemId}`,
         searchText: `${item.itemTitle} ${feedNames.get(item.feedId) ?? ""} ${decisionLabel(t, item.decision)}`,
         cells: [
-          <Cell key="title" className="text-wv-fg" title={item.error ?? item.itemTitle}>
+          <Cell
+            key="title"
+            className="text-wv-fg"
+            title={item.error ?? item.itemTitle}
+          >
             {item.itemTitle}
           </Cell>,
           <Cell key="feed" className="text-wv-muted">
@@ -658,10 +761,15 @@ export function RssPanel() {
   ];
 
   // The scripts a feed runs are feed instances, attached in the order they run.
-  const feedInstances = (data?.scriptInstances ?? []).filter((instance) => instance.trigger === "FEED");
-  const feedInstanceName = (id: string) => feedInstances.find((instance) => instance.id === id)?.name ?? id;
+  const feedInstances = (data?.scriptInstances ?? []).filter(
+    (instance) => instance.trigger === "FEED",
+  );
+  const feedInstanceName = (id: string) =>
+    feedInstances.find((instance) => instance.id === id)?.name ?? id;
   const attached = feedForm.scriptInstanceIds;
-  const attachable = feedInstances.filter((instance) => !attached.includes(instance.id));
+  const attachable = feedInstances.filter(
+    (instance) => !attached.includes(instance.id),
+  );
   const moveAttached = (from: number, to: number) => {
     const next = [...attached];
     const [moved] = next.splice(from, 1);
@@ -673,9 +781,19 @@ export function RssPanel() {
   const feedScripts = (
     <div className="flex w-[340px] max-w-full flex-col gap-2">
       {attached.map((id, index) => (
-        <div key={id} role="group" aria-label={feedInstanceName(id)} className="flex min-w-0 items-center gap-2">
-          <span className="w-4 flex-none font-wv-mono text-[11px] text-wv-faint">{index + 1}</span>
-          <span className="min-w-0 flex-1 truncate text-[12.5px] text-wv-fg" title={feedInstanceName(id)}>
+        <div
+          key={id}
+          role="group"
+          aria-label={feedInstanceName(id)}
+          className="flex min-w-0 items-center gap-2"
+        >
+          <span className="w-4 flex-none font-wv-mono text-[11px] text-wv-faint">
+            {index + 1}
+          </span>
+          <span
+            className="min-w-0 flex-1 truncate text-[12.5px] text-wv-fg"
+            title={feedInstanceName(id)}
+          >
             {feedInstanceName(id)}
           </span>
           <SecondaryButton
@@ -697,7 +815,11 @@ export function RssPanel() {
           <SecondaryButton
             className="h-7 px-2"
             title={t("next.common.remove")}
-            onClick={() => patchFeed({ scriptInstanceIds: attached.filter((entry) => entry !== id) })}
+            onClick={() =>
+              patchFeed({
+                scriptInstanceIds: attached.filter((entry) => entry !== id),
+              })
+            }
           >
             <Icon name="remove" size={13} />
           </SecondaryButton>
@@ -712,7 +834,10 @@ export function RssPanel() {
             { value: "", label: t("next.rss.attachScript") },
             ...attachable.map((instance) => ({
               value: instance.id,
-              label: instance.name === instance.script ? instance.name : `${instance.name} · ${instance.script}`,
+              label:
+                instance.name === instance.script
+                  ? instance.name
+                  : `${instance.name} · ${instance.script}`,
             })),
           ]}
           onChange={(next) => {
@@ -723,7 +848,9 @@ export function RssPanel() {
         />
       ) : null}
       {feedInstances.length === 0 ? (
-        <span className="text-[12px] leading-[1.45] text-wv-muted">{t("next.rss.noFeedInstances")}</span>
+        <span className="text-[12px] leading-[1.45] text-wv-muted">
+          {t("next.rss.noFeedInstances")}
+        </span>
       ) : null}
     </div>
   );
@@ -828,13 +955,16 @@ export function RssPanel() {
         {
           id: "password",
           label: t("next.rss.password"),
-          help: editingFeed?.hasPassword ? t("next.rss.passwordStored") : undefined,
+          help: editingFeed?.hasPassword
+            ? t("next.rss.passwordStored")
+            : undefined,
           control: {
             kind: "text",
             type: "password",
             value: feedForm.password,
             placeholder: editingFeed?.hasPassword ? "••••••••" : "",
-            onChange: (next) => patchFeed({ password: next, clearPassword: false }),
+            onChange: (next) =>
+              patchFeed({ password: next, clearPassword: false }),
           },
         },
         ...(editingFeed?.hasPassword
@@ -845,7 +975,8 @@ export function RssPanel() {
                 control: {
                   kind: "toggle" as const,
                   value: feedForm.clearPassword,
-                  onChange: (next: boolean) => patchFeed({ clearPassword: next, password: "" }),
+                  onChange: (next: boolean) =>
+                    patchFeed({ clearPassword: next, password: "" }),
                 },
               },
             ]
@@ -896,7 +1027,10 @@ export function RssPanel() {
       control: {
         kind: "segmented",
         value: ruleForm.action,
-        options: ACTIONS.map((option) => ({ ...option, label: t(option.label) })),
+        options: ACTIONS.map((option) => ({
+          ...option,
+          label: t(option.label),
+        })),
         onChange: (next) => patchRule({ action: next as RuleAction }),
       },
     },
@@ -992,7 +1126,11 @@ export function RssPanel() {
   return (
     <>
       <PanelControls>
-        <SecondaryButton icon="refresh" onClick={() => void sync()} disabled={feeds.length === 0}>
+        <SecondaryButton
+          icon="refresh"
+          onClick={() => void sync()}
+          disabled={feeds.length === 0}
+        >
           {t("next.rss.pollAll")}
         </SecondaryButton>
       </PanelControls>
@@ -1002,7 +1140,11 @@ export function RssPanel() {
       <RecordEditor
         testId={testIds.dialog("feed")}
         open={feedId !== null}
-        title={feedId === "new" ? t("next.rss.addFeed") : (editingFeed?.name ?? t("next.rss.feed"))}
+        title={
+          feedId === "new"
+            ? t("next.rss.addFeed")
+            : (editingFeed?.name ?? t("next.rss.feed"))
+        }
         note={
           feedId === "new" ? (
             t("next.rss.newFeed")
@@ -1026,10 +1168,14 @@ export function RssPanel() {
       <RecordEditor
         testId={testIds.dialog("rss-rule")}
         open={ruleId !== null}
-        title={ruleId === "new" ? t("next.rss.addRule") : t("next.rss.editRule")}
+        title={
+          ruleId === "new" ? t("next.rss.addRule") : t("next.rss.editRule")
+        }
         note={feedNames.get(ruleForm.feedId) ?? undefined}
         width={620}
-        sections={[{ id: "rule", title: t("next.rss.rule"), fields: ruleFields }]}
+        sections={[
+          { id: "rule", title: t("next.rss.rule"), fields: ruleFields },
+        ]}
         error={error}
         busy={busy}
         onSave={() => void saveRule()}
@@ -1065,7 +1211,11 @@ export function RssPanel() {
         testId={testIds.dialog("rss-rule-remove")}
         open={confirmRule !== null}
         title={t("next.rss.removeRule")}
-        note={confirmRule ? (feedNames.get(confirmRule.feedId) ?? undefined) : undefined}
+        note={
+          confirmRule
+            ? (feedNames.get(confirmRule.feedId) ?? undefined)
+            : undefined
+        }
         busy={busy}
         confirmLabel={t("next.rss.removeRule")}
         body={t("next.rss.removeRuleBody")}
@@ -1082,18 +1232,30 @@ export function RssPanel() {
       />
 
       <ConfirmDialog
-        testId={testIds.dialog(confirmSeen === "all" ? "rss-seen-clear" : "rss-seen-forget")}
+        testId={testIds.dialog(
+          confirmSeen === "all" ? "rss-seen-clear" : "rss-seen-forget",
+        )}
         open={confirmSeen !== null}
-        title={confirmSeen === "all" ? t("next.rss.clearSeenTitle") : t("next.rss.forgetItemTitle")}
+        title={
+          confirmSeen === "all"
+            ? t("next.rss.clearSeenTitle")
+            : t("next.rss.forgetItemTitle")
+        }
         note={
           confirmSeen === "all"
             ? countLabel(t, "next.rss.items", seenItems.length)
             : confirmSeen?.itemTitle
         }
         busy={busy}
-        confirmLabel={confirmSeen === "all" ? t("next.rss.clearHistory") : t("next.rss.forgetItem")}
+        confirmLabel={
+          confirmSeen === "all"
+            ? t("next.rss.clearHistory")
+            : t("next.rss.forgetItem")
+        }
         body={
-          confirmSeen === "all" ? t("next.rss.clearSeenBody") : t("next.rss.forgetItemBody")
+          confirmSeen === "all"
+            ? t("next.rss.clearSeenBody")
+            : t("next.rss.forgetItemBody")
         }
         onConfirm={() => {
           if (confirmSeen === "all") {
@@ -1104,12 +1266,13 @@ export function RssPanel() {
             return;
           }
           if (confirmSeen) {
-            void forgetSeenItem({ feedId: confirmSeen.feedId, itemId: confirmSeen.itemId }).then(
-              () => {
-                setConfirmSeen(null);
-                refresh();
-              },
-            );
+            void forgetSeenItem({
+              feedId: confirmSeen.feedId,
+              itemId: confirmSeen.itemId,
+            }).then(() => {
+              setConfirmSeen(null);
+              refresh();
+            });
           }
         }}
         onDismiss={() => setConfirmSeen(null)}

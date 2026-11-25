@@ -74,7 +74,9 @@ const MODES: { value: string; label: string }[] = [
 
 export function WatchFolderPanel() {
   const t = useTranslate();
-  const [{ data, fetching }, reexecute] = useQuery<{ settings: { watchFolder: WatchFolder } }>({
+  const [{ data, fetching }, reexecute] = useQuery<{
+    settings: { watchFolder: WatchFolder };
+  }>({
     query: WATCH_FOLDER_SETTINGS_QUERY,
   });
   const [updateState, updateSettings] = useMutation(UPDATE_SETTINGS_MUTATION);
@@ -114,7 +116,10 @@ export function WatchFolderPanel() {
           watchFolder: {
             mode: values.mode,
             path: values.path.trim() || null,
-            pollIntervalSecs: Math.max(1, Math.round(values.pollIntervalSecs || 60)),
+            pollIntervalSecs: Math.max(
+              1,
+              Math.round(values.pollIntervalSecs || 60),
+            ),
             stabilitySecs: Math.max(0, Math.round(values.stabilitySecs || 0)),
             categoryFromSubfolders: values.categoryFromSubfolders,
             scanningPaused: values.scanningPaused,
@@ -144,9 +149,18 @@ export function WatchFolderPanel() {
 
   const problems = report
     ? [
-        ...report.permanentErrors.map((entry) => ({ ...entry, tone: "error" as const })),
-        ...report.transientErrors.map((entry) => ({ ...entry, tone: "warn" as const })),
-        ...report.skippedInputs.map((entry) => ({ ...entry, tone: "muted" as const })),
+        ...report.permanentErrors.map((entry) => ({
+          ...entry,
+          tone: "error" as const,
+        })),
+        ...report.transientErrors.map((entry) => ({
+          ...entry,
+          tone: "warn" as const,
+        })),
+        ...report.skippedInputs.map((entry) => ({
+          ...entry,
+          tone: "muted" as const,
+        })),
       ]
     : [];
 
@@ -164,7 +178,10 @@ export function WatchFolderPanel() {
           control: {
             kind: "segmented",
             value: values.mode,
-            options: MODES.map((option) => ({ ...option, label: t(option.label) })),
+            options: MODES.map((option) => ({
+              ...option,
+              label: t(option.label),
+            })),
             onChange: (next) => draft.set({ mode: next as WatchFolderMode }),
           },
         },
@@ -189,7 +206,8 @@ export function WatchFolderPanel() {
                   kind: "number" as const,
                   value: values.pollIntervalSecs,
                   min: 1,
-                  onChange: (next: number) => draft.set({ pollIntervalSecs: next }),
+                  onChange: (next: number) =>
+                    draft.set({ pollIntervalSecs: next }),
                   suffix: t("next.general.seconds"),
                 },
               },
@@ -251,7 +269,10 @@ export function WatchFolderPanel() {
                 testId={settingsIds.watchQueued}
               />
               {problems.length === 0 ? (
-                <KeyValueRow label={t("next.watchFolder.problems")} value={t("next.job.none")} />
+                <KeyValueRow
+                  label={t("next.watchFolder.problems")}
+                  value={t("next.job.none")}
+                />
               ) : (
                 problems.map((problem) => (
                   <div
@@ -291,7 +312,9 @@ export function WatchFolderPanel() {
           disabled={scanState.fetching}
           testId={settingsIds.watchScanNow}
         >
-          {scanState.fetching ? t("next.watchFolder.scanning") : t("next.watchFolder.scanNow")}
+          {scanState.fetching
+            ? t("next.watchFolder.scanning")
+            : t("next.watchFolder.scanNow")}
         </SecondaryButton>
       </PanelControls>
       <SettingsBlocks blocks={blocks} loading={fetching && !data} />

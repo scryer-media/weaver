@@ -233,6 +233,66 @@ async fn a_magnets_add_is_answered_before_its_routes_session_opens() {
     rig.service.stop().await;
 }
 
+// A pause and a resume of a magnet whose metainfo is fetched, the resume
+// asked while the pause waits its turn at the torrents: the pause's intent
+// and the end of its fetch land together, before the resume, which finds
+// the fetch ended and starts it again. The magnet ends fetching, resumed.
+// The test holds the torrents while both are asked, so the pause comes
+// first and the resume waits behind it.
+#[tokio::test]
+async fn a_resume_asked_while_a_magnets_pause_lands_leaves_it_fetching() {
+    use crate::torrents::{KeptIntent, TorrentIntent};
+    let rig = rig(set_clock());
+    rig.service.open().await.unwrap();
+    rig.routes.unanswered.send_replace(true);
+    let mut asked = rig.routes.asked.subscribe();
+    let before = *asked.borrow_and_update();
+    let hash = "1123456789abcdef0123456789abcdef01234567";
+    let magnet = format!("magnet:?xt=urn:btih:{hash}&tr=http%3A%2F%2F127.0.0.1%3A9%2Fannounce");
+    let job_id = rig
+        .service
+        .add(request(AddSource::Magnet(magnet)))
+        .await
+        .unwrap();
+    asked.wait_for(|asked| *asked > before).await.unwrap();
+    assert!(matches!(
+        rig.service.inner.live.lock().await[&job_id].resolving,
+        Some(Resolving::Fetching(_))
+    ));
+
+    // Both are asked while the torrents are held: on this one thread each
+    // runs until it waits for them, the pause first.
+    let held = rig.service.inner.live.lock().await;
+    let pause = tokio::spawn({
+        let service = rig.service.clone();
+        async move { service.pause(job_id).await }
+    });
+    let resume = tokio::spawn({
+        let service = rig.service.clone();
+        async move { service.resume(job_id).await }
+    });
+    tokio::task::yield_now().await;
+    drop(held);
+    pause.await.unwrap().unwrap();
+    resume.await.unwrap().unwrap();
+
+    let live = rig.service.inner.live.lock().await;
+    assert_eq!(
+        live[&job_id].record.kept,
+        KeptIntent::Intent(TorrentIntent::Resumed)
+    );
+    assert!(
+        matches!(live[&job_id].resolving, Some(Resolving::Fetching(_))),
+        "the resumed magnet does not fetch"
+    );
+    drop(live);
+    assert_eq!(
+        rig.db.get_torrent(job_id).unwrap().unwrap().kept,
+        KeptIntent::Intent(TorrentIntent::Resumed)
+    );
+    rig.service.stop().await;
+}
+
 // A route with no DHT cannot find peers for a magnet with no trackers. The
 // add says so when the route's session runs; one added before the route
 // opened fails with the same words once it has.

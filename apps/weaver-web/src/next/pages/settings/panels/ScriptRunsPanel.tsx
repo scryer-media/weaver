@@ -1,14 +1,26 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
-import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
+import {
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useRef,
+  useState,
+} from "react";
 import { Link } from "react-router";
 import { gql, useClient } from "urql";
 import { SCRIPT_RUNS_QUERY } from "@/graphql/queries";
 import { copyText } from "@/lib/clipboard";
 import { useTranslate } from "@/lib/context/translate-context";
 import { cn } from "@/lib/utils";
-import { FireAndForgetTag, ScriptRunName, ScriptStatusMark, TruncatedTag, scriptRunName } from "../../../components/JobScriptResults";
+import {
+  FireAndForgetTag,
+  ScriptRunName,
+  ScriptStatusMark,
+  TruncatedTag,
+  scriptRunName,
+} from "../../../components/JobScriptResults";
 import { Icon } from "../../../components/icons";
 import { settingsIds } from "@/next/testids";
 import { Pagination } from "../../../components/Pagination";
@@ -17,9 +29,18 @@ import { Tabs } from "../../../components/Tabs";
 import { SecondaryButton, Select } from "../../../components/controls";
 import { Cell } from "../../../components/rows";
 import { EM_DASH, formatDate } from "../../../data/format";
-import { SCRIPT_KINDS, SCRIPT_KIND_LABELS, type ScriptKind } from "../../../data/script-instances";
+import {
+  SCRIPT_KINDS,
+  SCRIPT_KIND_LABELS,
+  type ScriptKind,
+} from "../../../data/script-instances";
 import { formatRunDuration, triggerLabel } from "../../../data/script-runs";
-import { PanelControls, SettingsBlocks, usePanelStatus, type SettingsBlock } from "../framework";
+import {
+  PanelControls,
+  SettingsBlocks,
+  usePanelStatus,
+  type SettingsBlock,
+} from "../framework";
 
 /**
  * Runs: what each script did, whatever started it.
@@ -70,7 +91,11 @@ const STATUS_LABELS: Record<ScriptStatus | typeof ANY_STATUS, string> = {
 /** The page sizes the list offers; the first is where it starts. */
 const PAGE_SIZES = [25, 50, 100] as const;
 
-const OUTPUT_QUERY = gql`query ScriptRunOutput($outputId: String!) { scriptOutput(outputId: $outputId) }`;
+const OUTPUT_QUERY = gql`
+  query ScriptRunOutput($outputId: String!) {
+    scriptOutput(outputId: $outputId)
+  }
+`;
 
 interface ScriptRun {
   id: string;
@@ -102,7 +127,12 @@ interface ScriptRunPage {
   statusCounts: { status: ScriptStatus; count: number }[];
 }
 
-const NO_RUNS: ScriptRunPage = { runs: [], nextBefore: null, total: 0, statusCounts: [] };
+const NO_RUNS: ScriptRunPage = {
+  runs: [],
+  nextBefore: null,
+  total: 0,
+  statusCounts: [],
+};
 
 /** A run's output once its row has been opened: read, being read, or refused. */
 type RunOutput =
@@ -130,9 +160,16 @@ function RunDetail({
   const retained = output?.state === "loaded" ? output.output : null;
   const reading = run.outputRetained && output?.state === "loading";
   const shown = retained ?? (reading ? null : run.outputTail);
-  const gone = !run.outputRetained || (output?.state === "loaded" && output.output === null);
+  const gone =
+    !run.outputRetained ||
+    (output?.state === "loaded" && output.output === null);
   const name = scriptRunName(run);
-  const adapter = run.adapter === null ? null : run.adapter === "SABNZBD" ? "SABnzbd" : "NZBGet";
+  const adapter =
+    run.adapter === null
+      ? null
+      : run.adapter === "SABNZBD"
+        ? "SABnzbd"
+        : "NZBGet";
   const copy = () => {
     if (shown === null) {
       onCopied(false);
@@ -143,13 +180,19 @@ function RunDetail({
   return (
     <div className="flex min-w-0 flex-col gap-2">
       {run.errorMessage ? (
-        <span className="text-[12.5px] text-wv-error-text">{run.errorMessage}</span>
+        <span className="text-[12.5px] text-wv-error-text">
+          {run.errorMessage}
+        </span>
       ) : null}
       <div className="flex flex-wrap items-center gap-x-4 gap-y-1">
         <span className="font-wv-mono text-[11px] text-wv-muted">
           {[
             run.script,
-            t(run.background ? "next.postProcessing.fireAndForget" : "next.postProcessing.blocking"),
+            t(
+              run.background
+                ? "next.postProcessing.fireAndForget"
+                : "next.postProcessing.blocking",
+            ),
             adapter,
             run.event,
           ]
@@ -157,7 +200,13 @@ function RunDetail({
             .join(" · ")}
         </span>
         {shown ? (
-          <SecondaryButton size="compact" icon="copy" className="ml-auto" onClick={copy} testId={settingsIds.scriptRunCopy}>
+          <SecondaryButton
+            size="compact"
+            icon="copy"
+            className="ml-auto"
+            onClick={copy}
+            testId={settingsIds.scriptRunCopy}
+          >
             {t("next.scriptRuns.copyOutput")}
           </SecondaryButton>
         ) : null}
@@ -175,9 +224,13 @@ function RunDetail({
         </span>
       ) : null}
       <div className="flex flex-wrap items-baseline gap-x-4 gap-y-1 font-wv-mono text-[11px] text-wv-muted">
-        {reading ? <span role="status">{t("next.scriptRuns.loadingOutput")}</span> : null}
+        {reading ? (
+          <span role="status">{t("next.scriptRuns.loadingOutput")}</span>
+        ) : null}
         {gone ? <span>{t("next.job.scriptOutputGone")}</span> : null}
-        {run.outputTruncated ? <span>{t("next.job.scriptOutputTruncated")}</span> : null}
+        {run.outputTruncated ? (
+          <span>{t("next.job.scriptOutputTruncated")}</span>
+        ) : null}
       </div>
     </div>
   );
@@ -187,7 +240,9 @@ export function ScriptRunsPanel() {
   const t = useTranslate();
   const client = useClient();
   const [kind, setKind] = useState<ScriptKind | typeof ANY_KIND>(ANY_KIND);
-  const [status, setStatus] = useState<ScriptStatus | typeof ANY_STATUS>(ANY_STATUS);
+  const [status, setStatus] = useState<ScriptStatus | typeof ANY_STATUS>(
+    ANY_STATUS,
+  );
   const [pageSize, setPageSize] = useState<number>(PAGE_SIZES[0]);
   const [pageIndex, setPageIndex] = useState(0);
   const [page, setPage] = useState<ScriptRunPage | null>(null);
@@ -197,7 +252,9 @@ export function ScriptRunsPanel() {
   const [open, setOpen] = useState<ReadonlySet<string>>(new Set());
   // A run's output never changes, so once read it is kept for as long as the
   // screen is up, and opening the row again does not ask for it again.
-  const [outputs, setOutputs] = useState<ReadonlyMap<string, RunOutput>>(new Map());
+  const [outputs, setOutputs] = useState<ReadonlyMap<string, RunOutput>>(
+    new Map(),
+  );
   const outputsRef = useRef(outputs);
   useLayoutEffect(() => {
     outputsRef.current = outputs;
@@ -235,7 +292,9 @@ export function ScriptRunsPanel() {
         }
         if (result.error) {
           setLoading(false);
-          setError(result.error.graphQLErrors[0]?.message ?? result.error.message);
+          setError(
+            result.error.graphQLErrors[0]?.message ?? result.error.message,
+          );
           setPage((current) => current ?? NO_RUNS);
           return;
         }
@@ -270,23 +329,37 @@ export function ScriptRunsPanel() {
   }, [goTo]);
 
   usePanelStatus(
-    error ?? (copied === null ? null : t(copied ? "next.scriptRuns.copied" : "next.scriptRuns.copyBlocked")),
+    error ??
+      (copied === null
+        ? null
+        : t(copied ? "next.scriptRuns.copied" : "next.scriptRuns.copyBlocked")),
     error !== null || copied === false,
   );
 
   const readOutput = async (run: ScriptRun) => {
     // A read that failed is not kept: opening the row again asks once more.
     const held = outputsRef.current.get(run.id);
-    if (!run.outputRetained || (held !== undefined && held.state !== "failed")) {
+    if (
+      !run.outputRetained ||
+      (held !== undefined && held.state !== "failed")
+    ) {
       return;
     }
     setOutputs((current) => new Map(current).set(run.id, { state: "loading" }));
     // A run is kept under its own id, which is what its output is asked for by.
     const result = await client
-      .query<{ scriptOutput: string | null }>(OUTPUT_QUERY, { outputId: run.id }, { requestPolicy: "network-only" })
+      .query<{ scriptOutput: string | null }>(
+        OUTPUT_QUERY,
+        { outputId: run.id },
+        { requestPolicy: "network-only" },
+      )
       .toPromise();
     const read: RunOutput = result.error
-      ? { state: "failed", message: result.error.graphQLErrors[0]?.message ?? result.error.message }
+      ? {
+          state: "failed",
+          message:
+            result.error.graphQLErrors[0]?.message ?? result.error.message,
+        }
       : { state: "loaded", output: result.data?.scriptOutput ?? null };
     setOutputs((current) => new Map(current).set(run.id, read));
   };
@@ -313,11 +386,17 @@ export function ScriptRunsPanel() {
 
   const kinds: { value: ScriptKind | typeof ANY_KIND; label: string }[] = [
     { value: ANY_KIND, label: t("next.scriptRuns.allTriggers") },
-    ...SCRIPT_KINDS.map((value) => ({ value, label: t(SCRIPT_KIND_LABELS[value]) })),
+    ...SCRIPT_KINDS.map((value) => ({
+      value,
+      label: t(SCRIPT_KIND_LABELS[value]),
+    })),
   ];
 
   // Until the first page lands there is nothing to count.
-  const ended = page === null ? null : new Map(page.statusCounts.map((entry) => [entry.status, entry.count]));
+  const ended =
+    page === null
+      ? null
+      : new Map(page.statusCounts.map((entry) => [entry.status, entry.count]));
   const tabs = STATUS_TABS.map((id) => ({
     id,
     label: t(STATUS_LABELS[id]),
@@ -339,7 +418,8 @@ export function ScriptRunsPanel() {
       id: "runs",
       title: t("next.job.scriptRuns"),
       note: t("next.scriptRuns.note"),
-      columns: "152px minmax(124px, 1fr) minmax(118px, 0.8fr) minmax(72px, 1.2fr) 78px 72px 72px",
+      columns:
+        "152px minmax(124px, 1fr) minmax(118px, 0.8fr) minmax(72px, 1.2fr) 78px 72px 72px",
       headers: [
         t("next.scriptRuns.finished"),
         t("next.scriptRuns.instance"),
@@ -349,7 +429,11 @@ export function ScriptRunsPanel() {
         t("next.scriptRuns.exitCode"),
         t("next.scriptRuns.duration"),
       ],
-      empty: t(kind === ANY_KIND && status === ANY_STATUS ? "next.job.noScriptRuns" : "next.scriptRuns.noneMatch"),
+      empty: t(
+        kind === ANY_KIND && status === ANY_STATUS
+          ? "next.job.noScriptRuns"
+          : "next.scriptRuns.noneMatch",
+      ),
       onRowClick: toggle,
       rows: runs.map((run) => {
         const finished = formatDate(run.finishedAtEpochMs);
@@ -360,25 +444,39 @@ export function ScriptRunsPanel() {
           searchText: `${scriptRunName(run)} ${run.script}`,
           expanded,
           detail: expanded ? (
-            <RunDetail run={run} output={outputs.get(run.id)} onCopied={setCopied} />
+            <RunDetail
+              run={run}
+              output={outputs.get(run.id)}
+              onCopied={setCopied}
+            />
           ) : undefined,
           cells: [
             <span key="finished" className="flex min-w-0 items-center gap-2">
               <Icon
                 name="expand"
                 size={12}
-                className={cn("flex-none text-wv-muted transition-transform", expanded && "rotate-90")}
+                className={cn(
+                  "flex-none text-wv-muted transition-transform",
+                  expanded && "rotate-90",
+                )}
               />
               <Cell mono className="text-wv-muted" title={finished}>
                 {finished}
               </Cell>
             </span>,
-            <div key="script" className="flex min-w-0 flex-wrap items-center gap-x-[10px] gap-y-1">
+            <div
+              key="script"
+              className="flex min-w-0 flex-wrap items-center gap-x-[10px] gap-y-1"
+            >
               <ScriptRunName run={run} />
               {run.background ? <FireAndForgetTag /> : null}
               {run.outputTruncated ? <TruncatedTag /> : null}
             </div>,
-            <Cell key="trigger" className="text-[12.5px] text-wv-secondary" title={trigger}>
+            <Cell
+              key="trigger"
+              className="text-[12.5px] text-wv-secondary"
+              title={trigger}
+            >
               {trigger}
             </Cell>,
             run.jobId === null ? (
@@ -399,7 +497,12 @@ export function ScriptRunsPanel() {
               </Link>
             ),
             <ScriptStatusMark key="status" status={run.status} />,
-            <Cell key="exitCode" mono className="text-wv-muted" testId={settingsIds.scriptRunExitCode}>
+            <Cell
+              key="exitCode"
+              mono
+              className="text-wv-muted"
+              testId={settingsIds.scriptRunExitCode}
+            >
               {run.exitCode ?? EM_DASH}
             </Cell>,
             <Cell key="duration" mono className="text-wv-muted">
@@ -433,7 +536,12 @@ export function ScriptRunsPanel() {
         </SecondaryButton>
       </PanelControls>
 
-      <Tabs tabs={tabs} active={status} onSelect={setStatus} testId={settingsIds.scriptRunsStatus} />
+      <Tabs
+        tabs={tabs}
+        active={status}
+        onSelect={setStatus}
+        testId={settingsIds.scriptRunsStatus}
+      />
 
       <SettingsBlocks blocks={blocks} loading={page === null} />
 
@@ -442,7 +550,9 @@ export function ScriptRunsPanel() {
           <Pagination
             pageIndex={pageIndex}
             pageCount={pageCount}
-            onPage={(next) => void goTo(Math.max(0, Math.min(pageCount - 1, next)))}
+            onPage={(next) =>
+              void goTo(Math.max(0, Math.min(pageCount - 1, next)))
+            }
             pageSize={pageSize}
             pageSizes={PAGE_SIZES}
             onPageSize={setPageSize}

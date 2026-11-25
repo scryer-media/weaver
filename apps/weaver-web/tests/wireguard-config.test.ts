@@ -4,7 +4,10 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { parseWireguardConfig, wireguardConfigProblems } from "../src/lib/wireguard-config.ts";
+import {
+  parseWireguardConfig,
+  wireguardConfigProblems,
+} from "../src/lib/wireguard-config.ts";
 
 const CONFIG = `# provided by the VPN
 [Interface]
@@ -112,30 +115,52 @@ const problems = (text: string) => {
 test("a whole configuration has nothing wrong with it, with or without what is optional", () => {
   assert.deepEqual(problems(WHOLE), []);
   assert.deepEqual(
-    problems(`${WHOLE}PresharedKey = ${KEY("c")}\nPersistentKeepalive = off\n[Interface]\nMTU = 1380\nDNS = 10.6.0.1`),
+    problems(
+      `${WHOLE}PresharedKey = ${KEY("c")}\nPersistentKeepalive = off\n[Interface]\nMTU = 1380\nDNS = 10.6.0.1`,
+    ),
     [],
   );
-  assert.deepEqual(problems(WHOLE.replace("vpn.example.com:51820", "[2001:db8::1]:51820")), []);
+  assert.deepEqual(
+    problems(WHOLE.replace("vpn.example.com:51820", "[2001:db8::1]:51820")),
+    [],
+  );
 });
 
 test("every fault of a configuration is listed at once, by the key at fault", () => {
-  assert.deepEqual(problems("MTU = big\nPersistentKeepalive = often\nPresharedKey = short"), [
-    { kind: "missing", key: "PrivateKey", section: "Interface" },
-    { kind: "missing", key: "Address", section: "Interface" },
-    { kind: "number", key: "MTU" },
-    { kind: "missing", key: "PublicKey", section: "Peer" },
-    { kind: "key", key: "PresharedKey" },
-    { kind: "missing", key: "Endpoint", section: "Peer" },
-    { kind: "number", key: "PersistentKeepalive" },
-  ]);
-  assert.deepEqual(problems(WHOLE.replace(KEY("a"), "cHJpdmF0ZQ==").replace(KEY("b"), "cGVlcg==")), [
-    { kind: "key", key: "PrivateKey" },
-    { kind: "key", key: "PublicKey" },
-  ]);
+  assert.deepEqual(
+    problems("MTU = big\nPersistentKeepalive = often\nPresharedKey = short"),
+    [
+      { kind: "missing", key: "PrivateKey", section: "Interface" },
+      { kind: "missing", key: "Address", section: "Interface" },
+      { kind: "number", key: "MTU" },
+      { kind: "missing", key: "PublicKey", section: "Peer" },
+      { kind: "key", key: "PresharedKey" },
+      { kind: "missing", key: "Endpoint", section: "Peer" },
+      { kind: "number", key: "PersistentKeepalive" },
+    ],
+  );
+  assert.deepEqual(
+    problems(
+      WHOLE.replace(KEY("a"), "cHJpdmF0ZQ==").replace(KEY("b"), "cGVlcg=="),
+    ),
+    [
+      { kind: "key", key: "PrivateKey" },
+      { kind: "key", key: "PublicKey" },
+    ],
+  );
 });
 
 test("an endpoint is a host and a port", () => {
-  for (const endpoint of ["vpn.example.com", "vpn.example.com:0", "vpn.example.com:70000", "vpn.example.com:wg"]) {
-    assert.deepEqual(problems(WHOLE.replace("vpn.example.com:51820", endpoint)), [{ kind: "endpoint" }], endpoint);
+  for (const endpoint of [
+    "vpn.example.com",
+    "vpn.example.com:0",
+    "vpn.example.com:70000",
+    "vpn.example.com:wg",
+  ]) {
+    assert.deepEqual(
+      problems(WHOLE.replace("vpn.example.com:51820", endpoint)),
+      [{ kind: "endpoint" }],
+      endpoint,
+    );
   }
 });

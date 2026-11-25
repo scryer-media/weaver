@@ -3,7 +3,10 @@
 
 import assert from "node:assert/strict";
 import test from "node:test";
-import { recheckLoginRequired, watchForSignOut } from "../src/lib/login-required.ts";
+import {
+  recheckLoginRequired,
+  watchForSignOut,
+} from "../src/lib/login-required.ts";
 
 test("browser refusals recheck sign-in without replaying the refused request", async (t) => {
   const oldWindow = Object.getOwnPropertyDescriptor(globalThis, "window");
@@ -19,16 +22,22 @@ test("browser refusals recheck sign-in without replaying the refused request", a
       : new Response(null, { status });
   });
   const browser = { fetch: globalThis.fetch };
-  Object.defineProperty(globalThis, "window", { configurable: true, value: browser });
+  Object.defineProperty(globalThis, "window", {
+    configurable: true,
+    value: browser,
+  });
   Object.defineProperty(globalThis, "document", {
-    configurable: true, value: { baseURI: "http://localhost:9090/" },
+    configurable: true,
+    value: { baseURI: "http://localhost:9090/" },
   });
   try {
     watchForSignOut();
     for (const refusal of [401, 403]) {
       status = refusal;
       calls.length = 0;
-      const response = await browser.fetch("http://localhost:9090/graphql", { method: "POST" });
+      const response = await browser.fetch("http://localhost:9090/graphql", {
+        method: "POST",
+      });
       assert.equal(response.status, refusal);
       assert.deepEqual(calls, ["http://localhost:9090/graphql", statusUrl]);
       await recheckLoginRequired();

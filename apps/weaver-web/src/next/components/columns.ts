@@ -34,7 +34,10 @@ export type Columns =
 /** The class that reads the properties below; pair it with `columnStyle`. */
 export const COLS_CLASS = "wv-cols";
 
-export function columnStyle(columns: Columns, extra?: CSSProperties): CSSProperties {
+export function columnStyle(
+  columns: Columns,
+  extra?: CSSProperties,
+): CSSProperties {
   const tracks =
     typeof columns === "string"
       ? { "--wv-cols": columns }

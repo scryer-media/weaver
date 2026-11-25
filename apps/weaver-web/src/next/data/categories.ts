@@ -131,7 +131,9 @@ export function categoryFacets({
   for (const name of configuredNames) {
     push(name);
   }
-  for (const name of [...straggling].sort((left, right) => left.localeCompare(right))) {
+  for (const name of [...straggling].sort((left, right) =>
+    left.localeCompare(right),
+  )) {
     push(name);
   }
   // Uncategorised is a facet, but only once there is something in it — or when
@@ -147,7 +149,10 @@ export function categoryFacets({
 }
 
 /** The facet set with `key` flipped; an empty result is the cleared state. */
-export function toggleFacet(current: ReadonlySet<string>, key: string): ReadonlySet<string> {
+export function toggleFacet(
+  current: ReadonlySet<string>,
+  key: string,
+): ReadonlySet<string> {
   const next = new Set(current);
   if (!next.delete(key)) {
     next.add(key);
@@ -163,7 +168,9 @@ export function toggleFacet(current: ReadonlySet<string>, key: string): Readonly
  * `undefined` so the filter is absent from the request rather than present
  * and vacuous.
  */
-export function facetsToCategories(facets: ReadonlySet<string>): string[] | undefined {
+export function facetsToCategories(
+  facets: ReadonlySet<string>,
+): string[] | undefined {
   if (facets.size === 0) {
     return undefined;
   }

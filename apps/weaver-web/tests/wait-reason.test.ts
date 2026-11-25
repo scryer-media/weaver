@@ -25,5 +25,8 @@ test("the other wait reasons read as before", () => {
   assert.equal(waitReasonDetail(t, "disk_space"), "Low disk space");
   assert.equal(waitReasonDetail(t, "nzb_slot"), "Waiting for an NZB slot");
   // A reason that is no code is the daemon's own sentence, shown as it came.
-  assert.equal(waitReasonDetail(t, "NNTP authentication blocked"), "NNTP authentication blocked");
+  assert.equal(
+    waitReasonDetail(t, "NNTP authentication blocked"),
+    "NNTP authentication blocked",
+  );
 });

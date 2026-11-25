@@ -4,13 +4,22 @@
 import { useEffect, useRef, useState } from "react";
 import { useTranslate } from "@/lib/context/translate-context";
 import { submissionStatusCanForceRetry } from "@/next/features/duplicates/duplicate-presentation";
-import { useUploadNzb, type UploadNzbEntry } from "@/next/features/upload/use-upload-nzb";
+import {
+  useUploadNzb,
+  type UploadNzbEntry,
+} from "@/next/features/upload/use-upload-nzb";
 import { cn } from "@/lib/utils";
 import { ConfirmDialog } from "@/next/components/ConfirmDialog";
 import { Dialog } from "@/next/components/Dialog";
 import { Eyebrow } from "@/next/components/chrome";
 import { FormRow } from "@/next/components/rows";
-import { PrimaryButton, SecondaryButton, Select, TextField, Toggle } from "@/next/components/controls";
+import {
+  PrimaryButton,
+  SecondaryButton,
+  Select,
+  TextField,
+  Toggle,
+} from "@/next/components/controls";
 import { formatSize } from "@/next/data/format";
 import { WV } from "@/next/data/palette";
 import { countLabel } from "@/next/i18n/labels";
@@ -22,13 +31,17 @@ const NO_CATEGORY_VALUE = "__none__";
 
 /** Staged, but the duplicate policy turned its submission away; only a forced submit takes it. */
 function isBlocked(entry: UploadNzbEntry): boolean {
-  return entry.status === "staged" && submissionStatusCanForceRetry(entry.submissionStatus);
+  return (
+    entry.status === "staged" &&
+    submissionStatusCanForceRetry(entry.submissionStatus)
+  );
 }
 
 function entryTone(entry: UploadNzbEntry): string {
   if (entry.status === "failed") return WV.error;
   if (isBlocked(entry)) return WV.warn;
-  if (entry.status === "staged" || entry.status === "submitted") return WV.accent;
+  if (entry.status === "staged" || entry.status === "submitted")
+    return WV.accent;
   return WV.idle;
 }
 
@@ -51,7 +64,11 @@ export function AddNzbDialog({
   initialFiles?: readonly File[] | null;
 }) {
   const t = useTranslate();
-  const upload = useUploadNzb({ open, resetOnOpen: true, onSubmitted: onClose });
+  const upload = useUploadNzb({
+    open,
+    resetOnOpen: true,
+    onSubmitted: onClose,
+  });
   const { addFiles, fileInputRef } = upload;
   const blocked = upload.entries.filter(isBlocked);
   // While torrents are off the dialog speaks of NZBs only, even with torrent jobs left.
@@ -61,7 +78,9 @@ export function AddNzbDialog({
   const torrent =
     torrentsOn &&
     (upload.entries.some((entry) => entry.kind === "TORRENT") ||
-      /^(magnet:|[0-9a-f]{40}$|[0-9a-f]{64}$|[a-z2-7]{32}$)/i.test(upload.text.trim()));
+      /^(magnet:|[0-9a-f]{40}$|[0-9a-f]{64}$|[a-z2-7]{32}$)/i.test(
+        upload.text.trim(),
+      ));
   // Set once a submit has answered, so its verdict is read from the entries it updated.
   const [awaitingVerdict, setAwaitingVerdict] = useState(false);
   const [confirmForce, setConfirmForce] = useState(false);
@@ -92,7 +111,11 @@ export function AddNzbDialog({
       stagedDrop.current = null;
       return;
     }
-    if (initialFiles && initialFiles.length > 0 && stagedDrop.current !== initialFiles) {
+    if (
+      initialFiles &&
+      initialFiles.length > 0 &&
+      stagedDrop.current !== initialFiles
+    ) {
       stagedDrop.current = initialFiles;
       addFiles([...initialFiles]);
     }
@@ -121,11 +144,11 @@ export function AddNzbDialog({
       testId={testIds.dialog("add")}
       footer={
         <>
-          <SecondaryButton onClick={onClose}>{t("action.cancel")}</SecondaryButton>
+          <SecondaryButton onClick={onClose}>
+            {t("action.cancel")}
+          </SecondaryButton>
           <PrimaryButton
-            disabled={
-              readyCount === 0 || upload.staging || upload.fetching
-            }
+            disabled={readyCount === 0 || upload.staging || upload.fetching}
             onClick={() => void submit()}
             testId={torrentIds.addSubmit}
           >
@@ -196,18 +219,25 @@ export function AddNzbDialog({
                 className="flex flex-wrap items-center gap-x-4 gap-y-2 border-b border-wv-hairline px-4 sm:px-6 py-3"
               >
                 <div className="flex min-w-0 flex-[1_1_260px] flex-col gap-1">
-                  <span title={entry.file.name} className="truncate text-[13px] text-wv-fg">
+                  <span
+                    title={entry.file.name}
+                    className="truncate text-[13px] text-wv-fg"
+                  >
                     {entry.displayName ?? entry.file.name}
                   </span>
                   {entry.error === undefined ? null : (
-                    <span className="text-[11.5px] text-wv-error-text">{entry.error}</span>
+                    <span className="text-[11.5px] text-wv-error-text">
+                      {entry.error}
+                    </span>
                   )}
                 </div>
                 <span
                   style={{ color: entryTone(entry) }}
                   className="flex-none font-wv-mono text-[10.5px] tracking-[0.1em] uppercase"
                 >
-                  {t(`next.addNzb.status.${isBlocked(entry) ? "blocked" : entry.status}`)}
+                  {t(
+                    `next.addNzb.status.${isBlocked(entry) ? "blocked" : entry.status}`,
+                  )}
                 </span>
                 <span className="w-[72px] flex-none text-right font-wv-mono text-[11.5px] text-wv-muted">
                   {formatSize(entry.file.size)}
@@ -237,7 +267,9 @@ export function AddNzbDialog({
                 testId={torrentIds.addLink}
               />
               {upload.textError === null ? null : (
-                <span className="text-[11.5px] text-wv-error-text">{upload.textError}</span>
+                <span className="text-[11.5px] text-wv-error-text">
+                  {upload.textError}
+                </span>
               )}
             </div>
           </FormRow>
@@ -279,7 +311,10 @@ export function AddNzbDialog({
               <Select
                 label={t("next.torrents.unpack")}
                 value={unpackChoice(upload.unpack)}
-                options={UNPACK_CHOICES.map((option) => ({ ...option, label: t(option.label) }))}
+                options={UNPACK_CHOICES.map((option) => ({
+                  ...option,
+                  label: t(option.label),
+                }))}
                 onChange={(choice) => upload.setUnpack(unpackOf(choice))}
               />
             </FormRow>
@@ -309,12 +344,18 @@ export function AddNzbDialog({
             </span>
             <span className="mt-3 flex flex-col gap-1 font-wv-mono text-[11.5px] text-wv-fg">
               {blocked.slice(0, 6).map((entry) => (
-                <span key={entry.localId} className="truncate" title={entry.file.name}>
+                <span
+                  key={entry.localId}
+                  className="truncate"
+                  title={entry.file.name}
+                >
                   {entry.displayName ?? entry.file.name}
                 </span>
               ))}
               {blocked.length > 6 ? (
-                <span className="text-wv-muted">{t("next.addNzb.andMore", { count: blocked.length - 6 })}</span>
+                <span className="text-wv-muted">
+                  {t("next.addNzb.andMore", { count: blocked.length - 6 })}
+                </span>
               ) : null}
             </span>
             <span className="mt-3 block">{t("upload.forceDesc")}</span>

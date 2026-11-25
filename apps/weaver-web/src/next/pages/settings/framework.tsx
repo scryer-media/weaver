@@ -278,7 +278,11 @@ export function FieldControlView({ spec }: { spec: FieldSpec }) {
         <TextArea
           value={control.value}
           onChange={control.onChange}
-          onBlur={control.onCommit ? () => control.onCommit?.(control.value) : undefined}
+          onBlur={
+            control.onCommit
+              ? () => control.onCommit?.(control.value)
+              : undefined
+          }
           label={spec.label}
           rows={control.rows}
           placeholder={control.placeholder}
@@ -310,7 +314,10 @@ export function FieldControlView({ spec }: { spec: FieldSpec }) {
       );
     case "static":
       return (
-        <div data-testid={testId} className="max-w-[380px] text-right font-wv-mono text-[12px] break-all text-wv-muted">
+        <div
+          data-testid={testId}
+          className="max-w-[380px] text-right font-wv-mono text-[12px] break-all text-wv-muted"
+        >
           {control.value}
         </div>
       );
@@ -337,13 +344,20 @@ const FieldRow = memo(function FieldRow({ field }: { field: FieldSpec }) {
       <FieldControlView spec={field} />
     </div>
   ) : (
-    <FormRow label={field.label} help={field.help} helpTestId={testIds.fieldHelp(field.id)} stacked={field.stacked}>
+    <FormRow
+      label={field.label}
+      help={field.help}
+      helpTestId={testIds.fieldHelp(field.id)}
+      stacked={field.stacked}
+    >
       {field.under === undefined ? (
         <FieldControlView spec={field} />
       ) : (
         <div className="flex min-w-0 flex-col items-start gap-[6px] sm:items-end">
           <FieldControlView spec={field} />
-          <div className="font-wv-mono text-[11.5px] text-wv-muted">{field.under}</div>
+          <div className="font-wv-mono text-[11.5px] text-wv-muted">
+            {field.under}
+          </div>
         </div>
       )}
     </FormRow>
@@ -360,7 +374,13 @@ const FieldRow = memo(function FieldRow({ field }: { field: FieldSpec }) {
  * slides it to its real height without measuring it; `inert` keeps a shut
  * fold out of the tab order and away from assistive technology.
  */
-export function Fold({ open, children }: { open: boolean; children: ReactNode }) {
+export function Fold({
+  open,
+  children,
+}: {
+  open: boolean;
+  children: ReactNode;
+}) {
   return (
     <div
       inert={!open}
@@ -513,7 +533,13 @@ export const SettingsBlocks = memo(function SettingsBlocks({
   }
 
   if (loading) {
-    return <EmptyState loading title={t("next.common.loading")} body={t("next.settings.loadingBody")} />;
+    return (
+      <EmptyState
+        loading
+        title={t("next.common.loading")}
+        body={t("next.settings.loadingBody")}
+      />
+    );
   }
 
   if (visible.length === 0) {
@@ -573,11 +599,18 @@ function BlockList({ blocks }: { blocks: readonly SettingsBlock[] }) {
 /** One block; a block a panel kept from its last render is not drawn again. */
 const BlockView = memo(function BlockView({ block }: { block: SettingsBlock }) {
   return (
-    <section aria-label={block.title} data-testid={testIds.section(block.id)} className="flex flex-none flex-col">
-      <SectionHeader label={block.title} tag={block.tag} note={block.note} noteTestId={testIds.sectionNote(block.id)} />
-      {block.kind === "section" ? (
-        <FieldRows fields={block.fields} />
-      ) : null}
+    <section
+      aria-label={block.title}
+      data-testid={testIds.section(block.id)}
+      className="flex flex-none flex-col"
+    >
+      <SectionHeader
+        label={block.title}
+        tag={block.tag}
+        note={block.note}
+        noteTestId={testIds.sectionNote(block.id)}
+      />
+      {block.kind === "section" ? <FieldRows fields={block.fields} /> : null}
       {block.kind === "custom" ? block.body : null}
       {block.kind === "table" ? <SettingsTable block={block} /> : null}
     </section>
@@ -614,14 +647,20 @@ function SettingsTable({ block }: { block: SettingsTableModel }) {
               role: "button",
               tabIndex: 0,
               ...(disclosure
-                ? { "aria-expanded": entry.expanded, "aria-controls": entry.expanded ? detailId : undefined }
+                ? {
+                    "aria-expanded": entry.expanded,
+                    "aria-controls": entry.expanded ? detailId : undefined,
+                  }
                 : {}),
               onClick: () => onRowClick?.(entry.id),
               onKeyDown: (event: React.KeyboardEvent) => {
                 if (event.target !== event.currentTarget && disclosure) {
                   return;
                 }
-                if (event.key === "Enter" || (disclosure && event.key === " ")) {
+                if (
+                  event.key === "Enter" ||
+                  (disclosure && event.key === " ")
+                ) {
                   event.preventDefault();
                   onRowClick?.(entry.id);
                 }
@@ -656,7 +695,10 @@ function SettingsTable({ block }: { block: SettingsTableModel }) {
       <Fragment key={entry.id}>
         {line}
         {entry.expanded ? (
-          <div id={detailId} className="border-b border-wv-hairline px-4 sm:px-6 pt-1 pb-4">
+          <div
+            id={detailId}
+            className="border-b border-wv-hairline px-4 sm:px-6 pt-1 pb-4"
+          >
             {entry.detail}
           </div>
         ) : null}
@@ -681,7 +723,9 @@ function SettingsTable({ block }: { block: SettingsTableModel }) {
               </Eyebrow>
             ))}
           </div>
-          {block.rows.length === 0 && groups.length === 0 && block.failure !== undefined ? (
+          {block.rows.length === 0 &&
+          groups.length === 0 &&
+          block.failure !== undefined ? (
             <div
               role="alert"
               data-testid={testIds.tableEmpty(block.id)}
@@ -690,7 +734,11 @@ function SettingsTable({ block }: { block: SettingsTableModel }) {
               }`}
             >
               <span className="min-w-0">{block.failure.message}</span>
-              <SecondaryButton size="compact" icon="reset" onClick={block.failure.retry.onClick}>
+              <SecondaryButton
+                size="compact"
+                icon="reset"
+                onClick={block.failure.retry.onClick}
+              >
                 {block.failure.retry.label}
               </SecondaryButton>
             </div>
@@ -707,11 +755,17 @@ function SettingsTable({ block }: { block: SettingsTableModel }) {
             <>
               {block.rows.map(row)}
               {groups.map((group) => (
-                <section key={group.id} aria-label={group.title} data-testid={testIds.rowGroup(block.id, group.id)}>
+                <section
+                  key={group.id}
+                  aria-label={group.title}
+                  data-testid={testIds.rowGroup(block.id, group.id)}
+                >
                   <div className="flex items-center gap-[10px] border-b border-wv-hairline px-4 sm:px-6 pb-2 pt-4">
                     <Eyebrow>{group.title}</Eyebrow>
                     {group.note === undefined ? null : (
-                      <span className="ml-auto truncate font-wv-mono text-[11px] text-wv-note">{group.note}</span>
+                      <span className="ml-auto truncate font-wv-mono text-[11px] text-wv-note">
+                        {group.note}
+                      </span>
                     )}
                   </div>
                   {group.rows.map(row)}
@@ -729,14 +783,23 @@ function SettingsTable({ block }: { block: SettingsTableModel }) {
       {/* Outside the scroller, so it centres on the width in view and not on the table's. */}
       {block.add === undefined ? null : (
         <div className="flex flex-none justify-center px-4 sm:px-6 py-3">
-          <PrimaryButton icon="add" onClick={block.add.onClick} disabled={block.add.disabled} testId={testIds.tableAdd(block.id)}>
+          <PrimaryButton
+            icon="add"
+            onClick={block.add.onClick}
+            disabled={block.add.disabled}
+            testId={testIds.tableAdd(block.id)}
+          >
             {block.add.label}
           </PrimaryButton>
         </div>
       )}
       {block.action === undefined ? null : (
         <div className="flex flex-none justify-center px-4 sm:px-6 py-3">
-          <PrimaryButton icon={block.action.icon} onClick={block.action.onClick} testId={testIds.tableAction(block.id)}>
+          <PrimaryButton
+            icon={block.action.icon}
+            onClick={block.action.onClick}
+            testId={testIds.tableAction(block.id)}
+          >
             {block.action.label}
           </PrimaryButton>
         </div>
@@ -785,7 +848,11 @@ export function SettingsShellProvider({
   controlsHost,
   registry,
   children,
-}: ShellApi & { search: string; controlsHost: HTMLElement | null; children: ReactNode }) {
+}: ShellApi & {
+  search: string;
+  controlsHost: HTMLElement | null;
+  children: ReactNode;
+}) {
   const value = useMemo<ShellApi>(
     () => ({ actionsRef, setFlags, registry }),
     [actionsRef, registry, setFlags],
@@ -794,7 +861,9 @@ export function SettingsShellProvider({
     <ShellContext.Provider value={value}>
       <SearchContext.Provider value={search}>
         <SearchingContext.Provider value={search.trim() !== ""}>
-          <ControlsHostContext.Provider value={controlsHost}>{children}</ControlsHostContext.Provider>
+          <ControlsHostContext.Provider value={controlsHost}>
+            {children}
+          </ControlsHostContext.Provider>
         </SearchingContext.Provider>
       </SearchContext.Provider>
     </ShellContext.Provider>
@@ -867,7 +936,10 @@ export function SettingsPanelScope({
   const { registry } = useShell();
   const searching = useContext(SearchingContext);
   const [resultsHost, setResultsHost] = useState<HTMLElement | null>(null);
-  const found = useSyncExternalStore(registry.subscribe, () => registry.panel(slug).count);
+  const found = useSyncExternalStore(
+    registry.subscribe,
+    () => registry.panel(slug).count,
+  );
   const scope = useMemo<PanelScope>(() => ({ slug, active }), [active, slug]);
   const shown = searching && found > 0;
 
@@ -875,21 +947,33 @@ export function SettingsPanelScope({
     <PanelScopeContext.Provider value={scope}>
       {/* Matches draw there only while searching, so its arrival on mount draws nothing else. */}
       <ResultsHostContext.Provider value={searching ? resultsHost : null}>
-        <section aria-label={title} hidden={!shown} className="flex flex-none flex-col">
+        <section
+          aria-label={title}
+          hidden={!shown}
+          className="flex flex-none flex-col"
+        >
           <div className="flex items-center gap-[10px] border-b border-wv-hairline bg-wv-list px-4 pt-5 pb-2 sm:px-6">
             {active ? (
-              <span className="text-[13px] font-medium text-wv-fg">{title}</span>
+              <span className="text-[13px] font-medium text-wv-fg">
+                {title}
+              </span>
             ) : (
               <button
                 type="button"
                 onClick={onOpen}
-                aria-label={t("next.settings.searchOpenPanel", { panel: title })}
+                aria-label={t("next.settings.searchOpenPanel", {
+                  panel: title,
+                })}
                 className="cursor-pointer text-[13px] font-medium text-wv-fg underline-offset-4 hover:underline"
               >
                 {title}
               </button>
             )}
-            {active ? <Eyebrow className="ml-auto">{t("next.settings.searchOpenNow")}</Eyebrow> : null}
+            {active ? (
+              <Eyebrow className="ml-auto">
+                {t("next.settings.searchOpenNow")}
+              </Eyebrow>
+            ) : null}
           </div>
           {/*
             Another panel's matches are a preview: its Save and Revert are not
@@ -901,7 +985,11 @@ export function SettingsPanelScope({
             onClick={active ? undefined : onOpen}
             className={active ? undefined : "cursor-pointer opacity-80"}
           >
-            <div ref={setResultsHost} inert={!active} className="flex flex-col" />
+            <div
+              ref={setResultsHost}
+              inert={!active}
+              className="flex flex-col"
+            />
           </div>
         </section>
         <div className={searching ? "hidden" : "contents"}>{children}</div>

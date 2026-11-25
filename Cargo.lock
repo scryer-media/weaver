@@ -6411,7 +6411,7 @@ dependencies = [
 
 [[package]]
 name = "weaver"
-version = "0.17.2"
+version = "0.17.4"
 dependencies = [
  "aho-corasick",
  "application-updater",
@@ -6473,7 +6473,7 @@ dependencies = [
 
 [[package]]
 name = "weaver-dnssec"
-version = "0.17.2"
+version = "0.17.4"
 dependencies = [
  "aws-lc-rs",
  "ed25519-dalek",
@@ -6488,7 +6488,7 @@ dependencies = [
 
 [[package]]
 name = "weaver-graph"
-version = "0.17.2"
+version = "0.17.4"
 dependencies = [
  "bytes",
  "crc-turbo",
@@ -6501,14 +6501,14 @@ dependencies = [
 
 [[package]]
 name = "weaver-model"
-version = "0.17.2"
+version = "0.17.4"
 dependencies = [
  "serde",
 ]
 
 [[package]]
 name = "weaver-nntp"
-version = "0.17.2"
+version = "0.17.4"
 dependencies = [
  "async-trait",
  "bytes",
@@ -6537,7 +6537,7 @@ dependencies = [
 
 [[package]]
 name = "weaver-nzb"
-version = "0.17.2"
+version = "0.17.4"
 dependencies = [
  "blake3",
  "html-escape",
@@ -6551,7 +6551,7 @@ dependencies = [
 
 [[package]]
 name = "weaver-objects"
-version = "0.17.2"
+version = "0.17.4"
 dependencies = [
  "aws-lc-rs",
  "brotli",
@@ -6576,7 +6576,7 @@ dependencies = [
 
 [[package]]
 name = "weaver-server-api"
-version = "0.17.2"
+version = "0.17.4"
 dependencies = [
  "async-graphql",
  "async-stream",
@@ -6607,7 +6607,7 @@ dependencies = [
 
 [[package]]
 name = "weaver-server-auth"
-version = "0.17.2"
+version = "0.17.4"
 dependencies = [
  "argon2",
  "base64 0.23.1",
@@ -6627,7 +6627,7 @@ dependencies = [
 
 [[package]]
 name = "weaver-server-base"
-version = "0.17.2"
+version = "0.17.4"
 dependencies = [
  "chrono",
  "crc-turbo",
@@ -6654,7 +6654,7 @@ dependencies = [
 
 [[package]]
 name = "weaver-server-composition"
-version = "0.17.2"
+version = "0.17.4"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -6737,7 +6737,7 @@ dependencies = [
 
 [[package]]
 name = "weaver-server-core"
-version = "0.17.2"
+version = "0.17.4"
 dependencies = [
  "aes-gcm",
  "application-updater",
@@ -6790,7 +6790,7 @@ dependencies = [
 
 [[package]]
 name = "weaver-server-db"
-version = "0.17.2"
+version = "0.17.4"
 dependencies = [
  "aes-gcm",
  "aws-lc-rs",
@@ -6815,7 +6815,7 @@ dependencies = [
 
 [[package]]
 name = "weaver-server-disk"
-version = "0.17.2"
+version = "0.17.4"
 dependencies = [
  "bytes",
  "cap-std",
@@ -6835,7 +6835,7 @@ dependencies = [
 
 [[package]]
 name = "weaver-server-history"
-version = "0.17.2"
+version = "0.17.4"
 dependencies = [
  "serde",
  "serde_json",
@@ -6851,7 +6851,7 @@ dependencies = [
 
 [[package]]
 name = "weaver-server-ingest"
-version = "0.17.2"
+version = "0.17.4"
 dependencies = [
  "blake3",
  "brotli",
@@ -6881,7 +6881,7 @@ dependencies = [
 
 [[package]]
 name = "weaver-server-jobs"
-version = "0.17.2"
+version = "0.17.4"
 dependencies = [
  "bitvec",
  "blake3",
@@ -6908,7 +6908,7 @@ dependencies = [
 
 [[package]]
 name = "weaver-server-migrations"
-version = "0.17.2"
+version = "0.17.4"
 dependencies = [
  "blake3",
  "chrono",
@@ -6935,7 +6935,7 @@ dependencies = [
 
 [[package]]
 name = "weaver-server-net"
-version = "0.17.2"
+version = "0.17.4"
 dependencies = [
  "async-trait",
  "base64 0.23.1",
@@ -6958,7 +6958,7 @@ dependencies = [
 
 [[package]]
 name = "weaver-server-net-runtime"
-version = "0.17.2"
+version = "0.17.4"
 dependencies = [
  "async-trait",
  "bytes",
@@ -6994,7 +6994,7 @@ dependencies = [
 
 [[package]]
 name = "weaver-server-orchestration"
-version = "0.17.2"
+version = "0.17.4"
 dependencies = [
  "async-trait",
  "axum",
@@ -7025,7 +7025,7 @@ dependencies = [
 
 [[package]]
 name = "weaver-server-pipeline"
-version = "0.17.2"
+version = "0.17.4"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -7109,7 +7109,7 @@ dependencies = [
 
 [[package]]
 name = "weaver-server-postproc"
-version = "0.17.2"
+version = "0.17.4"
 dependencies = [
  "blake3",
  "chrono",
@@ -7139,7 +7139,7 @@ dependencies = [
 
 [[package]]
 name = "weaver-server-rss"
-version = "0.17.2"
+version = "0.17.4"
 dependencies = [
  "blake3",
  "hex",
@@ -7151,7 +7151,7 @@ dependencies = [
 
 [[package]]
 name = "weaver-server-settings"
-version = "0.17.2"
+version = "0.17.4"
 dependencies = [
  "blake3",
  "crc-turbo",
@@ -7181,7 +7181,7 @@ dependencies = [
 
 [[package]]
 name = "weaver-server-speedtest"
-version = "0.17.2"
+version = "0.17.4"
 dependencies = [
  "chrono",
  "http",
@@ -7194,7 +7194,7 @@ dependencies = [
 
 [[package]]
 name = "weaver-server-torrent-store"
-version = "0.17.2"
+version = "0.17.4"
 dependencies = [
  "anyhow",
  "base64 0.23.1",
@@ -7225,7 +7225,7 @@ dependencies = [
 
 [[package]]
 name = "weaver-server-torrents"
-version = "0.17.2"
+version = "0.17.4"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -7269,7 +7269,7 @@ dependencies = [
 
 [[package]]
 name = "weaver-torrent"
-version = "0.17.2"
+version = "0.17.4"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -7336,7 +7336,7 @@ dependencies = [
 
 [[package]]
 name = "weaver-tunnel"
-version = "0.17.2"
+version = "0.17.4"
 dependencies = [
  "async-trait",
  "base64 0.23.1",
@@ -7367,7 +7367,7 @@ dependencies = [
 
 [[package]]
 name = "weaver-utp"
-version = "0.17.2"
+version = "0.17.4"
 dependencies = [
  "anyhow",
  "bitvec",
@@ -7384,7 +7384,7 @@ dependencies = [
 
 [[package]]
 name = "weaver-yenc"
-version = "0.17.2"
+version = "0.17.4"
 dependencies = [
  "cc",
  "crc-turbo",

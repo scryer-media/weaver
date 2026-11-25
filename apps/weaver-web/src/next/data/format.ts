@@ -77,7 +77,9 @@ export function formatCompactCount(value: number): string {
   if (magnitude >= 1_000) {
     return `${(value / 1_000).toFixed(magnitude >= 10_000 ? 0 : 1)}k`;
   }
-  return magnitude >= 10 ? value.toFixed(0) : value.toFixed(magnitude >= 1 ? 1 : 2);
+  return magnitude >= 10
+    ? value.toFixed(0)
+    : value.toFixed(magnitude >= 1 ? 1 : 2);
 }
 
 export function formatPerSecond(value: number): string {
@@ -136,7 +138,11 @@ export function splitUptime(seconds: number): SplitValue {
  * would be noise.
  */
 export function formatElapsed(milliseconds: number | null | undefined): string {
-  if (milliseconds == null || !Number.isFinite(milliseconds) || milliseconds < 0) {
+  if (
+    milliseconds == null ||
+    !Number.isFinite(milliseconds) ||
+    milliseconds < 0
+  ) {
     return EM_DASH;
   }
   const total = Math.round(milliseconds / 1000);
@@ -145,7 +151,9 @@ export function formatElapsed(milliseconds: number | null | undefined): string {
   }
   const minutes = Math.floor(total / 60) % 60;
   const hours = Math.floor(total / 3600);
-  return hours > 0 ? `${hours}h ${String(minutes).padStart(2, "0")}m` : `${minutes}m`;
+  return hours > 0
+    ? `${hours}h ${String(minutes).padStart(2, "0")}m`
+    : `${minutes}m`;
 }
 
 /**
@@ -155,7 +163,11 @@ export function formatElapsed(milliseconds: number | null | undefined): string {
  * that a 0.4s move and a 34s download sit on the same axis.
  */
 export function formatSpan(milliseconds: number | null | undefined): string {
-  if (milliseconds == null || !Number.isFinite(milliseconds) || milliseconds < 0) {
+  if (
+    milliseconds == null ||
+    !Number.isFinite(milliseconds) ||
+    milliseconds < 0
+  ) {
     return EM_DASH;
   }
   if (milliseconds < 60_000) {
@@ -165,7 +177,9 @@ export function formatSpan(milliseconds: number | null | undefined): string {
   const seconds = total % 60;
   const minutes = Math.floor(total / 60) % 60;
   const hours = Math.floor(total / 3600);
-  return hours > 0 ? `${hours}h ${minutes}m` : `${minutes}m ${String(seconds).padStart(2, "0")}s`;
+  return hours > 0
+    ? `${hours}h ${minutes}m`
+    : `${minutes}m ${String(seconds).padStart(2, "0")}s`;
 }
 
 /** Wall-clock including seconds — what a job's own events are stamped with. */
@@ -188,8 +202,16 @@ export function formatClockSeconds(epochMs: number | null | undefined): string {
 export function formatDayLabel(t: Translate, epochMs: number): string {
   const day = new Date(epochMs);
   const today = new Date();
-  const startOfToday = new Date(today.getFullYear(), today.getMonth(), today.getDate()).getTime();
-  const startOfDay = new Date(day.getFullYear(), day.getMonth(), day.getDate()).getTime();
+  const startOfToday = new Date(
+    today.getFullYear(),
+    today.getMonth(),
+    today.getDate(),
+  ).getTime();
+  const startOfDay = new Date(
+    day.getFullYear(),
+    day.getMonth(),
+    day.getDate(),
+  ).getTime();
   const daysBack = Math.round((startOfToday - startOfDay) / 86_400_000);
   if (daysBack === 0) {
     return t("next.day.today");
@@ -264,7 +286,11 @@ export function formatHostnames(names: readonly string[], shown = 3): string {
 }
 
 export function formatLatency(milliseconds: number | null | undefined): string {
-  if (milliseconds == null || !Number.isFinite(milliseconds) || milliseconds <= 0) {
+  if (
+    milliseconds == null ||
+    !Number.isFinite(milliseconds) ||
+    milliseconds <= 0
+  ) {
     return EM_DASH;
   }
   return milliseconds >= 100

@@ -12,21 +12,31 @@ test("the link Scryer writes mints a control key", () => {
 });
 
 test("the spellings Weaver accepted first still read", () => {
-  assert.deepEqual(takeApiKeyLink("?apiKeyGenerate=true&apiKeyName=Sonarr&apiKeyScope=read").link, {
-    name: "Sonarr",
-    scope: "READ",
-  });
-  assert.deepEqual(takeApiKeyLink("?createApiKey=1&name=%20Radarr%20&scope=ADMIN").link, {
-    name: "Radarr",
-    scope: "ADMIN",
-  });
+  assert.deepEqual(
+    takeApiKeyLink("?apiKeyGenerate=true&apiKeyName=Sonarr&apiKeyScope=read")
+      .link,
+    {
+      name: "Sonarr",
+      scope: "READ",
+    },
+  );
+  assert.deepEqual(
+    takeApiKeyLink("?createApiKey=1&name=%20Radarr%20&scope=ADMIN").link,
+    {
+      name: "Radarr",
+      scope: "ADMIN",
+    },
+  );
 });
 
 test("a scope that means nothing here falls back to control", () => {
-  assert.deepEqual(takeApiKeyLink("?createApiKey=1&name=Scryer&scope=everything").link, {
-    name: "Scryer",
-    scope: "CONTROL",
-  });
+  assert.deepEqual(
+    takeApiKeyLink("?createApiKey=1&name=Scryer&scope=everything").link,
+    {
+      name: "Scryer",
+      scope: "CONTROL",
+    },
+  );
   assert.deepEqual(takeApiKeyLink("?createApiKey=1&name=Scryer").link, {
     name: "Scryer",
     scope: "CONTROL",
@@ -44,7 +54,10 @@ test("read and control links mint on arrival; an admin link waits for a click", 
     assert.ok(link);
     assert.equal(mintsOnArrival(link), true, search);
   }
-  for (const search of ["?createApiKey=1&name=Scryer&scope=admin", "?apiKeyGenerate=true&apiKeyName=Scryer&apiKeyScope=ADMIN"]) {
+  for (const search of [
+    "?createApiKey=1&name=Scryer&scope=admin",
+    "?apiKeyGenerate=true&apiKeyName=Scryer&apiKeyScope=ADMIN",
+  ]) {
     const { link } = takeApiKeyLink(search);
     assert.ok(link);
     assert.equal(mintsOnArrival(link), false, search);
@@ -52,12 +65,20 @@ test("read and control links mint on arrival; an admin link waits for a click", 
 });
 
 test("a link is consumed, and the rest of the query string is kept", () => {
-  const taken = takeApiKeyLink("?panel=security&createApiKey=1&name=Scryer&scope=integration&lang=de");
+  const taken = takeApiKeyLink(
+    "?panel=security&createApiKey=1&name=Scryer&scope=integration&lang=de",
+  );
   assert.equal(taken.search, "panel=security&lang=de");
 });
 
 test("a query string that asks for no key is left alone", () => {
-  for (const search of ["", "?lang=de", "?createApiKey=0&name=Scryer", "?createApiKey=1", "?createApiKey=1&name=%20"]) {
+  for (const search of [
+    "",
+    "?lang=de",
+    "?createApiKey=0&name=Scryer",
+    "?createApiKey=1",
+    "?createApiKey=1&name=%20",
+  ]) {
     const taken = takeApiKeyLink(search);
     assert.equal(taken.link, null);
     assert.equal(taken.search, search);

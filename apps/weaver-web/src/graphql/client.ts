@@ -17,7 +17,8 @@ let browserCsrf: string | null = null;
 let csrfRequest: Promise<boolean> | null = null;
 let csrfLoaded = false;
 
-export type GraphqlConnectionStatus = "connecting" | "connected" | "disconnected";
+export type GraphqlConnectionStatus =
+  "connecting" | "connected" | "disconnected";
 
 interface GraphqlConnectionSnapshot {
   status: GraphqlConnectionStatus;
@@ -75,10 +76,14 @@ function emitGraphqlClientSnapshot() {
 }
 
 function updateConnectionSnapshot(
-  update: Partial<GraphqlConnectionSnapshot> | ((current: GraphqlConnectionSnapshot) => GraphqlConnectionSnapshot),
+  update:
+    | Partial<GraphqlConnectionSnapshot>
+    | ((current: GraphqlConnectionSnapshot) => GraphqlConnectionSnapshot),
 ) {
   const nextSnapshot =
-    typeof update === "function" ? update(connectionSnapshot) : { ...connectionSnapshot, ...update };
+    typeof update === "function"
+      ? update(connectionSnapshot)
+      : { ...connectionSnapshot, ...update };
 
   const hasChanged =
     nextSnapshot.status !== connectionSnapshot.status ||
@@ -154,11 +159,20 @@ function tokenRefreshUrl(): string {
   return new URL(".", document.baseURI).href;
 }
 
-function withSessionCredentials(input: RequestInfo | URL, init?: RequestInit): RequestInit {
-  const headers = new Headers(input instanceof Request ? input.headers : undefined);
+function withSessionCredentials(
+  input: RequestInfo | URL,
+  init?: RequestInit,
+): RequestInit {
+  const headers = new Headers(
+    input instanceof Request ? input.headers : undefined,
+  );
   new Headers(init?.headers).forEach((value, key) => headers.set(key, value));
-  const target = new URL(input instanceof Request ? input.url : String(input), document.baseURI);
-  if (browserCsrf && target.origin === window.location.origin) headers.set("X-Weaver-Csrf", browserCsrf);
+  const target = new URL(
+    input instanceof Request ? input.url : String(input),
+    document.baseURI,
+  );
+  if (browserCsrf && target.origin === window.location.origin)
+    headers.set("X-Weaver-Csrf", browserCsrf);
   return {
     ...init,
     headers,
@@ -233,7 +247,8 @@ function createTrackedWsClient(transportId: number): GraphqlWsClient {
       return code !== 4401 && code !== 4403;
     },
     retryWait: async (retries) => {
-      const delay = retries === 0 ? 0 : Math.min(1_000 * 2 ** (retries - 1), 30_000);
+      const delay =
+        retries === 0 ? 0 : Math.min(1_000 * 2 ** (retries - 1), 30_000);
       await new Promise((resolve) => setTimeout(resolve, delay));
       // Try to pick up a new session cookie before the next connection attempt.
       await refreshSessionCookie();
@@ -246,13 +261,18 @@ function createTrackedWsClient(transportId: number): GraphqlWsClient {
 
         updateConnectionSnapshot((current) => ({
           ...current,
-          status: current.lastConnectedAt === null && !isRetry ? "connecting" : "disconnected",
+          status:
+            current.lastConnectedAt === null && !isRetry
+              ? "connecting"
+              : "disconnected",
           reconnectAttempt:
-            current.lastConnectedAt === null && !isRetry ? 0 : current.reconnectAttempt + 1,
+            current.lastConnectedAt === null && !isRetry
+              ? 0
+              : current.reconnectAttempt + 1,
           disconnectedAt:
             current.lastConnectedAt === null && !isRetry
               ? null
-              : current.disconnectedAt ?? Date.now(),
+              : (current.disconnectedAt ?? Date.now()),
         }));
       },
       connected: () => {
@@ -336,7 +356,11 @@ export function useGraphqlConnectionState(): GraphqlConnectionSnapshot {
 }
 
 export function useGraphqlClient(): Client {
-  return useSyncExternalStore(subscribeToGraphqlClient, getGraphqlClient, getGraphqlClient);
+  return useSyncExternalStore(
+    subscribeToGraphqlClient,
+    getGraphqlClient,
+    getGraphqlClient,
+  );
 }
 
 /** Headers that authenticate requests to the Weaver API. */
@@ -353,18 +377,23 @@ export async function refreshSessionCookie(): Promise<boolean> {
   csrfRequest = (async () => {
     try {
       const csrf = await fetch(new URL("api/auth/csrf", document.baseURI), {
-        credentials: "include", cache: "no-store",
+        credentials: "include",
+        cache: "no-store",
       });
       if (csrf.ok) {
         const payload = await csrf.json();
-        browserCsrf = typeof payload.csrfToken === "string" ? payload.csrfToken : null;
+        browserCsrf =
+          typeof payload.csrfToken === "string" ? payload.csrfToken : null;
         csrfLoaded = true;
         return browserCsrf !== null;
       }
       browserCsrf = null;
       csrfLoaded = true;
       if (csrf.status !== 404) return false;
-      const response = await fetch(tokenRefreshUrl(), { credentials: "include", cache: "no-store" });
+      const response = await fetch(tokenRefreshUrl(), {
+        credentials: "include",
+        cache: "no-store",
+      });
       if (!response.ok) return false;
       await response.arrayBuffer();
       return true;

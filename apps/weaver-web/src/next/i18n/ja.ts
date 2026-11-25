@@ -47,10 +47,12 @@ export const nextJa: LocaleDictionary = {
   "next.rail.cause.overLimit": "接続数が多すぎます",
   "next.rail.cause.overLimitRetry": "接続数が多すぎます。{{time}}後に再試行",
   "next.rail.cause.coolingDown": "エラーが続いたため一時停止中",
-  "next.rail.cause.coolingDownResume": "エラーが続いたため一時停止中。{{time}}後に再開します",
+  "next.rail.cause.coolingDownResume":
+    "エラーが続いたため一時停止中。{{time}}後に再開します",
   "next.rail.cause.degraded": "最近のリクエストでエラーが発生しています",
   "next.rail.cause.disabled": "ログイン失敗またはエラーが続いたため一時停止中",
-  "next.rail.cause.disabledRetry": "ログイン失敗またはエラーが続いたため一時停止中。{{time}}後に再試行",
+  "next.rail.cause.disabledRetry":
+    "ログイン失敗またはエラーが続いたため一時停止中。{{time}}後に再試行",
   "next.rail.cause.preparing": "修復データを取得中",
   "next.rail.addProvider": "プロバイダーを追加",
   "next.rail.sinceRestart": "前回の再起動から",
@@ -61,7 +63,8 @@ export const nextJa: LocaleDictionary = {
   "next.attention.consecutiveFailures.one": "{{count}} 回連続で失敗",
   "next.attention.consecutiveFailures.other": "{{count}} 回連続で失敗",
   "next.attention.quotaReached": "プロバイダーのクォータに達しました",
-  "next.attention.scheduleHold": "スケジュールによりダウンロードが保留されています",
+  "next.attention.scheduleHold":
+    "スケジュールによりダウンロードが保留されています",
   "next.attention.resumes": "{{time}} に再開",
   "next.provider.state.healthy": "正常",
   "next.provider.state.degraded": "低下",
@@ -79,13 +82,16 @@ export const nextJa: LocaleDictionary = {
   // Error page
   "next.errorPage.notFound": "ページが見つかりません",
   "next.errorPage.requestFailed": "リクエストに失敗しました ({{status}})",
-  "next.errorPage.routingBody": "ページの読み込みが完了する前にルーティングエラーが発生しました。",
+  "next.errorPage.routingBody":
+    "ページの読み込みが完了する前にルーティングエラーが発生しました。",
   "next.errorPage.title": "問題が発生しました",
-  "next.errorPage.renderBody": "この画面の表示中に予期しないエラーが発生しました。",
+  "next.errorPage.renderBody":
+    "この画面の表示中に予期しないエラーが発生しました。",
   "next.errorPage.goBack": "戻る",
   "next.errorPage.retry": "再試行",
   "next.errorPage.checking": "確認中…",
-  "next.errorPage.unreachable": "Weaver が応答していません。応答があり次第、このページが Weaver を開きます。",
+  "next.errorPage.unreachable":
+    "Weaver が応答していません。応答があり次第、このページが Weaver を開きます。",
   "next.errorPage.details": "技術的な詳細",
 
   // Shared components
@@ -97,7 +103,8 @@ export const nextJa: LocaleDictionary = {
   "next.pagination.rows": "行",
   "next.pagination.range": "{{from}}–{{to}} / {{total}}",
   "next.pagination.empty": "0 / 0",
-  "next.routing.profilesUnreadable": "プロキシプロファイルを読み込めませんでした。既存の割り当てはそのまま維持されます。",
+  "next.routing.profilesUnreadable":
+    "プロキシプロファイルを読み込めませんでした。既存の割り当てはそのまま維持されます。",
   "next.routing.noRoutes": "プロキシルートなし",
   "next.routing.proxyId": "プロキシ #{{id}}",
   "next.routing.disabled": "無効",
@@ -110,7 +117,8 @@ export const nextJa: LocaleDictionary = {
   "next.routing.finalDirect": "最終ルート: 直接接続",
   "next.routing.finalBlocked": "最終ルート: ブロック",
   "next.routing.allowDirect": "最後の手段として直接接続を許可する",
-  "next.routing.cannotConnect": "プロキシも直接接続のフォールバックもないため、まったく接続できません。",
+  "next.routing.cannotConnect":
+    "プロキシも直接接続のフォールバックもないため、まったく接続できません。",
   "next.routing.state.idle": "ルート: アイドル",
   "next.routing.state.proxy": "ルート: プロキシ",
   "next.routing.state.direct": "ルート: 直接接続",
@@ -154,18 +162,23 @@ export const nextJa: LocaleDictionary = {
   "next.downloads.queueClear": "キューは空です",
   "next.downloads.sortBy": "並べ替え",
   "next.downloads.sortMenu": "ダウンロードを並べ替え",
-  "next.downloads.showingPage": "{{total}} 件中 {{shown}} 件のダウンロードを表示",
+  "next.downloads.showingPage":
+    "{{total}} 件中 {{shown}} 件のダウンロードを表示",
   "next.downloads.selectAllMatching": "{{count}} 件すべて選択",
   "next.downloads.selectionChanged": "選択内容が変わりました",
   "next.downloads.shown": "{{total}} 件中 {{shown}} 件のダウンロードを表示",
   "next.downloads.loadingBody": "キューを取得しています。",
   "next.downloads.emptyTitle": "アクティブなダウンロードはありません",
-  "next.downloads.emptyBody": "NZB またはトレントを追加するか、このリストのどこかにドロップしてください。",
-  "next.downloads.emptyBodyNzb": "NZB を追加するか、このリストのどこかにドロップしてください。",
+  "next.downloads.emptyBody":
+    "NZB またはトレントを追加するか、このリストのどこかにドロップしてください。",
+  "next.downloads.emptyBodyNzb":
+    "NZB を追加するか、このリストのどこかにドロップしてください。",
   "next.downloads.noMatchTitle": "この表示に一致するものはありません",
-  "next.downloads.noMatchBody": "検索をクリアするか、別のフィルターを選んでください。",
+  "next.downloads.noMatchBody":
+    "検索をクリアするか、別のフィルターを選んでください。",
   "next.downloads.selectGroup": "「{{group}}」のダウンロードをすべて選択",
-  "next.downloads.dropHint": "ドロップしてこれらの NZB またはトレントファイルを追加",
+  "next.downloads.dropHint":
+    "ドロップしてこれらの NZB またはトレントファイルを追加",
   "next.downloads.dropHintNzb": "ドロップしてこれらの NZB ファイルを追加",
   "next.downloads.waitPaused": "一時停止中",
   "next.downloads.setPriority": "優先度を設定",
@@ -173,21 +186,34 @@ export const nextJa: LocaleDictionary = {
   "next.downloads.cancelTitle": "ダウンロードをキャンセル",
   "next.downloads.keepDownloading": "ダウンロードを続ける",
   "next.downloads.bulk.paused.one": "1 件のダウンロードを一時停止しました",
-  "next.downloads.bulk.paused.other": "{{count}} 件のダウンロードを一時停止しました",
-  "next.downloads.bulk.pausedPartial": "{{total}} 件中 {{done}} 件を一時停止しました — {{refused}} 件は拒否されました",
+  "next.downloads.bulk.paused.other":
+    "{{count}} 件のダウンロードを一時停止しました",
+  "next.downloads.bulk.pausedPartial":
+    "{{total}} 件中 {{done}} 件を一時停止しました — {{refused}} 件は拒否されました",
   "next.downloads.bulk.resumed.one": "1 件のダウンロードを再開しました",
-  "next.downloads.bulk.resumed.other": "{{count}} 件のダウンロードを再開しました",
-  "next.downloads.bulk.resumedPartial": "{{total}} 件中 {{done}} 件を再開しました — {{refused}} 件は拒否されました",
-  "next.downloads.bulk.priority.one": "1 件のダウンロードに優先度を設定しました",
-  "next.downloads.bulk.priority.other": "{{count}} 件のダウンロードに優先度を設定しました",
-  "next.downloads.bulk.priorityPartial": "{{total}} 件中 {{done}} 件に優先度を設定しました — {{refused}} 件は拒否されました",
-  "next.downloads.bulk.category.one": "1 件のダウンロードにカテゴリを設定しました",
-  "next.downloads.bulk.category.other": "{{count}} 件のダウンロードにカテゴリを設定しました",
-  "next.downloads.bulk.categoryPartial": "{{total}} 件中 {{done}} 件にカテゴリを設定しました — {{refused}} 件は拒否されました",
+  "next.downloads.bulk.resumed.other":
+    "{{count}} 件のダウンロードを再開しました",
+  "next.downloads.bulk.resumedPartial":
+    "{{total}} 件中 {{done}} 件を再開しました — {{refused}} 件は拒否されました",
+  "next.downloads.bulk.priority.one":
+    "1 件のダウンロードに優先度を設定しました",
+  "next.downloads.bulk.priority.other":
+    "{{count}} 件のダウンロードに優先度を設定しました",
+  "next.downloads.bulk.priorityPartial":
+    "{{total}} 件中 {{done}} 件に優先度を設定しました — {{refused}} 件は拒否されました",
+  "next.downloads.bulk.category.one":
+    "1 件のダウンロードにカテゴリを設定しました",
+  "next.downloads.bulk.category.other":
+    "{{count}} 件のダウンロードにカテゴリを設定しました",
+  "next.downloads.bulk.categoryPartial":
+    "{{total}} 件中 {{done}} 件にカテゴリを設定しました — {{refused}} 件は拒否されました",
   "next.downloads.bulk.cancelled.one": "1 件のダウンロードをキャンセルしました",
-  "next.downloads.bulk.cancelled.other": "{{count}} 件のダウンロードをキャンセルしました",
-  "next.downloads.bulk.cancelledPartial": "{{total}} 件中 {{done}} 件をキャンセルしました — {{refused}} 件は拒否されました",
-  "next.downloads.bulk.failed": "選択したダウンロードは変更されませんでした — {{message}}",
+  "next.downloads.bulk.cancelled.other":
+    "{{count}} 件のダウンロードをキャンセルしました",
+  "next.downloads.bulk.cancelledPartial":
+    "{{total}} 件中 {{done}} 件をキャンセルしました — {{refused}} 件は拒否されました",
+  "next.downloads.bulk.failed":
+    "選択したダウンロードは変更されませんでした — {{message}}",
   "next.inspector.selected": "選択中のダウンロード",
   "next.inspector.openDetail": "ジョブの詳細を開く",
   "next.inspector.filesShown": "{{count}} 件中 {{shown}} 件",
@@ -195,7 +221,8 @@ export const nextJa: LocaleDictionary = {
   "next.inspector.rate": "速度",
   "next.inspector.seedingTime": "シード時間",
   "next.inspector.destination": "保存先",
-  "next.inspector.noFiles": "まだ何も書き込まれていません — ダウンロードが保存先に届くとファイルが表示されます。",
+  "next.inspector.noFiles":
+    "まだ何も書き込まれていません — ダウンロードが保存先に届くとファイルが表示されます。",
   "next.inspector.topOfQueue": "キューの先頭へ",
   "next.inspector.stopScripts": "スクリプトを停止",
   "next.inspector.removeDownload": "ダウンロードを削除",
@@ -208,12 +235,15 @@ export const nextJa: LocaleDictionary = {
   "next.speedLimit.ceilingAria": "速度制限（メガバイト毎秒）",
   "next.speedLimit.upload": "アップロード速度",
   "next.speedLimit.uploadAria": "アップロード制限 (MB/秒)",
-  "next.speedLimit.scheduleHolding": "現在、スケジュールによりダウンロードが {{rate}} に制限されています。",
+  "next.speedLimit.scheduleHolding":
+    "現在、スケジュールによりダウンロードが {{rate}} に制限されています。",
   "next.addNzb.title": "追加",
   "next.addNzb.submitOne": "ダウンロードを追加",
   "next.addNzb.submitMany": "{{count}} 件のダウンロードを追加",
-  "next.addNzb.dropZone": "NZB またはトレントファイルをここにドロップするか、クリックして選択",
-  "next.addNzb.dropZoneNzb": "NZB ファイルをここにドロップするか、クリックして選択",
+  "next.addNzb.dropZone":
+    "NZB またはトレントファイルをここにドロップするか、クリックして選択",
+  "next.addNzb.dropZoneNzb":
+    "NZB ファイルをここにドロップするか、クリックして選択",
   "next.addNzb.status.queued": "待機中",
   "next.addNzb.status.staging": "準備中",
   "next.addNzb.status.staged": "準備完了",
@@ -224,7 +254,8 @@ export const nextJa: LocaleDictionary = {
   "next.addNzb.forceTitle": "重複をそれでも追加しますか？",
   "next.addNzb.forceNote": "{{count}} 件ブロック",
   "next.addNzb.forceBody.one": "この NZB は重複ポリシーにより拒否されました:",
-  "next.addNzb.forceBody.other": "これら {{count}} 件の NZB は重複ポリシーにより拒否されました:",
+  "next.addNzb.forceBody.other":
+    "これら {{count}} 件の NZB は重複ポリシーにより拒否されました:",
   "next.addNzb.andMore": "ほか {{count}} 件",
   "next.addNzb.forceConfirm.one": "それでも追加",
   "next.addNzb.forceConfirm.other": "{{count}} 件をそれでも追加",
@@ -261,7 +292,8 @@ export const nextJa: LocaleDictionary = {
   "next.rail.uptime": "稼働時間",
   "next.downloads.tabDownloading": "ダウンロード中",
   "next.downloads.tabSeeding": "シード中",
-  "next.status.propagationUntil": "伝播を待っています。ダウンロードは {{time}} に開始します。",
+  "next.status.propagationUntil":
+    "伝播を待っています。ダウンロードは {{time}} に開始します。",
   "next.day.today": "今日",
   "next.day.yesterday": "昨日",
   "next.day.undated": "日付なし",
@@ -303,14 +335,18 @@ export const nextJa: LocaleDictionary = {
   "next.completed.sortMenu": "完了済みを並べ替え",
   "next.completed.bulk.requeued.one": "{{count}} 件を再度キューに入れました",
   "next.completed.bulk.requeued.other": "{{count}} 件を再度キューに入れました",
-  "next.completed.bulk.requeuedPartial": "{{total}} 件中 {{done}} 件を再度キューに入れました — {{refused}} 件は拒否されました",
+  "next.completed.bulk.requeuedPartial":
+    "{{total}} 件中 {{done}} 件を再度キューに入れました — {{refused}} 件は拒否されました",
   "next.completed.bulk.rerun.one": "{{count}} 件のスクリプトを再実行しました",
   "next.completed.bulk.rerun.other": "{{count}} 件のスクリプトを再実行しました",
-  "next.completed.bulk.rerunPartial": "{{total}} 件中 {{done}} 件のスクリプトを再実行しました — {{refused}} 件は拒否されました",
+  "next.completed.bulk.rerunPartial":
+    "{{total}} 件中 {{done}} 件のスクリプトを再実行しました — {{refused}} 件は拒否されました",
   "next.completed.redownload": "再ダウンロード",
   "next.completed.rerunScripts": "スクリプトを再実行",
-  "next.completed.exported.one": "このページをエクスポートしました — {{count}} 件",
-  "next.completed.exported.other": "このページをエクスポートしました — {{count}} 件",
+  "next.completed.exported.one":
+    "このページをエクスポートしました — {{count}} 件",
+  "next.completed.exported.other":
+    "このページをエクスポートしました — {{count}} 件",
   "next.completed.kept.one": "{{count}} 件のジョブを保持",
   "next.completed.kept.other": "{{count}} 件のジョブを保持",
   "next.completed.filterLabel": "完了済みを名前で絞り込む",
@@ -353,7 +389,8 @@ export const nextJa: LocaleDictionary = {
   "next.download.recovery": "リカバリ",
   "next.download.recoveryShown": "{{count}} 件中 {{shown}} 件を表示",
   "next.download.setsShown": "{{count}} セット中 {{shown}} セットを表示",
-  "next.download.recoverySet": "{{blocks}} ブロック · 破損 {{damaged}} · 修復 {{repaired}}",
+  "next.download.recoverySet":
+    "{{blocks}} ブロック · 破損 {{damaged}} · 修復 {{repaired}}",
   "next.download.files": "ファイル",
   "next.download.articles": "記事",
   "next.download.missing": "欠落",
@@ -404,20 +441,24 @@ export const nextJa: LocaleDictionary = {
   "next.completed.freeOn": "{{volume}} の空き {{size}}",
   "next.completed.freeAcross": "{{count}} ボリュームの空き {{size}}",
   "next.completed.loadingBody": "履歴ページを取得しています。",
-  "next.completed.noMatchBody": "フィルターをクリアするか、別の結果を選んでください。",
+  "next.completed.noMatchBody":
+    "フィルターをクリアするか、別の結果を選んでください。",
   "next.completed.items.one": "{{count}} 件",
   "next.completed.items.other": "{{count}} 件",
   "next.completed.dayTotal": "{{size}} 完了",
   "next.completed.deleting": "削除中",
   "next.completed.took": "所要 {{span}}",
-  "next.completed.deleteBody": "「削除（ファイルは残す）」は項目を削除し、ファイルはディスクに残します。「削除」はダウンロードしたファイルも削除します。どちらもバックグラウンドで実行され、完了するまで項目はロックされたままここに表示されます。",
+  "next.completed.deleteBody":
+    "「削除（ファイルは残す）」は項目を削除し、ファイルはディスクに残します。「削除」はダウンロードしたファイルも削除します。どちらもバックグラウンドで実行され、完了するまで項目はロックされたままここに表示されます。",
   "next.job.title": "ジョブ",
   "next.job.missingTitle": "ジョブが見つかりません",
-  "next.job.missingBody": "履歴から削除されたか、リンクが weaver にない ID を指しています。",
+  "next.job.missingBody":
+    "履歴から削除されたか、リンクが weaver にない ID を指しています。",
   "next.job.backToHistory": "履歴に戻る",
   "next.job.loadingBody": "このジョブの状態を取得しています。",
   "next.job.outcomeFailed": "失敗 — 不完全、何も移動していません",
-  "next.job.outcomePartial": "一部完了 — 一部のみ配信、完全なファイルを移動済み",
+  "next.job.outcomePartial":
+    "一部完了 — 一部のみ配信、完全なファイルを移動済み",
   "next.job.partial": "一部完了",
   "next.job.outcomeRepaired": "完了 — 修復、移動、スクリプト実行済み",
   "next.job.outcomeVerified": "完了 — 検証、移動、スクリプト実行済み",
@@ -433,8 +474,10 @@ export const nextJa: LocaleDictionary = {
   "next.job.verifiedWithoutRepair": "修復なしで検証済み",
   "next.job.started": "{{time}} に開始",
   "next.job.remaining": "残り {{duration}}",
-  "next.job.copiedEvents.one": "{{count}} 件のイベントをクリップボードにコピーしました",
-  "next.job.copiedEvents.other": "{{count}} 件のイベントをクリップボードにコピーしました",
+  "next.job.copiedEvents.one":
+    "{{count}} 件のイベントをクリップボードにコピーしました",
+  "next.job.copiedEvents.other":
+    "{{count}} 件のイベントをクリップボードにコピーしました",
   "next.job.report.stoppedScripts": "後処理を停止しました",
   "next.job.report.resumed": "再開しました",
   "next.job.report.paused": "一時停止しました",
@@ -476,11 +519,13 @@ export const nextJa: LocaleDictionary = {
   "next.job.noSetPosted": "リカバリセットの投稿なし",
   "next.job.ofFetched": "{{size}} 中を取得",
   "next.job.setSkipped": "par2 セットをスキップ",
-  "next.job.noStages": "まだ開始したステージはありません — ジョブが処理され始めるとパイプラインが表示されます。",
+  "next.job.noStages":
+    "まだ開始したステージはありません — ジョブが処理され始めるとパイプラインが表示されます。",
   "next.job.nothingWritten": "まだ何も書き込まれていません",
   "next.job.fileCount.one": "{{count}} ファイル",
   "next.job.fileCount.other": "{{count}} ファイル",
-  "next.job.filesAppear": "ジョブが保存先に届くと、ここにファイルが表示されます。",
+  "next.job.filesAppear":
+    "ジョブが保存先に届くと、ここにファイルが表示されます。",
   "next.job.copyPathTitle": "フルパスをコピー",
   "next.job.downloadNzb": "NZB をダウンロード",
   "next.job.nzbSaved": "{{name}} の NZB を保存しました",
@@ -489,16 +534,20 @@ export const nextJa: LocaleDictionary = {
   "next.support.copy": "コピー",
   "next.support.copyReport": "サポートレポートをコピー",
   "next.support.downloadJson": "JSON をダウンロード",
-  "next.support.copied": "サポートレポートをコピーしました。名前、グループ、メッセージ ID は含まれません。",
-  "next.support.copyBlocked": "ブラウザーがクリップボードをブロックしました。代わりに「JSON をダウンロード」を使ってください。",
+  "next.support.copied":
+    "サポートレポートをコピーしました。名前、グループ、メッセージ ID は含まれません。",
+  "next.support.copyBlocked":
+    "ブラウザーがクリップボードをブロックしました。代わりに「JSON をダウンロード」を使ってください。",
   "next.support.saved": "サポートレポートを保存しました。",
   "next.support.failed": "サポートレポートを作成できませんでした。",
   "next.analyzer.note": "キューに追加せずに NZB または torrent を調べます",
   "next.analyzer.noteNzb": "キューに追加せずに NZB を調べます",
   "next.analyzer.source": "NZB、torrent、マグネット",
   "next.analyzer.sourceNzb": "NZB",
-  "next.analyzer.dropZone": ".nzb、.nzb.gz、.torrent をここにドロップするか、クリックして選択",
-  "next.analyzer.dropZoneNzb": ".nzb、.nzb.gz をここにドロップするか、クリックして選択",
+  "next.analyzer.dropZone":
+    ".nzb、.nzb.gz、.torrent をここにドロップするか、クリックして選択",
+  "next.analyzer.dropZoneNzb":
+    ".nzb、.nzb.gz をここにドロップするか、クリックして選択",
   "next.analyzer.magnet": "マグネットリンク",
   "next.analyzer.analyze": "分析",
   "next.analyzer.analyzing": "分析中…",
@@ -506,8 +555,10 @@ export const nextJa: LocaleDictionary = {
   "next.analyzer.magnetFailed": "マグネットリンクを分析できませんでした。",
   "next.analyzer.tooLarge": "ファイルが {{size}} を超えています。",
   "next.analyzer.emptyTitle": "まだ何も分析していません",
-  "next.analyzer.emptyBody": "レポートには名前、パス、グループ、メッセージ ID、パスキーを含めずに構成、トラッカー、警告が表示されるため、公開の場に貼り付けても安全です。",
-  "next.analyzer.emptyBodyNzb": "レポートには名前、パス、グループ、メッセージ ID を含めずに構成と警告が表示されるため、公開の場に貼り付けても安全です。",
+  "next.analyzer.emptyBody":
+    "レポートには名前、パス、グループ、メッセージ ID、パスキーを含めずに構成、トラッカー、警告が表示されるため、公開の場に貼り付けても安全です。",
+  "next.analyzer.emptyBodyNzb":
+    "レポートには名前、パス、グループ、メッセージ ID を含めずに構成と警告が表示されるため、公開の場に貼り付けても安全です。",
   "next.analyzer.report": "レポート",
   "next.job.download": "ダウンロード",
   "next.job.downloadFileTitle": "{{name}} をダウンロード",
@@ -519,8 +570,10 @@ export const nextJa: LocaleDictionary = {
   "next.job.eventCount.one": "{{count}} 件のイベント",
   "next.job.eventCount.other": "{{count}} 件のイベント",
   "next.job.copyAsText": "テキストとしてコピー",
-  "next.job.copyLoadedEvents.one": "読み込み済みの {{count}} 件のイベントをコピー",
-  "next.job.copyLoadedEvents.other": "読み込み済みの {{count}} 件のイベントをコピー",
+  "next.job.copyLoadedEvents.one":
+    "読み込み済みの {{count}} 件のイベントをコピー",
+  "next.job.copyLoadedEvents.other":
+    "読み込み済みの {{count}} 件のイベントをコピー",
   "next.job.noEvents": "エンジンはこのジョブについて何も記録していません。",
   "next.job.scriptRuns": "スクリプトの実行",
   "next.job.scriptRunCount.one": "{{count}} 件の実行",
@@ -540,7 +593,8 @@ export const nextJa: LocaleDictionary = {
   "next.job.originalTitle": "元の NZB タイトル",
   "next.job.originalTorrentName": "元のトレント名",
   "next.job.providersUsed": "使用したプロバイダー",
-  "next.job.providersEmpty": "このジョブでは記録されていません — まだ何も届いていないか、weaver がプロバイダー別に集計する前に完了しました。",
+  "next.job.providersEmpty":
+    "このジョブでは記録されていません — まだ何も届いていないか、weaver がプロバイダー別に集計する前に完了しました。",
   "next.job.serverId": "サーバー {{id}}",
   "next.job.articles.one": "{{count}} 件の記事",
   "next.job.articles.other": "{{count}} 件の記事",
@@ -554,8 +608,10 @@ export const nextJa: LocaleDictionary = {
   "next.job.deleteTitle": "履歴から削除",
   "next.job.deleteBody": "項目は履歴から消え、ファイルはディスクに残ります。",
   "next.job.cancelTitle": "ダウンロードをキャンセル",
-  "next.job.cancelBody": "ダウンロードは停止しキューから外れます。途中のデータは通常どおり片付けられます。",
-  "next.job.forgetBody": "weaver はこのリリースを既知のものの重複として認識しなくなります。同じリリースを今後取得すると新規として扱われます。",
+  "next.job.cancelBody":
+    "ダウンロードは停止しキューから外れます。途中のデータは通常どおり片付けられます。",
+  "next.job.forgetBody":
+    "weaver はこのリリースを既知のものの重複として認識しなくなります。同じリリースを今後取得すると新規として扱われます。",
   "next.common.yes": "はい",
   "next.common.no": "いいえ",
   "next.monitoring.note": "パイプラインの負荷、プロバイダー、失敗",
@@ -574,7 +630,8 @@ export const nextJa: LocaleDictionary = {
   "next.monitoring.pipeline": "パイプライン",
   "next.monitoring.active": "稼働中",
   "next.monitoring.idle": "待機中",
-  "next.monitoring.pipelineNote": "ダウンロード {{downloads}} 件、修復 {{repairs}} 件",
+  "next.monitoring.pipelineNote":
+    "ダウンロード {{downloads}} 件、修復 {{repairs}} 件",
   "next.monitoring.peak": "このセッションのピーク {{value}} {{unit}}",
   "next.monitoring.noTraffic": "まだ通信なし",
   "next.monitoring.connections": "接続",
@@ -587,13 +644,15 @@ export const nextJa: LocaleDictionary = {
   "next.monitoring.writeQueue": "書き込みキュー",
   "next.monitoring.buffered": "{{unit}} をバッファ中",
   "next.monitoring.sampled": "5 秒ごとに取得 · {{window}} 期間",
-  "next.monitoring.throughputNote": "毎秒バイト数、ダウンロードと書き込みの比較",
+  "next.monitoring.throughputNote":
+    "毎秒バイト数、ダウンロードと書き込みの比較",
   "next.monitoring.segments": "記事",
   "next.monitoring.segmentsNote": "毎秒のダウンロード、デコード、再試行",
   "next.monitoring.depths": "キューの深さ",
   "next.monitoring.depthsNote": "ダウンロード、デコード、書き込みの滞留",
   "next.monitoring.providersNote": "接続負荷、往復時間、失敗",
-  "next.monitoring.noProviders": "プロバイダーが設定されていません — 設定 → プロバイダー で追加してください。",
+  "next.monitoring.noProviders":
+    "プロバイダーが設定されていません — 設定 → プロバイダー で追加してください。",
   "next.monitoring.roundTrip": "往復時間",
   "next.monitoring.pinnedAddress": "新規接続の接続先アドレス",
   "next.monitoring.failuresSinceStart": "起動以降の失敗",
@@ -673,7 +732,8 @@ export const nextJa: LocaleDictionary = {
   "next.system.volumeBufferedOf": "バッファ {{size}} / {{limit}}",
   "next.system.noVolumes": "まだ何も書き込まれていません。",
   "next.system.configuredStorage": "設定済みストレージ",
-  "next.system.configuredStorageNote": "エクスポートしたレポートではパスを伏せます",
+  "next.system.configuredStorageNote":
+    "エクスポートしたレポートではパスを伏せます",
   "next.system.noStorage": "保存場所はまだ設定されていません。",
   "next.system.storageFallback": "ストレージ",
   "next.settings.panel.general": "一般",
@@ -689,13 +749,18 @@ export const nextJa: LocaleDictionary = {
   "next.settings.panel.scriptJobs": "ジョブ",
   "next.settings.panel.secrets": "シークレット",
   "next.secrets.secret": "シークレット",
-  "next.secrets.note": "値は名前を付けて暗号化して保存され、二度と表示されません。スクリプトの入力は名前でシークレットを参照するため、ここで変更すると参照しているすべてのジョブに反映されます。",
+  "next.secrets.note":
+    "値は名前を付けて暗号化して保存され、二度と表示されません。スクリプトの入力は名前でシークレットを参照するため、ここで変更すると参照しているすべてのジョブに反映されます。",
   "next.secrets.name": "名前",
-  "next.secrets.nameHelp": "スクリプトの入力がこのシークレットを選ぶときの名前です。大文字と小文字を区別せず一意です。",
-  "next.secrets.nameInvalid": "シークレットには 128 バイト以内の名前を付けてください。",
+  "next.secrets.nameHelp":
+    "スクリプトの入力がこのシークレットを選ぶときの名前です。大文字と小文字を区別せず一意です。",
+  "next.secrets.nameInvalid":
+    "シークレットには 128 バイト以内の名前を付けてください。",
   "next.secrets.value": "値",
-  "next.secrets.valueHelp": "暗号化して保存されます。保存後は二度と表示されません。",
-  "next.secrets.valueKeepHelp": "空欄のままにすると保存済みの値が維持されます。新しい値を入力すると置き換えます。",
+  "next.secrets.valueHelp":
+    "暗号化して保存されます。保存後は二度と表示されません。",
+  "next.secrets.valueKeepHelp":
+    "空欄のままにすると保存済みの値が維持されます。新しい値を入力すると置き換えます。",
   "next.secrets.valueSaved": "保存済み · 空欄で維持",
   "next.secrets.valueRequired": "保存する値を入力してください。",
   "next.secrets.usedBy": "使用元",
@@ -706,7 +771,8 @@ export const nextJa: LocaleDictionary = {
   "next.secrets.created": "シークレット {{name}} を作成しました",
   "next.secrets.saved": "シークレット {{name}} を保存しました",
   "next.secrets.delete": "シークレットを削除",
-  "next.secrets.deleteBody": "{{name}} を削除しますか？参照しているジョブがある間は削除できません。",
+  "next.secrets.deleteBody":
+    "{{name}} を削除しますか？参照しているジョブがある間は削除できません。",
   "next.secrets.deleted": "シークレット {{name}} を削除しました",
   "next.settings.panel.scriptRuns": "実行履歴",
   "next.settings.panel.watchFolder": "監視フォルダー",
@@ -732,30 +798,38 @@ export const nextJa: LocaleDictionary = {
   "next.settings.nothingHere": "ここで設定する項目はありません",
   "next.settings.noMatch": "「{{search}}」に一致する設定はありません",
   "next.settings.nothingHereBody": "このパネルにはまだ設定がありません。",
-  "next.settings.noMatchBody": "別の語句を試すか、検索をクリアしてこのページを表示してください。",
+  "next.settings.noMatchBody":
+    "別の語句を試すか、検索をクリアしてこのページを表示してください。",
   "next.settings.nothingConfigured": "まだ何も設定されていません。",
   "next.general.duplicateAction.accept": "受け入れる",
   "next.general.duplicateAction.warn": "警告",
   "next.general.duplicateAction.pause": "一時停止",
   "next.general.duplicateAction.block": "ブロック",
   "next.general.duplicate.strictActive": "同じリリース(既存)",
-  "next.general.duplicate.strictActiveHelp": "ダウンロード中、または正常に完了した同一の NZB。",
+  "next.general.duplicate.strictActiveHelp":
+    "ダウンロード中、または正常に完了した同一の NZB。",
   "next.general.duplicate.strictFailed": "同じリリース(以前に失敗)",
-  "next.general.duplicate.strictFailedHelp": "以前の試行が失敗またはキャンセルされた同一の NZB。",
+  "next.general.duplicate.strictFailedHelp":
+    "以前の試行が失敗またはキャンセルされた同一の NZB。",
   "next.general.duplicate.layoutActive": "同じ記事構成(既存)",
-  "next.general.duplicate.layoutActiveHelp": "実行中または完了したジョブと同じ記事を投稿している別の NZB。",
+  "next.general.duplicate.layoutActiveHelp":
+    "実行中または完了したジョブと同じ記事を投稿している別の NZB。",
   "next.general.duplicate.layoutFailed": "同じ記事構成(以前に失敗)",
-  "next.general.duplicate.layoutFailedHelp": "失敗した試行と同じ記事を投稿している別の NZB。",
+  "next.general.duplicate.layoutFailedHelp":
+    "失敗した試行と同じ記事を投稿している別の NZB。",
   "next.general.duplicate.articleSet": "重複する記事セット",
-  "next.general.duplicate.articleSetHelp": "weaver が既に見たものとの部分的な重複。",
+  "next.general.duplicate.articleSetHelp":
+    "weaver が既に見たものとの部分的な重複。",
   "next.general.duplicate.normalizedName": "同じ正規化名",
-  "next.general.duplicate.normalizedNameHelp": "大文字小文字、空白、タグを除くと名前が一致するリリース。",
+  "next.general.duplicate.normalizedNameHelp":
+    "大文字小文字、空白、タグを除くと名前が一致するリリース。",
   "next.general.language": "言語",
   "next.general.languageHelp": "このブラウザーにのみ適用されます。",
   "next.general.interface": "インターフェース",
   "next.general.updates": "アップデート",
   "next.general.checkForUpdates": "アップデートを確認",
-  "next.general.checkForUpdatesHelp": "Weaver は 6 時間ごとに新しいリリースを確認します。",
+  "next.general.checkForUpdatesHelp":
+    "Weaver は 6 時間ごとに新しいリリースを確認します。",
   "next.general.checkNow": "今すぐ確認",
   "next.general.checking": "確認中…",
   "next.general.updateFound": "v{{version}} が利用可能です",
@@ -767,31 +841,42 @@ export const nextJa: LocaleDictionary = {
   "next.general.attempts": "回",
   "next.general.propagationDelay": "伝播待ち時間",
   "next.general.maxConcurrentNzbs": "最大同時 NZB 数",
-  "next.general.maxConcurrentNzbsHelp": "開始から修復、展開、最終完了までの Usenet NZB 数を制限します。すべてのプロバイダーで共有されます。",
+  "next.general.maxConcurrentNzbsHelp":
+    "開始から修復、展開、最終完了までの Usenet NZB 数を制限します。すべてのプロバイダーで共有されます。",
   "next.status.wait.nzb_slot": "NZB の空き枠を待機中",
   "next.status.wait.disk_space": "ディスク容量不足",
-  "next.status.wait.disk_space_need": "ディスク容量不足: {{need}} 必要、空き {{free}}",
+  "next.status.wait.disk_space_need":
+    "ディスク容量不足: {{need}} 必要、空き {{free}}",
   "next.status.wait.disk_space_unread": "ディスクの計測待ち: {{need}} 必要",
   "next.status.wait.disk_too_small": "ディスクが小さすぎます",
-  "next.status.wait.disk_too_small_need": "ディスクが小さすぎます: {{need}} 必要、容量 {{most}}",
+  "next.status.wait.disk_too_small_need":
+    "ディスクが小さすぎます: {{need}} 必要、容量 {{most}}",
   "next.status.wait.disk_full": "ディスクがいっぱい: シードのみ",
   "next.status.wait.goal_met": "シード目標を達成",
   "next.status.wait.fetch_trackers": "トラッカーにピアを問い合わせ中",
-  "next.status.wait.fetch_discovery": "トラッカー、DHT、LSD にピアを問い合わせ中",
+  "next.status.wait.fetch_discovery":
+    "トラッカー、DHT、LSD にピアを問い合わせ中",
   "next.status.wait.fetch_waiting": "トラッカーからピアなし",
-  "next.status.wait.login_refused": "待機中: {{server}} によりログインが拒否されました",
+  "next.status.wait.login_refused":
+    "待機中: {{server}} によりログインが拒否されました",
   "next.status.diskShort": "ディスクに書き込み中",
-  "next.status.diskWriting": "ディスクに書き込み中 · {{volume}} で {{waiting}} 待機中 · {{rate}}",
-  "next.status.diskWaiting": "ディスクに書き込み中 · {{volume}} で {{waiting}} 待機中",
-  "next.status.diskLeft": "ディスクに書き込み中: {{volume}} に書き込む残り {{left}}",
+  "next.status.diskWriting":
+    "ディスクに書き込み中 · {{volume}} で {{waiting}} 待機中 · {{rate}}",
+  "next.status.diskWaiting":
+    "ディスクに書き込み中 · {{volume}} で {{waiting}} 待機中",
+  "next.status.diskLeft":
+    "ディスクに書き込み中: {{volume}} に書き込む残り {{left}}",
   "next.attention.slowDisk": "保存先ディスクが低速です: {{rate}} で書き込み中",
   "next.attention.slowDiskUnmeasured": "保存先ディスクが低速です",
-  "next.general.propagationDelayHelp": "すべての記事がサーバーに届くよう、新しい NZB の開始をこの時間だけ保留します。",
+  "next.general.propagationDelayHelp":
+    "すべての記事がサーバーに届くよう、新しい NZB の開始をこの時間だけ保留します。",
   "next.general.seconds": "秒",
   "next.general.srrdb": "SRRDB リリース検索",
-  "next.general.srrdbHelp": "難読化されたアーカイブメンバーについて、CRC32 チェックサムだけを公開 SRRDB インデックスに送り、リリース名を復元します。",
+  "next.general.srrdbHelp":
+    "難読化されたアーカイブメンバーについて、CRC32 チェックサムだけを公開 SRRDB インデックスに送り、リリース名を復元します。",
   "next.general.unacceptableExtensions": "許可しない拡張子",
-  "next.general.unacceptableExtensionsHelp": "カンマ区切り。これらのいずれかを含む完了済みダウンロードの扱いは、下の処理で決まります。",
+  "next.general.unacceptableExtensionsHelp":
+    "カンマ区切り。これらのいずれかを含む完了済みダウンロードの扱いは、下の処理で決まります。",
   "next.general.unwantedExtensionAction": "許可しない拡張子の処理",
   "next.general.unwantedExtensionActionHelp":
     "一覧にあるファイルはアーカイブとして開かれません。「ジョブを失敗にする」はダウンロードを拒否し、「不要なファイルだけ削除」はそのファイルを削除して残りを一部完了として届けます。",
@@ -801,29 +886,39 @@ export const nextJa: LocaleDictionary = {
   "next.archivePasswords.list": "パスワード（1行に1つ）",
   "next.archivePasswords.edit": "パスワードを編集",
   "next.archivePasswords.clearTitle": "保存済みのパスワードを消去",
-  "next.archivePasswords.clearBody": "保存済みのパスワード一覧を削除しますか？表示も復元もできません。",
+  "next.archivePasswords.clearBody":
+    "保存済みのパスワード一覧を削除しますか？表示も復元もできません。",
   "next.archivePasswords.file": "パスワードファイル",
   "next.archivePasswords.password": "アーカイブのパスワード",
   "next.general.storage": "ストレージ",
-  "next.general.dataDirHelp": "サービスの起動時に決まります。データベースと既定のフォルダーはここにあります。",
+  "next.general.dataDirHelp":
+    "サービスの起動時に決まります。データベースと既定のフォルダーはここにあります。",
   "next.general.workingDir": "作業ディレクトリ",
-  "next.general.workingDirHelp": "後処理の前にダウンロードを組み立てる場所。空欄ならデータディレクトリを使います。",
+  "next.general.workingDirHelp":
+    "後処理の前にダウンロードを組み立てる場所。空欄ならデータディレクトリを使います。",
   "next.general.completeDir": "完了ディレクトリ",
-  "next.general.completeDirHelp": "保存先を指定していないカテゴリには、この中にフォルダーが作られます。",
+  "next.general.completeDirHelp":
+    "保存先を指定していないカテゴリには、この中にフォルダーが作られます。",
   "next.general.cleanup": "展開後に後片付け",
-  "next.general.cleanupHelp": "リリースの展開に成功したら、アーカイブと修復ファイルを削除します。",
-  "next.general.deleteFailedJobFiles": "メンテナンス時に失敗したジョブの不完全なファイルを削除",
+  "next.general.cleanupHelp":
+    "リリースの展開に成功したら、アーカイブと修復ファイルを削除します。",
+  "next.general.deleteFailedJobFiles":
+    "メンテナンス時に失敗したジョブの不完全なファイルを削除",
   "next.general.historyRetentionDays": "履歴の保持期間（日）",
-  "next.general.historyRetentionDaysHelp": "これより古いエントリは履歴から消えます。ファイルはディスクに残ります。0 にすると履歴を無期限に保持します。",
+  "next.general.historyRetentionDaysHelp":
+    "これより古いエントリは履歴から消えます。ファイルはディスクに残ります。0 にすると履歴を無期限に保持します。",
   "next.general.days": "日",
   "next.historyArchive.action": "アーカイブ",
   "next.historyArchive.title": "アーカイブ",
-  "next.historyArchive.body": "アーカイブすると、これらのエントリのダウンロード済みファイルをディスクから削除します。エントリと NZB はアーカイブ済みとして履歴に残ります。Weaver が作成したフォルダーだけが対象です。元に戻せません。",
-  "next.historyArchive.jobBody": "アーカイブすると、このエントリのダウンロード済みファイルをディスクから削除します。エントリと NZB はアーカイブ済みとして履歴に残ります。Weaver が作成したフォルダーだけが対象です。元に戻せません。",
+  "next.historyArchive.body":
+    "アーカイブすると、これらのエントリのダウンロード済みファイルをディスクから削除します。エントリと NZB はアーカイブ済みとして履歴に残ります。Weaver が作成したフォルダーだけが対象です。元に戻せません。",
+  "next.historyArchive.jobBody":
+    "アーカイブすると、このエントリのダウンロード済みファイルをディスクから削除します。エントリと NZB はアーカイブ済みとして履歴に残ります。Weaver が作成したフォルダーだけが対象です。元に戻せません。",
   "next.historyArchive.mark": "アーカイブ済み",
   "next.historyArchive.queued.one": "{{count}} 件をアーカイブ待ちにしました",
   "next.historyArchive.queued.other": "{{count}} 件をアーカイブ待ちにしました",
-  "next.historyArchive.queuedPartial": "{{total}} 件中 {{done}} 件をアーカイブ待ちにしました",
+  "next.historyArchive.queuedPartial":
+    "{{total}} 件中 {{done}} 件をアーカイブ待ちにしました",
   "next.historyArchive.pending": "アーカイブ中",
   "next.historyArchive.failed": "アーカイブされていません",
   "next.historyArchive.notAccepted": "アーカイブできませんでした。",
@@ -840,7 +935,8 @@ export const nextJa: LocaleDictionary = {
   "next.historyArchive.outcome.FAILED": "失敗",
   "next.historyArchive.outcome.NOT_FINISHED": "未完了",
   "next.general.duplicates": "重複",
-  "next.general.duplicatesNote": "新しい NZB が weaver の既知のものと一致したときの動作",
+  "next.general.duplicatesNote":
+    "新しい NZB が weaver の既知のものと一致したときの動作",
   "next.weekday.mon": "月曜日",
   "next.weekday.tue": "火曜日",
   "next.weekday.wed": "水曜日",
@@ -877,7 +973,8 @@ export const nextJa: LocaleDictionary = {
   "next.schedules.days": "曜日",
   "next.schedules.action": "動作",
   "next.schedules.label": "ラベル",
-  "next.schedules.empty": "スケジュールはまだありません。Weaver は処理があればいつでもダウンロードします。",
+  "next.schedules.empty":
+    "スケジュールはまだありません。Weaver は処理があればいつでもダウンロードします。",
   "next.schedules.add": "スケジュールを追加",
   "next.schedules.enabledAria": "{{time}} のスケジュールを有効化",
   "next.schedules.schedule": "スケジュール",
@@ -886,10 +983,12 @@ export const nextJa: LocaleDictionary = {
   "next.schedules.daysHelp": "どの曜日も選ばなければ毎日実行します。",
   "next.schedules.whatHappens": "実行内容",
   "next.schedules.speedLimitHelp": "メビバイト毎秒。",
-  "next.schedules.labelHelp": "任意。表に表示され、2 つのエントリーを 1 つの時間帯として読めるようにします。",
+  "next.schedules.labelHelp":
+    "任意。表に表示され、2 つのエントリーを 1 つの時間帯として読めるようにします。",
   "next.schedules.labelPlaceholder": "オフピーク開始",
   "next.schedules.enabled": "有効",
-  "next.schedules.removeBody": "キューは現在の状態のままで、ほかには何も変わりません。",
+  "next.schedules.removeBody":
+    "キューは現在の状態のままで、ほかには何も変わりません。",
   "next.categories.nameRequired": "カテゴリには名前が必要です。",
   "next.categories.note": "保存先が空欄なら完了フォルダー",
   "next.categories.name": "名前",
@@ -899,25 +998,33 @@ export const nextJa: LocaleDictionary = {
   "next.categories.add": "カテゴリを追加",
   "next.categories.category": "カテゴリ",
   "next.categories.remove": "カテゴリを削除",
-  "next.categories.nameHelp": "キュー、サイドバー、インデクサーでのこのカテゴリの呼び名。",
+  "next.categories.nameHelp":
+    "キュー、サイドバー、インデクサーでのこのカテゴリの呼び名。",
   "next.categories.destinationHelp": "空欄にすると {{path}} を使います。",
   "next.categories.completedFolder": "完了フォルダー",
   "next.categories.namePlaceholder": "<名前>",
-  "next.categories.aliasesHelp": "インデクサーがこの名前の代わりに送る可能性のある名前(カンマ区切り)。",
-  "next.categories.removeBody": "すでに {{name}} に振り分けられたダウンロードはフォルダーをそのまま保ち、新しいものは完了フォルダーに保存されます。",
+  "next.categories.aliasesHelp":
+    "インデクサーがこの名前の代わりに送る可能性のある名前(カンマ区切り)。",
+  "next.categories.removeBody":
+    "すでに {{name}} に振り分けられたダウンロードはフォルダーをそのまま保ち、新しいものは完了フォルダーに保存されます。",
   "next.watchFolder.polling": "ポーリング",
   "next.watchFolder.live": "リアルタイム",
-  "next.watchFolder.folderRequired": "監視をオンにする前にフォルダーを選んでください。",
+  "next.watchFolder.folderRequired":
+    "監視をオンにする前にフォルダーを選んでください。",
   "next.watchFolder.saveFailed": "監視フォルダーを保存できませんでした。",
   "next.watchFolder.watching": "監視",
-  "next.watchFolder.watchingHelp": "リアルタイムはファイルシステムのイベントを使い、ポーリングは一定間隔でフォルダーを読み直します。ネットワーク共有には通常ポーリングが必要です。",
+  "next.watchFolder.watchingHelp":
+    "リアルタイムはファイルシステムのイベントを使い、ポーリングは一定間隔でフォルダーを読み直します。ネットワーク共有には通常ポーリングが必要です。",
   "next.watchFolder.folder": "フォルダー",
-  "next.watchFolder.folderHelp": "ここに置いた .nzb はすべてキューに追加され、別の場所へ移されます。",
+  "next.watchFolder.folderHelp":
+    "ここに置いた .nzb はすべてキューに追加され、別の場所へ移されます。",
   "next.watchFolder.pollInterval": "ポーリング間隔",
   "next.watchFolder.settleTime": "安定待ち時間",
-  "next.watchFolder.settleTimeHelp": "書きかけの NZB をキューに入れないよう、ファイルの変更が止まってから読み込むまでこの時間待ちます。",
+  "next.watchFolder.settleTimeHelp":
+    "書きかけの NZB をキューに入れないよう、ファイルの変更が止まってから読み込むまでこの時間待ちます。",
   "next.watchFolder.categoryFromSubfolder": "サブフォルダーからカテゴリを設定",
-  "next.watchFolder.categoryFromSubfolderHelp": "`watch/tv` 内のファイルは `tv` カテゴリでキューに追加されます。",
+  "next.watchFolder.categoryFromSubfolderHelp":
+    "`watch/tv` 内のファイルは `tv` カテゴリでキューに追加されます。",
   "next.watchFolder.pauseScanning": "スキャンを一時停止",
   "next.watchFolder.lastScan": "前回のスキャン",
   "next.watchFolder.lastScanNote": "{{found}} 件中 {{queued}} 件をキューに追加",
@@ -927,23 +1034,30 @@ export const nextJa: LocaleDictionary = {
   "next.watchFolder.scanning": "スキャン中…",
   "next.watchFolder.scanNow": "今すぐスキャン",
   "next.proxies.needsPrivateKey": "WireGuard には秘密鍵が必要です。",
-  "next.proxies.malformedPrivateKey": "秘密鍵が WireGuard の鍵の形式ではありません。wg genkey が出力するとおりの 32 バイトの base64 です。",
-  "next.proxies.malformedPeerKey": "ピアの公開鍵が WireGuard の鍵の形式ではありません。wg genkey が出力するとおりの 32 バイトの base64 です。",
-  "next.proxies.malformedPresharedKey": "事前共有鍵が WireGuard の鍵の形式ではありません。wg genkey が出力するとおりの 32 バイトの base64 です。",
+  "next.proxies.malformedPrivateKey":
+    "秘密鍵が WireGuard の鍵の形式ではありません。wg genkey が出力するとおりの 32 バイトの base64 です。",
+  "next.proxies.malformedPeerKey":
+    "ピアの公開鍵が WireGuard の鍵の形式ではありません。wg genkey が出力するとおりの 32 バイトの base64 です。",
+  "next.proxies.malformedPresharedKey":
+    "事前共有鍵が WireGuard の鍵の形式ではありません。wg genkey が出力するとおりの 32 バイトの base64 です。",
   "next.proxies.needsPeerKey": "WireGuard にはピアの公開鍵が必要です。",
-  "next.proxies.needsAddress": "WireGuard にはインターフェースアドレスが 1 つ以上必要です(例: 10.6.0.2/32)。",
+  "next.proxies.needsAddress":
+    "WireGuard にはインターフェースアドレスが 1 つ以上必要です(例: 10.6.0.2/32)。",
   "next.proxies.configTooLarge": "その設定は 64 KiB を超えています。",
   "next.proxies.configNotWireguard": "WireGuard の設定ではないようです。",
   "next.proxies.configFilled": "設定からフォームを入力しました。",
-  "next.proxies.configPeers": "ピアが {{count}} 件ありますが、読み込んだのは最初の 1 件だけです。",
-  "next.proxies.configIgnored": "トンネルプロキシでは使わない {{fields}} を無視しました。",
+  "next.proxies.configPeers":
+    "ピアが {{count}} 件ありますが、読み込んだのは最初の 1 件だけです。",
+  "next.proxies.configIgnored":
+    "トンネルプロキシでは使わない {{fields}} を無視しました。",
   "next.proxies.nameRequired": "プロキシには名前が必要です。",
   "next.proxies.hostRequired": "プロキシにはホストが必要です。",
   "next.proxies.name": "名前",
   "next.proxies.type": "種類",
   "next.proxies.endpoint": "エンドポイント",
   "next.proxies.host": "ホスト",
-  "next.proxies.endpointHelp": "`Endpoint = host:port` の行をそのまま貼り付けても使えます。",
+  "next.proxies.endpointHelp":
+    "`Endpoint = host:port` の行をそのまま貼り付けても使えます。",
   "next.proxies.port": "ポート",
   "next.proxies.timeout": "タイムアウト",
   "next.proxies.enabled": "有効",
@@ -970,21 +1084,31 @@ export const nextJa: LocaleDictionary = {
   "next.dns.trust.AS_SENT": "DNSSEC オフ",
   "next.dns.trust.VALIDATE": "DNSSEC オン",
   "next.dns.tooMany": "DNS サーバーは {{count}} 個までです。",
-  "next.dns.orderHelp": "サーバーは上から順に問い合わせます。最大 {{count}} 個です。",
-  "next.dns.badAddress": "DNS サーバー {{number}} には IP アドレスが必要です。ポートは通常と異なる場合だけ付けます。",
-  "next.dns.badUrl": "DNS サーバー {{number}} にはホストとパスを含む https:// アドレスが必要です (例: https://cloudflare-dns.com/dns-query)。",
-  "next.dns.dohNeedsAddress": "DNS サーバー {{number}}: このホストに接続する IP アドレスを入力してください。",
-  "next.dns.badTlsName": "DNS サーバー {{number}} の TLS 名は有効なホスト名ではありません。",
+  "next.dns.orderHelp":
+    "サーバーは上から順に問い合わせます。最大 {{count}} 個です。",
+  "next.dns.badAddress":
+    "DNS サーバー {{number}} には IP アドレスが必要です。ポートは通常と異なる場合だけ付けます。",
+  "next.dns.badUrl":
+    "DNS サーバー {{number}} にはホストとパスを含む https:// アドレスが必要です (例: https://cloudflare-dns.com/dns-query)。",
+  "next.dns.dohNeedsAddress":
+    "DNS サーバー {{number}}: このホストに接続する IP アドレスを入力してください。",
+  "next.dns.badTlsName":
+    "DNS サーバー {{number}} の TLS 名は有効なホスト名ではありません。",
   "next.dns.title": "DNS",
-  "next.dns.note": "保存された DNS サーバーリストとプロファイルです。プロキシ名プロファイルは、アドレスが名前のプロキシを見つけるもので、プロキシのエディターで選びます。各ルートはエディターで選んだ 1 つのルートプロファイルに従います。変更は次の名前解決から適用されます。",
+  "next.dns.note":
+    "保存された DNS サーバーリストとプロファイルです。プロキシ名プロファイルは、アドレスが名前のプロキシを見つけるもので、プロキシのエディターで選びます。各ルートはエディターで選んだ 1 つのルートプロファイルに従います。変更は次の名前解決から適用されます。",
   "next.dns.who.SYSTEM": "システム",
   "next.dns.who.WEAVER": "Weaver",
   "next.dns.who.HOST": "ホスト",
-  "next.dns.nameWhoHelp.SYSTEM": "このプロキシはホストが名前解決します。チェーン内では、それを運ぶプロキシが解決します。",
+  "next.dns.nameWhoHelp.SYSTEM":
+    "このプロキシはホストが名前解決します。チェーン内では、それを運ぶプロキシが解決します。",
   "next.dns.profiles.hostName": "ホスト",
-  "next.dns.whoHelp.SYSTEM": "ホスト自身のリゾルバーが、ほかのプログラムと同じように応答します。",
-  "next.dns.whoHelp.PROXY": "SOCKS5・HTTP・SSH プロキシには名前をそのまま渡します。WireGuard プロキシでは、その DNS サーバーにトンネル経由で問い合わせます。",
-  "next.dns.whoHelp.WEAVER": "Weaver が保存済みリストのサーバーに順番に問い合わせます。",
+  "next.dns.whoHelp.SYSTEM":
+    "ホスト自身のリゾルバーが、ほかのプログラムと同じように応答します。",
+  "next.dns.whoHelp.PROXY":
+    "SOCKS5・HTTP・SSH プロキシには名前をそのまま渡します。WireGuard プロキシでは、その DNS サーバーにトンネル経由で問い合わせます。",
+  "next.dns.whoHelp.WEAVER":
+    "Weaver が保存済みリストのサーバーに順番に問い合わせます。",
   "next.dns.list": "サーバーリスト",
   "next.dns.listChoose": "リストを選択",
   "next.dns.listNew": "新しいリスト",
@@ -992,13 +1116,18 @@ export const nextJa: LocaleDictionary = {
   "next.dns.transit": "経路",
   "next.dns.transit.EGRESS": "出口経由",
   "next.dns.transit.PROXY": "プロキシ経由",
-  "next.dns.transitHelp": "プロキシ経由では、レッグで有効なプロキシの最後のホップを通して問い合わせます。プロキシのないレッグや段は出口から問い合わせます。",
+  "next.dns.transitHelp":
+    "プロキシ経由では、レッグで有効なプロキシの最後のホップを通して問い合わせます。プロキシのないレッグや段は出口から問い合わせます。",
   "next.dns.systemFallback": "プロキシのないレッグではシステムに問い合わせる",
-  "next.dns.systemFallbackHelp": "オフ：直接のレッグや直接のフォールバックがあるルートは、このプロファイルを使えません。",
+  "next.dns.systemFallbackHelp":
+    "オフ：直接のレッグや直接のフォールバックがあるルートは、このプロファイルを使えません。",
   "next.dns.systemFallbackOn": "プロキシを使わない所ではシステム",
-  "next.dns.routeNeedsWireGuard": "ここで検証できるのは WireGuard プロキシの応答だけなので、このルートのすべてのレッグは WireGuard プロキシで終わる必要があり、直接のレッグや直接へのフォールバックは使えません。",
-  "next.dns.routeNeedsProxy": "このルートには直接のレッグか直接のフォールバックがあり、そこではプロキシが DNS に応答できません。プロキシを付けるか、プロファイルで「プロキシのないレッグではシステムに問い合わせる」をオンにしてください。",
-  "next.dns.routeNeedsTunnelDns": "ここではプロキシが DNS に答えますが、次の WireGuard プロキシはトンネルの DNS サーバーを指定していません：{{proxies}}。それぞれにトンネルの DNS サーバーを追加してください。",
+  "next.dns.routeNeedsWireGuard":
+    "ここで検証できるのは WireGuard プロキシの応答だけなので、このルートのすべてのレッグは WireGuard プロキシで終わる必要があり、直接のレッグや直接へのフォールバックは使えません。",
+  "next.dns.routeNeedsProxy":
+    "このルートには直接のレッグか直接のフォールバックがあり、そこではプロキシが DNS に応答できません。プロキシを付けるか、プロファイルで「プロキシのないレッグではシステムに問い合わせる」をオンにしてください。",
+  "next.dns.routeNeedsTunnelDns":
+    "ここではプロキシが DNS に答えますが、次の WireGuard プロキシはトンネルの DNS サーバーを指定していません：{{proxies}}。それぞれにトンネルの DNS サーバーを追加してください。",
   "next.dns.wireShort.PLAIN": "平文",
   "next.dns.wireShort.TLS": "TLS",
   "next.dns.wireShort.HTTPS": "HTTPS",
@@ -1014,7 +1143,8 @@ export const nextJa: LocaleDictionary = {
   "next.dns.lists.section": "サーバーリスト",
   "next.dns.lists.save": "リストを保存",
   "next.dns.lists.delete": "リストを削除",
-  "next.dns.lists.deleteBody": "サーバーリスト {{name}} を削除しますか？プロファイルが使用中のリストは削除できません。",
+  "next.dns.lists.deleteBody":
+    "サーバーリスト {{name}} を削除しますか？プロファイルが使用中のリストは削除できません。",
   "next.dns.lists.nameRequired": "リストに名前を付けてください。",
   "next.dns.lists.serverCount.one": "{{count}} 台",
   "next.dns.lists.serverCount.other": "{{count}} 台",
@@ -1031,15 +1161,20 @@ export const nextJa: LocaleDictionary = {
   "next.dns.profiles.section": "プロファイル",
   "next.dns.profiles.save": "プロファイルを保存",
   "next.dns.profiles.delete": "プロファイルを削除",
-  "next.dns.profiles.deleteBody": "DNS プロファイル {{name}} を削除しますか？ルートが従っているプロファイルは削除できません。",
+  "next.dns.profiles.deleteBody":
+    "DNS プロファイル {{name}} を削除しますか？ルートが従っているプロファイルは削除できません。",
   "next.dns.profiles.nameRequired": "プロファイルに名前を付けてください。",
   "next.dns.profiles.builtIn": "組み込み",
-  "next.dns.nameWhoHelp.WEAVER": "Weaver が保存済みリストのサーバーに、出口から順番に問い合わせます。",
-  "next.dns.nameProfiles.deleteBody": "DNS プロファイル {{name}} を削除しますか？プロキシが使用中のプロファイルは削除できません。",
+  "next.dns.nameWhoHelp.WEAVER":
+    "Weaver が保存済みリストのサーバーに、出口から順番に問い合わせます。",
+  "next.dns.nameProfiles.deleteBody":
+    "DNS プロファイル {{name}} を削除しますか？プロキシが使用中のプロファイルは削除できません。",
   "next.dns.nameProfiles.add": "プロキシ名プロファイルを追加",
   "next.dns.nameProfiles.title": "プロキシ名プロファイル",
-  "next.dns.profiles.inUseByBoth": "次のルートがまだこのプロファイルに従っています：{{routes}}。次のプロキシがまだこれでアドレスを見つけています：{{proxies}}。先に別のプロファイルを選んでください。",
-  "next.dns.profiles.inUseByProxies": "次のプロキシがまだこのプロファイルでアドレスを見つけています：{{proxies}}。先に別のプロファイルを選んでください。",
+  "next.dns.profiles.inUseByBoth":
+    "次のルートがまだこのプロファイルに従っています：{{routes}}。次のプロキシがまだこれでアドレスを見つけています：{{proxies}}。先に別のプロファイルを選んでください。",
+  "next.dns.profiles.inUseByProxies":
+    "次のプロキシがまだこのプロファイルでアドレスを見つけています：{{proxies}}。先に別のプロファイルを選んでください。",
   "next.dns.profiles.proxyCount.other": "{{count}} 件のプロキシ",
   "next.dns.profiles.proxyCount.one": "{{count}} 件のプロキシ",
   "next.dns.profiles.proxies": "プロキシ",
@@ -1054,15 +1189,19 @@ export const nextJa: LocaleDictionary = {
   "next.dns.test.ownWire": "この行のプロトコル",
   "next.dns.test.signaturesValidated": "署名を検証済み",
   "next.proxies.tunnelDns": "DNS サーバー",
-  "next.proxies.tunnelDnsHelp": "トンネル自身の DNS サーバーです。1 行に 1 つの IP アドレスを入力します。ルートの DNS プロファイルでプロキシが応答するときに使われます。",
-  "next.proxies.tunnelDnsBad": "トンネルの DNS サーバーは IP アドレスで指定してください。",
+  "next.proxies.tunnelDnsHelp":
+    "トンネル自身の DNS サーバーです。1 行に 1 つの IP アドレスを入力します。ルートの DNS プロファイルでプロキシが応答するときに使われます。",
+  "next.proxies.tunnelDnsBad":
+    "トンネルの DNS サーバーは IP アドレスで指定してください。",
   "next.proxies.dnsProfileNumber": "DNS プロファイル #{{id}}",
   "next.proxies.dnsProfileDetail": "{{name}} で検索",
-  "next.proxies.dnsProfileHelp": "このプロキシのアドレスが名前のとき、その解決に使います。",
+  "next.proxies.dnsProfileHelp":
+    "このプロキシのアドレスが名前のとき、その解決に使います。",
   "next.proxies.dnsProfile": "このプロキシの検索方法",
   "next.proxies.mtuHelp": "空欄なら {{value}} を使います。",
   "next.proxies.keepalive": "キープアライブ",
-  "next.proxies.keepaliveHelp": "空欄なら {{seconds}} 秒を使います。0 でオフになります。",
+  "next.proxies.keepaliveHelp":
+    "空欄なら {{seconds}} 秒を使います。0 でオフになります。",
   "next.proxies.natpmp": "NAT-PMP ポート転送",
   "next.proxies.forwardedPort": "転送ポート",
   "next.proxies.username": "ユーザー名",
@@ -1090,38 +1229,51 @@ export const nextJa: LocaleDictionary = {
   "next.proxies.configUnreadable": "そのファイルを読み込めませんでした。",
   "next.proxies.configMissing": "[{{section}}] に {{key}} がありません。",
   "next.proxies.configBadKey": "{{key}} は WireGuard の鍵ではありません。",
-  "next.proxies.configBadEndpoint": "Endpoint が host:port 形式ではありません。",
+  "next.proxies.configBadEndpoint":
+    "Endpoint が host:port 形式ではありません。",
   "next.proxies.configBadNumber": "{{key}} は数値ではありません。",
-  "next.proxies.removeBody": "このプロキシ経由の通信は次のルートに切り替わります。直接接続が許可されていれば直接接続になります。",
+  "next.proxies.removeBody":
+    "このプロキシ経由の通信は次のルートに切り替わります。直接接続が許可されていれば直接接続になります。",
   "next.proxies.forgetKey": "鍵を削除",
-  "next.proxies.forgetBody": "次回の接続では、ホストが提示するどの鍵も信頼します。ホストを再構築したとわかっている場合にだけ実行してください。",
+  "next.proxies.forgetBody":
+    "次回の接続では、ホストが提示するどの鍵も信頼します。ホストを再構築したとわかっている場合にだけ実行してください。",
   "next.security.mode.required": "すべてのブラウザーでログインが必要",
-  "next.security.mode.exceptTrusted": "信頼済みネットワーク以外はログインが必要",
+  "next.security.mode.exceptTrusted":
+    "信頼済みネットワーク以外はログインが必要",
   "next.security.mode.noLogin": "ログインなし(このマシンのみ)",
   "next.security.scope.read": "読み取り専用",
   "next.security.scope.control": "キューの操作",
   "next.security.scope.admin": "完全な管理",
-  "next.security.listenSaved": "待ち受けアドレスを保存しました — 適用するには weaver を再起動してください",
-  "next.security.listenCleared": "待ち受けアドレスをクリアしました — 次回の再起動で weaver はこのマシンからのみアクセス可能に戻ります",
+  "next.security.listenSaved":
+    "待ち受けアドレスを保存しました — 適用するには weaver を再起動してください",
+  "next.security.listenCleared":
+    "待ち受けアドレスをクリアしました — 次回の再起動で weaver はこのマシンからのみアクセス可能に戻ります",
   "next.security.policyApplied": "アクセスポリシーを適用しました",
   "next.security.passwordsMismatch": "2 つのパスワードが一致しません。",
-  "next.security.credentialsRequired": "ユーザー名とパスワードの両方が必要です。",
+  "next.security.credentialsRequired":
+    "ユーザー名とパスワードの両方が必要です。",
   "next.security.keyNameRequired": "鍵を使うものの名前を付けてください。",
   "next.security.keyCreateFailed": "鍵を作成できませんでした。",
   "next.security.listenAddress": "待ち受けアドレス",
-  "next.security.listenHelp": "Weaver は既定で 127.0.0.1 で応答し、このマシンからしかアクセスできません。すべてのインターフェースで待ち受けるには 0.0.0.0 を使います。次回の再起動で有効になります。",
-  "next.security.listenPinnedHelp": "weaver の環境変数 {{variable}} で固定されています。デプロイ側で変更してください。",
+  "next.security.listenHelp":
+    "Weaver は既定で 127.0.0.1 で応答し、このマシンからしかアクセスできません。すべてのインターフェースで待ち受けるには 0.0.0.0 を使います。次回の再起動で有効になります。",
+  "next.security.listenPinnedHelp":
+    "weaver の環境変数 {{variable}} で固定されています。デプロイ側で変更してください。",
   "next.security.listenPlaceholder": "{{address}}(既定)",
   "next.security.browserAccess": "ブラウザーからのアクセス",
-  "next.security.accessPinnedHelp": "weaver の環境変数 {{variable}} で管理されています。",
-  "next.security.accessHelp": "サインインせずに Web インターフェースを使える範囲。",
+  "next.security.accessPinnedHelp":
+    "weaver の環境変数 {{variable}} で管理されています。",
+  "next.security.accessHelp":
+    "サインインせずに Web インターフェースを使える範囲。",
   "next.security.trustedNetworks": "信頼済みネットワーク",
-  "next.security.trustedNetworksHelp": "1 行に 1 つの CIDR。この範囲内のブラウザーはサインインを省略します。",
+  "next.security.trustedNetworksHelp":
+    "1 行に 1 つの CIDR。この範囲内のブラウザーはサインインを省略します。",
   "next.security.signIn": "サインイン",
   "next.security.signedInAs": "{{name}} としてサインイン中",
   "next.security.notConfigured": "未設定",
   "next.security.requireLogin": "ログインを必須にする",
-  "next.security.requireLoginOffHelp": "weaver にアクセスできる人は誰でも完全な管理権限を持ちます。",
+  "next.security.requireLoginOffHelp":
+    "weaver にアクセスできる人は誰でも完全な管理権限を持ちます。",
   "next.security.changePassword": "パスワードを変更",
   "next.security.turnOff": "オフにする",
   "next.security.setUpLogin": "ログインを設定",
@@ -1132,11 +1284,13 @@ export const nextJa: LocaleDictionary = {
   "next.security.scope": "スコープ",
   "next.security.created": "作成日時",
   "next.security.lastUsed": "最終使用",
-  "next.security.keysEmpty": "API キーはありません。Sonarr、Radarr、NZBGet 互換インターフェースにはそれぞれ 1 つ必要です。",
+  "next.security.keysEmpty":
+    "API キーはありません。Sonarr、Radarr、NZBGet 互換インターフェースにはそれぞれ 1 つ必要です。",
   "next.security.addKey": "API キーを追加",
   "next.security.never": "なし",
   "next.security.revoke": "取り消す",
-  "next.security.exposedWarning": "ログインが設定されていない間、次回の再起動後に Weaver はこのマシンの外からアクセス可能になります。",
+  "next.security.exposedWarning":
+    "ログインが設定されていない間、次回の再起動後に Weaver はこのマシンの外からアクセス可能になります。",
   "next.security.appliesImmediately": "すぐに適用",
   "next.security.turnOnLogin": "ログインをオンにする",
   "next.security.administrator": "管理者",
@@ -1150,86 +1304,119 @@ export const nextJa: LocaleDictionary = {
   "next.security.newKeyNote": "表示されるのは一度だけです",
   "next.security.createKey": "鍵を作成",
   "next.security.key": "鍵",
-  "next.security.scopeHelp": "読み取りはキューを参照、操作は処理の追加と削除、管理は設定の変更ができます。",
+  "next.security.scopeHelp":
+    "読み取りはキューを参照、操作は処理の追加と削除、管理は設定の変更ができます。",
   "next.security.keyCreated": "API キーを作成しました",
   "next.security.copied": "コピーしました",
-  "next.security.copyFailed": "コピーできませんでした。Ctrl+C または ⌘C を押してください",
+  "next.security.copyFailed":
+    "コピーできませんでした。Ctrl+C または ⌘C を押してください",
   "next.security.copyKey": "鍵をコピー",
   "next.security.done": "完了",
-  "next.security.copyNow": "今すぐコピーしてください。Weaver はハッシュしか保存しないため、再表示できません。",
+  "next.security.copyNow":
+    "今すぐコピーしてください。Weaver はハッシュしか保存しないため、再表示できません。",
   "next.security.apiKey": "API キー",
   "next.security.turnOffTitle": "ログインをオフにする",
   "next.security.turnOffLogin": "ログインをオフにする",
-  "next.security.turnOffBody": "weaver にアクセスできる人は誰でも、サインインなしで完全な管理権限を持つようになります。",
+  "next.security.turnOffBody":
+    "weaver にアクセスできる人は誰でも、サインインなしで完全な管理権限を持つようになります。",
   "next.security.revokeTitle": "API キーを取り消す",
   "next.security.revokeKey": "鍵を取り消す",
-  "next.security.revokeBody": "{{name}} をまだ使っているものは、すぐに動作しなくなります。",
+  "next.security.revokeBody":
+    "{{name}} をまだ使っているものは、すぐに動作しなくなります。",
   "next.security.thisKey": "この鍵",
   "next.security.checkTitle": "パスワードの確認",
   "next.security.checkNote": "15分ごとに1回確認します",
   "next.security.checkCancel": "キャンセル",
   "next.security.checkContinue": "続行",
   "next.security.checking": "確認中…",
-  "next.security.checkBusy": "試行回数が多すぎます。少し待ってから再試行してください。",
+  "next.security.checkBusy":
+    "試行回数が多すぎます。少し待ってから再試行してください。",
   "next.security.checkFailed": "パスワードが正しくありません。",
-  "next.security.checkUnreachable": "パスワードを確認するためにWeaverに接続できませんでした。",
-  "next.security.passwordHelp": "パスワードを変更するとすべてのセッションがサインアウトされます。",
+  "next.security.checkUnreachable":
+    "パスワードを確認するためにWeaverに接続できませんでした。",
+  "next.security.passwordHelp":
+    "パスワードを変更するとすべてのセッションがサインアウトされます。",
   "next.security.signOutEverywhere": "すべての場所でサインアウト",
   "next.security.signOutEverywhereTitle": "すべてのブラウザをサインアウト",
-  "next.security.signOutEverywhereBody": "このブラウザを含め、weaverにサインインしているすべてのブラウザがサインアウトされ、再度サインインが必要になります。APIキーは引き続き使えます。",
-  "next.security.signOutEverywhereFailed": "Weaverはほかのセッションをサインアウトできませんでした。再試行してください。",
+  "next.security.signOutEverywhereBody":
+    "このブラウザを含め、weaverにサインインしているすべてのブラウザがサインアウトされ、再度サインインが必要になります。APIキーは引き続き使えます。",
+  "next.security.signOutEverywhereFailed":
+    "Weaverはほかのセッションをサインアウトできませんでした。再試行してください。",
   "next.security.listeningNow": "現在の待ち受け",
-  "next.security.listenPending": "Weaverはまだこのアドレスで待ち受けています。保存したアドレスは次回の再起動で適用されます。",
+  "next.security.listenPending":
+    "Weaverはまだこのアドレスで待ち受けています。保存したアドレスは次回の再起動で適用されます。",
   "next.security.rememberedNetworks": "ログイン記憶を許可するネットワーク",
-  "next.security.rememberedNetworksHelp": "この範囲のブラウザはサインイン時に「ログイン状態を保持」を使えます。1行に1つのCIDR。空欄ならすべてのクライアントを許可します。",
+  "next.security.rememberedNetworksHelp":
+    "この範囲のブラウザはサインイン時に「ログイン状態を保持」を使えます。1行に1つのCIDR。空欄ならすべてのクライアントを許可します。",
   "next.security.trustedProxies": "信頼するプロキシ",
-  "next.security.trustedProxiesHelp": "転送ヘッダーはこれらのアドレスまたはCIDRからのみ信頼されます。自分のデプロイで運用するプロキシだけを指定してください。",
+  "next.security.trustedProxiesHelp":
+    "転送ヘッダーはこれらのアドレスまたはCIDRからのみ信頼されます。自分のデプロイで運用するプロキシだけを指定してください。",
   "next.security.thisBrowser": "このブラウザ",
-  "next.security.connectionHelp": "接続のピアアドレスと、そこからweaverが判定したクライアントアドレス。",
+  "next.security.connectionHelp":
+    "接続のピアアドレスと、そこからweaverが判定したクライアントアドレス。",
   "next.security.headersIgnored": "転送ヘッダーは無視されました。",
   "next.security.unknown": "不明",
   "next.security.draft": "下書き",
-  "next.security.draftHelp": "未保存の変更の解決結果。入力中にweaverが確認します。",
-  "next.security.draftResolves": "{{networks}}からのログイン記憶、信頼するプロキシ: {{proxies}}。",
+  "next.security.draftHelp":
+    "未保存の変更の解決結果。入力中にweaverが確認します。",
+  "next.security.draftResolves":
+    "{{networks}}からのログイン記憶、信頼するプロキシ: {{proxies}}。",
   "next.security.anyClient": "すべてのクライアント",
-  "next.security.draftRestart": "待ち受けアドレスは次回の再起動で適用されます。",
-  "next.security.draftLocksOut": "このブラウザはログイン状態を保持できなくなります。",
-  "next.security.policyInvalid": "保存されているログイン記憶用ネットワークが無効なため、weaverはすべての記憶済みセッションを拒否しています。下で修正してください。",
-  "next.security.networkSaved": "ネットワークアクセスを保存しました。待ち受けアドレスの変更は次回の再起動で適用されます。",
-  "next.security.lockoutTitle": "このブラウザはログイン状態を保持できなくなります",
-  "next.security.lockoutBody": "このブラウザは保存しようとしているネットワークの範囲外です。「ログイン状態を保持」でサインインしている場合は、再度サインインが必要になります。",
+  "next.security.draftRestart":
+    "待ち受けアドレスは次回の再起動で適用されます。",
+  "next.security.draftLocksOut":
+    "このブラウザはログイン状態を保持できなくなります。",
+  "next.security.policyInvalid":
+    "保存されているログイン記憶用ネットワークが無効なため、weaverはすべての記憶済みセッションを拒否しています。下で修正してください。",
+  "next.security.networkSaved":
+    "ネットワークアクセスを保存しました。待ち受けアドレスの変更は次回の再起動で適用されます。",
+  "next.security.lockoutTitle":
+    "このブラウザはログイン状態を保持できなくなります",
+  "next.security.lockoutBody":
+    "このブラウザは保存しようとしているネットワークの範囲外です。「ログイン状態を保持」でサインインしている場合は、再度サインインが必要になります。",
   "next.security.lockoutConfirm": "このまま保存",
-  "next.backup.requestFailed": "リクエストがステータス {{status}} で失敗しました",
+  "next.backup.requestFailed":
+    "リクエストがステータス {{status}} で失敗しました",
   "next.backup.building": "アーカイブを作成しています…",
   "next.backup.savedFile": "{{name}} を保存しました",
   "next.backup.reading": "アーカイブを読み込んでいます…",
-  "next.backup.readNeedsRemaps": "アーカイブを読み込みました。下のカテゴリに、このマシン上の保存先を指定してください。",
+  "next.backup.readNeedsRemaps":
+    "アーカイブを読み込みました。下のカテゴリに、このマシン上の保存先を指定してください。",
   "next.backup.readDone": "アーカイブを読み込みました。",
   "next.backup.staging": "復元を準備しています…",
-  "next.backup.staged.one": "復元を準備しました · 履歴に {{count}} 件のダウンロード · 適用するには weaver を再起動してください",
-  "next.backup.staged.other": "復元を準備しました · 履歴に {{count}} 件のダウンロード · 適用するには weaver を再起動してください",
-  "next.backup.restored.one": "履歴から {{count}} 件のダウンロードを復元しました",
-  "next.backup.restored.other": "履歴から {{count}} 件のダウンロードを復元しました",
+  "next.backup.staged.one":
+    "復元を準備しました · 履歴に {{count}} 件のダウンロード · 適用するには weaver を再起動してください",
+  "next.backup.staged.other":
+    "復元を準備しました · 履歴に {{count}} 件のダウンロード · 適用するには weaver を再起動してください",
+  "next.backup.restored.one":
+    "履歴から {{count}} 件のダウンロードを復元しました",
+  "next.backup.restored.other":
+    "履歴から {{count}} 件のダウンロードを復元しました",
   "next.backup.theDataDirectory": "データディレクトリ",
   "next.backup.archive": "アーカイブ",
-  "next.backup.archiveHelp": "このマシンまたは別のマシンでバックアップが作成した .enc ファイル。",
+  "next.backup.archiveHelp":
+    "このマシンまたは別のマシンでバックアップが作成した .enc ファイル。",
   "next.backup.noFile": "ファイル未選択",
   "next.backup.chooseFile": "ファイルを選択",
   "next.backup.password": "パスワード",
-  "next.backup.dataDirHelp": "復元したデータベースと状態をこのマシンのどこに書き込むか。",
+  "next.backup.dataDirHelp":
+    "復元したデータベースと状態をこのマシンのどこに書き込むか。",
   "next.backup.intermediateDir": "中間ディレクトリ",
   "next.backup.blankUses": "空欄なら {{path}} を使います。",
   "next.backup.readTheArchive": "アーカイブを確認",
-  "next.backup.readTheArchiveHelp": "Weaver はアーカイブを検査し、復元で何が起きるかを実行前に報告します。",
+  "next.backup.readTheArchiveHelp":
+    "Weaver はアーカイブを検査し、復元で何が起きるかを実行前に報告します。",
   "next.backup.checking": "確認中…",
   "next.backup.restoreAvailable": "復元可能",
   "next.backup.restoreUnavailable": "復元不可",
   "next.backup.readArchive": "アーカイブを読み込む",
   "next.backup.restore": "復元",
-  "next.backup.restoreHelp": "このマシンの設定、プロバイダー、カテゴリ、履歴をアーカイブの内容で置き換えます。",
+  "next.backup.restoreHelp":
+    "このマシンの設定、プロバイダー、カテゴリ、履歴をアーカイブの内容で置き換えます。",
   "next.backup.restoreFromArchive": "アーカイブから復元",
   "next.backup.exportNote": "設定、プロバイダー、カテゴリ、スケジュール、履歴",
-  "next.backup.passwordHelp": "アーカイブはこのパスワードで暗号化されます。Weaver では復旧できません。",
+  "next.backup.passwordHelp":
+    "アーカイブはこのパスワードで暗号化されます。Weaver では復旧できません。",
   "next.backup.confirmPassword": "パスワードの確認",
   "next.backup.stagedRestore": "準備済みの復元",
   "next.backup.waitingRestart": "再起動待ち",
@@ -1247,31 +1434,40 @@ export const nextJa: LocaleDictionary = {
   "next.backup.sourceDataDir": "元のデータディレクトリ",
   "next.backup.sourceCompleteDir": "元の完了ディレクトリ",
   "next.backup.sourceIntermediateDir": "元の中間ディレクトリ",
-  "next.backup.keyIncompatible": "このアーカイブの暗号鍵は設定済みの鍵ストアに取り込めないため、ここでは復元できません。",
+  "next.backup.keyIncompatible":
+    "このアーカイブの暗号鍵は設定済みの鍵ストアに取り込めないため、ここでは復元できません。",
   "next.backup.categoryDestinations": "カテゴリの保存先",
-  "next.backup.categoryDestinationsNote": "これらのフォルダーはこのマシンにありません",
+  "next.backup.categoryDestinationsNote":
+    "これらのフォルダーはこのマシンにありません",
   "next.backup.was": "以前",
   "next.backup.now": "変更後",
   "next.backup.destinationFor": "{{name}} の保存先",
   "next.backup.download": "バックアップをダウンロード",
   "next.backup.stageRestore": "復元を準備",
-  "next.backup.restoreBody": "weaver が持つすべて — プロバイダー、カテゴリ、スケジュール、履歴 — がアーカイブの内容で置き換えられます。復元は別の場所に書き込まれ、サービスの次回起動時に適用されます。",
-  "next.postProcessing.directorySaved": "スクリプトディレクトリを保存しました · すべてのスクリプトジョブをオフにしました",
+  "next.backup.restoreBody":
+    "weaver が持つすべて — プロバイダー、カテゴリ、スケジュール、履歴 — がアーカイブの内容で置き換えられます。復元は別の場所に書き込まれ、サービスの次回起動時に適用されます。",
+  "next.postProcessing.directorySaved":
+    "スクリプトディレクトリを保存しました · すべてのスクリプトジョブをオフにしました",
   "next.postProcessing.required": "必須。",
   "next.postProcessing.defaultValue": "既定値: {{value}}。",
   "next.postProcessing.execution": "実行",
   "next.postProcessing.strictOn": "厳格なセキュリティが有効",
   "next.postProcessing.runScripts": "スクリプトを実行",
-  "next.postProcessing.runScriptsHelp": "オフの場合、weaver はスクリプトを検出しますが実行はしません。",
+  "next.postProcessing.runScriptsHelp":
+    "オフの場合、weaver はスクリプトを検出しますが実行はしません。",
   "next.postProcessing.concurrency": "同時実行スクリプト数",
-  "next.postProcessing.concurrencyHelp": "すべてのダウンロードとイベントを通じて、同時に実行できるスクリプトの数。1 つのダウンロードのスクリプトはこれまでどおり順番に実行されます。",
+  "next.postProcessing.concurrencyHelp":
+    "すべてのダウンロードとイベントを通じて、同時に実行できるスクリプトの数。1 つのダウンロードのスクリプトはこれまでどおり順番に実行されます。",
   "next.postProcessing.grace": "終了猶予",
   "next.postProcessing.interpreters": "インタープリター",
-  "next.postProcessing.interpretersNote": "空欄ならデーモンの PATH にあるものを使用",
+  "next.postProcessing.interpretersNote":
+    "空欄ならデーモンの PATH にあるものを使用",
   "next.postProcessing.directory": "スクリプトディレクトリ",
-  "next.postProcessing.directoryNote": "デーモン自身のファイルシステムから読み込み",
+  "next.postProcessing.directoryNote":
+    "デーモン自身のファイルシステムから読み込み",
   "next.postProcessing.directoryLabel": "ディレクトリ",
-  "next.postProcessing.directoryHelp": "スクリプトはここで検出されます。Weaver がアップロード、編集、削除することはありません。",
+  "next.postProcessing.directoryHelp":
+    "スクリプトはここで検出されます。Weaver がアップロード、編集、削除することはありません。",
   "next.postProcessing.change": "変更",
   "next.postProcessing.script": "スクリプト",
   "next.postProcessing.timeout": "タイムアウト",
@@ -1283,40 +1479,52 @@ export const nextJa: LocaleDictionary = {
   "next.postProcessing.moveUp": "上へ移動",
   "next.postProcessing.moveDown": "下へ移動",
   "next.postProcessing.adapter": "アダプター",
-  "next.postProcessing.discoveredEmpty": "スクリプトが見つかりません。スクリプトディレクトリに置いてから更新してください。",
+  "next.postProcessing.discoveredEmpty":
+    "スクリプトが見つかりません。スクリプトディレクトリに置いてから更新してください。",
   "next.postProcessing.problems": "読み込めなかったスクリプト",
   "next.postProcessing.changeDirTitle": "スクリプトディレクトリを変更",
   "next.postProcessing.changeDirConfirm": "ディレクトリを変更",
-  "next.postProcessing.changeDirBody": "新しいディレクトリにある同じ名前のファイルが、割り当て済みのスクリプトと同じとは限らないため、すべてのスクリプトジョブがオフになります。保存された内容はすべて残ります。ディスク上のファイルには手を加えません。",
+  "next.postProcessing.changeDirBody":
+    "新しいディレクトリにある同じ名前のファイルが、割り当て済みのスクリプトと同じとは限らないため、すべてのスクリプトジョブがオフになります。保存された内容はすべて残ります。ディスク上のファイルには手を加えません。",
   "next.postProcessing.events": "イベントスクリプトと出力の保持",
-  "next.postProcessing.eventsNote": "1 つのダウンロードのキューイベントは一度に一つずつ実行",
+  "next.postProcessing.eventsNote":
+    "1 つのダウンロードのキューイベントは一度に一つずつ実行",
   "next.postProcessing.eventTimeout": "イベントの既定タイムアウト",
-  "next.postProcessing.eventTimeoutHelp": "キュー、スキャン、スケジュール、フィードのスクリプトジョブに独自のタイムアウトがない場合に使われます。",
+  "next.postProcessing.eventTimeoutHelp":
+    "キュー、スキャン、スケジュール、フィードのスクリプトジョブに独自のタイムアウトがない場合に使われます。",
   "next.postProcessing.fileEventInterval": "ファイルイベントの間隔",
-  "next.postProcessing.fileEventIntervalHelp": "一つのダウンロードでファイルイベントを送る最小間隔。0 は制限なし、-1 は無効です。ダイレクトストアのダウンロードには、スクリプトが調べられるアーカイブファイルがない場合があります。",
+  "next.postProcessing.fileEventIntervalHelp":
+    "一つのダウンロードでファイルイベントを送る最小間隔。0 は制限なし、-1 は無効です。ダイレクトストアのダウンロードには、スクリプトが調べられるアーカイブファイルがない場合があります。",
   "next.postProcessing.outputRuns": "ダウンロードごとの保持実行数",
-  "next.postProcessing.outputRunsHelp": "各ダウンロード、および各スキャン、スケジュール、フィードごとに保持する最新の実行数です。",
+  "next.postProcessing.outputRunsHelp":
+    "各ダウンロード、および各スキャン、スケジュール、フィードごとに保持する最新の実行数です。",
   "next.postProcessing.outputFailedRuns": "失敗した実行を保持",
-  "next.postProcessing.outputFailedRunsHelp": "ダウンロードごとに、その数を超えて保持される失敗した実行数です。失敗をあとから確認できます。",
-  "next.postProcessing.outputLoweringDeletes": "この値を下げると、保存した時点ですべてのダウンロードの古い実行が削除されます。",
+  "next.postProcessing.outputFailedRunsHelp":
+    "ダウンロードごとに、その数を超えて保持される失敗した実行数です。失敗をあとから確認できます。",
+  "next.postProcessing.outputLoweringDeletes":
+    "この値を下げると、保存した時点ですべてのダウンロードの古い実行が削除されます。",
   "next.postProcessing.outputTruncatedChip": "切り詰め",
   "next.postProcessing.kindPostProcessing": "後処理",
   "next.postProcessing.kindQueue": "キュー",
   "next.postProcessing.kindScan": "スキャン",
   "next.postProcessing.kindFeed": "フィード",
   "next.postProcessing.instances": "ジョブ",
-  "next.postProcessing.instancesNote": "全カテゴリ向けのジョブは、カテゴリ固有のものより先に実行されます",
-  "next.postProcessing.instancesNoteOnlyWithout": "全カテゴリ向けのジョブは、カテゴリに固有のものがない場合にだけ実行されます",
+  "next.postProcessing.instancesNote":
+    "全カテゴリ向けのジョブは、カテゴリ固有のものより先に実行されます",
+  "next.postProcessing.instancesNoteOnlyWithout":
+    "全カテゴリ向けのジョブは、カテゴリに固有のものがない場合にだけ実行されます",
   "next.postProcessing.noInstances": "ジョブはまだありません。",
   "next.postProcessing.createInstance": "ジョブを追加",
   "next.postProcessing.chooseScript": "スクリプトを選択",
   "next.postProcessing.queueEvent": "キューイベント",
   "next.postProcessing.instanceName": "ジョブ名",
-  "next.postProcessing.instanceNameHelp": "空欄の場合はスクリプト名が使われます。",
+  "next.postProcessing.instanceNameHelp":
+    "空欄の場合はスクリプト名が使われます。",
   "next.postProcessing.inputs": "入力",
   "next.postProcessing.noInputs": "このジョブには入力がありません。",
   "next.postProcessing.secret": "シークレット",
-  "next.postProcessing.secretLinkHelp": "設定 · スクリプト · シークレットから参照します。スクリプトの実行時に値が渡されますが、ここに表示されることはありません。",
+  "next.postProcessing.secretLinkHelp":
+    "設定 · スクリプト · シークレットから参照します。スクリプトの実行時に値が渡されますが、ここに表示されることはありません。",
   "next.postProcessing.chooseSecret": "シークレットを選択",
   "next.postProcessing.noSecret": "シークレットなし",
   "next.postProcessing.createSecret": "新しいシークレットを作成…",
@@ -1328,54 +1536,73 @@ export const nextJa: LocaleDictionary = {
   "next.postProcessing.newInputIsSecret": "新しい入力はシークレットです",
   "next.postProcessing.ownSecretSaved": "保存済み。入力で置き換え",
   "next.postProcessing.addInput": "入力を追加",
-  "next.postProcessing.inputNameInvalid": "英字で始め、英字、数字、-、_ を使ってください。こうした部分はドットでつなげられます。",
-  "next.postProcessing.inputNameTaken": "このジョブには同じ名前の入力がすでにあります。",
+  "next.postProcessing.inputNameInvalid":
+    "英字で始め、英字、数字、-、_ を使ってください。こうした部分はドットでつなげられます。",
+  "next.postProcessing.inputNameTaken":
+    "このジョブには同じ名前の入力がすでにあります。",
   "next.postProcessing.runPolicy": "実行のしかた",
   "next.postProcessing.categories": "カテゴリ",
-  "next.postProcessing.categoriesHelp": "これらのカテゴリのダウンロードに対してだけ実行されます。何も選ばなければ、すべてのカテゴリで実行されます。",
+  "next.postProcessing.categoriesHelp":
+    "これらのカテゴリのダウンロードに対してだけ実行されます。何も選ばなければ、すべてのカテゴリで実行されます。",
   "next.postProcessing.everyCategory": "すべてのカテゴリ",
   "next.postProcessing.noCategories": "カテゴリが定義されていません",
   "next.postProcessing.runTimes": "実行時刻",
-  "next.postProcessing.runTimeNeeded": "このジョブの実行時刻を指定するか、起動時の実行をオンにしてください。",
-  "next.postProcessing.runTimeInvalid": "{{time}} は時刻ではありません。HH:MM、または毎時の *:MM を使用してください。",
-  "next.postProcessing.runModeHelp": "ブロッキングでは、終了を待ってから先へ進みます。完了を待たない場合は、開始したまま終了を待ちません。",
-  "next.postProcessing.timeoutHelp": "0 は既定値を使います。後処理スクリプトは 1 日、それ以外はイベントの既定タイムアウトです。最長は 7 日です。",
+  "next.postProcessing.runTimeNeeded":
+    "このジョブの実行時刻を指定するか、起動時の実行をオンにしてください。",
+  "next.postProcessing.runTimeInvalid":
+    "{{time}} は時刻ではありません。HH:MM、または毎時の *:MM を使用してください。",
+  "next.postProcessing.runModeHelp":
+    "ブロッキングでは、終了を待ってから先へ進みます。完了を待たない場合は、開始したまま終了を待ちません。",
+  "next.postProcessing.timeoutHelp":
+    "0 は既定値を使います。後処理スクリプトは 1 日、それ以外はイベントの既定タイムアウトです。最長は 7 日です。",
   "next.postProcessing.timeoutDefault": "既定",
   "next.postProcessing.enabledFor": "{{name}} を有効化",
   "next.postProcessing.headerDrift": "入力がスクリプトのヘッダーと一致しません",
-  "next.postProcessing.headerDriftBody": "このジョブの入力は、スクリプトのヘッダーが宣言している内容と一致しなくなっています。ヘッダーから再適用すると揃えられ、保存済みの値は維持されます。",
+  "next.postProcessing.headerDriftBody":
+    "このジョブの入力は、スクリプトのヘッダーが宣言している内容と一致しなくなっています。ヘッダーから再適用すると揃えられ、保存済みの値は維持されます。",
   "next.postProcessing.reapply": "ヘッダーから再適用",
-  "next.postProcessing.reapplyBody": "保存済みの値は維持され、新しい入力は既定値で追加され、ヘッダーが宣言しなくなった入力は削除されます。トリガーは変わりません。",
+  "next.postProcessing.reapplyBody":
+    "保存済みの値は維持され、新しい入力は既定値で追加され、ヘッダーが宣言しなくなった入力は削除されます。トリガーは変わりません。",
   "next.postProcessing.reapplied": "{{name}} をヘッダーから再適用しました",
   "next.postProcessing.setUpFromHeader": "ヘッダーからジョブをセットアップ",
-  "next.postProcessing.setUpFromHeaderHelp": "スクリプトのヘッダーが宣言しているトリガーのうち、まだジョブがないものそれぞれにジョブを作成します。",
-  "next.postProcessing.setUpDone.one": "{{name}} のジョブを {{count}} 件作成しました",
-  "next.postProcessing.setUpDone.other": "{{name}} のジョブを {{count}} 件作成しました",
+  "next.postProcessing.setUpFromHeaderHelp":
+    "スクリプトのヘッダーが宣言しているトリガーのうち、まだジョブがないものそれぞれにジョブを作成します。",
+  "next.postProcessing.setUpDone.one":
+    "{{name}} のジョブを {{count}} 件作成しました",
+  "next.postProcessing.setUpDone.other":
+    "{{name}} のジョブを {{count}} 件作成しました",
   "next.postProcessing.instanceCreated": "{{name}} を作成しました",
   "next.postProcessing.instanceSaved": "{{name}} を保存しました",
   "next.postProcessing.instanceDeleted": "{{name}} を削除しました",
   "next.postProcessing.deleteTitle": "ジョブを削除",
-  "next.postProcessing.deleteBody": "ジョブは削除され、フィードへの割り当てもすべて削除されます。スクリプトファイルには手を加えません。",
+  "next.postProcessing.deleteBody":
+    "ジョブは削除され、フィードへの割り当てもすべて削除されます。スクリプトファイルには手を加えません。",
   "next.postProcessing.feedGroupNote": "割り当てられたフィードで実行",
   "next.postProcessing.globalScriptsRun": "グローバルスクリプトの実行",
-  "next.postProcessing.globalScriptsRunHelp": "グローバルスクリプトとは、固有のカテゴリを持たないジョブで、カテゴリのスクリプトより先に実行されます。カテゴリにスクリプトがあるダウンロードでも実行するかどうかをここで決めます。",
+  "next.postProcessing.globalScriptsRunHelp":
+    "グローバルスクリプトとは、固有のカテゴリを持たないジョブで、カテゴリのスクリプトより先に実行されます。カテゴリにスクリプトがあるダウンロードでも実行するかどうかをここで決めます。",
   "next.postProcessing.globalAlways": "すべてのダウンロードで",
   "next.postProcessing.globalOnlyWithout": "カテゴリにスクリプトがない場合のみ",
   "next.postProcessing.test": "テスト",
   "next.postProcessing.testTitle": "{{name}} をテスト",
-  "next.postProcessing.testNote": "保存されているとおりのジョブを、作り物の入力で一度だけ実行します。スクリプトが要求したことは何も適用されません。",
+  "next.postProcessing.testNote":
+    "保存されているとおりのジョブを、作り物の入力で一度だけ実行します。スクリプトが要求したことは何も適用されません。",
   "next.postProcessing.testStarting": "テストを開始しています…",
   "next.postProcessing.testRunning": "実行中",
-  "next.postProcessing.testGone": "デーモンはこのテスト実行をもう保持していません。",
+  "next.postProcessing.testGone":
+    "デーモンはこのテスト実行をもう保持していません。",
   "next.postProcessing.testInputs": "シミュレートした入力",
-  "next.postProcessing.testInputsNote": "この実行のために作ったもの · ジョブ自身の入力は含みません",
+  "next.postProcessing.testInputsNote":
+    "この実行のために作ったもの · ジョブ自身の入力は含みません",
   "next.postProcessing.testArguments": "引数",
   "next.postProcessing.testLog": "実行ログ",
-  "next.postProcessing.testLogWaiting": "スクリプトはまだ何も出力していません。",
+  "next.postProcessing.testLogWaiting":
+    "スクリプトはまだ何も出力していません。",
   "next.postProcessing.testLogEmpty": "スクリプトは何も出力しませんでした。",
   "next.postProcessing.testCommands": "スクリプトが要求したこと",
   "next.postProcessing.testCommandsNote": "いずれも適用されていません",
-  "next.postProcessing.testCommandsTruncated": "スクリプトはここに表示されている以上のことを要求しました。",
+  "next.postProcessing.testCommandsTruncated":
+    "スクリプトはここに表示されている以上のことを要求しました。",
   "next.postProcessing.testAgain": "もう一度実行",
   "next.postProcessing.cancelTest": "テストをキャンセル",
   "next.scriptRuns.note": "新しい順",
@@ -1388,7 +1615,8 @@ export const nextJa: LocaleDictionary = {
   "next.scriptRuns.allTriggers": "すべてのトリガー",
   "next.scriptRuns.copyOutput": "出力をコピー",
   "next.scriptRuns.copied": "出力をクリップボードにコピーしました",
-  "next.scriptRuns.copyBlocked": "ブラウザーがクリップボードへのアクセスをブロックしました。",
+  "next.scriptRuns.copyBlocked":
+    "ブラウザーがクリップボードへのアクセスをブロックしました。",
   "next.scriptRuns.loadingOutput": "出力を読み込んでいます…",
   "next.scriptRuns.outputOf": "{{name}} の出力",
   "next.scriptRuns.status.all": "すべて",
@@ -1412,20 +1640,26 @@ export const nextJa: LocaleDictionary = {
   "next.providers.connections": "接続数",
   "next.providers.transport": "通信方式",
   "next.providers.role": "役割",
-  "next.providers.empty": "プロバイダーはまだありません。追加するとダウンロードを開始できます。",
+  "next.providers.empty":
+    "プロバイダーはまだありません。追加するとダウンロードを開始できます。",
   "next.providers.add": "プロバイダーを追加",
   "next.providers.enabledAria": "{{host}} 有効",
   "next.providers.connection": "接続",
   "next.providers.port": "ポート",
   "next.providers.username": "ユーザー名",
   "next.providers.password": "パスワード",
-  "next.providers.passwordKeep": "保存済みのパスワードを使う場合は空欄のままにします。",
-  "next.providers.connectionsHelp": "weaver が同時に開ける接続数。契約で許される数を超えないでください。",
+  "next.providers.passwordKeep":
+    "保存済みのパスワードを使う場合は空欄のままにします。",
+  "next.providers.connectionsHelp":
+    "weaver が同時に開ける接続数。契約で許される数を超えないでください。",
   "next.providers.enabled": "有効",
-  "next.providers.killSwitchHelp": "このプロバイダーを無効のまま、接続テストなしで、外に出る経路のない状態で保存します。ネットワークでルートを設定してから、ここで有効にしてください。",
+  "next.providers.killSwitchHelp":
+    "このプロバイダーを無効のまま、接続テストなしで、外に出る経路のない状態で保存します。ネットワークでルートを設定してから、ここで有効にしてください。",
   "next.providers.priority": "優先度",
-  "next.providers.priorityHelp": "小さい数値が優先され、同じ数値のプロバイダーは帯域を共有します。上位グループがその記事を提供できない場合にのみ下位グループを使用します。接続が使用中でも下位には切り替わりません。",
-  "next.providers.backfillServerHelp": "メインサーバーにない記事の補完にのみ使われます。メインサーバーが停止しているときや認証情報を拒否したときには使われません。",
+  "next.providers.priorityHelp":
+    "小さい数値が優先され、同じ数値のプロバイダーは帯域を共有します。上位グループがその記事を提供できない場合にのみ下位グループを使用します。接続が使用中でも下位には切り替わりません。",
+  "next.providers.backfillServerHelp":
+    "メインサーバーにない記事の補完にのみ使われます。メインサーバーが停止しているときや認証情報を拒否したときには使われません。",
   "next.providers.retention": "保持期間",
   "next.providers.days": "日",
   "next.providers.unlimitedSpeed": "速度無制限",
@@ -1441,9 +1675,11 @@ export const nextJa: LocaleDictionary = {
   "next.providers.test": "接続をテスト",
   "next.providers.loading": "プロバイダーを読み込み中…",
   "next.providers.pipelining": "パイプライン",
-  "next.providers.certMismatch": "このサーバーの証明書には別のホスト名が記載されています。プロバイダーのサーバーであると確信できる場合にのみ信頼してください。",
+  "next.providers.certMismatch":
+    "このサーバーの証明書には別のホスト名が記載されています。プロバイダーのサーバーであると確信できる場合にのみ信頼してください。",
   "next.providers.trustCert": "この証明書を信頼",
-  "next.providers.removeBody": "weaver は {{host}} の使用を停止します。進行中のダウンロードは残りのプロバイダーに切り替わります。",
+  "next.providers.removeBody":
+    "weaver は {{host}} の使用を停止します。進行中のダウンロードは残りのプロバイダーに切り替わります。",
   "next.providers.thisProvider": "このプロバイダー",
   "next.providers.quotaWindow": "容量の期間",
   "next.providers.usedSoFar": "これまでの使用量: {{size}}。",
@@ -1485,7 +1721,8 @@ export const nextJa: LocaleDictionary = {
   "next.rss.url": "URL",
   "next.rss.interval": "間隔",
   "next.rss.lastPoll": "最終取得",
-  "next.rss.feedsEmpty": "フィードがありません。追加すると weaver がインデクサーの検索を監視します。",
+  "next.rss.feedsEmpty":
+    "フィードがありません。追加すると weaver がインデクサーの検索を監視します。",
   "next.rss.addFeed": "フィードを追加",
   "next.rss.poll": "取得",
   "next.rss.rules": "ルール",
@@ -1495,7 +1732,8 @@ export const nextJa: LocaleDictionary = {
   "next.rss.order": "順序",
   "next.rss.titleMatches": "タイトル一致",
   "next.rss.filesInto": "振り分け先",
-  "next.rss.rulesEmpty": "ルールがありません。フィードが報告するアイテムはすべて受け入れられます。",
+  "next.rss.rulesEmpty":
+    "ルールがありません。フィードが報告するアイテムはすべて受け入れられます。",
   "next.rss.addRule": "ルールを追加",
   "next.rss.anything": "すべて",
   "next.rss.recentlySeen": "最近確認したアイテム",
@@ -1505,20 +1743,26 @@ export const nextJa: LocaleDictionary = {
   "next.rss.decisionColumn": "判定",
   "next.rss.size": "サイズ",
   "next.rss.seen": "確認日時",
-  "next.rss.seenEmpty": "まだ何もありません。フィードを取得するとここにアイテムが表示されます。",
+  "next.rss.seenEmpty":
+    "まだ何もありません。フィードを取得するとここにアイテムが表示されます。",
   "next.rss.clearHistory": "履歴を消去",
   "next.rss.urlHelp": "インデクサーの RSS または Newznab 検索 (API キー付き)。",
   "next.rss.enabled": "有効",
-  "next.rss.killSwitchHelp": "このフィードを無効のまま、外に出る経路のない状態で保存します。ネットワークでルートを設定してから、ここで有効にしてください。",
+  "next.rss.killSwitchHelp":
+    "このフィードを無効のまま、外に出る経路のない状態で保存します。ネットワークでルートを設定してから、ここで有効にしてください。",
   "next.rss.pollInterval": "取得間隔",
   "next.rss.defaultCategory": "既定のカテゴリ",
-  "next.rss.defaultCategoryHelp": "ルールで上書きされない場合に、受け入れたアイテムを振り分けるカテゴリ。",
+  "next.rss.defaultCategoryHelp":
+    "ルールで上書きされない場合に、受け入れたアイテムを振り分けるカテゴリ。",
   "next.rss.feedScripts": "フィードスクリプト",
-  "next.rss.feedScriptsHelp": "このフィードが実行するフィードジョブを、この順序で並べます。何もなければ、このフィードではスクリプトは実行されません。",
+  "next.rss.feedScriptsHelp":
+    "このフィードが実行するフィードジョブを、この順序で並べます。何もなければ、このフィードではスクリプトは実行されません。",
   "next.rss.attachScript": "フィードジョブを割り当て",
-  "next.rss.noFeedInstances": "フィードジョブはまだありません。「スクリプト」で作成してください。",
+  "next.rss.noFeedInstances":
+    "フィードジョブはまだありません。「スクリプト」で作成してください。",
   "next.rss.defaultMetadata": "既定のメタデータ",
-  "next.rss.defaultMetadataHelp": "1 行に 1 つの キー = 値。このフィードがキューに追加するすべてのアイテムに付加されます。",
+  "next.rss.defaultMetadataHelp":
+    "1 行に 1 つの キー = 値。このフィードがキューに追加するすべてのアイテムに付加されます。",
   "next.rss.credentials": "認証情報",
   "next.rss.credentialsNote": "任意 · 書き込み専用で保存",
   "next.rss.username": "ユーザー名",
@@ -1528,34 +1772,44 @@ export const nextJa: LocaleDictionary = {
   "next.rss.orderHelp": "小さい数値から先に試します。",
   "next.rss.titleMatchesHelp": "正規表現。空欄はすべてのタイトルに一致します。",
   "next.rss.feedCategories": "フィードのカテゴリ",
-  "next.rss.feedCategoriesHelp": "インデクサーが付けるカテゴリをカンマ区切りで。空欄はすべてに一致します。",
+  "next.rss.feedCategoriesHelp":
+    "インデクサーが付けるカテゴリをカンマ区切りで。空欄はすべてに一致します。",
   "next.rss.minSize": "最小サイズ",
   "next.rss.maxSize": "最大サイズ",
   "next.rss.fileInto": "振り分け先",
-  "next.rss.fileIntoHelp": "このルールが受け入れたアイテムについて、フィードの既定カテゴリを上書きします。",
+  "next.rss.fileIntoHelp":
+    "このルールが受け入れたアイテムについて、フィードの既定カテゴリを上書きします。",
   "next.rss.metadata": "メタデータ",
-  "next.rss.metadataHelp": "1 行に 1 つの キー = 値。このルールが受け入れたアイテムに付加されます。",
+  "next.rss.metadataHelp":
+    "1 行に 1 つの キー = 値。このルールが受け入れたアイテムに付加されます。",
   "next.rss.pollAll": "すべて取得",
   "next.rss.newFeed": "新しいフィード",
   "next.rss.removeFeed": "フィードを削除",
   "next.rss.editRule": "ルールを編集",
   "next.rss.rule": "ルール",
   "next.rss.removeRule": "ルールを削除",
-  "next.rss.removeFeedBody": "そのルールと記憶していたアイテムもすべて削除されます。すでにキューに追加したダウンロードには影響しません。",
-  "next.rss.removeRuleBody": "このルールが判定していたアイテムは、後に続くルールで判定されます。",
+  "next.rss.removeFeedBody":
+    "そのルールと記憶していたアイテムもすべて削除されます。すでにキューに追加したダウンロードには影響しません。",
+  "next.rss.removeRuleBody":
+    "このルールが判定していたアイテムは、後に続くルールで判定されます。",
   "next.rss.clearSeenTitle": "確認履歴を消去",
   "next.rss.forgetItemTitle": "このアイテムを忘れる",
   "next.rss.items.one": "{{count}} 件",
   "next.rss.items.other": "{{count}} 件",
   "next.rss.forgetItem": "アイテムを忘れる",
-  "next.rss.clearSeenBody": "次回の取得時に、各フィードは報告したものを再びキューに追加する場合があります。",
-  "next.rss.forgetItemBody": "このアイテムを報告する次回の取得では新規として扱われ、再びキューに追加される場合があります。",
+  "next.rss.clearSeenBody":
+    "次回の取得時に、各フィードは報告したものを再びキューに追加する場合があります。",
+  "next.rss.forgetItemBody":
+    "このアイテムを報告する次回の取得では新規として扱われ、再びキューに追加される場合があります。",
   "next.proxies.clearStored": "消去",
   "next.proxies.keepStored": "保持",
   "next.proxies.clearedPlaceholder": "保存時に削除されます",
-  "next.proxies.storedCleared": "保存すると保存済みの値は削除されます。置き換える場合は新しい値を入力してください。",
-  "next.proxies.typeLocked": "プロファイルの種類は変更できません。別の種類を使うには新しいプロファイルを追加してください。",
-  "next.routing.full": "1 つのルートに設定できるプロキシは最大 {{count}} 個です。",
+  "next.proxies.storedCleared":
+    "保存すると保存済みの値は削除されます。置き換える場合は新しい値を入力してください。",
+  "next.proxies.typeLocked":
+    "プロファイルの種類は変更できません。別の種類を使うには新しいプロファイルを追加してください。",
+  "next.routing.full":
+    "1 つのルートに設定できるプロキシは最大 {{count}} 個です。",
   "next.inspector.removeFailed": "このダウンロードを削除できませんでした。",
   "next.schedules.pauseWatchFolder": "監視フォルダーのスキャンを一時停止",
   "next.schedules.resumeWatchFolder": "監視フォルダーのスキャンを再開",
@@ -1584,10 +1838,12 @@ export const nextJa: LocaleDictionary = {
   "next.schedules.profileTo": "{{profile}} に切り替え",
   "next.schedules.setSplit": "帯域の配分",
   "next.schedules.splitLift": "解除",
-  "next.schedules.splitTo": "帯域の配分: Usenet {{usenet}}%、トレント {{torrent}}%",
+  "next.schedules.splitTo":
+    "帯域の配分: Usenet {{usenet}}%、トレント {{torrent}}%",
   "next.schedules.splitLifted": "帯域の配分: 解除",
   "next.schedules.profile": "ハードウェアプロファイル",
-  "next.schedules.profileHelp": "次のプロファイルルールまで適用されます。このマシンで実行できるプロファイルだけが表示されます。",
+  "next.schedules.profileHelp":
+    "次のプロファイルルールまで適用されます。このマシンで実行できるプロファイルだけが表示されます。",
   "next.system.kernels": "カーネル",
   "next.system.kernelsNote": "高速な順 · 強調表示が使用中",
   "next.system.kernelLadder": "このライブラリが選択できるカーネル（高速な順）",
@@ -1605,18 +1861,24 @@ export const nextJa: LocaleDictionary = {
   "next.login.password": "パスワード",
   "next.login.submit": "サインイン",
   "next.login.signingIn": "サインイン中…",
-  "next.login.invalid": "認証情報が正しくありません。ユーザー名とパスワードを確認してください。",
-  "next.login.tooMany": "サインインの試行回数が多すぎます。1 分待ってから再試行してください。",
+  "next.login.invalid":
+    "認証情報が正しくありません。ユーザー名とパスワードを確認してください。",
+  "next.login.tooMany":
+    "サインインの試行回数が多すぎます。1 分待ってから再試行してください。",
   "next.login.failed": "サインインできませんでした: {{error}}",
-  "next.login.unreachable": "Weaver が応答しません。起動していることを確認してから再試行してください。",
+  "next.login.unreachable":
+    "Weaver が応答しません。起動していることを確認してから再試行してください。",
   "next.login.forgot": "パスワードをお忘れですか？",
-  "next.login.resetHelp": "Weaver を停止し、ログインのリセットと新しいブートストラップ認証情報を指定して再起動します。環境変数にパスワードを置くより、パスワードファイルの方が安全です。",
+  "next.login.resetHelp":
+    "Weaver を停止し、ログインのリセットと新しいブートストラップ認証情報を指定して再起動します。環境変数にパスワードを置くより、パスワードファイルの方が安全です。",
   "next.login.docker": "Docker",
   "next.login.bareMetal": "直接インストール",
-  "next.login.trustedNetworks": "または {{variable}} に信頼できるネットワークを指定すると、そのネットワークのブラウザはサインインなしで管理者として利用できます。",
+  "next.login.trustedNetworks":
+    "または {{variable}} に信頼できるネットワークを指定すると、そのネットワークのブラウザはサインインなしで管理者として利用できます。",
   "next.job.deleteSaveFiles": "削除（ファイルは残す）",
   "next.job.deleteAllTitle": "すべてのファイルごと削除",
-  "next.job.deleteAllBody": "エントリは履歴から消え、ダウンロードしたファイルもディスクから削除されます。処理はバックグラウンドで行われ、元に戻せません。",
+  "next.job.deleteAllBody":
+    "エントリは履歴から消え、ダウンロードしたファイルもディスクから削除されます。処理はバックグラウンドで行われ、元に戻せません。",
   // First-run setup
   "next.firstRun.title": "Weaver へようこそ",
   "next.firstRun.step": "ステップ {{step}}/{{total}}",
@@ -1629,71 +1891,105 @@ export const nextJa: LocaleDictionary = {
   "next.firstRun.continue": "続行",
   "next.firstRun.saving": "保存中…",
   "next.firstRun.provider.title": "Usenet プロバイダーに接続",
-  "next.firstRun.provider.body": "Weaver はプロバイダーのニュースサーバーからダウンロードします。サーバーアドレス、ポート、ログイン情報は、プロバイダーの案内メールまたはアカウントページに記載されています。",
+  "next.firstRun.provider.body":
+    "Weaver はプロバイダーのニュースサーバーからダウンロードします。サーバーアドレス、ポート、ログイン情報は、プロバイダーの案内メールまたはアカウントページに記載されています。",
   "next.firstRun.provider.tls": "暗号化接続 (TLS)",
-  "next.firstRun.provider.tlsHint": "ほぼすべてのプロバイダーが対応しています。通常のポートは TLS ありで 563、なしで 119 です。",
-  "next.providers.certFingerprint": "SHA-256 フィンガープリント: {{fingerprint}}",
-  "next.providers.certIssuedFor": "このサーバーの証明書は {{host}} を対象としていません。発行先は {{names}} です。プロバイダーのサーバーであると確信できる場合にのみ信頼してください。",
+  "next.firstRun.provider.tlsHint":
+    "ほぼすべてのプロバイダーが対応しています。通常のポートは TLS ありで 563、なしで 119 です。",
+  "next.providers.certFingerprint":
+    "SHA-256 フィンガープリント: {{fingerprint}}",
+  "next.providers.certIssuedFor":
+    "このサーバーの証明書は {{host}} を対象としていません。発行先は {{names}} です。プロバイダーのサーバーであると確信できる場合にのみ信頼してください。",
   "next.providers.certNames": "発行先: {{names}}",
-  "next.providers.certificateTrusted": "このプロバイダーの証明書を信頼しました。",
+  "next.providers.certificateTrusted":
+    "このプロバイダーの証明書を信頼しました。",
   "next.providers.trustTitle": "この証明書を信頼しますか？",
-  "next.providers.trustBody": "Weaver は証明書のそれ以外の点を引き続き検証します。ホスト名が一致しない場合にのみこの証明書そのものを受け入れ、別のホストを示すほかの証明書は拒否します。",
+  "next.providers.trustBody":
+    "Weaver は証明書のそれ以外の点を引き続き検証します。ホスト名が一致しない場合にのみこの証明書そのものを受け入れ、別のホストを示すほかの証明書は拒否します。",
   "next.providers.trustConfirm": "証明書を信頼",
   "next.providers.forgetCertificate": "証明書を削除",
   "next.firstRun.provider.save": "プロバイダーを保存",
-  "next.firstRun.provider.saveFailed": "プロバイダーを保存できませんでした: {{message}}",
+  "next.firstRun.provider.saveFailed":
+    "プロバイダーを保存できませんでした: {{message}}",
   "next.firstRun.provider.saved": "登録済みのプロバイダー",
   "next.firstRun.provider.addAnother": "別のプロバイダーを追加",
   "next.firstRun.provider.skip": "今はスキップ",
   "next.firstRun.folders.title": "フォルダーの設定",
-  "next.firstRun.folders.saveFailed": "フォルダーを保存できませんでした: {{message}}",
+  "next.firstRun.folders.saveFailed":
+    "フォルダーを保存できませんでした: {{message}}",
   "next.firstRun.categories.title": "カテゴリ",
-  "next.firstRun.categories.body": "カテゴリを使うと、そのダウンロード専用のフォルダーが用意されます。Weaver にダウンロードを送るアプリは、通常 tv や movies などのカテゴリを指定します。",
+  "next.firstRun.categories.body":
+    "カテゴリを使うと、そのダウンロード専用のフォルダーが用意されます。Weaver にダウンロードを送るアプリは、通常 tv や movies などのカテゴリを指定します。",
   "next.firstRun.categories.remove": "{{name}} を削除",
-  "next.firstRun.categories.saveFailed": "カテゴリを保存できませんでした: {{message}}",
+  "next.firstRun.categories.saveFailed":
+    "カテゴリを保存できませんでした: {{message}}",
   "next.firstRun.done.title": "準備が整いました",
-  "next.firstRun.done.body": "NZB を追加すると最初のダウンロードが始まります。ここでの設定は後から設定画面で変更できます。",
+  "next.firstRun.done.body":
+    "NZB を追加すると最初のダウンロードが始まります。ここでの設定は後から設定画面で変更できます。",
   "next.firstRun.done.providers": "プロバイダー",
-  "next.firstRun.done.noProvider": "まだありません。ダウンロードする前に設定で追加してください。",
+  "next.firstRun.done.noProvider":
+    "まだありません。ダウンロードする前に設定で追加してください。",
   "next.firstRun.done.categoriesNone": "なし",
   "next.firstRun.done.open": "Weaver を開く",
-  "next.firstRun.finishFailed": "セットアップを完了できませんでした: {{message}}",
+  "next.firstRun.finishFailed":
+    "セットアップを完了できませんでした: {{message}}",
   "next.performance.title": "パフォーマンス",
   "next.performance.profile": "ハードウェアプロファイル",
-  "next.performance.body": "Weaver がこのマシンをどれだけ使ってよいかを選びます。このマシンで実行できないプロファイルは表示されません。",
+  "next.performance.body":
+    "Weaver がこのマシンをどれだけ使ってよいかを選びます。このマシンで実行できないプロファイルは表示されません。",
   "next.performance.efficient": "省リソース",
   "next.performance.balanced": "バランス",
   "next.performance.performance": "パフォーマンス",
-  "next.performance.efficientBody": "最小のフットプリント。小型ボードや、他の作業と共有するマシン向けです。",
-  "next.performance.balancedBody": "デスクトップや家庭用サーバーでの標準的な選択です。",
-  "next.performance.performanceBody": "最も広い上限。メモリとコアに余裕のある大型マシン向けです。",
+  "next.performance.efficientBody":
+    "最小のフットプリント。小型ボードや、他の作業と共有するマシン向けです。",
+  "next.performance.balancedBody":
+    "デスクトップや家庭用サーバーでの標準的な選択です。",
+  "next.performance.performanceBody":
+    "最も広い上限。メモリとコアに余裕のある大型マシン向けです。",
   "next.performance.recommendedTag": "推奨",
   "next.performance.factDecodeMemory": "7z デコードメモリ {{size}}",
-  "next.performance.factThreads": "スレッド: デコード {{decode}} · 展開 {{extract}}",
+  "next.performance.factThreads":
+    "スレッド: デコード {{decode}} · 展開 {{extract}}",
   "next.performance.factDownloads": "同時ダウンロード最大 {{count}} 件",
-  "next.performance.detected": "このマシンへの推奨: RAM {{memory}}、{{cores}} コア。",
-  "next.performance.timing": "変更は次に始まるダウンロードや展開から適用されます。実行中の処理は開始時の設定のまま完了します。",
+  "next.performance.detected":
+    "このマシンへの推奨: RAM {{memory}}、{{cores}} コア。",
+  "next.performance.timing":
+    "変更は次に始まるダウンロードや展開から適用されます。実行中の処理は開始時の設定のまま完了します。",
   "next.performance.notConfirmed": "推奨プロファイルで動作中です（未確認）。",
-  "next.performance.scheduled": "スケジュールにより現在 {{profile}} プロファイルが適用されています。スケジュールルールが適用されていないときは、選択したプロファイルが使われます。",
-  "next.performance.saveFailed": "プロファイルを保存できませんでした: {{message}}",
+  "next.performance.scheduled":
+    "スケジュールにより現在 {{profile}} プロファイルが適用されています。スケジュールルールが適用されていないときは、選択したプロファイルが使われます。",
+  "next.performance.saveFailed":
+    "プロファイルを保存できませんでした: {{message}}",
   "next.securityNotice.title": "新しいアクセスモデルが利用できます",
-  "next.securityNotice.intro": "このインストールは 0.12.0 より前のアクセス設定のままなので、誰が入れるかは変わっていません。Weaver にはより簡単なモデルがあり、準備ができたらいつでも移行できます。",
+  "next.securityNotice.intro":
+    "このインストールは 0.12.0 より前のアクセス設定のままなので、誰が入れるかは変わっていません。Weaver にはより簡単なモデルがあり、準備ができたらいつでも移行できます。",
   "next.securityNotice.changesTitle": "新しいモデルでは",
-  "next.securityNotice.changeSignIn": "すべてのブラウザがサインインします。これまでログインなしで入れたネットワークは、ブラウザを記憶できる場所を決めるだけになります。",
-  "next.securityNotice.changeProxies": "信頼するプロキシは 設定 → セキュリティ で設定します。",
-  "next.securityNotice.changeHosts": "どのホスト名も WEAVER_HTTP_ALLOWED_HOSTS に登録せずに使えます。",
+  "next.securityNotice.changeSignIn":
+    "すべてのブラウザがサインインします。これまでログインなしで入れたネットワークは、ブラウザを記憶できる場所を決めるだけになります。",
+  "next.securityNotice.changeProxies":
+    "信頼するプロキシは 設定 → セキュリティ で設定します。",
+  "next.securityNotice.changeHosts":
+    "どのホスト名も WEAVER_HTTP_ALLOWED_HOSTS に登録せずに使えます。",
   "next.securityNotice.stepsTitle": "このインストールを移行するには",
-  "next.securityNotice.container": "コンテナの環境にこの変数を追加します。Docker Compose の場合:",
-  "next.securityNotice.containerAfter": "その後 docker compose up -d でコンテナを再作成します。Unraid ではコンテナテンプレートの Access Mode を authenticated に設定します。",
+  "next.securityNotice.container":
+    "コンテナの環境にこの変数を追加します。Docker Compose の場合:",
+  "next.securityNotice.containerAfter":
+    "その後 docker compose up -d でコンテナを再作成します。Unraid ではコンテナテンプレートの Access Mode を authenticated に設定します。",
   "next.securityNotice.windows": "PowerShell で実行します:",
-  "next.securityNotice.windowsAfter": "その後トレイアイコンから「Exit」を選び、スタートメニューから Weaver を再起動します。",
+  "next.securityNotice.windowsAfter":
+    "その後トレイアイコンから「Exit」を選び、スタートメニューから Weaver を再起動します。",
   "next.securityNotice.macos": "ターミナルで実行します:",
-  "next.securityNotice.macosAfter": "その後メニューバーのアイコンから「Quit Weaver」を選び、Weaver をもう一度開きます。Homebrew の場合は代わりに brew services restart weaver-usenet を実行します。",
-  "next.securityNotice.linux": "Weaver の systemd ユニットの [Service] セクションにこの行を追加するか、Weaver を起動する場所で変数を設定します:",
+  "next.securityNotice.macosAfter":
+    "その後メニューバーのアイコンから「Quit Weaver」を選び、Weaver をもう一度開きます。Homebrew の場合は代わりに brew services restart weaver-usenet を実行します。",
+  "next.securityNotice.linux":
+    "Weaver の systemd ユニットの [Service] セクションにこの行を追加するか、Weaver を起動する場所で変数を設定します:",
   "next.securityNotice.linuxAfter": "その後 Weaver を再起動します。",
-  "next.securityNotice.other": "Weaver を起動する場所で環境変数 WEAVER_ACCESS_MODE=authenticated を設定し、Weaver を再起動します。",
-  "next.securityNotice.keepsLogin": "ログインと API キーは引き継がれ、すべてのブラウザがもう一度サインインします。その起動から移行は恒久的です。",
-  "next.securityNotice.createsLogin": "このインストールにはログインがないため、再起動後に Weaver はログインを作成するセットアップを開きます。",
+  "next.securityNotice.other":
+    "Weaver を起動する場所で環境変数 WEAVER_ACCESS_MODE=authenticated を設定し、Weaver を再起動します。",
+  "next.securityNotice.keepsLogin":
+    "ログインと API キーは引き継がれ、すべてのブラウザがもう一度サインインします。その起動から移行は恒久的です。",
+  "next.securityNotice.createsLogin":
+    "このインストールにはログインがないため、再起動後に Weaver はログインを作成するセットアップを開きます。",
   "next.securityNotice.guide": "ガイドを読む",
   "next.securityNotice.dismiss": "OK",
   "next.securityNotice.dismissFailed": "保存できませんでした: {{message}}",
@@ -1707,7 +2003,8 @@ export const nextJa: LocaleDictionary = {
   "next.schedules.trackQuota": "使用量の計測",
   "next.schedules.trackServers": "サーバー",
   "next.schedules.trackOneShot": "単発アクション",
-  "next.schedules.scriptTimeHelp": "現地時刻。HH:MM、または毎時を表す *:MM。複数指定はカンマで区切ります。",
+  "next.schedules.scriptTimeHelp":
+    "現地時刻。HH:MM、または毎時を表す *:MM。複数指定はカンマで区切ります。",
   "next.schedules.runAtStartup": "起動時にも実行",
   "next.schedules.trackNote": "現地時刻 · グループ内の次のルールまで有効",
   "next.schedules.oneShotNote": "現地時刻 · その都度一度だけ実行",
@@ -1723,24 +2020,34 @@ export const nextJa: LocaleDictionary = {
   "next.schedules.pruneCancelled": "キャンセル",
   "next.schedules.deleteFiles": "ファイルも削除",
   "next.schedules.oneShotHelp": "停止中の実行はスキップします。",
-  "next.schedules.multipleTimesHelp": "任意。カンマ区切り。上の単一時刻を置き換えます。",
-  "next.schedules.pauseAllHelp": "ダウンロード、フォルダースキャン、RSS を停止します。再開で解除されます。後処理は続行します。",
-  "next.schedules.postHelp": "実行中の作業は完了し、新しい検証、修復、展開、移動、スクリプトは再開まで待機します。",
-  "next.schedules.serverHelp": "接続テストなしで有効状態を保存し、全サーバーの接続を再読み込みします。",
-  "next.schedules.quotaHelp": "計測対象外の通信量は統計に残りますが、上限には計上されません。設定済みの上限は変わりません。",
+  "next.schedules.multipleTimesHelp":
+    "任意。カンマ区切り。上の単一時刻を置き換えます。",
+  "next.schedules.pauseAllHelp":
+    "ダウンロード、フォルダースキャン、RSS を停止します。再開で解除されます。後処理は続行します。",
+  "next.schedules.postHelp":
+    "実行中の作業は完了し、新しい検証、修復、展開、移動、スクリプトは再開まで待機します。",
+  "next.schedules.serverHelp":
+    "接続テストなしで有効状態を保存し、全サーバーの接続を再読み込みします。",
+  "next.schedules.quotaHelp":
+    "計測対象外の通信量は統計に残りますが、上限には計上されません。設定済みの上限は変わりません。",
   "next.schedules.pruneWarning": "完了履歴の削除は重複防止も解除します。",
-  "next.schedules.pruneFilesWarning": "完了ファイルの削除は出力フォルダーも削除します。",
+  "next.schedules.pruneFilesWarning":
+    "完了ファイルの削除は出力フォルダーも削除します。",
   "next.backup.storage": "バックアップ保存先",
   "next.backup.customPath": "カスタム保存パス",
   "next.backup.saveStorage": "保存パスを保存",
   "next.backup.automatic": "自動バックアップ",
-  "next.backup.retention": "現在のバージョンを3件、前のバージョンを1件保持します。手動バックアップは削除するまで保持されます。",
-  "next.backup.verifyAccountPassword": "続行するにはアカウントのパスワードを確認してください。アーカイブの暗号化キーではなく、ログイン用のパスワードです。",
+  "next.backup.retention":
+    "現在のバージョンを3件、前のバージョンを1件保持します。手動バックアップは削除するまで保持されます。",
+  "next.backup.verifyAccountPassword":
+    "続行するにはアカウントのパスワードを確認してください。アーカイブの暗号化キーではなく、ログイン用のパスワードです。",
   "next.backup.autoEnabled": "自動バックアップを有効化",
   "next.backup.dailyTime": "毎日の時刻（現地時間）",
   "next.backup.autoKey": "自動バックアップキー",
-  "next.backup.keyPresent": "キーは保存済みです。変更する場合は新しいキーを入力してください。",
-  "next.backup.keyAbsent": "有効化する前に空白以外で8文字以上のキーを設定してください。",
+  "next.backup.keyPresent":
+    "キーは保存済みです。変更する場合は新しいキーを入力してください。",
+  "next.backup.keyAbsent":
+    "有効化する前に空白以外で8文字以上のキーを設定してください。",
   "next.backup.clearKey": "自動バックアップキーを削除",
   "next.backup.nextRun": "次回実行",
   "next.backup.notScheduled": "予定なし",
@@ -1758,7 +2065,8 @@ export const nextJa: LocaleDictionary = {
   "next.backup.failed": "失敗",
   "next.backup.downloadStored": "ダウンロード",
   "next.backup.deleteStored": "バックアップを削除",
-  "next.backup.deleteBody": "この保存済みアーカイブとメタデータを削除しますか？",
+  "next.backup.deleteBody":
+    "この保存済みアーカイブとメタデータを削除しますか？",
   "next.backup.createStored": "ダウンロードせずに作成",
   // Networking
   "next.networking.saved": "保存しました",
@@ -1766,9 +2074,12 @@ export const nextJa: LocaleDictionary = {
   "next.networking.requestFailed": "リクエストに失敗しました",
   "next.networking.loadFailed": "ネットワーク設定を読み込めませんでした",
   "next.networking.retry": "再試行",
-  "next.networking.loading": "送信インターフェース、プロキシ、ルートを読み込んでいます。",
-  "next.networking.bridgeNotice": "コンテナのブリッジネットワークではコンテナ側のインターフェースしか見えません。独立した回線を選ぶには、ホストネットワークを使うか複数のコンテナネットワークを接続してください。",
-  "next.networking.liveUnavailable": "ライブ更新を利用できません。最後に受信した状態を表示しています。",
+  "next.networking.loading":
+    "送信インターフェース、プロキシ、ルートを読み込んでいます。",
+  "next.networking.bridgeNotice":
+    "コンテナのブリッジネットワークではコンテナ側のインターフェースしか見えません。独立した回線を選ぶには、ホストネットワークを使うか複数のコンテナネットワークを接続してください。",
+  "next.networking.liveUnavailable":
+    "ライブ更新を利用できません。最後に受信した状態を表示しています。",
   "next.networking.close": "閉じる",
   "next.networking.enabled": "有効",
   "next.networking.disabled": "無効",
@@ -1798,123 +2109,209 @@ export const nextJa: LocaleDictionary = {
   "next.networking.binding.interface": "ネットワークインターフェース",
   "next.networking.binding.sourceAddress": "送信元アドレス",
   "next.refusal.EGRESS_NAME_LENGTH": "送信の名前は1～128文字にしてください。",
-  "next.refusal.EGRESS_SYSTEM_IMMUTABLE": "System 送信は名前変更、バインド変更、無効化ができません。",
-  "next.refusal.EGRESS_SYSTEM_BINDING_RESERVED": "System バインドを使えるのは System 送信だけです。",
-  "next.refusal.EGRESS_INTERFACE_NAME_INVALID": "有効なインターフェース名を入力してください。",
-  "next.refusal.EGRESS_INTERFACE_NAME_REQUIRED": "インターフェース名を入力してください。",
-  "next.refusal.EGRESS_INTERFACE_BINDING_UNSUPPORTED": "Windows ではインターフェースにバインドできません。送信元アドレスを使ってください。",
-  "next.refusal.EGRESS_SOURCE_ADDRESS_REQUIRED": "送信元アドレスを入力してください。",
-  "next.refusal.EGRESS_SOURCE_ADDRESS_INVALID": "送信元アドレスが有効な IP アドレスではありません。",
-  "next.refusal.EGRESS_SOURCE_ADDRESS_NOT_UNICAST": "送信元アドレスは単一ホストのアドレスにしてください。",
+  "next.refusal.EGRESS_SYSTEM_IMMUTABLE":
+    "System 送信は名前変更、バインド変更、無効化ができません。",
+  "next.refusal.EGRESS_SYSTEM_BINDING_RESERVED":
+    "System バインドを使えるのは System 送信だけです。",
+  "next.refusal.EGRESS_INTERFACE_NAME_INVALID":
+    "有効なインターフェース名を入力してください。",
+  "next.refusal.EGRESS_INTERFACE_NAME_REQUIRED":
+    "インターフェース名を入力してください。",
+  "next.refusal.EGRESS_INTERFACE_BINDING_UNSUPPORTED":
+    "Windows ではインターフェースにバインドできません。送信元アドレスを使ってください。",
+  "next.refusal.EGRESS_SOURCE_ADDRESS_REQUIRED":
+    "送信元アドレスを入力してください。",
+  "next.refusal.EGRESS_SOURCE_ADDRESS_INVALID":
+    "送信元アドレスが有効な IP アドレスではありません。",
+  "next.refusal.EGRESS_SOURCE_ADDRESS_NOT_UNICAST":
+    "送信元アドレスは単一ホストのアドレスにしてください。",
   "next.refusal.EGRESS_QUOTA_LIMIT_TOO_LARGE": "クォータの上限が大きすぎます。",
-  "next.refusal.EGRESS_QUOTA_SOFT_ABOVE_HARD": "アップロードのソフト上限はハード上限を超えられません。",
+  "next.refusal.EGRESS_QUOTA_SOFT_ABOVE_HARD":
+    "アップロードのソフト上限はハード上限を超えられません。",
   "next.refusal.BANDWIDTH_LIMIT_TOO_LARGE": "速度制限が大きすぎます。",
-  "next.refusal.BANDWIDTH_SPLIT_RANGE": "帯域の配分では Usenet に 1% から 99% を割り当てます。",
+  "next.refusal.BANDWIDTH_SPLIT_RANGE":
+    "帯域の配分では Usenet に 1% から 99% を割り当てます。",
   "next.refusal.TORRENT_ROUTE_LEGS": "トレント経路のレッグは 1 つです。",
-  "next.refusal.TORRENT_ROUTE_DIRECT_FALLBACK": "トレント経路は直接接続にフォールバックできません。",
+  "next.refusal.TORRENT_ROUTE_DIRECT_FALLBACK":
+    "トレント経路は直接接続にフォールバックできません。",
   "next.refusal.TORRENT_ROUTE_RUNGS": "トレント経路の段は 1 つです。",
-  "next.refusal.EGRESS_QUOTA_RESET_TIME_RANGE": "クォータのリセット時刻が範囲外です。",
-  "next.refusal.EGRESS_QUOTA_RESET_DAY_RANGE": "毎月のリセット日は 1～31 にしてください。",
+  "next.refusal.EGRESS_QUOTA_RESET_TIME_RANGE":
+    "クォータのリセット時刻が範囲外です。",
+  "next.refusal.EGRESS_QUOTA_RESET_DAY_RANGE":
+    "毎月のリセット日は 1～31 にしてください。",
   "next.refusal.EGRESS_SPEED_LIMIT_TOO_LARGE": "速度制限が大きすぎます。",
   "next.refusal.EGRESS_NOT_FOUND": "この送信はもう存在しません。",
   "next.refusal.EGRESS_SYSTEM_UNDELETABLE": "System 送信は削除できません。",
   "next.refusal.EGRESS_IN_USE": "この送信はまだルートで使われています。",
   "next.refusal.POOL_NAME_LENGTH": "プールの名前は1～128文字にしてください。",
-  "next.refusal.POOL_MEMBER_COUNT": "プールに入れられるプロキシは最大16個です。",
-  "next.refusal.POOL_PROXY_REPEATED": "同じプロキシをプールに入れられるのは1回だけです。",
-  "next.refusal.POOL_PROXY_MISSING": "このプールのプロキシの1つがもう存在しません。",
-  "next.refusal.POOL_MEMBER_KIND_MISMATCH": "プール内のプロキシはすべてプールと同じ種類にしてください。",
+  "next.refusal.POOL_MEMBER_COUNT":
+    "プールに入れられるプロキシは最大16個です。",
+  "next.refusal.POOL_PROXY_REPEATED":
+    "同じプロキシをプールに入れられるのは1回だけです。",
+  "next.refusal.POOL_PROXY_MISSING":
+    "このプールのプロキシの1つがもう存在しません。",
+  "next.refusal.POOL_MEMBER_KIND_MISMATCH":
+    "プール内のプロキシはすべてプールと同じ種類にしてください。",
   "next.refusal.POOL_NOT_FOUND": "このプールはもう存在しません。",
   "next.refusal.POOL_IN_USE": "このプールはまだルートで使われています。",
-  "next.refusal.POOL_EDIT_REPEATS_PROXY": "このプールを使うルートが、すでにこれらのプロキシの1つを使っています。",
-  "next.refusal.POOL_IN_USE_EMPTY": "このプールはルートで使われているため、少なくとも1つのプロキシが必要です。",
+  "next.refusal.POOL_EDIT_REPEATS_PROXY":
+    "このプールを使うルートが、すでにこれらのプロキシの1つを使っています。",
+  "next.refusal.POOL_IN_USE_EMPTY":
+    "このプールはルートで使われているため、少なくとも1つのプロキシが必要です。",
   "next.refusal.ROUTE_LEG_COUNT": "レッグは1～8個にしてください。",
-  "next.refusal.ROUTE_LEG_WEIGHT_RANGE": "各レッグの重みは 1～100 にしてください。",
+  "next.refusal.ROUTE_LEG_WEIGHT_RANGE":
+    "各レッグの重みは 1～100 にしてください。",
   "next.refusal.ROUTE_LEG_WEIGHT_SUM": "レッグの重みは合計100%にしてください。",
-  "next.refusal.ROUTE_LADDER_RUNG_COUNT": "プロキシラダーには1～8段が必要です。",
+  "next.refusal.ROUTE_LADDER_RUNG_COUNT":
+    "プロキシラダーには1～8段が必要です。",
   "next.refusal.ROUTE_CHAIN_LENGTH": "チェーンにはプロキシが2～3個必要です。",
-  "next.refusal.ROUTE_EGRESS_MISSING": "ルートが、もう存在しない送信を使っています。",
+  "next.refusal.ROUTE_EGRESS_MISSING":
+    "ルートが、もう存在しない送信を使っています。",
   "next.refusal.ROUTE_EGRESS_DISABLED": "ルートが無効な送信を使っています。",
-  "next.refusal.ROUTE_POOL_MISSING": "ルートが、もう存在しないプールを使っています。",
-  "next.refusal.ROUTE_POOL_EMPTY": "ルートが、プロキシのないプールを使っています。",
-  "next.refusal.ROUTE_PROXY_MISSING": "ルートが、もう存在しないプロキシを使っています。",
-  "next.refusal.ROUTE_CHAIN_TRANSPORT": "WireGuard と HTTP/3 はチェーンの最初のプロキシにしか置けません。WireGuard は WireGuard の次にも置けます。",
-  "next.refusal.ROUTE_PROXY_REPEATED": "同じプロキシは、プールとチェーンを含め、プロキシラダーに1回しか使えません。",
-  "next.refusal.ROUTE_PROXY_COUNT": "1つのルートで使えるプロキシは8個までです。",
-  "next.refusal.ROUTE_HAS_ADVANCED_LEGS": "このルートは「ネットワーク」で編集してください。",
+  "next.refusal.ROUTE_POOL_MISSING":
+    "ルートが、もう存在しないプールを使っています。",
+  "next.refusal.ROUTE_POOL_EMPTY":
+    "ルートが、プロキシのないプールを使っています。",
+  "next.refusal.ROUTE_PROXY_MISSING":
+    "ルートが、もう存在しないプロキシを使っています。",
+  "next.refusal.ROUTE_CHAIN_TRANSPORT":
+    "WireGuard と HTTP/3 はチェーンの最初のプロキシにしか置けません。WireGuard は WireGuard の次にも置けます。",
+  "next.refusal.ROUTE_PROXY_REPEATED":
+    "同じプロキシは、プールとチェーンを含め、プロキシラダーに1回しか使えません。",
+  "next.refusal.ROUTE_PROXY_COUNT":
+    "1つのルートで使えるプロキシは8個までです。",
+  "next.refusal.ROUTE_HAS_ADVANCED_LEGS":
+    "このルートは「ネットワーク」で編集してください。",
   "next.refusal.ROUTE_CONSUMER_NOT_FOUND": "このルートはもう存在しません。",
-  "next.refusal.WIREGUARD_PROXY_PATH_CONFLICT": "WireGuard プロキシが送信に届く経路は1つだけにしてください。",
-  "next.refusal.WIREGUARD_INSTANCE_LIMIT": "これらのルートには WireGuard インスタンスが {{required}} 個必要ですが、このホストで使えるのは {{limit}} 個です。",
-  "next.refusal.PROXY_NAME_LENGTH": "プロキシの名前は1～128文字にしてください。",
-  "next.refusal.PROXY_ENDPOINT_INVALID": "有効なホストとポートを入力してください。",
-  "next.refusal.PROXY_TIMEOUT_RANGE": "タイムアウトは 1～300 秒にしてください。",
-  "next.refusal.PROXY_ADDRESS_COUNT": "WireGuard プロキシのトンネルアドレスは最大 {{limit}} 個です。",
-  "next.refusal.PROXY_DNS_SERVER_COUNT": "DNS サーバーは最大 {{limit}} 台まで指定できます。",
+  "next.refusal.WIREGUARD_PROXY_PATH_CONFLICT":
+    "WireGuard プロキシが送信に届く経路は1つだけにしてください。",
+  "next.refusal.WIREGUARD_INSTANCE_LIMIT":
+    "これらのルートには WireGuard インスタンスが {{required}} 個必要ですが、このホストで使えるのは {{limit}} 個です。",
+  "next.refusal.PROXY_NAME_LENGTH":
+    "プロキシの名前は1～128文字にしてください。",
+  "next.refusal.PROXY_ENDPOINT_INVALID":
+    "有効なホストとポートを入力してください。",
+  "next.refusal.PROXY_TIMEOUT_RANGE":
+    "タイムアウトは 1～300 秒にしてください。",
+  "next.refusal.PROXY_ADDRESS_COUNT":
+    "WireGuard プロキシのトンネルアドレスは最大 {{limit}} 個です。",
+  "next.refusal.PROXY_DNS_SERVER_COUNT":
+    "DNS サーバーは最大 {{limit}} 台まで指定できます。",
   "next.refusal.PROXY_CREDENTIAL_TOO_LARGE": "認証情報が大きすぎます。",
   "next.refusal.PROXY_SSH_USERNAME_REQUIRED": "SSH にはユーザー名が必要です。",
   "next.refusal.PROXY_SSH_KEY_REQUIRED": "SSH には Ed25519 秘密鍵が必要です。",
-  "next.refusal.PROXY_SSH_PASSWORD_UNSUPPORTED": "SSH はパスワードではなく Ed25519 秘密鍵を使います。",
-  "next.refusal.PROXY_SOCKS5_PASSWORD_NEEDS_USERNAME": "SOCKS5 のパスワードにはユーザー名が必要です。",
-  "next.refusal.PROXY_SOCKS5_CREDENTIAL_LENGTH": "SOCKS5 の認証情報は 255 バイト以内にしてください。",
-  "next.refusal.PROXY_HTTP_USERNAME_COLON": "HTTP プロキシのユーザー名にコロンは使えません。",
-  "next.refusal.PROXY_HTTP3_PASSWORD_NEEDS_USERNAME": "HTTP/3 のパスワードにはユーザー名が必要です。",
-  "next.refusal.PROXY_DNS_SERVER_INVALID": "DNS サーバーは IP アドレスで指定してください。",
-  "next.refusal.PROXY_DNS_SERVERS_REQUIRED": "一覧のサーバーが応答する DNS 設定には、サーバーが少なくとも 1 つ必要です。",
-  "next.refusal.PROXY_DNS_TLS_NAME_INVALID": "DNS サーバーの TLS 名は有効なホスト名にしてください。",
-  "next.refusal.PROXY_DNS_URL_INVALID": "DNS over HTTPS サーバーには、IP アドレスとパスを含む https URL が必要です。",
-  "next.refusal.PROXY_DNS_URL_HOSTNAME": "ホスト名で指定した DNS over HTTPS サーバーには IP アドレスも必要です。",
-  "next.refusal.PROXY_DNS_PLAIN_AFTER_ENCRYPTED": "平文の DNS サーバーを暗号化されたサーバーの後に置くことはできません。",
-  "next.refusal.PROXY_DNS_SERVER_DUPLICATE": "DNS サーバーは一度だけ一覧に載せられます。",
-  "next.refusal.DNS_LIST_NAME_LENGTH": "サーバーリストの名前は 1〜128 文字にしてください。",
+  "next.refusal.PROXY_SSH_PASSWORD_UNSUPPORTED":
+    "SSH はパスワードではなく Ed25519 秘密鍵を使います。",
+  "next.refusal.PROXY_SOCKS5_PASSWORD_NEEDS_USERNAME":
+    "SOCKS5 のパスワードにはユーザー名が必要です。",
+  "next.refusal.PROXY_SOCKS5_CREDENTIAL_LENGTH":
+    "SOCKS5 の認証情報は 255 バイト以内にしてください。",
+  "next.refusal.PROXY_HTTP_USERNAME_COLON":
+    "HTTP プロキシのユーザー名にコロンは使えません。",
+  "next.refusal.PROXY_HTTP3_PASSWORD_NEEDS_USERNAME":
+    "HTTP/3 のパスワードにはユーザー名が必要です。",
+  "next.refusal.PROXY_DNS_SERVER_INVALID":
+    "DNS サーバーは IP アドレスで指定してください。",
+  "next.refusal.PROXY_DNS_SERVERS_REQUIRED":
+    "一覧のサーバーが応答する DNS 設定には、サーバーが少なくとも 1 つ必要です。",
+  "next.refusal.PROXY_DNS_TLS_NAME_INVALID":
+    "DNS サーバーの TLS 名は有効なホスト名にしてください。",
+  "next.refusal.PROXY_DNS_URL_INVALID":
+    "DNS over HTTPS サーバーには、IP アドレスとパスを含む https URL が必要です。",
+  "next.refusal.PROXY_DNS_URL_HOSTNAME":
+    "ホスト名で指定した DNS over HTTPS サーバーには IP アドレスも必要です。",
+  "next.refusal.PROXY_DNS_PLAIN_AFTER_ENCRYPTED":
+    "平文の DNS サーバーを暗号化されたサーバーの後に置くことはできません。",
+  "next.refusal.PROXY_DNS_SERVER_DUPLICATE":
+    "DNS サーバーは一度だけ一覧に載せられます。",
+  "next.refusal.DNS_LIST_NAME_LENGTH":
+    "サーバーリストの名前は 1〜128 文字にしてください。",
   "next.refusal.DNS_LIST_NOT_FOUND": "そのサーバーリストはもう存在しません。",
-  "next.refusal.DNS_LIST_LIMIT_REACHED": "これ以上サーバーリストを追加できません。",
-  "next.refusal.DNS_LIST_IN_USE": "次の DNS プロファイルがまだこのリストを使っています: {{profiles}}。",
-  "next.refusal.DNS_PROFILE_NAME_LENGTH": "DNS プロファイルの名前は 1〜128 文字にしてください。",
-  "next.refusal.DNS_PROFILE_NOT_FOUND": "その DNS プロファイルはもう存在しません。",
-  "next.refusal.DNS_PROFILE_LIMIT_REACHED": "これ以上 DNS プロファイルを追加できません。",
-  "next.refusal.DNS_PROFILE_BUILT_IN": "System プロファイルは組み込みのため、変更も削除もできません。",
-  "next.refusal.DNS_PROFILE_IN_USE": "次のルートがまだこのプロファイルに従っています：{{routes}}。先に別のプロファイルを選んでください。",
-  "next.refusal.DNS_PROFILE_KIND": "ルートは System かルートプロファイルに従い、プロキシは System かプロキシ名プロファイルで見つけます。",
-  "next.refusal.DNS_PROFILE_PROXY_NAME_INVALID": "プロキシ名プロファイルは、システムか、出口からリストのサーバーに問い合わせる Weaver が応答します。",
-  "next.refusal.DNS_PROFILE_KIND_IMMUTABLE": "プロファイルの種類は作成時のまま変わりません。代わりにもう一方の種類で新しいプロファイルを作成してください。",
-  "next.refusal.DNS_PROFILE_KIND_REQUIRED": "新しいプロファイルには、ルートとプロキシのどちらが選ぶかを指定します。",
-  "next.refusal.DNS_PROFILE_LIST_REQUIRED": "Weaver が応答する場合は、サーバーリストを選んでください。",
-  "next.refusal.DNS_PROFILE_TRUST_INVALID": "システムの応答はそのまま使います。プロキシの応答はそのまま使うか、ここで検証します。",
-  "next.refusal.DNS_PROFILE_NEEDS_PROXY": "次のルートには直接のレッグか直接のフォールバックがあり、そこではプロキシが DNS に応答できません：{{routes}}。それぞれにプロキシを付けるか、プロファイルで「プロキシのないレッグではシステムに問い合わせる」をオンにしてください。",
-  "next.refusal.DNS_PROFILE_NEEDS_WIREGUARD": "ここで検証できるのは WireGuard プロキシの応答だけですが、次のルートには直接のレッグ、直接へのフォールバック、または別の種類のプロキシがあります：{{routes}}。",
-  "next.refusal.DNS_PROFILE_NEEDS_TUNNEL_DNS": "次のルートではプロキシが DNS に答えます：{{routes}}。そこで使う次の WireGuard プロキシはトンネルの DNS サーバーを指定していません：{{proxies}}。それぞれにトンネルの DNS サーバーを追加するか、別のプロファイルを選んでください。",
-  "next.refusal.PROXY_KIND_IMMUTABLE": "プロキシの種類は変更できません。新しいプロキシを追加してください。",
+  "next.refusal.DNS_LIST_LIMIT_REACHED":
+    "これ以上サーバーリストを追加できません。",
+  "next.refusal.DNS_LIST_IN_USE":
+    "次の DNS プロファイルがまだこのリストを使っています: {{profiles}}。",
+  "next.refusal.DNS_PROFILE_NAME_LENGTH":
+    "DNS プロファイルの名前は 1〜128 文字にしてください。",
+  "next.refusal.DNS_PROFILE_NOT_FOUND":
+    "その DNS プロファイルはもう存在しません。",
+  "next.refusal.DNS_PROFILE_LIMIT_REACHED":
+    "これ以上 DNS プロファイルを追加できません。",
+  "next.refusal.DNS_PROFILE_BUILT_IN":
+    "System プロファイルは組み込みのため、変更も削除もできません。",
+  "next.refusal.DNS_PROFILE_IN_USE":
+    "次のルートがまだこのプロファイルに従っています：{{routes}}。先に別のプロファイルを選んでください。",
+  "next.refusal.DNS_PROFILE_KIND":
+    "ルートは System かルートプロファイルに従い、プロキシは System かプロキシ名プロファイルで見つけます。",
+  "next.refusal.DNS_PROFILE_PROXY_NAME_INVALID":
+    "プロキシ名プロファイルは、システムか、出口からリストのサーバーに問い合わせる Weaver が応答します。",
+  "next.refusal.DNS_PROFILE_KIND_IMMUTABLE":
+    "プロファイルの種類は作成時のまま変わりません。代わりにもう一方の種類で新しいプロファイルを作成してください。",
+  "next.refusal.DNS_PROFILE_KIND_REQUIRED":
+    "新しいプロファイルには、ルートとプロキシのどちらが選ぶかを指定します。",
+  "next.refusal.DNS_PROFILE_LIST_REQUIRED":
+    "Weaver が応答する場合は、サーバーリストを選んでください。",
+  "next.refusal.DNS_PROFILE_TRUST_INVALID":
+    "システムの応答はそのまま使います。プロキシの応答はそのまま使うか、ここで検証します。",
+  "next.refusal.DNS_PROFILE_NEEDS_PROXY":
+    "次のルートには直接のレッグか直接のフォールバックがあり、そこではプロキシが DNS に応答できません：{{routes}}。それぞれにプロキシを付けるか、プロファイルで「プロキシのないレッグではシステムに問い合わせる」をオンにしてください。",
+  "next.refusal.DNS_PROFILE_NEEDS_WIREGUARD":
+    "ここで検証できるのは WireGuard プロキシの応答だけですが、次のルートには直接のレッグ、直接へのフォールバック、または別の種類のプロキシがあります：{{routes}}。",
+  "next.refusal.DNS_PROFILE_NEEDS_TUNNEL_DNS":
+    "次のルートではプロキシが DNS に答えます：{{routes}}。そこで使う次の WireGuard プロキシはトンネルの DNS サーバーを指定していません：{{proxies}}。それぞれにトンネルの DNS サーバーを追加するか、別のプロファイルを選んでください。",
+  "next.refusal.PROXY_KIND_IMMUTABLE":
+    "プロキシの種類は変更できません。新しいプロキシを追加してください。",
   "next.refusal.PROXY_LIMIT_REACHED": "プロキシは 128 個までです。",
-  "next.refusal.PROXY_KIND_LOCKED_BY_POOL": "プールに入っているプロキシの種類は変更できません。",
-  "next.refusal.PROXY_REVISION_CHANGED": "このプロキシは別の場所で変更されました。開き直してもう一度お試しください。",
+  "next.refusal.PROXY_KIND_LOCKED_BY_POOL":
+    "プールに入っているプロキシの種類は変更できません。",
+  "next.refusal.PROXY_REVISION_CHANGED":
+    "このプロキシは別の場所で変更されました。開き直してもう一度お試しください。",
   "next.refusal.PROXY_NOT_FOUND": "このプロキシはもう存在しません。",
-  "next.refusal.PROXY_IN_POOL": "このプロキシはプールに入っています。先にプールから外してください。",
+  "next.refusal.PROXY_IN_POOL":
+    "このプロキシはプールに入っています。先にプールから外してください。",
   "next.refusal.PROXY_IN_USE": "このプロキシはまだルートで使われています。",
-  "next.refusal.PROXY_HOST_KEY_NOT_SSH": "ホスト鍵があるのは SSH プロキシだけです。",
-  "next.refusal.SPEED_TEST_ALREADY_RUNNING": "速度テスト {{runId}} はまだ実行中です。",
-  "next.refusal.SPEED_TEST_QUEUE_BUSY": "前回の速度テストがまだキューを解放しています。",
-  "next.refusal.SPEED_TEST_USENET_NEEDS_SERVER": "フィードは帯域テストのみ実行できます。",
-  "next.refusal.SPEED_TEST_TORRENT_NEEDS_TORRENT_ROUTE": "トレントテストを実行できるのはトレントのルートだけです。",
+  "next.refusal.PROXY_HOST_KEY_NOT_SSH":
+    "ホスト鍵があるのは SSH プロキシだけです。",
+  "next.refusal.SPEED_TEST_ALREADY_RUNNING":
+    "速度テスト {{runId}} はまだ実行中です。",
+  "next.refusal.SPEED_TEST_QUEUE_BUSY":
+    "前回の速度テストがまだキューを解放しています。",
+  "next.refusal.SPEED_TEST_USENET_NEEDS_SERVER":
+    "フィードは帯域テストのみ実行できます。",
+  "next.refusal.SPEED_TEST_TORRENT_NEEDS_TORRENT_ROUTE":
+    "トレントテストを実行できるのはトレントのルートだけです。",
   "next.refusal.SPEED_TEST_TORRENTS_OFF": "トレントはオフです。",
-  "next.refusal.SPEED_TEST_LEG_DOWN_ALL": "少なくとも 1 つのレグを有効にしてください。",
-  "next.refusal.SPEED_TEST_QUOTA_BLOCKED": "{{name}} はダウンロード上限に達しています。",
-  "next.refusal.SPEED_TEST_LEASE_REFUSED": "{{name}} は接続を貸し出せません: {{reason}}。",
+  "next.refusal.SPEED_TEST_LEG_DOWN_ALL":
+    "少なくとも 1 つのレグを有効にしてください。",
+  "next.refusal.SPEED_TEST_QUOTA_BLOCKED":
+    "{{name}} はダウンロード上限に達しています。",
+  "next.refusal.SPEED_TEST_LEASE_REFUSED":
+    "{{name}} は接続を貸し出せません: {{reason}}。",
   "next.refusal.TEST_NEEDS_ROUTE": "テストには通るルートが必要です。",
-  "next.refusal.TEST_TARGET_REQUIRED": "ルートをテストするには、ホストとポートを入力してください。",
-  "next.refusal.TEST_SUBJECT_IN_ROUTE": "ルートがテスト対象のプロキシを使っています。ルートから外してください。",
-  "next.refusal.TEST_PATH_COUNT": "1回のテストで試せる経路は最大 {{limit}} 本です。段やプールのメンバーを減らしてください。",
+  "next.refusal.TEST_TARGET_REQUIRED":
+    "ルートをテストするには、ホストとポートを入力してください。",
+  "next.refusal.TEST_SUBJECT_IN_ROUTE":
+    "ルートがテスト対象のプロキシを使っています。ルートから外してください。",
+  "next.refusal.TEST_PATH_COUNT":
+    "1回のテストで試せる経路は最大 {{limit}} 本です。段やプールのメンバーを減らしてください。",
   "next.networking.problem.legCount": "レッグは1～8個にしてください。",
-  "next.networking.problem.weights": "重みは整数のパーセントで、合計100%にしてください。",
+  "next.networking.problem.weights":
+    "重みは整数のパーセントで、合計100%にしてください。",
   "next.networking.problem.rungCount": "プロキシラダーには1～8段が必要です。",
-  "next.networking.problem.rungTarget": "すべての段にプロキシかプールを選んでください。",
-  "next.networking.problem.chain": "チェーンには異なるプロキシが2～3個必要です。",
-  "next.networking.problem.egressDisabled": "このルートは無効な送信を使っています。",
-  "next.networking.problem.proxyRepeated": "プロキシラダーでは各プロキシを一度しか使えません。",
+  "next.networking.problem.rungTarget":
+    "すべての段にプロキシかプールを選んでください。",
+  "next.networking.problem.chain":
+    "チェーンには異なるプロキシが2～3個必要です。",
+  "next.networking.problem.egressDisabled":
+    "このルートは無効な送信を使っています。",
+  "next.networking.problem.proxyRepeated":
+    "プロキシラダーでは各プロキシを一度しか使えません。",
   "next.networking.overview.flow": "接続の流れ",
   "next.networking.flow.consumer": "エンドポイント",
   "next.networking.flow.allConsumers": "すべてのエンドポイント",
   "next.networking.flow.groups": "送信グループ",
-  "next.networking.flow.diagram": "送信インターフェースはルートのレッグとプロキシを通じてエンドポイントにつながります",
+  "next.networking.flow.diagram":
+    "送信インターフェースはルートのレッグとプロキシを通じてエンドポイントにつながります",
   "next.networking.flow.egressColumn": "送信インターフェース",
   "next.networking.flow.legsColumn": "ルート",
   "next.networking.flow.proxyColumn": "プロキシ",
@@ -1926,7 +2323,8 @@ export const nextJa: LocaleDictionary = {
   "next.networking.flow.shareMoved": "割り当てを移動",
   "next.networking.flow.planned": "{{count}} 予定",
   "next.networking.flow.egressLoad": "{{open}} 接続中 · {{rate}}",
-  "next.networking.flow.editLeg": "{{name}} のルートを編集（レッグ {{position}}）",
+  "next.networking.flow.editLeg":
+    "{{name}} のルートを編集（レッグ {{position}}）",
   "next.networking.flow.openKillSwitch": "{{name}} のルートを設定",
   "next.networking.flow.legTitle": "{{name}} · レッグ {{position}}",
   "next.networking.flow.legShort": "レッグ {{position}}",
@@ -1943,16 +2341,26 @@ export const nextJa: LocaleDictionary = {
   "next.networking.flow.dnsProxyCard": "{{proxy}} · そのリゾルバー",
   "next.networking.flow.dnsProxyNote": "Weaver からは不明",
   "next.networking.flow.dnsListMissing": "サーバーリスト",
-  "next.networking.flow.dnsSaysHost": "{{profile}}: ホストのリゾルバーが応答します。検証は行われません。",
-  "next.networking.flow.dnsSaysFallback": "{{profile}}: このレッグには名前を渡すプロキシがないため、ホストのリゾルバーが応答します。",
-  "next.networking.flow.dnsSaysList": "{{profile}}: Weaver が {{from}} から {{list}} に問い合わせます。",
-  "next.networking.flow.dnsSaysListThrough": "{{profile}}: Weaver が {{proxy}} 経由で {{list}} に問い合わせます。",
-  "next.networking.flow.dnsSaysTunnel": "{{profile}}: Weaver が {{proxy}} 経由でトンネルの DNS サーバーに問い合わせます。",
-  "next.networking.flow.dnsSaysProxy": "{{profile}}: {{proxy}} が名前を受け取って解決します。Weaver はその名前解決を確認も検証もできません。",
-  "next.networking.flow.dnsSaysValidates": "Weaver が応答の DNSSEC を検証します。",
-  "next.networking.flow.dnsRefusedNoProxy": "{{profile}} は名前をプロキシに渡しますが、このレッグにはプロキシがないため、接続は失敗します。",
-  "next.networking.flow.dnsRefusedNoTunnelDns": "{{profile}} は {{proxy}} のトンネル DNS に問い合わせますが、サーバーが設定されていないため、このレッグの接続は失敗します。",
-  "next.networking.flow.dnsRefusedValidate": "{{profile}} は DNSSEC を検証しますが、検証できるのは WireGuard トンネルの名前解決だけのため、このレッグの接続は失敗します。",
+  "next.networking.flow.dnsSaysHost":
+    "{{profile}}: ホストのリゾルバーが応答します。検証は行われません。",
+  "next.networking.flow.dnsSaysFallback":
+    "{{profile}}: このレッグには名前を渡すプロキシがないため、ホストのリゾルバーが応答します。",
+  "next.networking.flow.dnsSaysList":
+    "{{profile}}: Weaver が {{from}} から {{list}} に問い合わせます。",
+  "next.networking.flow.dnsSaysListThrough":
+    "{{profile}}: Weaver が {{proxy}} 経由で {{list}} に問い合わせます。",
+  "next.networking.flow.dnsSaysTunnel":
+    "{{profile}}: Weaver が {{proxy}} 経由でトンネルの DNS サーバーに問い合わせます。",
+  "next.networking.flow.dnsSaysProxy":
+    "{{profile}}: {{proxy}} が名前を受け取って解決します。Weaver はその名前解決を確認も検証もできません。",
+  "next.networking.flow.dnsSaysValidates":
+    "Weaver が応答の DNSSEC を検証します。",
+  "next.networking.flow.dnsRefusedNoProxy":
+    "{{profile}} は名前をプロキシに渡しますが、このレッグにはプロキシがないため、接続は失敗します。",
+  "next.networking.flow.dnsRefusedNoTunnelDns":
+    "{{profile}} は {{proxy}} のトンネル DNS に問い合わせますが、サーバーが設定されていないため、このレッグの接続は失敗します。",
+  "next.networking.flow.dnsRefusedValidate":
+    "{{profile}} は DNSSEC を検証しますが、検証できるのは WireGuard トンネルの名前解決だけのため、このレッグの接続は失敗します。",
   "next.networking.flow.dnsEditProfile": "DNS プロファイル {{profile}} を編集",
   "next.networking.flow.dnsEditList": "DNS サーバーリスト {{list}} を編集",
   "next.networking.flow.killSwitchNote": "プロキシなし、直接は無効",
@@ -1966,26 +2374,32 @@ export const nextJa: LocaleDictionary = {
   "next.networking.flow.holding.one": "{{count}} 接続",
   "next.networking.flow.holding.other": "{{count}} 接続",
   "next.networking.flow.parked": "{{count}} 保留",
-  "next.networking.flow.expandGroup": "レッグを見るには送信グループを開いてください。",
-  "next.networking.flow.noLegs": "ルートを見るにはサーバーかフィードを追加してください。",
+  "next.networking.flow.expandGroup":
+    "レッグを見るには送信グループを開いてください。",
+  "next.networking.flow.noLegs":
+    "ルートを見るにはサーバーかフィードを追加してください。",
   "next.networking.flow.waiting": "ライブ計測を待っています",
   "next.networking.flow.emptyTitle": "まだ表示するものがありません",
-  "next.networking.flow.emptyBody": "接続の出口を見るにはサーバーか RSS フィードを追加してください。",
-  "next.networking.flow.detailConnectionsValue": "{{open}} 接続中 · {{opening}} 接続処理中 · 目標 {{target}} · {{rate}}",
+  "next.networking.flow.emptyBody":
+    "接続の出口を見るにはサーバーか RSS フィードを追加してください。",
+  "next.networking.flow.detailConnectionsValue":
+    "{{open}} 接続中 · {{opening}} 接続処理中 · 目標 {{target}} · {{rate}}",
   "next.networking.flow.detailPin": "宛先の固定",
   "next.networking.flow.noSocket": "ソケットなし",
   "next.networking.egress.title": "送信インターフェース",
   "next.networking.egress.add": "送信を追加",
   "next.networking.egress.save": "送信を保存",
   "next.networking.egress.delete": "送信を削除",
-  "next.networking.egress.deleteBody": "{{name}} を削除しますか？使用しているルートを先に変更する必要があります。",
+  "next.networking.egress.deleteBody":
+    "{{name}} を削除しますか？使用しているルートを先に変更する必要があります。",
   "next.networking.egress.section": "送信",
   "next.networking.egress.newNote": "接続がこのマシンを出る場所",
   "next.networking.egress.empty": "送信インターフェースはまだありません。",
   "next.networking.egress.name": "名前",
   "next.networking.egress.bindingColumn": "バインド / 現在のアドレス",
   "next.networking.egress.binding": "バインド",
-  "next.networking.egress.bindingHelp": "名前付きインターフェースか、1つの送信元アドレスにバインドします。",
+  "next.networking.egress.bindingHelp":
+    "名前付きインターフェースか、1つの送信元アドレスにバインドします。",
   "next.networking.egress.health": "状態",
   "next.networking.egress.limit": "上限",
   "next.networking.egress.interface": "インターフェース",
@@ -1995,7 +2409,8 @@ export const nextJa: LocaleDictionary = {
   "next.networking.egress.linkDown": "停止",
   "next.networking.egress.sourceAddress": "送信元アドレス",
   "next.networking.egress.downloadLimit": "ダウンロード上限",
-  "next.attention.egressQuotaReached": "{{name}} のダウンロード容量に達しました",
+  "next.attention.egressQuotaReached":
+    "{{name}} のダウンロード容量に達しました",
   "next.monitoring.quotaNotEnforced": "適用されていません",
   "next.monitoring.egressLink": "設定 → ネットワーク → Egress",
   "next.monitoring.quotaUsed": "{{name}} のダウンロード容量の使用量",
@@ -2004,23 +2419,32 @@ export const nextJa: LocaleDictionary = {
   "next.torrents.seeding": "シード",
   "next.torrents.connection": "接続",
   "next.torrents.enabled": "有効",
-  "next.torrents.windingDown": "トレントはオフです。実行中のトレントは完了まで続けます。新しいトレントは追加されません。",
+  "next.torrents.windingDown":
+    "トレントはオフです。実行中のトレントは完了まで続けます。新しいトレントは追加されません。",
   "next.torrents.offTitle": "トレントをオフにする",
   "next.torrents.enableButton": "トレントを有効にする",
-  "next.torrents.enableBody": "トレントは初期ベータ版です。自己責任でご利用ください。",
-  "next.torrents.offBody": "実行中のトレントがあります。どのように終了しますか？どの場合も新しいトレントは追加されません。",
-  "next.torrents.offIdleBody": "実行中のトレントはありません。トレントは今すぐオフになり、新しいトレントは追加されません。",
-  "next.torrents.offFinishDownloadsBox": "実行中のトレントのダウンロードを完了する",
-  "next.torrents.offFinishDownloadsOn": "ダウンロード中のトレントを先に完了します。",
-  "next.torrents.offFinishDownloadsOff": "ダウンロード中のトレントは今すぐ停止します。",
+  "next.torrents.enableBody":
+    "トレントは初期ベータ版です。自己責任でご利用ください。",
+  "next.torrents.offBody":
+    "実行中のトレントがあります。どのように終了しますか？どの場合も新しいトレントは追加されません。",
+  "next.torrents.offIdleBody":
+    "実行中のトレントはありません。トレントは今すぐオフになり、新しいトレントは追加されません。",
+  "next.torrents.offFinishDownloadsBox":
+    "実行中のトレントのダウンロードを完了する",
+  "next.torrents.offFinishDownloadsOn":
+    "ダウンロード中のトレントを先に完了します。",
+  "next.torrents.offFinishDownloadsOff":
+    "ダウンロード中のトレントは今すぐ停止します。",
   "next.torrents.offFinishSeedingBox": "実行中のジョブのシードを完了する",
   "next.torrents.offFinishSeedingOff": "シード中のトレントは今すぐ停止します。",
   "next.torrents.offForceTitle": "すべてのトレントをキャンセル",
-  "next.torrents.offForceBody": "すべてのトレントが強制的にキャンセルされ、プライベートトラッカーでヒットアンドランになる可能性があります。",
+  "next.torrents.offForceBody":
+    "すべてのトレントが強制的にキャンセルされ、プライベートトラッカーでヒットアンドランになる可能性があります。",
   "next.torrents.offStopNow": "すべてのトレント処理を今すぐ停止",
   "next.torrents.offStopNowNote": "すべてのトレントがすぐに停止します。",
   "next.torrents.stopNow": "今すぐ停止",
-  "next.torrents.finishAllForced": "強制中の torrent、またはシード上限のない torrent は「今すぐ停止」までシードを続けます。",
+  "next.torrents.finishAllForced":
+    "強制中の torrent、またはシード上限のない torrent は「今すぐ停止」までシードを続けます。",
   "next.torrents.basePort": "基本ポート",
   "next.torrents.announcePort": "アナウンスポート",
   "next.torrents.upnp": "UPnP",
@@ -2036,13 +2460,17 @@ export const nextJa: LocaleDictionary = {
   "next.torrents.bittorrent": "BitTorrent",
   "next.torrents.advanced": "詳細",
   "next.torrents.peerTcp": "TCP",
-  "next.torrents.peerTcpHelp": "ピアとの接続と受け入れを TCP で行います。TCP と uTP のどちらかはオンのままです。",
+  "next.torrents.peerTcpHelp":
+    "ピアとの接続と受け入れを TCP で行います。TCP と uTP のどちらかはオンのままです。",
   "next.torrents.peerUtp": "uTP",
-  "next.torrents.peerUtpHelp": "ピアとの接続と受け入れを uTP で行います。TCP と uTP のどちらかはオンのままです。",
+  "next.torrents.peerUtpHelp":
+    "ピアとの接続と受け入れを uTP で行います。TCP と uTP のどちらかはオンのままです。",
   "next.torrents.preferDownloading": "ダウンロード中に優先",
-  "next.torrents.preferDownloadingHelp": "トレントに必要なピースが欠けている間、各ピアに最初に試す方式です。失敗したらもう一方を試します。",
+  "next.torrents.preferDownloadingHelp":
+    "トレントに必要なピースが欠けている間、各ピアに最初に試す方式です。失敗したらもう一方を試します。",
   "next.torrents.preferSeeding": "シード中に優先",
-  "next.torrents.preferSeedingHelp": "トレントが必要なピースをすべて持った後、各ピアに最初に試す方式です。失敗したらもう一方を試します。",
+  "next.torrents.preferSeedingHelp":
+    "トレントが必要なピースをすべて持った後、各ピアに最初に試す方式です。失敗したらもう一方を試します。",
   "next.torrents.connectionsLimit": "全体の接続数",
   "next.torrents.unchokeSlots": "アップロードスロット",
   "next.torrents.blocklistEnabled": "IP フィルター",
@@ -2062,18 +2490,22 @@ export const nextJa: LocaleDictionary = {
   "next.torrents.trackerRule": "トラッカールール",
   "next.torrents.trackerRuleAdd": "ルールを追加",
   "next.torrents.trackerRuleNewNote": "新しいトラッカールール",
-  "next.torrents.trackerRuleRemoveBody": "このトラッカーのトレントは、カテゴリまたはグローバルのシード設定に戻ります。",
+  "next.torrents.trackerRuleRemoveBody":
+    "このトラッカーのトレントは、カテゴリまたはグローバルのシード設定に戻ります。",
   "next.torrents.trackerRuleName": "名前",
   "next.torrents.trackerRuleHosts": "ホスト",
-  "next.torrents.trackerRuleHostsNote": "トラッカーのいずれかがチェックしたホストにあるトレントがこのルールに従います。変更はこれ以降に追加されたトレントと、Weaver の再起動後はすべてのトレントに適用されます。",
+  "next.torrents.trackerRuleHostsNote":
+    "トラッカーのいずれかがチェックしたホストにあるトレントがこのルールに従います。変更はこれ以降に追加されたトレントと、Weaver の再起動後はすべてのトレントに適用されます。",
   "next.torrents.trackerRuleHostUnder": "およびその配下のすべてのホスト",
   "next.torrents.trackerRuleHostOnly": "このホストのみ",
   "next.torrents.trackerRuleHostLocked": "{{name}} のトラッカーファイルで設定",
   "next.torrents.trackerRuleHostAdd": "追加",
   "next.torrents.trackerRuleHostsMore": "{{host}} +{{count}}",
   "next.torrents.trackerRuleHostsNone": "ホストを 1 つ以上追加してください。",
-  "next.torrents.trackerRuleFilePrivate": "プライベートトレント: 記載のトラッカーはすべてチェックされます。",
-  "next.torrents.trackerRuleFilePublic": "公開トレント: メイントラッカーのみチェックされます。ルールに含める他のトラッカーもチェックしてください。",
+  "next.torrents.trackerRuleFilePrivate":
+    "プライベートトレント: 記載のトラッカーはすべてチェックされます。",
+  "next.torrents.trackerRuleFilePublic":
+    "公開トレント: メイントラッカーのみチェックされます。ルールに含める他のトラッカーもチェックしてください。",
   "next.torrents.trackerRuleHostKnown": "既知",
   "next.torrents.trackerRuleHostCustom": "カスタム",
   "next.torrents.trackerRuleHostFile": "Torrent ファイル",
@@ -2089,7 +2521,8 @@ export const nextJa: LocaleDictionary = {
   "next.torrents.trackerRulePrivate": "プライベートトラッカー",
   "next.torrents.trackerRulePublic": "パブリックトラッカー",
   "next.torrents.trackerRuleAdvanced": "詳細設定",
-  "next.torrents.trackerRuleCovers": "チェックしたホストにトラッカーがあるトレントに適用され、そのトレントのすべてのトラッカーとピアにも適用されます。",
+  "next.torrents.trackerRuleCovers":
+    "チェックしたホストにトラッカーがあるトレントに適用され、そのトレントのすべてのトラッカーとピアにも適用されます。",
   "next.torrents.trackerRuleEffective": "実効値: {{value}}",
   "next.torrents.trackerRuleGoalInherited": "全体のシード設定から",
   "next.torrents.trackerRuleRouteOwn": "ルートで編集",
@@ -2109,7 +2542,8 @@ export const nextJa: LocaleDictionary = {
   "next.torrents.trackerFileRecommended": "推奨",
   "next.torrents.trackerFileArchivePasswords": "アーカイブのパスワード",
   "next.torrents.trackerFileUnbind": "解除",
-  "next.torrents.trackerFileUnbindBody": "すべての値はそのまま残り、編集できます。",
+  "next.torrents.trackerFileUnbindBody":
+    "すべての値はそのまま残り、編集できます。",
   "next.torrents.trackerRuleCertificatePem": "証明書",
   "next.torrents.trackerRulePrivateKey": "秘密鍵",
   "next.torrents.trackerRulesEmpty": "トラッカールールはありません。",
@@ -2142,13 +2576,19 @@ export const nextJa: LocaleDictionary = {
   "next.torrents.routeReason.QUOTA_SILENCED": "割り当て量に到達",
   "next.torrents.routeReason.TORRENTS_DISABLED": "トレントは無効",
   "next.torrents.routeReason.LEG_OPEN_FAILED": "接続経路を開けませんでした",
-  "next.torrents.routeReason.STATE_DIRECTORY_FAILED": "状態ディレクトリを利用できません",
-  "next.torrents.routeReason.LISTEN_PORT_UNAVAILABLE": "待受ポートを利用できません",
-  "next.torrents.routeReason.LISTEN_PORT_BIND_FAILED": "待受ポートをバインドできませんでした",
-  "next.torrents.routeReason.SESSION_STATE_UNREADABLE": "セッション状態を読み取れません",
-  "next.torrents.routeReason.SESSION_BUILD_FAILED": "セッションを開けませんでした",
+  "next.torrents.routeReason.STATE_DIRECTORY_FAILED":
+    "状態ディレクトリを利用できません",
+  "next.torrents.routeReason.LISTEN_PORT_UNAVAILABLE":
+    "待受ポートを利用できません",
+  "next.torrents.routeReason.LISTEN_PORT_BIND_FAILED":
+    "待受ポートをバインドできませんでした",
+  "next.torrents.routeReason.SESSION_STATE_UNREADABLE":
+    "セッション状態を読み取れません",
+  "next.torrents.routeReason.SESSION_BUILD_FAILED":
+    "セッションを開けませんでした",
   "next.torrents.routeReason.UTP_UNAVAILABLE": "uTP のみ、ルートが uTP 非対応",
-  "next.torrents.routeReason.BLOCKLIST_FAILED": "ブロックリストを読み込めませんでした",
+  "next.torrents.routeReason.BLOCKLIST_FAILED":
+    "ブロックリストを読み込めませんでした",
   "next.torrents.routeReason.SESSION_LIMIT": "セッション数の上限に到達",
   "next.torrents.routeReason.OPENING": "開いています",
   "next.torrents.stated.DISK_SPACE": "ディスク容量不足",
@@ -2159,7 +2599,8 @@ export const nextJa: LocaleDictionary = {
   "next.torrents.stated.HELD_SCHEDULED": "スケジュールで保留中",
   "next.torrents.stated.HELD_SPEED_TEST": "速度テストのため保留中",
   "next.torrents.stated.FETCH_TRACKERS": "トラッカーにピアを問い合わせ中",
-  "next.torrents.stated.FETCH_DISCOVERY": "トラッカー、DHT、LSD にピアを問い合わせ中",
+  "next.torrents.stated.FETCH_DISCOVERY":
+    "トラッカー、DHT、LSD にピアを問い合わせ中",
   "next.torrents.stated.FETCH_WAITING": "トラッカーからピアなし",
   "next.torrents.routesEmpty": "ルートはありません。",
   "next.seeding.ratioGoal": "比率の目標",
@@ -2207,7 +2648,8 @@ export const nextJa: LocaleDictionary = {
   "next.quota.trickle": "低速",
   "next.quota.stopped": "停止",
   "next.monitoring.egressQuotas": "Egress 容量",
-  "next.monitoring.noEgressQuota": "容量が設定された Egress はありません。{{link}} で設定できます。",
+  "next.monitoring.noEgressQuota":
+    "容量が設定された Egress はありません。{{link}} で設定できます。",
   "next.schedules.speedGlobalUpload": "全体のアップロード上限",
   "next.schedules.speedSet": "制限",
   "next.protocol.torrent": "トレント",
@@ -2216,7 +2658,8 @@ export const nextJa: LocaleDictionary = {
   "next.torrent.removeTitle": "トレントを削除",
   "next.torrent.deleteFiles": "ファイルも削除",
   "next.torrent.unmetGoalTitle": "シード目標未達成",
-  "next.torrent.unmetGoalBody": "シード目標はまだ達成されていません: {{left}}。",
+  "next.torrent.unmetGoalBody":
+    "シード目標はまだ達成されていません: {{left}}。",
   "next.torrent.removeAnyway": "それでも削除",
   "next.torrent.seedingCell": "比率 · アップロード",
   "next.torrent.force": "強制",
@@ -2227,8 +2670,10 @@ export const nextJa: LocaleDictionary = {
   "next.torrent.forced": "強制中",
   "next.torrent.unforced": "強制を解除しました",
   "next.torrent.recheck": "再チェック",
-  "next.torrent.recheckBody": "すべてのピースをディスクから読み直して再確認します。",
-  "next.torrent.filesMissingBody": "このトレントのファイルがフォルダーにないため、再開できません。ファイルを元に戻すか、ファイルのあるフォルダーへトレントを移動してください。ダウンロードをやり直す場合は再チェックしてください。ディスク上のデータは残り、残りが再度取得されます。",
+  "next.torrent.recheckBody":
+    "すべてのピースをディスクから読み直して再確認します。",
+  "next.torrent.filesMissingBody":
+    "このトレントのファイルがフォルダーにないため、再開できません。ファイルを元に戻すか、ファイルのあるフォルダーへトレントを移動してください。ダウンロードをやり直す場合は再チェックしてください。ディスク上のデータは残り、残りが再度取得されます。",
   "next.torrent.rechecking": "再チェック中",
   "next.torrent.move": "移動",
   "next.torrent.moved": "移動しました",
@@ -2241,7 +2686,8 @@ export const nextJa: LocaleDictionary = {
   "next.torrent.transfer": "転送",
   "next.torrent.information": "情報",
   "next.torrent.timeActive": "アクティブ時間",
-  "next.torrent.timeActiveSeeded": "{{active}}（シード {{seeded}}、連続 {{run}}）",
+  "next.torrent.timeActiveSeeded":
+    "{{active}}（シード {{seeded}}、連続 {{run}}）",
   "next.torrent.eta": "残り時間",
   "next.torrent.connections": "接続",
   "next.torrent.connectionsValue": "{{count}} (最大 {{max}})",
@@ -2289,7 +2735,8 @@ export const nextJa: LocaleDictionary = {
   "next.torrent.addTrackers": "トラッカーを追加",
   "next.torrent.editTracker": "トラッカーを編集",
   "next.torrent.trackerUrls": "トラッカーのURL",
-  "next.torrent.privateTrackerWarning": "このトレントは非公開です。そのトラッカーから提供された URL だけを追加してください。",
+  "next.torrent.privateTrackerWarning":
+    "このトレントは非公開です。そのトラッカーから提供された URL だけを追加してください。",
   "next.torrent.trackerUrl": "トラッカーURL",
   "next.torrent.trackerSource": "ソース",
   "next.torrent.trackerStatus": "状態",
@@ -2320,10 +2767,13 @@ export const nextJa: LocaleDictionary = {
   "next.quota.remaining": "残り {{size}}",
   "next.networking.egress.quota": "容量",
   "next.networking.egress.enabled": "有効",
-  "next.networking.egress.systemHelp": "システムの送信は常に有効です。OS 自身のルーティングです。",
+  "next.networking.egress.systemHelp":
+    "システムの送信は常に有効です。OS 自身のルーティングです。",
   "next.networking.egress.nameRequired": "送信に名前を付けてください。",
-  "next.networking.egress.interfaceRequired": "バインドするインターフェースを選んでください。",
-  "next.networking.egress.sourceRequired": "バインドする送信元アドレスを入力してください。",
+  "next.networking.egress.interfaceRequired":
+    "バインドするインターフェースを選んでください。",
+  "next.networking.egress.sourceRequired":
+    "バインドする送信元アドレスを入力してください。",
   "next.networking.egress.test": "テスト",
   "next.networking.testVia.title": "ルート経由でテスト",
   "next.networking.testVia.route": "ルート",
@@ -2342,7 +2792,8 @@ export const nextJa: LocaleDictionary = {
   "next.networking.testVia.resolvedSystem": "システム",
   "next.networking.testVia.resolvedProxy": "プロキシ ({{name}})",
   "next.networking.testVia.resolvedServers": "DNS {{servers}}（{{name}} 経由）",
-  "next.networking.testVia.resolvedWeaver": "Weaver: {{name}} 経由の DNS {{servers}}",
+  "next.networking.testVia.resolvedWeaver":
+    "Weaver: {{name}} 経由の DNS {{servers}}",
   "next.networking.testVia.cached": "キャッシュ済み",
   "next.networking.testVia.torrent": "テストトレント",
   "next.networking.testVia.step.TORRENT": "トレント",
@@ -2355,39 +2806,47 @@ export const nextJa: LocaleDictionary = {
   "next.networking.pools.title": "プロキシプール",
   "next.networking.pools.count.one": "{{count}} プール",
   "next.networking.pools.count.other": "{{count}} プール",
-  "next.networking.pools.note": "プールは同じ種類のプロキシを競わせ、配信実績のあるメンバーを優先します。WireGuard はすべての送信経路で最大 {{count}} 本のトンネルを使え、1 本ごとに {{budget}} MiB を確保します。",
+  "next.networking.pools.note":
+    "プールは同じ種類のプロキシを競わせ、配信実績のあるメンバーを優先します。WireGuard はすべての送信経路で最大 {{count}} 本のトンネルを使え、1 本ごとに {{budget}} MiB を確保します。",
   "next.networking.pools.name": "名前",
   "next.networking.pools.type": "プロキシの種類",
-  "next.networking.pools.typeHelp": "メンバーはすべてこの種類です。変更するとメンバーは外れます。",
+  "next.networking.pools.typeHelp":
+    "メンバーはすべてこの種類です。変更するとメンバーは外れます。",
   "next.networking.pools.members": "メンバー",
   "next.networking.pools.noCandidates": "{{kind}} プロキシはまだありません。",
   "next.networking.pools.state": "状態",
   "next.networking.pools.enabled": "有効",
-  "next.networking.pools.empty": "プールはまだありません。単独のプロキシをルートで直接使うこともできます。",
+  "next.networking.pools.empty":
+    "プールはまだありません。単独のプロキシをルートで直接使うこともできます。",
   "next.networking.pools.add": "プールを追加",
   "next.networking.pools.save": "プールを保存",
   "next.networking.pools.section": "プール",
   "next.networking.pools.nameRequired": "プールに名前を付けてください。",
   "next.networking.pools.delete": "プールを削除",
-  "next.networking.pools.deleteBody": "{{name}} を削除しますか？先にすべてのルートから外す必要があります。",
+  "next.networking.pools.deleteBody":
+    "{{name}} を削除しますか？先にすべてのルートから外す必要があります。",
   "next.networking.pools.test": "プールをテスト",
   "next.networking.pools.testVia": "テスト",
   "next.networking.routes.title": "利用先ごとのルート",
-  "next.networking.routes.note": "サーバーとフィードはそれぞれ独自のルートを持ちます",
+  "next.networking.routes.note":
+    "サーバーとフィードはそれぞれ独自のルートを持ちます",
   "next.networking.routes.consumer": "利用先",
   "next.networking.routes.type": "種類",
   "next.networking.routes.typeHttp": "HTTP",
   "next.networking.routes.typeUsenet": "Usenet",
   "next.networking.routes.typeTorrent": "トレント",
   "next.networking.routes.live": "ライブ",
-  "next.networking.routes.empty": "ルートを割り当てる前にサーバーか RSS フィードを追加してください。",
+  "next.networking.routes.empty":
+    "ルートを割り当てる前にサーバーか RSS フィードを追加してください。",
   "next.networking.routes.rssFeed": "RSS フィード",
   "next.networking.routes.editorTitle": "{{name}} のルート",
   "next.networking.routes.save": "ルートを保存",
-  "next.networking.route.intro": "最大 {{count}} 本の接続を独立した経路に分けます。重みを変えても、実行中の転送はその経路で完了します。",
+  "next.networking.route.intro":
+    "最大 {{count}} 本の接続を独立した経路に分けます。重みを変えても、実行中の転送はその経路で完了します。",
   "next.networking.route.distribution": "レッグごとの重み配分",
   "next.networking.route.legWeight": "レッグ {{position}} の重み",
-  "next.networking.route.preview": "プレビューのみ：{{assigned}} 割り当て、{{parked}} 保留。動作中のルートは変わりません。",
+  "next.networking.route.preview":
+    "プレビューのみ：{{assigned}} 割り当て、{{parked}} 保留。動作中のルートは変わりません。",
   "next.networking.route.leg": "レッグ {{position}}",
   "next.networking.route.live": "{{open}}/{{target}} 接続 · {{source}}",
   "next.networking.route.noSource": "送信元アドレスはまだありません",
@@ -2409,9 +2868,11 @@ export const nextJa: LocaleDictionary = {
   "next.networking.route.rungUp": "段を上へ",
   "next.networking.route.rungDown": "段を下へ",
   "next.networking.route.removeRung": "段を削除",
-  "next.networking.route.noRungs": "段を追加して、このレッグが通るプロキシを選んでください。",
+  "next.networking.route.noRungs":
+    "段を追加して、このレッグが通るプロキシを選んでください。",
   "next.networking.route.addRung": "段を追加",
-  "next.networking.route.directFallback": "この送信で直接接続へのフォールバックを許可",
+  "next.networking.route.directFallback":
+    "この送信で直接接続へのフォールバックを許可",
   "next.networking.route.target": "目標：{{count}} 接続",
   "next.networking.route.simulateDown": "レッグ停止を試す",
   "next.networking.route.legUp": "上へ",
@@ -2445,15 +2906,19 @@ export const nextJa: LocaleDictionary = {
   "next.networking.speed.sab.GB_10": "10 GB",
   "next.networking.speed.run": "実行",
   "next.networking.speed.pauseTitle": "ダウンロードを一時停止しますか？",
-  "next.networking.speed.pauseBody": "テスト中はダウンロードを一時停止し、終了後に再開します。",
+  "next.networking.speed.pauseBody":
+    "テスト中はダウンロードを一時停止し、終了後に再開します。",
   "next.networking.speed.pauseConfirm": "一時停止して実行",
   "next.networking.speed.cancel": "テストを中止",
   "next.networking.speed.upSwitch": "稼働",
   "next.networking.speed.downSwitch": "停止",
-  "next.networking.speed.usenetNeedsServer": "フィードにはテストできる Usenet サーバーがありません。",
-  "next.networking.speed.torrentNeedsTorrentRoute": "トレントテストにはトレントのルートが必要です。",
+  "next.networking.speed.usenetNeedsServer":
+    "フィードにはテストできる Usenet サーバーがありません。",
+  "next.networking.speed.torrentNeedsTorrentRoute":
+    "トレントテストにはトレントのルートが必要です。",
   "next.networking.speed.customUrlInvalid": "HTTPS の URL を入力してください。",
-  "next.networking.speed.nzbUrlInvalid": "NZB の http または https URL を入力してください。",
+  "next.networking.speed.nzbUrlInvalid":
+    "NZB の http または https URL を入力してください。",
   "next.networking.speed.nzbFileMissing": ".nzb ファイルを選択してください。",
   "next.networking.speed.phase.pausing": "ダウンロードを一時停止中",
   "next.networking.speed.phase.draining": "実行中の {{count}} 件を待機中",
@@ -2475,7 +2940,8 @@ export const nextJa: LocaleDictionary = {
   "next.networking.speed.decoded": "デコード済み",
   "next.networking.speed.upload": "アップロード",
   "next.networking.speed.uploadPeers": "ピアへのアップロード（下限）",
-  "next.networking.speed.uploadOutcome.UNAVAILABLE": "{{provider}} はアップロードを受け付けません",
+  "next.networking.speed.uploadOutcome.UNAVAILABLE":
+    "{{provider}} はアップロードを受け付けません",
   "next.networking.speed.uploadOutcome.NO_DEMAND": "需要なし",
   "next.networking.speed.uploadOutcome.FAILED": "失敗",
   "next.networking.speed.uploadOutcome.MEASURED": "測定済み",
@@ -2483,60 +2949,107 @@ export const nextJa: LocaleDictionary = {
   "next.networking.speed.status.COMPLETED": "完了",
   "next.networking.speed.status.CANCELLED": "中止",
   "next.networking.speed.status.FAILED": "失敗",
-  "next.networking.speed.failure.RATE_LIMITED": "プロバイダーが現在あなたの IP を制限しています。別のプロバイダーを選んでください。",
-  "next.networking.speed.failure.HTTP_STATUS": "プロバイダーが HTTP {{status}} を返しました。",
-  "next.networking.speed.failure.TLS_VERIFICATION": "{{host}} の TLS 検証に失敗しました。",
-  "next.networking.speed.failure.UNRESOLVED": "{{host}} を名前解決できませんでした。",
-  "next.networking.speed.failure.ADDRESS_NOT_ALLOWED": "{{host}} は許可されていないアドレスに解決されます。",
-  "next.networking.speed.failure.EGRESS_QUOTA_USED": "送信インターフェースはダウンロード上限に達しています。",
+  "next.networking.speed.failure.RATE_LIMITED":
+    "プロバイダーが現在あなたの IP を制限しています。別のプロバイダーを選んでください。",
+  "next.networking.speed.failure.HTTP_STATUS":
+    "プロバイダーが HTTP {{status}} を返しました。",
+  "next.networking.speed.failure.TLS_VERIFICATION":
+    "{{host}} の TLS 検証に失敗しました。",
+  "next.networking.speed.failure.UNRESOLVED":
+    "{{host}} を名前解決できませんでした。",
+  "next.networking.speed.failure.ADDRESS_NOT_ALLOWED":
+    "{{host}} は許可されていないアドレスに解決されます。",
+  "next.networking.speed.failure.EGRESS_QUOTA_USED":
+    "送信インターフェースはダウンロード上限に達しています。",
   "next.networking.speed.failure.NO_LEG_UP": "有効なレグがありません。",
-  "next.networking.speed.failure.LEASE_REFUSED": "{{name}} は接続を貸し出せません: {{reason}}。",
-  "next.networking.speed.failure.SERVER_LEFT_POOL": "サーバーが接続プールから外れました。",
+  "next.networking.speed.failure.LEASE_REFUSED":
+    "{{name}} は接続を貸し出せません: {{reason}}。",
+  "next.networking.speed.failure.SERVER_LEFT_POOL":
+    "サーバーが接続プールから外れました。",
   "next.networking.speed.failure.STOPPED": "速度テストは停止されました。",
-  "next.networking.speed.failure.STOPPED_UNEXPECTEDLY": "速度テストが予期せず停止しました。",
+  "next.networking.speed.failure.STOPPED_UNEXPECTEDLY":
+    "速度テストが予期せず停止しました。",
   "next.networking.speed.failure.NO_BYTES": "バイトを受信しませんでした。",
-  "next.proxyFault.NAME_NOT_RESOLVED": "ホスト名を解決できませんでした。綴りと DNS サーバーを確認してください。",
-  "next.proxyFault.CONNECTION_REFUSED": "接続が拒否されました。ポートと、プロキシが動作していることを確認してください。",
-  "next.proxyFault.HOST_UNREACHABLE": "ホストに到達できません。アドレスと、そこまでのネットワーク経路を確認してください。",
-  "next.proxyFault.NETWORK_UNREACHABLE": "ネットワークに到達できません。このマシンのネットワーク接続を確認してください。",
-  "next.proxyFault.NO_ROUTE_VIA": "{{via}} 経由の経路がありません。そのインターフェースのネットワーク接続を確認してください。",
-  "next.proxyFault.CONNECTION_CLOSED": "プロキシが応答する前に接続が閉じられました。プロキシの種類とポートを確認してください。",
-  "next.proxyFault.TIMED_OUT": "{{seconds}} 秒以内に応答がありません。アドレス、ポート、ファイアウォールを確認してください。",
-  "next.proxyFault.UDP_TIMED_OUT": "{{seconds}} 秒以内に UDP で応答がありません。アドレス、ポート、ファイアウォールが UDP を通すことを確認してください。",
-  "next.proxyFault.EGRESS_UNUSABLE": "送信インターフェースを使用できませんでした。有効になっていて、アドレスがあることを確認してください。",
-  "next.proxyFault.NOT_A_PROXY": "サーバーが {{protocol}} プロキシプロトコルで応答しませんでした。プロキシの種類とポートを確認してください。",
-  "next.proxyFault.AUTH_REQUIRED": "プロキシにはユーザー名とパスワードが必要です。",
-  "next.proxyFault.AUTH_UNSUPPORTED": "プロキシはユーザー名とパスワードを受け付けません。削除してください。",
-  "next.proxyFault.CREDENTIALS_REJECTED": "プロキシがユーザー名またはパスワードを拒否しました。",
-  "next.proxyFault.CREDENTIALS_INVALID": "SOCKS5 では、ユーザー名は 1〜255 バイト、パスワードは 255 バイト以下にしてください。",
-  "next.proxyFault.CLOSED_DURING_SIGN_IN": "サインイン中にプロキシが接続を閉じました。ユーザー名とパスワードを確認してください。",
-  "next.proxyFault.CONNECT_REFUSED": "プロキシが HTTP {{status}} で接続を拒否しました。",
+  "next.proxyFault.NAME_NOT_RESOLVED":
+    "ホスト名を解決できませんでした。綴りと DNS サーバーを確認してください。",
+  "next.proxyFault.CONNECTION_REFUSED":
+    "接続が拒否されました。ポートと、プロキシが動作していることを確認してください。",
+  "next.proxyFault.HOST_UNREACHABLE":
+    "ホストに到達できません。アドレスと、そこまでのネットワーク経路を確認してください。",
+  "next.proxyFault.NETWORK_UNREACHABLE":
+    "ネットワークに到達できません。このマシンのネットワーク接続を確認してください。",
+  "next.proxyFault.NO_ROUTE_VIA":
+    "{{via}} 経由の経路がありません。そのインターフェースのネットワーク接続を確認してください。",
+  "next.proxyFault.CONNECTION_CLOSED":
+    "プロキシが応答する前に接続が閉じられました。プロキシの種類とポートを確認してください。",
+  "next.proxyFault.TIMED_OUT":
+    "{{seconds}} 秒以内に応答がありません。アドレス、ポート、ファイアウォールを確認してください。",
+  "next.proxyFault.UDP_TIMED_OUT":
+    "{{seconds}} 秒以内に UDP で応答がありません。アドレス、ポート、ファイアウォールが UDP を通すことを確認してください。",
+  "next.proxyFault.EGRESS_UNUSABLE":
+    "送信インターフェースを使用できませんでした。有効になっていて、アドレスがあることを確認してください。",
+  "next.proxyFault.NOT_A_PROXY":
+    "サーバーが {{protocol}} プロキシプロトコルで応答しませんでした。プロキシの種類とポートを確認してください。",
+  "next.proxyFault.AUTH_REQUIRED":
+    "プロキシにはユーザー名とパスワードが必要です。",
+  "next.proxyFault.AUTH_UNSUPPORTED":
+    "プロキシはユーザー名とパスワードを受け付けません。削除してください。",
+  "next.proxyFault.CREDENTIALS_REJECTED":
+    "プロキシがユーザー名またはパスワードを拒否しました。",
+  "next.proxyFault.CREDENTIALS_INVALID":
+    "SOCKS5 では、ユーザー名は 1〜255 バイト、パスワードは 255 バイト以下にしてください。",
+  "next.proxyFault.CLOSED_DURING_SIGN_IN":
+    "サインイン中にプロキシが接続を閉じました。ユーザー名とパスワードを確認してください。",
+  "next.proxyFault.CONNECT_REFUSED":
+    "プロキシが HTTP {{status}} で接続を拒否しました。",
   "next.proxyFault.DESTINATION_REFUSED": "{{target}} が接続を拒否しました。",
-  "next.proxyFault.DESTINATION_UNREACHABLE": "{{target}} に到達できませんでした ({{reply}})。",
-  "next.proxyFault.DESTINATION_TIMED_OUT": "{{target}} が時間内に応答しませんでした。",
-  "next.proxyFault.DESTINATION_FORBIDDEN": "プロキシのルールで {{target}} への接続が許可されていません。",
+  "next.proxyFault.DESTINATION_UNREACHABLE":
+    "{{target}} に到達できませんでした ({{reply}})。",
+  "next.proxyFault.DESTINATION_TIMED_OUT":
+    "{{target}} が時間内に応答しませんでした。",
+  "next.proxyFault.DESTINATION_FORBIDDEN":
+    "プロキシのルールで {{target}} への接続が許可されていません。",
   "next.proxyFault.SSH_KEY_MISSING": "SSH には Ed25519 秘密鍵が必要です。",
-  "next.proxyFault.SSH_KEY_PASSPHRASE": "秘密鍵はパスフレーズで保護されています。パスフレーズを入力してください。",
-  "next.proxyFault.SSH_KEY_NOT_ED25519": "秘密鍵が Ed25519 ではありません。ssh-keygen -t ed25519 で生成してください。",
-  "next.proxyFault.SSH_KEY_UNREADABLE": "秘密鍵を読み取れませんでした。BEGIN 行と END 行を含め、鍵全体を貼り付けてください。",
-  "next.proxyFault.SSH_HOST_KEY_CHANGED": "サーバーのホスト鍵が変わりました。サーバーを確認してから、古いホスト鍵を削除してください。",
-  "next.proxyFault.SSH_KEY_REJECTED": "サーバーが {{username}} の秘密鍵を受け付けませんでした。authorized_keys を確認してください。",
-  "next.proxyFault.SSH_HANDSHAKE_FAILED": "SSH ハンドシェイクに失敗しました: {{detail}}",
-  "next.proxyFault.SSH_FORWARDING_REFUSED": "SSH サーバーが {{target}} への転送を拒否しました。このユーザーの TCP 転送を許可してください。",
-  "next.proxyFault.WIREGUARD_KEY_INVALID": "WireGuard の鍵が無効です。各鍵を wg の出力どおりに貼り付けてください。",
-  "next.proxyFault.WIREGUARD_PEER_IS_SELF": "ピアの公開鍵がこのトンネル自身のものです。サーバーの公開鍵を使用してください。",
-  "next.proxyFault.WIREGUARD_NO_DNS": "トンネルに DNS サーバーがありません。設定の DNS 行を追加するか、IP アドレスを使用してください。",
-  "next.proxyFault.WIREGUARD_NO_HANDSHAKE": "{{seconds}} 秒以内にハンドシェイクがありません。エンドポイントと、サーバーのピア一覧に公開鍵 {{publicKey}} があることを確認してください。",
-  "next.proxyFault.WIREGUARD_FAILED": "WireGuard トンネルを開始できませんでした: {{detail}}",
-  "next.proxyFault.HTTP3_TLS": "プロキシとの TLS に失敗しました。ホスト名とプロキシの証明書を確認してください。",
-  "next.proxyFault.HTTP3_HANDSHAKE_FAILED": "QUIC ハンドシェイクに失敗しました。ポートと、プロキシが HTTP/3 を提供していることを確認してください。",
-  "next.proxyFault.HTTP3_FAILED": "プロキシへの HTTP/3 に失敗しました: {{detail}}",
-  "next.proxyFault.PROXY_UNAVAILABLE": "プロキシが無効か、設定できませんでした。",
-  "next.proxyFault.STREAM_FAILED": "プロキシ経由の接続が、開いた後に失敗しました。",
-  "next.proxyFault.TEST_NEEDS_DNS": "HTTP/3 プロキシのテストには、ホストとポート、または名前解決に使う DNS サーバーが必要です。",
+  "next.proxyFault.SSH_KEY_PASSPHRASE":
+    "秘密鍵はパスフレーズで保護されています。パスフレーズを入力してください。",
+  "next.proxyFault.SSH_KEY_NOT_ED25519":
+    "秘密鍵が Ed25519 ではありません。ssh-keygen -t ed25519 で生成してください。",
+  "next.proxyFault.SSH_KEY_UNREADABLE":
+    "秘密鍵を読み取れませんでした。BEGIN 行と END 行を含め、鍵全体を貼り付けてください。",
+  "next.proxyFault.SSH_HOST_KEY_CHANGED":
+    "サーバーのホスト鍵が変わりました。サーバーを確認してから、古いホスト鍵を削除してください。",
+  "next.proxyFault.SSH_KEY_REJECTED":
+    "サーバーが {{username}} の秘密鍵を受け付けませんでした。authorized_keys を確認してください。",
+  "next.proxyFault.SSH_HANDSHAKE_FAILED":
+    "SSH ハンドシェイクに失敗しました: {{detail}}",
+  "next.proxyFault.SSH_FORWARDING_REFUSED":
+    "SSH サーバーが {{target}} への転送を拒否しました。このユーザーの TCP 転送を許可してください。",
+  "next.proxyFault.WIREGUARD_KEY_INVALID":
+    "WireGuard の鍵が無効です。各鍵を wg の出力どおりに貼り付けてください。",
+  "next.proxyFault.WIREGUARD_PEER_IS_SELF":
+    "ピアの公開鍵がこのトンネル自身のものです。サーバーの公開鍵を使用してください。",
+  "next.proxyFault.WIREGUARD_NO_DNS":
+    "トンネルに DNS サーバーがありません。設定の DNS 行を追加するか、IP アドレスを使用してください。",
+  "next.proxyFault.WIREGUARD_NO_HANDSHAKE":
+    "{{seconds}} 秒以内にハンドシェイクがありません。エンドポイントと、サーバーのピア一覧に公開鍵 {{publicKey}} があることを確認してください。",
+  "next.proxyFault.WIREGUARD_FAILED":
+    "WireGuard トンネルを開始できませんでした: {{detail}}",
+  "next.proxyFault.HTTP3_TLS":
+    "プロキシとの TLS に失敗しました。ホスト名とプロキシの証明書を確認してください。",
+  "next.proxyFault.HTTP3_HANDSHAKE_FAILED":
+    "QUIC ハンドシェイクに失敗しました。ポートと、プロキシが HTTP/3 を提供していることを確認してください。",
+  "next.proxyFault.HTTP3_FAILED":
+    "プロキシへの HTTP/3 に失敗しました: {{detail}}",
+  "next.proxyFault.PROXY_UNAVAILABLE":
+    "プロキシが無効か、設定できませんでした。",
+  "next.proxyFault.STREAM_FAILED":
+    "プロキシ経由の接続が、開いた後に失敗しました。",
+  "next.proxyFault.TEST_NEEDS_DNS":
+    "HTTP/3 プロキシのテストには、ホストとポート、または名前解決に使う DNS サーバーが必要です。",
   "next.proxyTest.CONNECTED": "接続しました。",
   "next.proxyTest.FORWARDED": "接続し、プロキシ経由で転送しました。",
-  "next.proxyTest.REACHABLE": "到達可能です。転送を確認するには、ホストとポートを指定してください。",
+  "next.proxyTest.REACHABLE":
+    "到達可能です。転送を確認するには、ホストとポートを指定してください。",
   "next.lookupError.NO_SUCH_NAME": "名前が存在しません",
   "next.lookupError.NO_ADDRESS": "アドレスなし",
   "next.lookupError.TIMED_OUT": "タイムアウト",
@@ -2600,7 +3113,8 @@ export const nextJa: LocaleDictionary = {
   "next.overview.jobs.other": "{{count}} 件 · 残り {{size}}",
   "next.overview.queueEmpty": "キューは空",
   "next.overview.finishedToday": "今日完了",
-  "next.overview.finished": "完了 {{complete}} · 一部 {{partial}} · 失敗 {{failed}}",
+  "next.overview.finished":
+    "完了 {{complete}} · 一部 {{partial}} · 失敗 {{failed}}",
   "next.overview.dataToday": "今日のデータ",
   "next.overview.dataPeriods": "週 {{week}} · 月 {{month}} · 全期間 {{all}}",
   "next.overview.last30": "過去 30 日",
@@ -2634,10 +3148,12 @@ export const nextJa: LocaleDictionary = {
   "next.integrity.failed": "失敗",
   "next.integrity.repairsPerDay": "1日あたりの修復",
   "next.integrity.noRepairs": "修復なし",
-  "next.integrity.noRepairsBody": "修復が必要だったジョブがここに表示されます。",
+  "next.integrity.noRepairsBody":
+    "修復が必要だったジョブがここに表示されます。",
   "next.integrity.causes": "原因別の失敗",
   "next.integrity.noFailures": "失敗なし",
-  "next.integrity.noFailuresBody": "失敗したジョブが原因別にここに表示されます。",
+  "next.integrity.noFailuresBody":
+    "失敗したジョブが原因別にここに表示されます。",
   "next.integrity.cause.repair": "修復に失敗",
   "next.integrity.cause.password": "パスワードが違うか未設定",
   "next.integrity.cause.disk_full": "ディスクがいっぱい",
@@ -2648,7 +3164,8 @@ export const nextJa: LocaleDictionary = {
   "next.integrity.cause.other": "その他",
   "next.integrity.stages": "段階ごとの時間",
   "next.integrity.noStages": "段階の時間なし",
-  "next.integrity.noStagesBody": "ジョブが実行されると各段階の時間がここに表示されます。",
+  "next.integrity.noStagesBody":
+    "ジョブが実行されると各段階の時間がここに表示されます。",
   "next.integrity.stage": "段階",
   "next.integrity.runs": "回数",
   "next.integrity.average": "平均",
@@ -2667,13 +3184,15 @@ export const nextJa: LocaleDictionary = {
   "next.torrentDash.peersNote": "シード: {{seeds}} · トレント: {{torrents}}",
   "next.torrentDash.perDay": "1日ごと",
   "next.torrentDash.trackers": "トラッカー",
-  "next.torrentDash.trackersNote": "トレントはトラッカールールに、ルールがなければ記載された各トラッカーに数えられます",
+  "next.torrentDash.trackersNote":
+    "トレントはトラッカールールに、ルールがなければ記載された各トラッカーに数えられます",
   "next.torrentDash.tracker": "トラッカー",
   "next.torrentDash.downloaded": "ダウンロード",
   "next.torrentDash.uploaded": "アップロード",
   "next.torrentDash.noTracker": "トラッカーなし",
   "next.torrentDash.none": "トレントなし",
-  "next.torrentDash.noneBody": "トレントを追加すると比率、シード時間、トラッカーがここに表示されます。",
+  "next.torrentDash.noneBody":
+    "トレントを追加すると比率、シード時間、トラッカーがここに表示されます。",
   "next.completed.since": "{{time}} 以降",
   "next.completed.showAll": "すべて表示",
 };

@@ -1423,6 +1423,12 @@ async fn room_made_before_the_first_reading_since_the_failure_lets_the_job_go() 
         "held, it has what its disk showed before the write failed to beat"
     );
 
+    // A probe begun before the failure reads the disk when it runs, and
+    // what it shows is taken as what the disk showed then: room is made
+    // only once every probe begun so far has read and published.
+    let begun = capacity(&pipeline).probes_begun(StorageRoot::Intermediate);
+    capacity(&pipeline).wait_for_probes(StorageRoot::Intermediate, begun);
+
     // Room is made before the disk is looked at again.
     fill_after(None);
     room.store(2 * PLENTY, Ordering::Release);

@@ -50,13 +50,29 @@ export default function LoginPage() {
               className="w-full"
             />
           </Field>
-          <label className="flex items-center gap-2 text-[12px] text-wv-muted"><input type="checkbox" checked={form.remember} onChange={(event) => form.setRemember(event.target.checked)} /> Remember this browser for 30 days</label>
+          <label className="flex items-center gap-2 text-[12px] text-wv-muted">
+            <input
+              type="checkbox"
+              checked={form.remember}
+              onChange={(event) => form.setRemember(event.target.checked)}
+            />{" "}
+            Remember this browser for 30 days
+          </label>
           {form.error ? (
-            <div id="error" role="alert" className="text-[12.5px] leading-[1.45] text-wv-error-text">
+            <div
+              id="error"
+              role="alert"
+              className="text-[12.5px] leading-[1.45] text-wv-error-text"
+            >
               {form.error}
             </div>
           ) : null}
-          <PrimaryButton type="submit" disabled={!form.canSubmit} className="mt-1 w-full justify-center" testId={settingsIds.loginSubmit}>
+          <PrimaryButton
+            type="submit"
+            disabled={!form.canSubmit}
+            className="mt-1 w-full justify-center"
+            testId={settingsIds.loginSubmit}
+          >
             {form.busy ? t("next.login.signingIn") : t("next.login.submit")}
           </PrimaryButton>
         </form>
@@ -73,9 +89,19 @@ export default function LoginPage() {
           {showReset ? (
             <div className="flex w-full flex-col gap-3 border border-wv-hairline bg-wv-chrome p-4 text-[12px] leading-[1.5] text-wv-muted">
               <p>{t("next.login.resetHelp")}</p>
-              <ResetCommand label={t("next.login.docker")} command={LOGIN_RESET_COMMANDS.docker} />
-              <ResetCommand label={t("next.login.bareMetal")} command={LOGIN_RESET_COMMANDS.bareMetal} />
-              <p>Without bootstrap credentials, use the one-time code shown at startup after resetting login. Remove the reset override when setup is complete.</p>
+              <ResetCommand
+                label={t("next.login.docker")}
+                command={LOGIN_RESET_COMMANDS.docker}
+              />
+              <ResetCommand
+                label={t("next.login.bareMetal")}
+                command={LOGIN_RESET_COMMANDS.bareMetal}
+              />
+              <p>
+                Without bootstrap credentials, use the one-time code shown at
+                startup after resetting login. Remove the reset override when
+                setup is complete.
+              </p>
             </div>
           ) : null}
         </div>
@@ -84,10 +110,21 @@ export default function LoginPage() {
   );
 }
 
-function Field({ label, htmlFor, children }: { label: string; htmlFor: string; children: React.ReactNode }) {
+function Field({
+  label,
+  htmlFor,
+  children,
+}: {
+  label: string;
+  htmlFor: string;
+  children: React.ReactNode;
+}) {
   return (
     <div className="flex flex-col gap-[7px]">
-      <label htmlFor={htmlFor} className="text-[12px] font-medium text-wv-secondary">
+      <label
+        htmlFor={htmlFor}
+        className="text-[12px] font-medium text-wv-secondary"
+      >
         {label}
       </label>
       {children}
@@ -99,7 +136,9 @@ function ResetCommand({ label, command }: { label: string; command: string }) {
   return (
     <div className="flex flex-col gap-1">
       <div className="font-medium text-wv-fg">{label}</div>
-      <code className="block break-all bg-wv-input px-2 py-1.5 font-wv-mono text-[11px] text-wv-fg">{command}</code>
+      <code className="block break-all bg-wv-input px-2 py-1.5 font-wv-mono text-[11px] text-wv-fg">
+        {command}
+      </code>
     </div>
   );
 }

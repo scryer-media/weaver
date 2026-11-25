@@ -247,14 +247,38 @@ impl RouteLine {
     // The route is asked because a ring can be late: the socket it rang for
     // may already have gone to a lane let go on the route's word, whose dial
     // has ended. Going on the ring alone would dial the full route again.
-    fn rung(&self) {
+    //
+    // A route still full may name a slot the line does not hear yet (an
+    // allocation change exposed another leg): the line hears it too, or it
+    // could wait forever on slots that no longer free for it.
+    fn rung(self: &Arc<Self>) {
         let going = {
             let mut line = self.line();
             line.rang |= line.going;
             line.going
         };
-        if !going && self.dialer.room().is_ok() {
-            self.let_one_go();
+        if going {
+            return;
+        }
+        match self.dialer.room() {
+            Ok(()) => {
+                self.let_one_go();
+            }
+            Err(more) => {
+                let unheard = {
+                    let line = self.line();
+                    let heard = line
+                        .hearing
+                        .as_ref()
+                        .map(|hearing| hearing.slots.as_slice())
+                        .unwrap_or_default();
+                    more.iter()
+                        .any(|slot| !heard.iter().any(|seen| Arc::ptr_eq(seen, slot)))
+                };
+                if unheard {
+                    self.hear(more, true);
+                }
+            }
         }
     }
 
@@ -429,10 +453,21 @@ mod tests {
     // A route whose room the test sets: none, naming one slot, or room.
     struct Route {
         full_on: Mutex<Option<Arc<Notify>>>,
+        // How many times the line asked the route for room.
+        asked: tokio::sync::watch::Sender<usize>,
+    }
+    impl Route {
+        fn full_on(slot: &Arc<Notify>) -> Arc<Self> {
+            Arc::new(Self {
+                full_on: Mutex::new(Some(Arc::clone(slot))),
+                asked: tokio::sync::watch::channel(0).0,
+            })
+        }
     }
     #[async_trait::async_trait]
     impl Dialer for Route {
         fn room(&self, _: &Purpose) -> Result<(), Vec<Arc<Notify>>> {
+            self.asked.send_modify(|asked| *asked += 1);
             match &*self.full_on.lock().unwrap() {
                 Some(slot) => Err(vec![Arc::clone(slot)]),
                 None => Ok(()),
@@ -472,9 +507,7 @@ mod tests {
     async fn a_refusal_on_an_unheard_slot_that_already_freed_is_not_lost() {
         let socket = Arc::new(Notify::new());
         let budget = Arc::new(Notify::new());
-        let route = Arc::new(Route {
-            full_on: Mutex::new(Some(Arc::clone(&socket))),
-        });
+        let route = Route::full_on(&socket);
         let line = line_over(Arc::clone(&route));
         let first = line.join(vec![Arc::clone(&socket)], false).unwrap();
         let second = line.join(vec![Arc::clone(&socket)], false).unwrap();
@@ -500,6 +533,38 @@ mod tests {
         assert_eq!((state(&third), state(&second)), (WAITING, WAITING));
         budget.notify_waiters();
         assert!(third.given().await);
+        assert_eq!(state(&second), WAITING);
+    }
+
+    // A line waits on slot A. The route's allocation changes and it now
+    // names slot B instead. A rings, but the route is still full on B: the
+    // line hears B too. B then rings with room, and exactly one lane goes.
+    #[tokio::test]
+    async fn a_ring_that_finds_the_route_full_on_a_new_slot_hears_it() {
+        let a = Arc::new(Notify::new());
+        let b = Arc::new(Notify::new());
+        let route = Route::full_on(&a);
+        let line = line_over(Arc::clone(&route));
+        let first = line.join(vec![Arc::clone(&a)], false).unwrap();
+        let second = line.join(vec![Arc::clone(&a)], false).unwrap();
+        assert_eq!((state(&first), state(&second)), (WAITING, WAITING));
+
+        // The route now names B. A rings: the line asks the route, is told
+        // B, hears B with A and asks again.
+        *route.full_on.lock().unwrap() = Some(Arc::clone(&b));
+        let mut asked = route.asked.subscribe();
+        let before = *asked.borrow_and_update();
+        a.notify_waiters();
+        asked
+            .wait_for(|asked| *asked >= before + 2)
+            .await
+            .expect("the route fixture is alive");
+        assert_eq!((state(&first), state(&second)), (WAITING, WAITING));
+
+        // B frees: exactly one lane goes.
+        *route.full_on.lock().unwrap() = None;
+        b.notify_waiters();
+        assert!(first.given().await);
         assert_eq!(state(&second), WAITING);
     }
 }

@@ -5,7 +5,14 @@ import { useMemo, useState } from "react";
 import { useLocation, useNavigate } from "react-router";
 import { SAVE_ROUTE } from "@/graphql/networking";
 import { useTranslate } from "@/lib/context/translate-context";
-import { isTorrentConsumer, routeInput, routeProblem, type ConsumerKind, type NetworkFlow, type NetworkRoute } from "@/lib/networking";
+import {
+  isTorrentConsumer,
+  routeInput,
+  routeProblem,
+  type ConsumerKind,
+  type NetworkFlow,
+  type NetworkRoute,
+} from "@/lib/networking";
 import { SYSTEM_DNS_PROFILE_ID, dnsRouteProblem } from "@/lib/dns";
 import { cn } from "@/lib/utils";
 import { networkIds, testIds } from "@/next/testids";
@@ -13,8 +20,17 @@ import { Dialog } from "../../components/Dialog";
 import { PrimaryButton, SecondaryButton } from "../../components/controls";
 import { Icon } from "../../components/icons";
 import { Cell } from "../../components/rows";
-import { SettingsBlocks, type SettingsBlock } from "../../pages/settings/framework";
-import { defaultRoute, speedPage, type Consumer, type NetworkingAction, type NetworkingData } from "./data";
+import {
+  SettingsBlocks,
+  type SettingsBlock,
+} from "../../pages/settings/framework";
+import {
+  defaultRoute,
+  speedPage,
+  type Consumer,
+  type NetworkingAction,
+  type NetworkingData,
+} from "./data";
 import { useRouteDnsProfiles } from "./dns-choices";
 import { RouteEditor } from "./RouteEditor";
 import { stateLabel, StatusMark } from "./presentation";
@@ -47,17 +63,34 @@ type SortColumn = "name" | "type";
 type Sort = { column: SortColumn; descending: boolean };
 
 /** A header the table sorts by: a click sorts by it, a second click turns it around. */
-function SortHeader({ label, column, sort, onSort }: { label: string; column: SortColumn; sort: Sort; onSort: (column: SortColumn) => void }) {
+function SortHeader({
+  label,
+  column,
+  sort,
+  onSort,
+}: {
+  label: string;
+  column: SortColumn;
+  sort: Sort;
+  onSort: (column: SortColumn) => void;
+}) {
   const active = sort.column === column;
   return (
     <button
       type="button"
       aria-pressed={active}
       onClick={() => onSort(column)}
-      className={cn("flex cursor-pointer items-center gap-1 uppercase hover:text-wv-strong", active && "text-wv-strong")}
+      className={cn(
+        "flex cursor-pointer items-center gap-1 uppercase hover:text-wv-strong",
+        active && "text-wv-strong",
+      )}
     >
       {label}
-      <Icon name={active ? (sort.descending ? "moveDown" : "moveUp") : "priority"} size={11} className={cn("flex-none", !active && "opacity-50")} />
+      <Icon
+        name={active ? (sort.descending ? "moveDown" : "moveUp") : "priority"}
+        size={11}
+        className={cn("flex-none", !active && "opacity-50")}
+      />
     </button>
   );
 }
@@ -68,7 +101,10 @@ function consumerState(flow: NetworkFlow, consumer: Consumer): string {
   if (legs.some((leg) => leg.open > 0)) {
     return "ACTIVE";
   }
-  if (legs.length > 0 && legs.every((leg) => leg.state === "DOWN" || leg.state === "BLOCKED")) {
+  if (
+    legs.length > 0 &&
+    legs.every((leg) => leg.state === "DOWN" || leg.state === "BLOCKED")
+  ) {
     return "DOWN";
   }
   return "IDLE";
@@ -91,19 +127,26 @@ export function RoutesPage({
   const location = useLocation();
   const navigate = useNavigate();
   const requested = new URLSearchParams(location.search).get("consumer");
-  const preselected = consumers.find((consumer) => consumer.key === requested) ?? null;
+  const preselected =
+    consumers.find((consumer) => consumer.key === requested) ?? null;
   const [editing, setEditing] = useState<Consumer | null>(preselected);
   const [sort, setSort] = useState<Sort>({ column: "name", descending: false });
-  const typeLabel = (consumer: Pick<Consumer, "kind">) => t(TYPE_KEYS[consumerType(consumer.kind)]);
+  const typeLabel = (consumer: Pick<Consumer, "kind">) =>
+    t(TYPE_KEYS[consumerType(consumer.kind)]);
   const sorted = useMemo(() => {
     const byName = (a: Consumer, b: Consumer) => a.name.localeCompare(b.name);
     const byType = (a: Consumer, b: Consumer) =>
-      t(TYPE_KEYS[consumerType(a.kind)]).localeCompare(t(TYPE_KEYS[consumerType(b.kind)])) || byName(a, b);
+      t(TYPE_KEYS[consumerType(a.kind)]).localeCompare(
+        t(TYPE_KEYS[consumerType(b.kind)]),
+      ) || byName(a, b);
     const order = [...consumers].sort(sort.column === "name" ? byName : byType);
     return sort.descending ? order.reverse() : order;
   }, [consumers, sort, t]);
   const onSort = (column: SortColumn) =>
-    setSort((current) => ({ column, descending: current.column === column && !current.descending }));
+    setSort((current) => ({
+      column,
+      descending: current.column === column && !current.descending,
+    }));
 
   const blocks: SettingsBlock[] = [
     {
@@ -113,8 +156,20 @@ export function RoutesPage({
       note: t("next.networking.routes.note"),
       columns: "minmax(0, 1.6fr) minmax(0, 0.8fr) minmax(0, 1fr) 208px",
       headers: [
-        <SortHeader key="name" label={t("next.networking.routes.consumer")} column="name" sort={sort} onSort={onSort} />,
-        <SortHeader key="type" label={t("next.networking.routes.type")} column="type" sort={sort} onSort={onSort} />,
+        <SortHeader
+          key="name"
+          label={t("next.networking.routes.consumer")}
+          column="name"
+          sort={sort}
+          onSort={onSort}
+        />,
+        <SortHeader
+          key="type"
+          label={t("next.networking.routes.type")}
+          column="type"
+          sort={sort}
+          onSort={onSort}
+        />,
         t("next.networking.routes.live"),
         "",
       ],
@@ -143,9 +198,17 @@ export function RoutesPage({
               key="live"
               state={state}
               label={stateLabel(t, state)}
-              detail={consumer.kind === "SERVER" ? `${openCount} / ${consumer.cap}` : undefined}
+              detail={
+                consumer.kind === "SERVER"
+                  ? `${openCount} / ${consumer.cap}`
+                  : undefined
+              }
             />,
-            <span key="edit" className="ml-auto flex gap-2" onClick={(event) => event.stopPropagation()}>
+            <span
+              key="edit"
+              className="ml-auto flex gap-2"
+              onClick={(event) => event.stopPropagation()}
+            >
               <SecondaryButton
                 size="compact"
                 icon="speedTest"
@@ -153,7 +216,11 @@ export function RoutesPage({
               >
                 {t("next.networking.speed.title")}
               </SecondaryButton>
-              <SecondaryButton size="compact" icon="edit" onClick={() => setEditing(consumer)}>
+              <SecondaryButton
+                size="compact"
+                icon="edit"
+                onClick={() => setEditing(consumer)}
+              >
                 {t("next.common.edit")}
               </SecondaryButton>
             </span>,
@@ -202,13 +269,19 @@ export function RouteDialog({
   onClose: () => void;
 }) {
   const t = useTranslate();
-  const [route, setRoute] = useState<NetworkRoute>(consumer.route ?? defaultRoute());
+  const [route, setRoute] = useState<NetworkRoute>(
+    consumer.route ?? defaultRoute(),
+  );
   const [error, setError] = useState<string | null>(null);
   const [testing, setTesting] = useState(false);
   const dnsProfiles = useRouteDnsProfiles();
 
   const save = async () => {
-    const failure = await action(SAVE_ROUTE, { kind: consumer.kind, id: consumer.id, input: routeInput(route) });
+    const failure = await action(SAVE_ROUTE, {
+      kind: consumer.kind,
+      id: consumer.id,
+      input: routeInput(route),
+    });
     if (failure) {
       setError(failure);
     } else {
@@ -216,10 +289,16 @@ export function RouteDialog({
     }
   };
 
-  const problem = routeProblem(route, { egresses: data.egressInterfaces, pools: data.proxyPools, kind: consumer.kind });
+  const problem = routeProblem(route, {
+    egresses: data.egressInterfaces,
+    pools: data.proxyPools,
+    kind: consumer.kind,
+  });
   const dnsProblem = dnsRouteProblem(
     route,
-    dnsProfiles?.find((choice) => choice.id === (route.dnsProfileId ?? SYSTEM_DNS_PROFILE_ID)),
+    dnsProfiles?.find(
+      (choice) => choice.id === (route.dnsProfileId ?? SYSTEM_DNS_PROFILE_ID),
+    ),
     { proxies: data.proxyProfiles, pools: data.proxyPools },
   );
 
@@ -234,11 +313,17 @@ export function RouteDialog({
       footer={
         <>
           {isTorrentConsumer(consumer.kind) ? (
-            <SecondaryButton icon="test" disabled={problem !== null} onClick={() => setTesting(true)}>
+            <SecondaryButton
+              icon="test"
+              disabled={problem !== null}
+              onClick={() => setTesting(true)}
+            >
               {t("next.networking.testVia.title")}
             </SecondaryButton>
           ) : null}
-          <SecondaryButton onClick={onClose}>{t("action.cancel")}</SecondaryButton>
+          <SecondaryButton onClick={onClose}>
+            {t("action.cancel")}
+          </SecondaryButton>
           <PrimaryButton
             icon="save"
             disabled={busy || problem !== null || dnsProblem !== null}
@@ -264,14 +349,22 @@ export function RouteDialog({
         />
       </div>
       {error ? (
-        <div role="alert" data-testid={networkIds.routeError} className="flex-none border-t border-wv-hairline px-4 py-4 text-[12.5px] text-wv-error-text sm:px-6">
+        <div
+          role="alert"
+          data-testid={networkIds.routeError}
+          className="flex-none border-t border-wv-hairline px-4 py-4 text-[12.5px] text-wv-error-text sm:px-6"
+        >
           {error}
         </div>
       ) : null}
       {testing && isTorrentConsumer(consumer.kind) ? (
-        <TestViaDialog subject={null} route={route} torrent={consumer.kind} onClose={() => setTesting(false)} />
+        <TestViaDialog
+          subject={null}
+          route={route}
+          torrent={consumer.kind}
+          onClose={() => setTesting(false)}
+        />
       ) : null}
     </Dialog>
   );
 }
-

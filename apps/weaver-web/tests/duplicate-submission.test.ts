@@ -19,15 +19,30 @@ import { duplicateSubmissionInput } from "../src/next/features/upload/duplicate-
 
 test("SCORE keeps a normalized candidate key and integer score", () => {
   assert.deepEqual(
-    duplicateSubmissionInput({ force: false, mode: "SCORE", key: "  release-group  ", score: "42" }),
-    { force: false, dupeMode: "SCORE", dupeKey: "release-group", dupeScore: 42 },
+    duplicateSubmissionInput({
+      force: false,
+      mode: "SCORE",
+      key: "  release-group  ",
+      score: "42",
+    }),
+    {
+      force: false,
+      dupeMode: "SCORE",
+      dupeKey: "release-group",
+      dupeScore: 42,
+    },
   );
 });
 
 test("ordinary and ALL submissions do not send semantic candidate data", () => {
   for (const mode of ["ENFORCE", "ALL"] as const) {
     assert.deepEqual(
-      duplicateSubmissionInput({ force: false, mode, key: "release-group", score: "42" }),
+      duplicateSubmissionInput({
+        force: false,
+        mode,
+        key: "release-group",
+        score: "42",
+      }),
       { force: false, dupeMode: mode, dupeKey: null, dupeScore: null },
     );
   }
@@ -35,24 +50,37 @@ test("ordinary and ALL submissions do not send semantic candidate data", () => {
 
 test("FORCE wins over SCORE and never forwards semantic candidate data", () => {
   assert.deepEqual(
-    duplicateSubmissionInput({ force: true, mode: "SCORE", key: "release-group", score: "42" }),
+    duplicateSubmissionInput({
+      force: true,
+      mode: "SCORE",
+      key: "release-group",
+      score: "42",
+    }),
     { force: true, dupeMode: "FORCE", dupeKey: null, dupeScore: null },
   );
 });
 
 test("invalid SCORE input is represented as an absent score", () => {
   assert.deepEqual(
-    duplicateSubmissionInput({ force: false, mode: "SCORE", key: "", score: "not-a-score" }),
+    duplicateSubmissionInput({
+      force: false,
+      mode: "SCORE",
+      key: "",
+      score: "not-a-score",
+    }),
     { force: false, dupeMode: "SCORE", dupeKey: null, dupeScore: null },
   );
 });
 
 test("duplicate policy defaults preserve the accepted status matrix", () => {
   assert.deepEqual(normalizeDuplicatePolicy(), DEFAULT_DUPLICATE_POLICY);
-  assert.deepEqual(normalizeDuplicatePolicy({ strictActiveOrSuccess: "WARN" }), {
-    ...DEFAULT_DUPLICATE_POLICY,
-    strictActiveOrSuccess: "WARN",
-  });
+  assert.deepEqual(
+    normalizeDuplicatePolicy({ strictActiveOrSuccess: "WARN" }),
+    {
+      ...DEFAULT_DUPLICATE_POLICY,
+      strictActiveOrSuccess: "WARN",
+    },
+  );
 });
 
 test("every structured submission status has a localized outcome mapping", () => {
@@ -86,5 +114,8 @@ test("compact list duplicate evidence maps to localized action and reason keys",
     duplicateFingerprintKindI18nKey("STRICT_ARTICLE_LAYOUT"),
     "duplicate.match.strict-article-layout",
   );
-  assert.equal(duplicateLifecycleI18nKey("PARKED"), "duplicate.lifecycle.parked");
+  assert.equal(
+    duplicateLifecycleI18nKey("PARKED"),
+    "duplicate.lifecycle.parked",
+  );
 });

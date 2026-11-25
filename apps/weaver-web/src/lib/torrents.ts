@@ -121,7 +121,8 @@ export interface TorrentUnpackedFileData {
 export type TrackerSource = "TORRENT" | "OPERATOR";
 
 /** Where the label for who named a tracker lives in the dictionary. */
-export const trackerSourceKey = (source: TrackerSource) => `next.torrent.trackerSource.${source}`;
+export const trackerSourceKey = (source: TrackerSource) =>
+  `next.torrent.trackerSource.${source}`;
 
 /** Where the label for who resolves a name lives in the dictionary. */
 export const resolvedByKey = (by: ResolvedBy) => `next.resolvedBy.${by}`;
@@ -168,7 +169,10 @@ export interface TorrentSummaryData {
   /** Seconds of the current unbroken seeding run. */
   consecutiveSeedingSeconds: number;
   /** The goals in effect, and which seconds the seed-time goal counts. */
-  seedingPolicy: Pick<SeedingTermsData, "ratioGoal" | "seedTimeGoalMinutes" | "seedTimeCounting">;
+  seedingPolicy: Pick<
+    SeedingTermsData,
+    "ratioGoal" | "seedTimeGoalMinutes" | "seedTimeCounting"
+  >;
 }
 
 /** How far a seeding torrent is toward each goal it has, in percent; null for a goal it does not have. */
@@ -182,13 +186,23 @@ export interface SeedingGoalProgress {
  * counts the seconds its terms count: every second seeded, or those of the
  * current run. A goal of zero is met at once.
  */
-export function seedingGoalProgress(torrent: TorrentSummaryData): SeedingGoalProgress {
-  const { ratioGoal, seedTimeGoalMinutes, seedTimeCounting } = torrent.seedingPolicy;
-  const toward = (have: number, goal: number) => (goal <= 0 ? 100 : Math.max(0, Math.min(100, (have / goal) * 100)));
-  const seeded = seedTimeCounting === "CONSECUTIVE" ? torrent.consecutiveSeedingSeconds : torrent.seedingSeconds;
+export function seedingGoalProgress(
+  torrent: TorrentSummaryData,
+): SeedingGoalProgress {
+  const { ratioGoal, seedTimeGoalMinutes, seedTimeCounting } =
+    torrent.seedingPolicy;
+  const toward = (have: number, goal: number) =>
+    goal <= 0 ? 100 : Math.max(0, Math.min(100, (have / goal) * 100));
+  const seeded =
+    seedTimeCounting === "CONSECUTIVE"
+      ? torrent.consecutiveSeedingSeconds
+      : torrent.seedingSeconds;
   return {
     ratio: ratioGoal === null ? null : toward(torrent.ratio, ratioGoal),
-    seedTime: seedTimeGoalMinutes === null ? null : toward(seeded, seedTimeGoalMinutes * 60),
+    seedTime:
+      seedTimeGoalMinutes === null
+        ? null
+        : toward(seeded, seedTimeGoalMinutes * 60),
   };
 }
 
@@ -294,7 +308,9 @@ export interface TorrentData extends TorrentSummaryData {
  * "Checking resume data"), or one held because its files were not there
  * (qBittorrent's "Missing Files"). Null for every other state.
  */
-export function torrentStateLabelKey(state: TorrentState | undefined): string | null {
+export function torrentStateLabelKey(
+  state: TorrentState | undefined,
+): string | null {
   switch (state) {
     case "NEEDS_CERTIFICATE":
       return "next.torrent.needsCertificate";
@@ -315,15 +331,24 @@ export function showsSeeding(state: TorrentState): boolean {
 /** As much of a failed GraphQL request as a torrent action reads. */
 export interface TorrentActionError {
   message: string;
-  graphQLErrors: readonly { message: string; extensions?: Record<string, unknown> }[];
+  graphQLErrors: readonly {
+    message: string;
+    extensions?: Record<string, unknown>;
+  }[];
 }
 
 /** How a remove went: done, or failed with the daemon's own message. */
-export type RemoveOutcome = { kind: "removed" } | { kind: "failed"; message: string };
+export type RemoveOutcome =
+  { kind: "removed" } | { kind: "failed"; message: string };
 
-export function removeOutcome(error: TorrentActionError | undefined): RemoveOutcome {
+export function removeOutcome(
+  error: TorrentActionError | undefined,
+): RemoveOutcome {
   if (!error) return { kind: "removed" };
-  return { kind: "failed", message: error.graphQLErrors[0]?.message ?? error.message };
+  return {
+    kind: "failed",
+    message: error.graphQLErrors[0]?.message ?? error.message,
+  };
 }
 
 /** The daemon's own text for a failed torrent action. */
@@ -345,17 +370,32 @@ export interface TorrentExposure {
 }
 
 /** An exposure as label and value pairs, in the order the views show them. */
-export function exposureValues(t: Translate, exposure: TorrentExposure): { label: string; value: string }[] {
+export function exposureValues(
+  t: Translate,
+  exposure: TorrentExposure,
+): { label: string; value: string }[] {
   const yesNo = (on: boolean) => t(on ? "next.common.yes" : "next.common.no");
   return [
     {
       label: t("next.proxies.resolvedBy"),
-      value: exposure.resolvedBy === null ? "\u2014" : t(resolvedByKey(exposure.resolvedBy)),
+      value:
+        exposure.resolvedBy === null
+          ? "\u2014"
+          : t(resolvedByKey(exposure.resolvedBy)),
     },
-    { label: t("next.exposure.address"), value: exposure.address ?? t("next.exposure.unknown") },
-    { label: t("next.exposure.announcedPort"), value: String(exposure.announcedPort) },
+    {
+      label: t("next.exposure.address"),
+      value: exposure.address ?? t("next.exposure.unknown"),
+    },
+    {
+      label: t("next.exposure.announcedPort"),
+      value: String(exposure.announcedPort),
+    },
     { label: t("next.exposure.inbound"), value: yesNo(exposure.inbound) },
-    { label: t("next.exposure.udpTrackers"), value: yesNo(exposure.udpTrackers) },
+    {
+      label: t("next.exposure.udpTrackers"),
+      value: yesNo(exposure.udpTrackers),
+    },
     { label: t("next.exposure.dht"), value: yesNo(exposure.dht) },
     { label: t("next.exposure.utp"), value: yesNo(exposure.utp) },
   ];
@@ -391,8 +431,15 @@ export const TORRENT_ROUTE_REASONS = [
 
 export type TorrentRouteReason = (typeof TORRENT_ROUTE_REASONS)[number];
 
-export function routeReasonText(t: Translate, reason: TorrentRouteReason): string {
-  return t(reason.startsWith("TORRENT_ROUTE_") ? `next.refusal.${reason}` : `next.torrents.routeReason.${reason}`);
+export function routeReasonText(
+  t: Translate,
+  reason: TorrentRouteReason,
+): string {
+  return t(
+    reason.startsWith("TORRENT_ROUTE_")
+      ? `next.refusal.${reason}`
+      : `next.torrents.routeReason.${reason}`,
+  );
 }
 
 /** The reasons the server states a torrent's state with, by name. */
@@ -411,7 +458,10 @@ export const TORRENT_STATED_REASONS = [
 
 export type TorrentStatedReason = (typeof TORRENT_STATED_REASONS)[number];
 
-export function statedReasonText(t: Translate, reason: TorrentStatedReason): string {
+export function statedReasonText(
+  t: Translate,
+  reason: TorrentStatedReason,
+): string {
   return t(`next.torrents.stated.${reason}`);
 }
 
@@ -424,5 +474,7 @@ export function routeExposureText(
   route: { resolvedBy: ResolvedBy | null; exposure: TorrentExposure | null },
 ): string {
   if (route.exposure !== null) return exposureText(t, route.exposure);
-  return route.resolvedBy === null ? "\u2014" : `${t("next.proxies.resolvedBy")} ${t(resolvedByKey(route.resolvedBy))}`;
+  return route.resolvedBy === null
+    ? "\u2014"
+    : `${t("next.proxies.resolvedBy")} ${t(resolvedByKey(route.resolvedBy))}`;
 }

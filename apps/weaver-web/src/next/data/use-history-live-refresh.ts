@@ -69,9 +69,9 @@ export function useHistoryLiveRefresh({
         return previous;
       }
       if (
-        event.kind === "ITEM_COMPLETED"
-        || (event.kind === "ITEM_STATE_CHANGED" && event.state === "FAILED")
-        || event.kind === "ITEM_REMOVED"
+        event.kind === "ITEM_COMPLETED" ||
+        (event.kind === "ITEM_STATE_CHANGED" && event.state === "FAILED") ||
+        event.kind === "ITEM_REMOVED"
       ) {
         schedule();
       }
@@ -80,11 +80,17 @@ export function useHistoryLiveRefresh({
     [schedule],
   );
 
-  const [{ error }] = useSubscription({ query: HISTORY_FACADE_EVENTS_SUBSCRIPTION }, handle);
+  const [{ error }] = useSubscription(
+    { query: HISTORY_FACADE_EVENTS_SUBSCRIPTION },
+    handle,
+  );
 
   const lastConnectedAt = useRef<number | null | undefined>(undefined);
   useEffect(() => {
-    if (connection.status !== "connected" || connection.lastConnectedAt === null) {
+    if (
+      connection.status !== "connected" ||
+      connection.lastConnectedAt === null
+    ) {
       return;
     }
     if (lastConnectedAt.current === undefined) {

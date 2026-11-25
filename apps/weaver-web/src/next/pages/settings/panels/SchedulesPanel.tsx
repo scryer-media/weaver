@@ -17,7 +17,10 @@ import { RecordEditor } from "../../../components/RecordEditor";
 import { Toggle } from "../../../components/controls";
 import { Cell } from "../../../components/rows";
 import { settingsIds, testIds } from "../../../testids";
-import { SCHEDULE_TRACKS, type ScheduleTrack } from "../../../data/schedule-tracks";
+import {
+  SCHEDULE_TRACKS,
+  type ScheduleTrack,
+} from "../../../data/schedule-tracks";
 import { withoutTorrentOnly } from "../../../data/torrents-shown";
 import { useTorrentsShown } from "../../../data/use-torrents-shown";
 import {
@@ -25,9 +28,38 @@ import {
   type HardwareProfileName,
   type HardwareProfileSettings,
 } from "../../../data/hardware-profiles";
-import { SettingsBlocks, usePanelStatus, type SettingsBlock } from "../framework";
-import { scheduleActionFields, scheduleActionHelp, scheduleSpeedSections, scheduleTimingFields, useScheduleTargets } from "../../../components/ScheduleOptionsFields";
-import { NEW_SCHEDULE_OPTIONS, SCHEDULE_ACTIONS, SCHEDULE_DAYS, isOneShot, optionsFromSchedule, scheduleActionKey, scheduleActionOfKey, optionsInput, scheduleActionDetails, scheduleDaysLabel, scheduleTimeLabel, speedProblem, speedTarget, torrentOnlyAction, type ScheduleClass, type ScheduleOptions, type ScheduleOptionsForm, type ScheduleTargets } from "../../../data/schedule-options";
+import {
+  SettingsBlocks,
+  usePanelStatus,
+  type SettingsBlock,
+} from "../framework";
+import {
+  scheduleActionFields,
+  scheduleActionHelp,
+  scheduleSpeedSections,
+  scheduleTimingFields,
+  useScheduleTargets,
+} from "../../../components/ScheduleOptionsFields";
+import {
+  NEW_SCHEDULE_OPTIONS,
+  SCHEDULE_ACTIONS,
+  SCHEDULE_DAYS,
+  isOneShot,
+  optionsFromSchedule,
+  scheduleActionKey,
+  scheduleActionOfKey,
+  optionsInput,
+  scheduleActionDetails,
+  scheduleDaysLabel,
+  scheduleTimeLabel,
+  speedProblem,
+  speedTarget,
+  torrentOnlyAction,
+  type ScheduleClass,
+  type ScheduleOptions,
+  type ScheduleOptionsForm,
+  type ScheduleTargets,
+} from "../../../data/schedule-options";
 
 /**
  * Schedules: a clock that pauses, resumes or throttles the queue, or switches
@@ -72,13 +104,21 @@ const NEW_SCHEDULE: ScheduleForm = {
   hardwareProfile: null,
 };
 
-function actionLabel(t: Translate, schedule: Schedule, targets?: ScheduleTargets): string {
+function actionLabel(
+  t: Translate,
+  schedule: Schedule,
+  targets?: ScheduleTargets,
+): string {
   const details = scheduleActionDetails(t, schedule, targets);
   if (details) return details;
   if (schedule.actionType === "hardware_profile" && schedule.hardwareProfile) {
-    return t("next.schedules.profileTo", { profile: profileName(t, schedule.hardwareProfile) });
+    return t("next.schedules.profileTo", {
+      profile: profileName(t, schedule.hardwareProfile),
+    });
   }
-  const action = SCHEDULE_ACTIONS.find((option) => option.value === scheduleActionKey(schedule));
+  const action = SCHEDULE_ACTIONS.find(
+    (option) => option.value === scheduleActionKey(schedule),
+  );
   return action ? t(action.label) : schedule.actionType;
 }
 
@@ -86,12 +126,16 @@ export function SchedulesPanel() {
   const t = useTranslate();
   const targets = useScheduleTargets();
   const torrentsOn = useTorrentsShown();
-  const [{ data, fetching }, reexecute] = useQuery<{ schedules: Schedule[] }>({ query: SCHEDULES_QUERY });
+  const [{ data, fetching }, reexecute] = useQuery<{ schedules: Schedule[] }>({
+    query: SCHEDULES_QUERY,
+  });
   const [, createSchedule] = useMutation(CREATE_SCHEDULE_MUTATION);
   const [, updateSchedule] = useMutation(UPDATE_SCHEDULE_MUTATION);
   const [, deleteSchedule] = useMutation(DELETE_SCHEDULE_MUTATION);
   const [, toggleSchedule] = useMutation(TOGGLE_SCHEDULE_MUTATION);
-  const [{ data: profileData }] = useQuery<{ hardwareProfile: HardwareProfileSettings }>({
+  const [{ data: profileData }] = useQuery<{
+    hardwareProfile: HardwareProfileSettings;
+  }>({
     query: HARDWARE_PROFILE_QUERY,
   });
 
@@ -112,9 +156,11 @@ export function SchedulesPanel() {
   const formProfile =
     form.hardwareProfile && offeredProfiles.includes(form.hardwareProfile)
       ? form.hardwareProfile
-      : offeredProfiles.find((profile) => profile === profileData?.hardwareProfile.recommended) ??
+      : (offeredProfiles.find(
+          (profile) => profile === profileData?.hardwareProfile.recommended,
+        ) ??
         offeredProfiles[0] ??
-        null;
+        null);
 
   const open = (schedule: Schedule | null) => {
     setError(null);
@@ -139,7 +185,11 @@ export function SchedulesPanel() {
     if (form.actionType === "speed_limit") {
       // What is wrong with a rate, or a rule that sets nothing, is said before saving.
       const typed = Object.entries(form.options.speeds);
-      if (typed.some(([key, entry]) => speedProblem(entry, speedTarget(key).kind) !== null)) {
+      if (
+        typed.some(
+          ([key, entry]) => speedProblem(entry, speedTarget(key).kind) !== null,
+        )
+      ) {
         setError(t("next.schedules.speedInvalid"));
         return;
       }
@@ -155,7 +205,11 @@ export function SchedulesPanel() {
       days: form.days.length > 0 ? form.days : null,
       label: form.label.trim() || null,
       enabled: form.enabled,
-      ...optionsInput(form.options, form.actionType, editing?.speedLimits ?? []),
+      ...optionsInput(
+        form.options,
+        form.actionType,
+        editing?.speedLimits ?? [],
+      ),
     };
     if (form.actionType === "hardware_profile") {
       input.hardwareProfile = formProfile;
@@ -194,7 +248,11 @@ export function SchedulesPanel() {
   const toggle = async (schedule: Schedule, enabled: boolean) => {
     setStatus(null);
     const result = await toggleSchedule({ id: schedule.id, enabled });
-    setError(result.error ? (result.error.graphQLErrors[0]?.message ?? result.error.message) : null);
+    setError(
+      result.error
+        ? (result.error.graphQLErrors[0]?.message ?? result.error.message)
+        : null,
+    );
     void reexecute({ requestPolicy: "network-only" });
   };
 
@@ -202,7 +260,12 @@ export function SchedulesPanel() {
     id: schedule.id,
     searchText: `${scheduleTimeLabel(schedule)} ${scheduleDaysLabel(t, schedule.days)} ${actionLabel(t, schedule, targets)} ${schedule.label ?? ""}`,
     cells: [
-      <Cell key="time" mono className="text-wv-fg" title={scheduleTimeLabel(schedule)}>
+      <Cell
+        key="time"
+        mono
+        className="text-wv-fg"
+        title={scheduleTimeLabel(schedule)}
+      >
         {scheduleTimeLabel(schedule)}
       </Cell>,
       <Cell key="days" mono className="text-wv-secondary">
@@ -255,7 +318,10 @@ export function SchedulesPanel() {
         id: track.value,
         title: t(track.label),
         // The one group whose rules do not hold says so in place of the list's note.
-        note: track.value === "ONE_SHOT" ? t("next.schedules.oneShotNote") : undefined,
+        note:
+          track.value === "ONE_SHOT"
+            ? t("next.schedules.oneShotNote")
+            : undefined,
         // A torrent-only rule is hidden with torrent things. Each rule saves
         // on its own, so a hidden one is left as it is.
         rows: withoutTorrentOnly(
@@ -271,7 +337,8 @@ export function SchedulesPanel() {
     t,
     action: form.actionType,
     value: form.options,
-    onChange: (options: ScheduleOptionsForm) => setForm((current) => ({ ...current, options })),
+    onChange: (options: ScheduleOptionsForm) =>
+      setForm((current) => ({ ...current, options })),
   };
   // The editor says how long a rule lasts in the words its group uses in the list.
   const runsOnce = isOneShot(form.actionType);
@@ -288,7 +355,11 @@ export function SchedulesPanel() {
             ? t("next.schedules.add")
             : editing?.label || editing?.time || t("next.schedules.schedule")
         }
-        note={editingId === "new" ? undefined : scheduleDaysLabel(t, editing?.days ?? [])}
+        note={
+          editingId === "new"
+            ? undefined
+            : scheduleDaysLabel(t, editing?.days ?? [])
+        }
         error={error}
         busy={busy}
         onSave={() => void save()}
@@ -299,7 +370,11 @@ export function SchedulesPanel() {
           {
             id: "when",
             title: t("next.schedules.when"),
-            note: t(runsOnce ? "next.schedules.oneShotNote" : "next.schedules.trackNote"),
+            note: t(
+              runsOnce
+                ? "next.schedules.oneShotNote"
+                : "next.schedules.trackNote",
+            ),
             fields: [
               {
                 id: "time",
@@ -307,7 +382,8 @@ export function SchedulesPanel() {
                 control: {
                   kind: "time",
                   value: form.time,
-                  onChange: (next: string) => setForm((current) => ({ ...current, time: next })),
+                  onChange: (next: string) =>
+                    setForm((current) => ({ ...current, time: next })),
                 },
               },
               ...scheduleTimingFields(optionFields),
@@ -318,7 +394,11 @@ export function SchedulesPanel() {
                 control: {
                   kind: "custom",
                   control: (
-                    <div role="group" aria-label={t("next.schedules.days")} className="flex flex-wrap justify-end gap-1.5">
+                    <div
+                      role="group"
+                      aria-label={t("next.schedules.days")}
+                      className="flex flex-wrap justify-end gap-1.5"
+                    >
                       {SCHEDULE_DAYS.map((day) => {
                         const active = form.days.includes(day.key);
                         return (
@@ -330,7 +410,9 @@ export function SchedulesPanel() {
                               setForm((current) => ({
                                 ...current,
                                 days: active
-                                  ? current.days.filter((entry) => entry !== day.key)
+                                  ? current.days.filter(
+                                      (entry) => entry !== day.key,
+                                    )
                                   : [...current.days, day.key],
                               }))
                             }
@@ -366,9 +448,15 @@ export function SchedulesPanel() {
                   options: withoutTorrentOnly(
                     SCHEDULE_ACTIONS,
                     torrentsOn,
-                    (option) => "torrentOnly" in option && option.value !== form.actionType,
-                  ).map((option) => ({ value: option.value, label: t(option.label) })),
-                  onChange: (next) => setForm((current) => ({ ...current, actionType: next })),
+                    (option) =>
+                      "torrentOnly" in option &&
+                      option.value !== form.actionType,
+                  ).map((option) => ({
+                    value: option.value,
+                    label: t(option.label),
+                  })),
+                  onChange: (next) =>
+                    setForm((current) => ({ ...current, actionType: next })),
                 },
               },
               ...scheduleActionFields({ ...optionFields, targets }),
@@ -403,7 +491,8 @@ export function SchedulesPanel() {
                   mono: false,
                   value: form.label,
                   placeholder: t("next.schedules.labelPlaceholder"),
-                  onChange: (next) => setForm((current) => ({ ...current, label: next })),
+                  onChange: (next) =>
+                    setForm((current) => ({ ...current, label: next })),
                 },
               },
               {
@@ -412,7 +501,8 @@ export function SchedulesPanel() {
                 control: {
                   kind: "toggle",
                   value: form.enabled,
-                  onChange: (next) => setForm((current) => ({ ...current, enabled: next })),
+                  onChange: (next) =>
+                    setForm((current) => ({ ...current, enabled: next })),
                 },
               },
             ],

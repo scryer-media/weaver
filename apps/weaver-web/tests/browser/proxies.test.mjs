@@ -5,20 +5,34 @@ import assert from "node:assert/strict";
 import { join } from "node:path";
 import { after, before, test } from "node:test";
 import { createServer } from "vite";
-const { chromium } = await import(process.env.PLAYWRIGHT_MODULE_PATH ?? "playwright");
+const { chromium } = await import(
+  process.env.PLAYWRIGHT_MODULE_PATH ?? "playwright"
+);
 let server, browser, baseUrl;
 before(async () => {
-  server = await createServer({ cacheDir: "node_modules/.vite/browser-proxies", server: { host: "127.0.0.1", port: 0 } });
+  server = await createServer({
+    cacheDir: "node_modules/.vite/browser-proxies",
+    server: { host: "127.0.0.1", port: 0 },
+  });
   await server.listen();
   baseUrl = `http://127.0.0.1:${server.httpServer.address().port}`;
   browser = await chromium.launch({ headless: true });
 });
-after(async () => { await browser?.close(); await server?.close(); });
+after(async () => {
+  await browser?.close();
+  await server?.close();
+});
 async function open(query = "", shown = "Amsterdam") {
-  const page = await browser.newPage({ viewport: { width: 1400, height: 1500 } });
+  const page = await browser.newPage({
+    viewport: { width: 1400, height: 1500 },
+  });
   page.setDefaultTimeout(0);
   page.on("pageerror", (error) => console.error(error));
-  await page.route("**/*", (route) => new URL(route.request().url()).origin === baseUrl ? route.continue() : route.abort());
+  await page.route("**/*", (route) =>
+    new URL(route.request().url()).origin === baseUrl
+      ? route.continue()
+      : route.abort(),
+  );
   await page.goto(`${baseUrl}/tests/browser/proxies.html${query}`);
   await page.getByText(shown, { exact: true }).waitFor();
   return page;
@@ -26,30 +40,48 @@ async function open(query = "", shown = "Amsterdam") {
 /** With `PROXIES_SCREENSHOT_DIR` set to a directory, the page as it stands is saved there as `name`.png. */
 async function shot(page, name) {
   if (process.env.PROXIES_SCREENSHOT_DIR) {
-    await page.screenshot({ path: join(process.env.PROXIES_SCREENSHOT_DIR, `${name}.png`) });
+    await page.screenshot({
+      path: join(process.env.PROXIES_SCREENSHOT_DIR, `${name}.png`),
+    });
   }
 }
 const daemon = (page) => page.evaluate(() => window.proxiesFixture);
-const action = (scope, name) => scope.getByRole("button", { name, exact: true });
+const action = (scope, name) =>
+  scope.getByRole("button", { name, exact: true });
 const field = (scope, name) => scope.getByLabel(name, { exact: true });
 /** The fields in `scope` a password manager is still free to fill or to offer to save. */
 const openToPasswordManagers = (scope) =>
   scope
-    .locator("input:not([type='file']):not([type='checkbox']):not([type='radio']):not([type='range']), textarea")
+    .locator(
+      "input:not([type='file']):not([type='checkbox']):not([type='radio']):not([type='range']), textarea",
+    )
     .evaluateAll((fields) =>
       fields
-        .filter((field) => field.getAttribute("data-1p-ignore") !== "true" || field.getAttribute("autocomplete") !== "off")
-        .map((field) => field.getAttribute("aria-label") ?? field.outerHTML));
+        .filter(
+          (field) =>
+            field.getAttribute("data-1p-ignore") !== "true" ||
+            field.getAttribute("autocomplete") !== "off",
+        )
+        .map((field) => field.getAttribute("aria-label") ?? field.outerHTML),
+    );
 const option = (scope, name) => scope.getByRole("radio", { name, exact: true });
-const dropZone = (scope) => action(scope, "Drop a config file here, or click to choose");
-const file = (name, text) => ({ name, mimeType: "text/plain", buffer: Buffer.from(text) });
+const dropZone = (scope) =>
+  action(scope, "Drop a config file here, or click to choose");
+const file = (name, text) => ({
+  name,
+  mimeType: "text/plain",
+  buffer: Buffer.from(text),
+});
 /** Drags a file of this name and text over `zone`, and lets go of it there. */
 async function drop(page, zone, name, text) {
-  const dragged = await page.evaluateHandle(([fileName, content]) => {
-    const transfer = new DataTransfer();
-    transfer.items.add(new File([content], fileName, { type: "text/plain" }));
-    return transfer;
-  }, [name, text]);
+  const dragged = await page.evaluateHandle(
+    ([fileName, content]) => {
+      const transfer = new DataTransfer();
+      transfer.items.add(new File([content], fileName, { type: "text/plain" }));
+      return transfer;
+    },
+    [name, text],
+  );
   await zone.dispatchEvent("dragover", { dataTransfer: dragged });
   await zone.dispatchEvent("drop", { dataTransfer: dragged });
 }
@@ -91,30 +123,67 @@ AllowedIPs = 0.0.0.0/0
 Endpoint = vpn.fixture.invalid:51999
 PersistentKeepalive = off
 `;
-const DETAILS = ["Endpoint", "Port", "Private key", "Peer public key", "Preshared key", "Interface addresses", "MTU", "Keepalive"];
+const DETAILS = [
+  "Endpoint",
+  "Port",
+  "Private key",
+  "Peer public key",
+  "Preshared key",
+  "Interface addresses",
+  "MTU",
+  "Keepalive",
+];
 /** What the configuration above fills the form with, as the daemon is sent it. */
 const FILLED = {
-  kind: "WIRE_GUARD", enabled: true, host: "vpn.fixture.invalid", port: 51999,
-  dnsServers: ["10.6.0.1"], dnsProfileId: 0,
-  tunnelAddresses: ["10.6.0.2/32", "fd00::2/128"], peerPublicKey: KEY("b"), mtu: 1380, keepaliveSeconds: 0,
-  natpmp: false, forwardedPort: null, timeoutSeconds: 30, privateKey: KEY("a"), presharedKey: KEY("c"),
+  kind: "WIRE_GUARD",
+  enabled: true,
+  host: "vpn.fixture.invalid",
+  port: 51999,
+  dnsServers: ["10.6.0.1"],
+  dnsProfileId: 0,
+  tunnelAddresses: ["10.6.0.2/32", "fd00::2/128"],
+  peerPublicKey: KEY("b"),
+  mtu: 1380,
+  keepaliveSeconds: 0,
+  natpmp: false,
+  forwardedPort: null,
+  timeoutSeconds: 30,
+  privateKey: KEY("a"),
+  presharedKey: KEY("c"),
 };
 async function filled(editor) {
   // What the file carried that a tunnel has no use for is said, not dropped in silence.
-  await editor.getByText(
-    "Filled the form from the configuration. Ignored ListenPort, AllowedIPs, which a tunnel proxy does not use.",
-    { exact: true },
-  ).waitFor();
-  assert.equal(await option(editor, "Enter details manually").getAttribute("aria-checked"), "true");
-  assert.equal(await field(editor, "Endpoint").inputValue(), "vpn.fixture.invalid");
+  await editor
+    .getByText(
+      "Filled the form from the configuration. Ignored ListenPort, AllowedIPs, which a tunnel proxy does not use.",
+      { exact: true },
+    )
+    .waitFor();
+  assert.equal(
+    await option(editor, "Enter details manually").getAttribute("aria-checked"),
+    "true",
+  );
+  assert.equal(
+    await field(editor, "Endpoint").inputValue(),
+    "vpn.fixture.invalid",
+  );
   assert.equal(await field(editor, "Port").inputValue(), "51999");
   assert.equal(await field(editor, "Private key").inputValue(), KEY("a"));
-  assert.equal(await field(editor, "Private key").getAttribute("type"), "password");
+  assert.equal(
+    await field(editor, "Private key").getAttribute("type"),
+    "password",
+  );
   assert.equal(await field(editor, "Peer public key").inputValue(), KEY("b"));
   assert.equal(await field(editor, "Preshared key").inputValue(), KEY("c"));
-  assert.equal(await field(editor, "Interface addresses").inputValue(), "10.6.0.2/32\nfd00::2/128");
+  assert.equal(
+    await field(editor, "Interface addresses").inputValue(),
+    "10.6.0.2/32\nfd00::2/128",
+  );
   // The file's DNS line fills the tunnel's own DNS servers; who answers is a route's DNS profile, not the proxy's.
-  assert.equal(await editor.getByTestId("field-dnsServers").inputValue(), "10.6.0.1");
+  assert.equal(
+    await editor.getByTestId("field-dnsServers").inputValue(),
+    "10.6.0.1",
+  );
   assert.equal(await editor.getByTestId("field-dnsWho").count(), 0);
   assert.equal(await field(editor, "MTU").inputValue(), "1380");
   assert.equal(await field(editor, "Keepalive").inputValue(), "0");
@@ -124,22 +193,44 @@ test("a new WireGuard proxy has three ways in and opens on the file, and enterin
   const page = await open();
   try {
     const editor = await adding(page);
-    const start = editor.getByRole("radiogroup", { name: "Set up from", exact: true });
+    const start = editor.getByRole("radiogroup", {
+      name: "Set up from",
+      exact: true,
+    });
     assert.deepEqual(await start.getByRole("radio").allTextContents(), [
-      "Upload a file", "Paste raw config", "Enter details manually",
+      "Upload a file",
+      "Paste raw config",
+      "Enter details manually",
     ]);
     // It opens waiting for a file, so there are no details to fill in yet and nothing to save.
-    assert.deepEqual(await start.locator("[aria-checked='true']").allTextContents(), ["Upload a file"]);
+    assert.deepEqual(
+      await start.locator("[aria-checked='true']").allTextContents(),
+      ["Upload a file"],
+    );
     await dropZone(editor).waitFor();
-    for (const name of DETAILS) assert.equal(await field(editor, name).count(), 0, name);
-    assert.equal(await editor.getByRole("textbox", { name: "WireGuard configuration", exact: true }).count(), 0);
+    for (const name of DETAILS)
+      assert.equal(await field(editor, name).count(), 0, name);
+    assert.equal(
+      await editor
+        .getByRole("textbox", { name: "WireGuard configuration", exact: true })
+        .count(),
+      0,
+    );
     assert.equal(await action(editor, "Save").isDisabled(), true);
     await field(editor, "Name").waitFor();
     await shot(page, "proxy-wireguard-start");
 
     await option(editor, "Enter details manually").click();
     for (const name of DETAILS) await field(editor, name).waitFor();
-    for (const name of ["Endpoint", "Private key", "Peer public key", "Preshared key", "Interface addresses", "MTU", "Keepalive"]) {
+    for (const name of [
+      "Endpoint",
+      "Private key",
+      "Peer public key",
+      "Preshared key",
+      "Interface addresses",
+      "MTU",
+      "Keepalive",
+    ]) {
       assert.equal(await field(editor, name).inputValue(), "", name);
     }
     // The tunnel's own DNS servers start empty; who answers is a route's DNS profile, not the proxy's.
@@ -155,8 +246,13 @@ test("a new WireGuard proxy has three ways in and opens on the file, and enterin
     assert.equal(await field(editor, "Endpoint").count(), 0);
     assert.equal(await action(editor, "Save").isDisabled(), true);
     await option(editor, "Enter details manually").click();
-    assert.equal(await field(editor, "Endpoint").inputValue(), "typed.fixture.invalid");
-  } finally { await page.close(); }
+    assert.equal(
+      await field(editor, "Endpoint").inputValue(),
+      "typed.fixture.invalid",
+    );
+  } finally {
+    await page.close();
+  }
 });
 
 test("a pasted configuration is checked as it is typed, and Parse fills the form once nothing is wrong with it", async () => {
@@ -164,17 +260,24 @@ test("a pasted configuration is checked as it is typed, and Parse fills the form
   try {
     const editor = await adding(page);
     await option(editor, "Paste raw config").click();
-    const config = editor.getByRole("textbox", { name: "WireGuard configuration", exact: true });
+    const config = editor.getByRole("textbox", {
+      name: "WireGuard configuration",
+      exact: true,
+    });
     const parse = action(editor, "Parse");
     assert.equal(await parse.isDisabled(), true);
     assert.equal(await editor.getByRole("alert").count(), 0);
 
     await config.fill("the quick brown fox");
-    await faults(editor, ["That does not look like a WireGuard configuration."]);
+    await faults(editor, [
+      "That does not look like a WireGuard configuration.",
+    ]);
     assert.equal(await parse.isDisabled(), true);
 
     // Every fault is listed at once, by the key at fault.
-    await config.fill(`[Interface]\nPrivateKey = short\nMTU = big\n\n[Peer]\nEndpoint = vpn.fixture.invalid\n`);
+    await config.fill(
+      `[Interface]\nPrivateKey = short\nMTU = big\n\n[Peer]\nEndpoint = vpn.fixture.invalid\n`,
+    );
     await faults(editor, [
       "PrivateKey is not a WireGuard key.",
       "Address is missing from [Interface].",
@@ -204,9 +307,12 @@ test("a pasted configuration is checked as it is typed, and Parse fills the form
     await page.getByText("Pasted", { exact: true }).waitFor();
     const held = await daemon(page);
     assert.deepEqual(held.requests.at(-1), {
-      name: "SaveProxyProfile", variables: { id: null, input: { name: "Pasted", ...FILLED, mtu: 1400 } },
+      name: "SaveProxyProfile",
+      variables: { id: null, input: { name: "Pasted", ...FILLED, mtu: 1400 } },
     });
-  } finally { await page.close(); }
+  } finally {
+    await page.close();
+  }
 });
 
 test("a configuration file dropped on the target or chosen through it is read, its faults are listed, and a sound one fills the form", async () => {
@@ -219,10 +325,17 @@ test("a configuration file dropped on the target or chosen through it is read, i
 
     await input.setInputFiles(file("notes.conf", "the quick brown fox"));
     await editor.getByText("notes.conf", { exact: true }).waitFor();
-    await faults(editor, ["That does not look like a WireGuard configuration."]);
+    await faults(editor, [
+      "That does not look like a WireGuard configuration.",
+    ]);
     assert.equal(await field(editor, "Endpoint").count(), 0);
 
-    await drop(page, zone, "broken.conf", CONFIG.replace(KEY("b"), "short").replace("Address", "#Address"));
+    await drop(
+      page,
+      zone,
+      "broken.conf",
+      CONFIG.replace(KEY("b"), "short").replace("Address", "#Address"),
+    );
     await editor.getByText("broken.conf", { exact: true }).waitFor();
     await faults(editor, [
       "Address is missing from [Interface].",
@@ -231,7 +344,9 @@ test("a configuration file dropped on the target or chosen through it is read, i
     assert.equal(await action(editor, "Save").isDisabled(), true);
     await shot(page, "proxy-wireguard-upload-errors");
 
-    await input.setInputFiles(file("too-large.conf", `${CONFIG}#${"x".repeat(65536)}`));
+    await input.setInputFiles(
+      file("too-large.conf", `${CONFIG}#${"x".repeat(65536)}`),
+    );
     await editor.getByText("too-large.conf", { exact: true }).waitFor();
     await faults(editor, ["That configuration is larger than 64 KiB."]);
 
@@ -242,24 +357,42 @@ test("a configuration file dropped on the target or chosen through it is read, i
     await action(editor, "Save").click();
     await page.getByText("Uploaded", { exact: true }).waitFor();
     assert.deepEqual((await daemon(page)).requests.at(-1), {
-      name: "SaveProxyProfile", variables: { id: null, input: { name: "Uploaded", ...FILLED } },
+      name: "SaveProxyProfile",
+      variables: { id: null, input: { name: "Uploaded", ...FILLED } },
     });
-  } finally { await page.close(); }
+  } finally {
+    await page.close();
+  }
 });
 
 test("a stored WireGuard proxy opens on its details, and a configuration can still be loaded over them", async () => {
   const page = await open();
   try {
     const editor = await editing(page, "Amsterdam");
-    assert.equal(await option(editor, "Enter details manually").getAttribute("aria-checked"), "true");
-    assert.equal(await field(editor, "Endpoint").inputValue(), "amsterdam.fixture.invalid");
-    assert.equal(await field(editor, "Interface addresses").inputValue(), "10.0.0.1/32");
+    assert.equal(
+      await option(editor, "Enter details manually").getAttribute(
+        "aria-checked",
+      ),
+      "true",
+    );
+    assert.equal(
+      await field(editor, "Endpoint").inputValue(),
+      "amsterdam.fixture.invalid",
+    );
+    assert.equal(
+      await field(editor, "Interface addresses").inputValue(),
+      "10.0.0.1/32",
+    );
     assert.equal(await action(editor, "Save").isDisabled(), false);
     await option(editor, "Upload a file").click();
     await dropZone(editor).waitFor();
-    await editor.locator("input[type='file']").setInputFiles(file("wg0.conf", CONFIG));
+    await editor
+      .locator("input[type='file']")
+      .setInputFiles(file("wg0.conf", CONFIG));
     await filled(editor);
-  } finally { await page.close(); }
+  } finally {
+    await page.close();
+  }
 });
 
 test("pools and proxies are each added from the middle under their own table, and never from the top bar", async () => {
@@ -271,7 +404,10 @@ test("pools and proxies are each added from the middle under their own table, an
       await under.waitFor();
       assert.equal(await action(page, name).count(), 1);
       // The button's middle is the list's middle, to the pixel either side.
-      const [button, table] = [await under.boundingBox(), await list.boundingBox()];
+      const [button, table] = [
+        await under.boundingBox(),
+        await list.boundingBox(),
+      ];
       const off = button.x + button.width / 2 - (table.x + table.width / 2);
       assert.ok(Math.abs(off) <= 1, `${name} is centred`);
       await under.click();
@@ -279,12 +415,18 @@ test("pools and proxies are each added from the middle under their own table, an
       await editor.waitFor();
       // A new pool, like a new proxy, starts as WireGuard.
       if (name === "Add pool") {
-        assert.match(await action(editor, "Proxy type").innerText(), /WireGuard/);
+        assert.match(
+          await action(editor, "Proxy type").innerText(),
+          /WireGuard/,
+        );
       }
       await action(editor, "Cancel").click();
       await editor.waitFor({ state: "detached" });
     }
-    assert.equal(await page.locator("#controls").getByRole("button").count(), 0);
+    assert.equal(
+      await page.locator("#controls").getByRole("button").count(),
+      0,
+    );
     await shot(page, "pools-and-proxies");
   } finally {
     await page.close();
@@ -299,24 +441,35 @@ test("a pool can be saved before it has a member, and saves with one", async () 
     await field(editor, "Name").fill("Solo");
     // A pool can be made before any proxy is put in it.
     assert.equal(await action(editor, "Save pool").isEnabled(), true);
-    await editor.getByRole("checkbox", { name: "Amsterdam", exact: true }).click();
-    await editor.getByRole("checkbox", { name: "Amsterdam", checked: true, exact: true }).waitFor();
+    await editor
+      .getByRole("checkbox", { name: "Amsterdam", exact: true })
+      .click();
+    await editor
+      .getByRole("checkbox", { name: "Amsterdam", checked: true, exact: true })
+      .waitFor();
     assert.equal(await action(editor, "Save pool").isEnabled(), true);
     await action(editor, "Save pool").click();
     await editor.waitFor({ state: "detached" });
     const { poolSaves } = await daemon(page);
-    assert.deepEqual(poolSaves.map(({ input }) => input), [{ name: "Solo", kind: "WIRE_GUARD", memberIds: [1], enabled: true }]);
+    assert.deepEqual(
+      poolSaves.map(({ input }) => input),
+      [{ name: "Solo", kind: "WIRE_GUARD", memberIds: [1], enabled: true }],
+    );
   } finally {
     await page.close();
   }
 });
 
 /** The line of a table that holds `text`, which is a button itself and holds its own Edit button. */
-const line = (page, text) => page.locator("main").getByRole("button").filter({ hasText: text });
+const line = (page, text) =>
+  page.locator("main").getByRole("button").filter({ hasText: text });
 /** Opens `title` from the line's own body, then from its Edit button, and closes it each time. */
 async function opensBothWays(page, text, edit, title) {
   const editor = page.getByRole("dialog", { name: title, exact: true });
-  for (const target of [page.getByText(text, { exact: true }), action(line(page, text), edit)]) {
+  for (const target of [
+    page.getByText(text, { exact: true }),
+    action(line(page, text), edit),
+  ]) {
     await target.click();
     await editor.waitFor();
     await action(editor, "Cancel").click();
@@ -339,13 +492,26 @@ test("a proxy is removed from its own line once confirmed, and a refusal says wh
   const page = await open();
   try {
     const proxies = page.locator("main");
-    assert.equal(await proxies.getByText("assigned to providers and feeds on their own panels").count(), 0);
-    const confirm = page.getByRole("dialog", { name: "Remove proxy", exact: true });
+    assert.equal(
+      await proxies
+        .getByText("assigned to providers and feeds on their own panels")
+        .count(),
+      0,
+    );
+    const confirm = page.getByRole("dialog", {
+      name: "Remove proxy",
+      exact: true,
+    });
 
     // A pool's member is refused, and the dialog stays open to say so.
     await action(line(page, "Relay"), "Remove").click();
     await action(confirm, "Remove proxy").click();
-    await confirm.getByRole("alert").getByText("This proxy is in a pool. Remove it from the pool first.", { exact: true }).waitFor();
+    await confirm
+      .getByRole("alert")
+      .getByText("This proxy is in a pool. Remove it from the pool first.", {
+        exact: true,
+      })
+      .waitFor();
     await action(confirm, "Cancel").click();
     await confirm.waitFor({ state: "detached" });
     assert.equal(await line(page, "Relay").count(), 1);
@@ -357,8 +523,13 @@ test("a proxy is removed from its own line once confirmed, and a refusal says wh
     await action(confirm, "Remove proxy").click();
     await confirm.waitFor({ state: "detached" });
     await line(page, "Seedbox").waitFor({ state: "detached" });
-    const removes = (await daemon(page)).requests.filter((request) => request.name === "DeleteProxyProfile");
-    assert.deepEqual(removes.map((request) => request.variables.id), [3, 2]);
+    const removes = (await daemon(page)).requests.filter(
+      (request) => request.name === "DeleteProxyProfile",
+    );
+    assert.deepEqual(
+      removes.map((request) => request.variables.id),
+      [3, 2],
+    );
   } finally {
     await page.close();
   }
@@ -367,7 +538,12 @@ test("a proxy is removed from its own line once confirmed, and a refusal says wh
 test("a route opens from anywhere on its line and from its Edit button", async () => {
   const page = await open("?routes", "news.fixture.invalid");
   try {
-    await opensBothWays(page, "news.fixture.invalid", "Edit", "Route for news.fixture.invalid");
+    await opensBothWays(
+      page,
+      "news.fixture.invalid",
+      "Edit",
+      "Route for news.fixture.invalid",
+    );
     await shot(page, "routes-edit");
   } finally {
     await page.close();
@@ -378,25 +554,52 @@ test("a rung starts on the first target it offers, and a chain's hops offer only
   const page = await open("?routes", "news.fixture.invalid");
   try {
     await action(page, "Edit").click();
-    const editor = page.getByRole("dialog", { name: "Route for news.fixture.invalid", exact: true });
+    const editor = page.getByRole("dialog", {
+      name: "Route for news.fixture.invalid",
+      exact: true,
+    });
     // A ladder starts with its first rung.
     await option(editor, "Proxy ladder").click();
     // A new ladder falls back to direct until that is turned off.
-    assert.equal(await editor.getByRole("checkbox", { name: "Allow direct fallback on this egress", exact: true }).isChecked(), true);
+    assert.equal(
+      await editor
+        .getByRole("checkbox", {
+          name: "Allow direct fallback on this egress",
+          exact: true,
+        })
+        .isChecked(),
+      true,
+    );
     // A proxy's or a pool's select sits under the rung's type, where a chain's hops do, and starts on the first it offers.
-    const type = editor.getByRole("radiogroup", { name: "Leg 1 rung 1 type", exact: true });
-    for (const [kind, first] of [["Proxy", "Amsterdam"], ["Pool", "Exits"]]) {
+    const type = editor.getByRole("radiogroup", {
+      name: "Leg 1 rung 1 type",
+      exact: true,
+    });
+    for (const [kind, first] of [
+      ["Proxy", "Amsterdam"],
+      ["Pool", "Exits"],
+    ]) {
       await option(editor, kind).click();
       const target = action(editor, "Leg 1 rung 1");
       assert.equal(await target.textContent(), first);
-      const [select, group] = [await target.boundingBox(), await type.boundingBox()];
-      assert.ok(select.y >= group.y + group.height, `${kind} select is under the type`);
-      assert.ok(select.x < group.x, `${kind} select starts at the rung's left edge`);
+      const [select, group] = [
+        await target.boundingBox(),
+        await type.boundingBox(),
+      ];
+      assert.ok(
+        select.y >= group.y + group.height,
+        `${kind} select is under the type`,
+      );
+      assert.ok(
+        select.x < group.x,
+        `${kind} select starts at the rung's left edge`,
+      );
     }
     await shot(page, "route-rung-pool");
     await option(editor, "Chain").click();
     const hop = (position) => action(editor, `Chain hop ${position}`);
-    const hops = () => Promise.all([1, 2, 3].map((position) => hop(position).textContent()));
+    const hops = () =>
+      Promise.all([1, 2, 3].map((position) => hop(position).textContent()));
     /** What the hop's menu lists, read with the menu open and closed again by picking `choice`. */
     const offered = async (position, choice) => {
       await hop(position).click();
@@ -406,33 +609,65 @@ test("a rung starts on the first target it offers, and a chain's hops offer only
       return names;
     };
     // A new chain takes the first two proxies that can ride one another, and no third.
-    assert.deepEqual(await hops(), ["Amsterdam · WireGuard", "Seedbox · SSH", "None"]);
-    assert.deepEqual(await Promise.all([1, 2, 3].map((position) => hop(position).isDisabled())), [false, false, false]);
+    assert.deepEqual(await hops(), [
+      "Amsterdam · WireGuard",
+      "Seedbox · SSH",
+      "None",
+    ]);
+    assert.deepEqual(
+      await Promise.all(
+        [1, 2, 3].map((position) => hop(position).isDisabled()),
+      ),
+      [false, false, false],
+    );
     // The three share one row, however long the names in them.
-    const tops = await Promise.all([1, 2, 3].map(async (position) => (await hop(position).boundingBox()).y));
+    const tops = await Promise.all(
+      [1, 2, 3].map(async (position) => (await hop(position).boundingBox()).y),
+    );
     assert.equal(new Set(tops).size, 1, `hops sit at ${tops.join(", ")}`);
     // Under each hop, whether the chain needs it: the first two, and not the third.
-    const notes = editor.locator("span").filter({ hasText: /^(\* Required|Optional)$/ });
-    assert.deepEqual(await notes.allTextContents(), ["* Required", "* Required", "Optional"]);
+    const notes = editor
+      .locator("span")
+      .filter({ hasText: /^(\* Required|Optional)$/ });
+    assert.deepEqual(await notes.allTextContents(), [
+      "* Required",
+      "* Required",
+      "Optional",
+    ]);
     await shot(page, "route-chain-new");
 
     // The proxy beneath is gone from the list, and WireGuard still rides WireGuard.
-    assert.deepEqual(await offered(2, "Seedbox"), ["Seedbox · SSH", "Relay · SOCKS5", "Paris · WireGuard"]);
+    assert.deepEqual(await offered(2, "Seedbox"), [
+      "Seedbox · SSH",
+      "Relay · SOCKS5",
+      "Paris · WireGuard",
+    ]);
     // Nothing that needs UDP rides SSH.
     assert.deepEqual(await offered(3, "Relay"), ["None", "Relay · SOCKS5"]);
     await shot(page, "route-chain");
     // The third hop comes off again.
     await offered(3, "None");
-    assert.deepEqual(await hops(), ["Amsterdam · WireGuard", "Seedbox · SSH", "None"]);
+    assert.deepEqual(await hops(), [
+      "Amsterdam · WireGuard",
+      "Seedbox · SSH",
+      "None",
+    ]);
 
     // A second hop that cannot ride the new first gives way to the first that can.
     await offered(2, "Paris");
-    assert.deepEqual(await offered(1, "Seedbox"), ["Amsterdam · WireGuard", "Seedbox · SSH", "Relay · SOCKS5"]);
+    assert.deepEqual(await offered(1, "Seedbox"), [
+      "Amsterdam · WireGuard",
+      "Seedbox · SSH",
+      "Relay · SOCKS5",
+    ]);
     assert.deepEqual(await hops(), ["Seedbox · SSH", "Relay · SOCKS5", "None"]);
 
     // An added rung starts on the first proxy the ladder has not used.
     await action(editor, "Add rung").click();
-    assert.equal(await action(editor, "Leg 1 rung 2").textContent(), "Amsterdam");
+    assert.equal(
+      await action(editor, "Leg 1 rung 2").textContent(),
+      "Amsterdam",
+    );
   } finally {
     await page.close();
   }
@@ -447,7 +682,12 @@ test("SSH signs in with an Ed25519 key and has no password", async () => {
     await field(editor, "Password").fill("fixture-password");
     await pick(page, editor, "Type", "SSH");
     assert.equal(await field(editor, "Password").count(), 0);
-    assert.equal(await editor.getByRole("radiogroup", { name: "Set up from", exact: true }).count(), 0);
+    assert.equal(
+      await editor
+        .getByRole("radiogroup", { name: "Set up from", exact: true })
+        .count(),
+      0,
+    );
     assert.equal(await field(editor, "Port").inputValue(), "22");
     await editor.getByText("Ed25519 keys only.", { exact: true }).waitFor();
     // None of it is the Weaver login, so no field is left to a password manager.
@@ -470,12 +710,18 @@ test("SSH signs in with an Ed25519 key and has no password", async () => {
     // A stored one says the same, beside what it says of the key it holds.
     const stored = await editing(page, "Seedbox");
     assert.equal(await field(stored, "Password").count(), 0);
-    await stored.getByText("Ed25519 keys only. Stored. Leave blank to keep it.", { exact: true }).waitFor();
+    await stored
+      .getByText("Ed25519 keys only. Stored. Leave blank to keep it.", {
+        exact: true,
+      })
+      .waitFor();
     await action(stored, "Cancel").click();
     // The types that do take a password still have one.
     const relay = await editing(page, "Relay");
     await field(relay, "Password").waitFor();
-  } finally { await page.close(); }
+  } finally {
+    await page.close();
+  }
 });
 
 test("a proxy keeps no DNS setting, and a WireGuard proxy keeps its tunnel's own DNS servers", async () => {
@@ -483,7 +729,12 @@ test("a proxy keeps no DNS setting, and a WireGuard proxy keeps its tunnel's own
   try {
     // Who answers is a route's DNS profile; a SOCKS5 or SSH proxy has nothing of DNS to set.
     const seedbox = await editing(page, "Seedbox");
-    for (const id of ["field-dnsWho", "field-dnsTrust", "field-dnsServer-0-address", "field-dnsServers"]) {
+    for (const id of [
+      "field-dnsWho",
+      "field-dnsTrust",
+      "field-dnsServer-0-address",
+      "field-dnsServers",
+    ]) {
       assert.equal(await seedbox.getByTestId(id).count(), 0, id);
     }
     await action(seedbox, "Save").click();
@@ -497,10 +748,16 @@ test("a proxy keeps no DNS setting, and a WireGuard proxy keeps its tunnel's own
     const servers = amsterdam.getByTestId("field-dnsServers");
     await servers.fill("10.6.0.1\ndns.fixture.invalid");
     await action(amsterdam, "Save").click();
-    await amsterdam.getByText("Tunnel DNS servers must be IP addresses.", { exact: true }).waitFor();
-    await servers.fill(Array.from({ length: 11 }, (_, at) => `10.6.0.${at + 1}`).join("\n"));
+    await amsterdam
+      .getByText("Tunnel DNS servers must be IP addresses.", { exact: true })
+      .waitFor();
+    await servers.fill(
+      Array.from({ length: 11 }, (_, at) => `10.6.0.${at + 1}`).join("\n"),
+    );
     await action(amsterdam, "Save").click();
-    await amsterdam.getByText("Keep at most 10 DNS servers.", { exact: true }).waitFor();
+    await amsterdam
+      .getByText("Keep at most 10 DNS servers.", { exact: true })
+      .waitFor();
     await servers.fill("10.6.0.1\nfd00::1");
     await action(amsterdam, "Save").click();
     await amsterdam.waitFor({ state: "detached" });
@@ -508,9 +765,14 @@ test("a proxy keeps no DNS setting, and a WireGuard proxy keeps its tunnel's own
     assert.deepEqual(input.dnsServers, ["10.6.0.1", "fd00::1"]);
     // Opened again, the servers read as they were saved.
     const saved = await editing(page, "Amsterdam");
-    assert.equal(await saved.getByTestId("field-dnsServers").inputValue(), "10.6.0.1\nfd00::1");
+    assert.equal(
+      await saved.getByTestId("field-dnsServers").inputValue(),
+      "10.6.0.1\nfd00::1",
+    );
     await action(saved, "Cancel").click();
-  } finally { await page.close(); }
+  } finally {
+    await page.close();
+  }
 });
 
 test("a proxy is found with the host or a proxy name profile, saved with it and shown on its line when not the host", async () => {
@@ -521,26 +783,53 @@ test("a proxy is found with the host or a proxy name profile, saved with it and 
     // copy-is-claim: the built-in profile reads as the host here.
     await select.getByText("Host", { exact: true }).waitFor();
     // copy-is-claim: the select says what it is for.
-    assert.equal(await relay.getByTestId("help-proxyDnsProfile").textContent(), "Used to look up this proxy's address when it is a name.");
+    assert.equal(
+      await relay.getByTestId("help-proxyDnsProfile").textContent(),
+      "Used to look up this proxy's address when it is a name.",
+    );
     assert.equal(await page.getByTestId("proxy-dns-profile-3").count(), 0);
     await select.click();
-    await page.getByRole("menuitemradio", { name: "Proxy names", exact: true }).waitFor();
+    await page
+      .getByRole("menuitemradio", { name: "Proxy names", exact: true })
+      .waitFor();
     // A route profile is never offered for finding a proxy.
-    assert.equal(await page.getByRole("menuitemradio", { name: "Checked", exact: true }).count(), 0);
-    await page.getByRole("menuitemradio", { name: "Proxy names", exact: true }).click();
+    assert.equal(
+      await page
+        .getByRole("menuitemradio", { name: "Checked", exact: true })
+        .count(),
+      0,
+    );
+    await page
+      .getByRole("menuitemradio", { name: "Proxy names", exact: true })
+      .click();
     await action(relay, "Save").click();
     await relay.waitFor({ state: "detached" });
-    const input = (await daemon(page)).requests.filter((request) => request.name === "SaveProxyProfile").at(-1).variables.input;
+    const input = (await daemon(page)).requests
+      .filter((request) => request.name === "SaveProxyProfile")
+      .at(-1).variables.input;
     assert.equal(input.dnsProfileId, 6);
     // copy-is-claim: the line names the profile only once it is not the host.
-    await page.getByTestId("proxy-dns-profile-3").getByText("Found with Proxy names", { exact: true }).waitFor();
+    await page
+      .getByTestId("proxy-dns-profile-3")
+      .getByText("Found with Proxy names", { exact: true })
+      .waitFor();
     // Every kind has the select, WireGuard included.
     const amsterdam = await editing(page, "Amsterdam");
-    await amsterdam.getByTestId("field-proxyDnsProfile").getByText("Host", { exact: true }).waitFor();
+    await amsterdam
+      .getByTestId("field-proxyDnsProfile")
+      .getByText("Host", { exact: true })
+      .waitFor();
     await action(amsterdam, "Cancel").click();
     // Secondary evidence: the profile names are read once, for both editors and the lines.
-    assert.equal((await daemon(page)).requests.filter((request) => request.name === "DnsProfileNames").length, 1);
-  } finally { await page.close(); }
+    assert.equal(
+      (await daemon(page)).requests.filter(
+        (request) => request.name === "DnsProfileNames",
+      ).length,
+      1,
+    );
+  } finally {
+    await page.close();
+  }
 });
 
 /** Opens Test via from the proxy's own line. */
@@ -552,19 +841,24 @@ async function testingVia(page, name) {
 }
 /** Each path a run tried, as its row reads: the hops, how it went, and what was said of it. */
 async function paths(dialog, count) {
-  const rows = dialog.getByRole("list", { name: "Paths", exact: true }).getByRole("listitem");
+  const rows = dialog
+    .getByRole("list", { name: "Paths", exact: true })
+    .getByRole("listitem");
   await rows.nth(count - 1).waitFor();
   assert.equal(await rows.count(), count);
-  return Promise.all(Array.from({ length: count }, async (_, index) => {
-    const row = rows.nth(index);
-    return {
-      hops: await row.locator("span").first().textContent(),
-      failing: await row.locator("span.text-wv-error-text").allTextContents(),
-      sentence: await row.locator("p").textContent(),
-    };
-  }));
+  return Promise.all(
+    Array.from({ length: count }, async (_, index) => {
+      const row = rows.nth(index);
+      return {
+        hops: await row.locator("span").first().textContent(),
+        failing: await row.locator("span.text-wv-error-text").allTextContents(),
+        sentence: await row.locator("p").textContent(),
+      };
+    }),
+  );
 }
-const runs = async (page) => (await daemon(page)).requests.filter((request) => request.name === "TestVia");
+const runs = async (page) =>
+  (await daemon(page)).requests.filter((request) => request.name === "TestVia");
 
 test("a proxy is tested through a route drafted for it, which cannot use the proxy, and each path is a row", async () => {
   const page = await open();
@@ -573,36 +867,71 @@ test("a proxy is tested through a route drafted for it, which cannot use the pro
     await dialog.getByText("Relay · SOCKS5", { exact: true }).waitFor();
     // The draft starts direct on the first egress that is turned on.
     assert.equal(await action(dialog, "Egress").textContent(), "System");
-    assert.equal(await option(dialog, "Direct").getAttribute("aria-checked"), "true");
+    assert.equal(
+      await option(dialog, "Direct").getAttribute("aria-checked"),
+      "true",
+    );
     // A test tries every path, so the draft has no weights or share to hold.
     assert.equal(await dialog.getByRole("slider").count(), 0);
-    assert.equal(await dialog.getByText("Simulate leg down", { exact: true }).count(), 0);
-    assert.equal(await dialog.getByText("When a leg goes down", { exact: true }).count(), 0);
+    assert.equal(
+      await dialog.getByText("Simulate leg down", { exact: true }).count(),
+      0,
+    );
+    assert.equal(
+      await dialog.getByText("When a leg goes down", { exact: true }).count(),
+      0,
+    );
 
     await option(dialog, "Proxy ladder").click();
     // The proxy under test cannot carry itself, so it is not offered.
     await action(dialog, "Leg 1 rung 1").click();
-    assert.deepEqual(await page.getByRole("menuitemradio").allTextContents(), ["Amsterdam", "Seedbox"]);
-    await page.getByRole("menuitemradio", { name: "Amsterdam", exact: true }).click();
+    assert.deepEqual(await page.getByRole("menuitemradio").allTextContents(), [
+      "Amsterdam",
+      "Seedbox",
+    ]);
+    await page
+      .getByRole("menuitemradio", { name: "Amsterdam", exact: true })
+      .click();
     await action(dialog, "Add rung").click();
     assert.equal(await action(dialog, "Leg 1 rung 2").textContent(), "Seedbox");
 
     await action(dialog, "Test").click();
     const reachable = "Reachable. Give a host and port to check forwarding.";
-    const silent = "No answer within 10 seconds. Check the address, the port and any firewall.";
+    const silent =
+      "No answer within 10 seconds. Check the address, the port and any firewall.";
     assert.deepEqual(await paths(dialog, 3), [
       { hops: "System > Amsterdam > Relay", failing: [], sentence: reachable },
-      { hops: "System > Seedbox > Relay", failing: ["Seedbox"], sentence: silent },
+      {
+        hops: "System > Seedbox > Relay",
+        failing: ["Seedbox"],
+        sentence: silent,
+      },
       { hops: "System > Relay", failing: [], sentence: reachable },
     ]);
-    const rows = dialog.getByRole("list", { name: "Paths", exact: true }).getByRole("listitem");
+    const rows = dialog
+      .getByRole("list", { name: "Paths", exact: true })
+      .getByRole("listitem");
     await rows.nth(1).getByText("Failed at Seedbox", { exact: true }).waitFor();
     await rows.nth(0).getByText("Passed", { exact: true }).waitFor();
-    await rows.nth(0).getByText("13 ms · source 192.0.2.10:40000", { exact: true }).waitFor();
+    await rows
+      .nth(0)
+      .getByText("13 ms · source 192.0.2.10:40000", { exact: true })
+      .waitFor();
     assert.deepEqual((await runs(page)).at(-1).variables, {
       route: {
         failover: "REDISTRIBUTE",
-        legs: [{ egressId: 0, weight: 100, path: { ladder: { directFallback: true, rungs: [{ proxy: 1 }, { proxy: 2 }] } } }],
+        legs: [
+          {
+            egressId: 0,
+            weight: 100,
+            path: {
+              ladder: {
+                directFallback: true,
+                rungs: [{ proxy: 1 }, { proxy: 2 }],
+              },
+            },
+          },
+        ],
       },
       subject: { proxy: 3 },
       target: null,
@@ -620,11 +949,20 @@ test("a proxy is tested through a route drafted for it, which cannot use the pro
     await field(dialog, "Host").fill("news.fixture.invalid");
     await field(dialog, "Port").fill("563");
     await action(dialog, "Test").click();
-    await rows.first().getByText("Connected and forwarded through the proxy.", { exact: true }).waitFor();
-    assert.deepEqual((await runs(page)).at(-1).variables.target, { host: "news.fixture.invalid", port: 563 });
+    await rows
+      .first()
+      .getByText("Connected and forwarded through the proxy.", { exact: true })
+      .waitFor();
+    assert.deepEqual((await runs(page)).at(-1).variables.target, {
+      host: "news.fixture.invalid",
+      port: 563,
+    });
     // Each path says how the host was resolved, the address it reached marked among several.
     const resolved = rows.first().locator("p").nth(1);
-    assert.equal(await resolved.textContent(), "news.fixture.invalid → 192.0.2.80, 192.0.2.81 · DNS 192.0.2.53 via Relay · DNS over TLS · Validated");
+    assert.equal(
+      await resolved.textContent(),
+      "news.fixture.invalid → 192.0.2.80, 192.0.2.81 · DNS 192.0.2.53 via Relay · DNS over TLS · Validated",
+    );
     assert.equal(await resolved.locator("strong").textContent(), "192.0.2.81");
     // A path that failed before its lookup says nothing of one.
     assert.equal(await rows.nth(1).locator("p").count(), 1);
@@ -644,8 +982,13 @@ test("a proxy is tested through a route drafted for it, which cannot use the pro
     await action(dialog, "Close").click();
     await dialog.waitFor({ state: "detached" });
     await line(page, "Relay").getByText(silent, { exact: true }).waitFor();
-    assert.equal(await line(page, "Amsterdam").getByText("—", { exact: true }).count(), 1);
-  } finally { await page.close(); }
+    assert.equal(
+      await line(page, "Amsterdam").getByText("—", { exact: true }).count(),
+      1,
+    );
+  } finally {
+    await page.close();
+  }
 });
 
 test("a test the daemon refuses says why in our words, and leaves no rows", async () => {
@@ -657,12 +1000,28 @@ test("a test the daemon refuses says why in our words, and leaves no rows", asyn
     await option(dialog, "Proxy ladder").click();
     await action(dialog, "Add rung").click();
     await action(dialog, "Test").click();
-    await dialog.getByRole("alert").getByText("A test can try at most 2 paths. Use fewer rungs or pool members.", { exact: true }).waitFor();
-    assert.equal(await dialog.getByRole("list", { name: "Paths", exact: true }).count(), 0);
+    await dialog
+      .getByRole("alert")
+      .getByText(
+        "A test can try at most 2 paths. Use fewer rungs or pool members.",
+        { exact: true },
+      )
+      .waitFor();
+    assert.equal(
+      await dialog.getByRole("list", { name: "Paths", exact: true }).count(),
+      0,
+    );
     await shot(page, "test-via-refused");
     await action(dialog, "Close").click();
-    await line(page, "Relay").getByText("A test can try at most 2 paths. Use fewer rungs or pool members.", { exact: true }).waitFor();
-  } finally { await page.close(); }
+    await line(page, "Relay")
+      .getByText(
+        "A test can try at most 2 paths. Use fewer rungs or pool members.",
+        { exact: true },
+      )
+      .waitFor();
+  } finally {
+    await page.close();
+  }
 });
 
 test("a pool is tested member by member through a route drafted for it, and carries a host through the member it picks", async () => {
@@ -676,15 +1035,27 @@ test("a pool is tested member by member through a route drafted for it, and carr
     // The draft may not use the pool's own members.
     await option(dialog, "Proxy ladder").click();
     await action(dialog, "Leg 1 rung 1").click();
-    assert.deepEqual(await page.getByRole("menuitemradio").allTextContents(), ["Amsterdam", "Seedbox"]);
-    await page.getByRole("menuitemradio", { name: "Amsterdam", exact: true }).click();
+    assert.deepEqual(await page.getByRole("menuitemradio").allTextContents(), [
+      "Amsterdam",
+      "Seedbox",
+    ]);
+    await page
+      .getByRole("menuitemradio", { name: "Amsterdam", exact: true })
+      .click();
     await option(dialog, "Direct").click();
     await action(dialog, "Test").click();
     assert.deepEqual(await paths(dialog, 1), [
-      { hops: "System > Relay", failing: [], sentence: "Reachable. Give a host and port to check forwarding." },
+      {
+        hops: "System > Relay",
+        failing: [],
+        sentence: "Reachable. Give a host and port to check forwarding.",
+      },
     ]);
     assert.deepEqual((await runs(page)).at(-1).variables, {
-      route: { failover: "REDISTRIBUTE", legs: [{ egressId: 0, weight: 100, path: { direct: true } }] },
+      route: {
+        failover: "REDISTRIBUTE",
+        legs: [{ egressId: 0, weight: 100, path: { direct: true } }],
+      },
       subject: { pool: 1 },
       target: null,
       torrent: false,
@@ -695,16 +1066,26 @@ test("a pool is tested member by member through a route drafted for it, and carr
     await action(dialog, "Optional").click();
     await field(dialog, "Host").fill("news.fixture.invalid");
     await action(dialog, "Test").click();
-    const rows = dialog.getByRole("list", { name: "Paths", exact: true }).getByRole("listitem");
-    await rows.first().getByText("Connected and forwarded through the proxy.", { exact: true }).waitFor();
+    const rows = dialog
+      .getByRole("list", { name: "Paths", exact: true })
+      .getByRole("listitem");
+    await rows
+      .first()
+      .getByText("Connected and forwarded through the proxy.", { exact: true })
+      .waitFor();
     assert.equal(await rows.count(), 1);
     const hops = rows.first().locator("span").first();
     assert.equal(await hops.textContent(), "System > Exits (Relay)");
     assert.equal(await hops.locator("strong").textContent(), "Relay");
     assert.equal(await hops.locator("span.text-wv-error-text").count(), 0);
-    assert.deepEqual((await runs(page)).at(-1).variables.target, { host: "news.fixture.invalid", port: 443 });
+    assert.deepEqual((await runs(page)).at(-1).variables.target, {
+      host: "news.fixture.invalid",
+      port: 443,
+    });
     await shot(page, "test-via-pool-picked");
-  } finally { await page.close(); }
+  } finally {
+    await page.close();
+  }
 });
 
 test("a pool's line opens Test via for the pool", async () => {
@@ -713,11 +1094,16 @@ test("a pool's line opens Test via for the pool", async () => {
     const dialog = await testingVia(page, "Exits");
     await dialog.getByText("Exits · SOCKS5", { exact: true }).waitFor();
     // The pool's editor stays closed.
-    assert.equal(await page.getByRole("dialog", { name: "Exits", exact: true }).count(), 0);
+    assert.equal(
+      await page.getByRole("dialog", { name: "Exits", exact: true }).count(),
+      0,
+    );
     await action(dialog, "Test").click();
     await paths(dialog, 1);
     assert.deepEqual((await runs(page)).at(-1).variables.subject, { pool: 1 });
     await action(dialog, "Close").click();
     await dialog.waitFor({ state: "detached" });
-  } finally { await page.close(); }
+  } finally {
+    await page.close();
+  }
 });

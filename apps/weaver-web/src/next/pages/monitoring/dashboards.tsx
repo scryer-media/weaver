@@ -1,7 +1,15 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
-import { lazy, Suspense, useEffect, useMemo, useState, type ComponentType, type LazyExoticComponent } from "react";
+import {
+  lazy,
+  Suspense,
+  useEffect,
+  useMemo,
+  useState,
+  type ComponentType,
+  type LazyExoticComponent,
+} from "react";
 import { Navigate, useNavigate, useParams } from "react-router";
 import { useTranslate } from "@/lib/context/translate-context";
 import { Tabs } from "../../components/Tabs";
@@ -13,8 +21,14 @@ import { AttentionBlock, UptimeBlock } from "../../shell/rail-blocks";
 import { ShellHostsContext, type ShellHosts } from "./shell-slots";
 
 /** A dashboard's page, loaded on first use, and the load itself. */
-function lazyPage<K extends string>(load: () => Promise<Record<K, ComponentType>>, name: K) {
-  return { page: lazy(() => load().then((module) => ({ default: module[name] }))), load };
+function lazyPage<K extends string>(
+  load: () => Promise<Record<K, ComponentType>>,
+  name: K,
+) {
+  return {
+    page: lazy(() => load().then((module) => ({ default: module[name] }))),
+    load,
+  };
 }
 
 interface Dashboard {
@@ -64,13 +78,22 @@ const DASHBOARDS: readonly Dashboard[] = [
 export function DashboardNav({ active }: { active: string }) {
   const t = useTranslate();
   const navigate = useNavigate();
-  const shown = withoutTorrentOnly(DASHBOARDS, useTorrentsShown(), (dashboard) => dashboard.torrentOnly === true);
+  const shown = withoutTorrentOnly(
+    DASHBOARDS,
+    useTorrentsShown(),
+    (dashboard) => dashboard.torrentOnly === true,
+  );
   return (
     <Tabs
-      tabs={shown.map((dashboard) => ({ id: dashboard.id, label: t(dashboard.label) }))}
+      tabs={shown.map((dashboard) => ({
+        id: dashboard.id,
+        label: t(dashboard.label),
+      }))}
       active={active}
       testId="monitoring"
-      onSelect={(id) => navigate(id === DASHBOARDS[0]!.id ? "/monitoring" : `/monitoring/${id}`)}
+      onSelect={(id) =>
+        navigate(id === DASHBOARDS[0]!.id ? "/monitoring" : `/monitoring/${id}`)
+      }
     />
   );
 }
@@ -84,12 +107,18 @@ export function DashboardNav({ active }: { active: string }) {
 export function MonitoringRoute() {
   const t = useTranslate();
   const { dashboard: id } = useParams();
-  const dashboard = id === undefined ? DASHBOARDS[0]! : DASHBOARDS.find((entry) => entry.id === id);
+  const dashboard =
+    id === undefined
+      ? DASHBOARDS[0]!
+      : DASHBOARDS.find((entry) => entry.id === id);
   const [note, setNote] = useState<HTMLElement | null>(null);
   const [controls, setControls] = useState<HTMLElement | null>(null);
   const [strip, setStrip] = useState<HTMLElement | null>(null);
   const [status, setStatus] = useState<HTMLElement | null>(null);
-  const hosts = useMemo<ShellHosts>(() => ({ note, controls, strip, status }), [note, controls, strip, status]);
+  const hosts = useMemo<ShellHosts>(
+    () => ({ note, controls, strip, status }),
+    [note, controls, strip, status],
+  );
   useEffect(() => {
     for (const entry of DASHBOARDS) {
       void entry.load();
@@ -100,11 +129,19 @@ export function MonitoringRoute() {
   }
   const Page = dashboard.page;
   const loading = (
-    <div role="status" aria-busy="true" className="flex flex-1 items-center justify-center bg-wv-list">
+    <div
+      role="status"
+      aria-busy="true"
+      className="flex flex-1 items-center justify-center bg-wv-list"
+    >
       <LoadingMark className="h-10" reveal />
     </div>
   );
-  const page = <Suspense fallback={loading}><Page /></Suspense>;
+  const page = (
+    <Suspense fallback={loading}>
+      <Page />
+    </Suspense>
+  );
   return (
     <NextShell
       title={t("next.nav.monitoring")}
@@ -124,7 +161,10 @@ export function MonitoringRoute() {
         {/* A torrent-only dashboard waits for whether torrents are on, and
             leaves for the first dashboard once they are known to be off. */}
         {dashboard.torrentOnly ? (
-          <TorrentsOnly pending={loading} fallback={<Navigate to="/monitoring" replace />}>
+          <TorrentsOnly
+            pending={loading}
+            fallback={<Navigate to="/monitoring" replace />}
+          >
             {page}
           </TorrentsOnly>
         ) : (

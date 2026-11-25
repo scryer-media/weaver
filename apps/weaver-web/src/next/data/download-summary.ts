@@ -78,7 +78,9 @@ const ORIGIN_GROUP: Record<string, PasswordOriginGroup | undefined> = {
   PASSWORD_FILE: "list",
 };
 
-export function passwordOriginGroup(origin: string | null | undefined): PasswordOriginGroup | null {
+export function passwordOriginGroup(
+  origin: string | null | undefined,
+): PasswordOriginGroup | null {
   return origin ? (ORIGIN_GROUP[origin] ?? null) : null;
 }
 
@@ -113,16 +115,22 @@ export interface DownloadTreeNode {
  * one whose parents only lead back round to it (a loop, which a sound summary
  * never holds) is shown as a root too, where the loop is first met.
  */
-export function downloadTree(nodes: readonly DownloadNodeData[]): DownloadTreeNode[] {
+export function downloadTree(
+  nodes: readonly DownloadNodeData[],
+): DownloadTreeNode[] {
   const listed = new Set(nodes.map((node) => node.id));
   const children = new Map<number | null, DownloadNodeData[]>();
   for (const node of nodes) {
-    const parent = node.parentId !== null && listed.has(node.parentId) ? node.parentId : null;
+    const parent =
+      node.parentId !== null && listed.has(node.parentId)
+        ? node.parentId
+        : null;
     const siblings = children.get(parent);
     if (siblings) siblings.push(node);
     else children.set(parent, [node]);
   }
-  for (const siblings of children.values()) siblings.sort((a, b) => a.id - b.id);
+  for (const siblings of children.values())
+    siblings.sort((a, b) => a.id - b.id);
 
   const placed = new Set<number>();
   const grow = (node: DownloadNodeData): DownloadTreeNode => {

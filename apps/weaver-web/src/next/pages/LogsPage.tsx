@@ -45,13 +45,16 @@ const ROW_ESTIMATE_PX = 31;
 
 const FILTERS: LogLevelFilter[] = ["all", ...LOG_LEVELS];
 
-type LogFilterPreset = "default" | "download" | "graphEngine" | "everything" | "custom";
+type LogFilterPreset =
+  "default" | "download" | "graphEngine" | "everything" | "custom";
 
 /** Directives per preset. Blank asks the server for its startup filter. */
 const PRESET_DIRECTIVES: Record<Exclude<LogFilterPreset, "custom">, string> = {
   default: "",
-  download: "info,weaver_server_pipeline::pipeline::download=debug,weaver_nntp=debug",
-  graphEngine: "info,weaver_server_pipeline::pipeline::graph=debug,weaver_graph=debug",
+  download:
+    "info,weaver_server_pipeline::pipeline::download=debug,weaver_nntp=debug",
+  graphEngine:
+    "info,weaver_server_pipeline::pipeline::graph=debug,weaver_graph=debug",
   everything: "debug",
 };
 
@@ -78,9 +81,9 @@ function LogFilterBar() {
   const [{ data, error: loadError }] = useQuery<{ logFilter: LogFilterState }>({
     query: LOG_FILTER_QUERY,
   });
-  const [{ fetching }, setLogFilter] = useMutation<{ setLogFilter: LogFilterState }>(
-    SET_LOG_FILTER_MUTATION,
-  );
+  const [{ fetching }, setLogFilter] = useMutation<{
+    setLogFilter: LogFilterState;
+  }>(SET_LOG_FILTER_MUTATION);
   const [applied, setApplied] = useState<LogFilterState | null>(null);
   // `null` until edited: the field shows what is in force.
   const [edited, setEdited] = useState<string | null>(null);
@@ -98,7 +101,10 @@ function LogFilterBar() {
     if (result.error || !result.data) {
       setFailure(
         t("next.logs.filter.failed", {
-          error: result.error?.graphQLErrors[0]?.message ?? result.error?.message ?? "",
+          error:
+            result.error?.graphQLErrors[0]?.message ??
+            result.error?.message ??
+            "",
         }),
       );
       return;
@@ -199,7 +205,10 @@ export function LogsPage() {
 }
 
 type LogLinesView = Pick<ServiceLogs, "lines" | "loading">;
-type LogCountsView = Pick<ServiceLogs, "counts" | "bufferedCount" | "matchedCount">;
+type LogCountsView = Pick<
+  ServiceLogs,
+  "counts" | "bufferedCount" | "matchedCount"
+>;
 type LogTailView = Pick<ServiceLogs, "paused" | "setPaused" | "connected">;
 
 const LogLinesContext = createContext<LogLinesView | null>(null);
@@ -232,17 +241,23 @@ function ServiceLogsFeed({
   const logs = useServiceLogs(level, query);
   const lines = useSettled(logs.lines, sameElements);
   const counts = useSettled(logs.counts, shallowEqual);
-  const { loading, bufferedCount, matchedCount, paused, setPaused, connected } = logs;
+  const { loading, bufferedCount, matchedCount, paused, setPaused, connected } =
+    logs;
   const linesView = useMemo(() => ({ lines, loading }), [lines, loading]);
   const countsView = useMemo(
     () => ({ counts, bufferedCount, matchedCount }),
     [bufferedCount, counts, matchedCount],
   );
-  const tailView = useMemo(() => ({ paused, setPaused, connected }), [connected, paused, setPaused]);
+  const tailView = useMemo(
+    () => ({ paused, setPaused, connected }),
+    [connected, paused, setPaused],
+  );
   return (
     <LogLinesContext.Provider value={linesView}>
       <LogCountsContext.Provider value={countsView}>
-        <LogTailContext.Provider value={tailView}>{children}</LogTailContext.Provider>
+        <LogTailContext.Provider value={tailView}>
+          {children}
+        </LogTailContext.Provider>
       </LogCountsContext.Provider>
     </LogLinesContext.Provider>
   );
@@ -251,7 +266,9 @@ function ServiceLogsFeed({
 function BufferedNote() {
   const t = useTranslate();
   const { bufferedCount } = useLogsPart(LogCountsContext);
-  return countLabel(t, "next.logs.buffered", bufferedCount, { count: formatCount(bufferedCount) });
+  return countLabel(t, "next.logs.buffered", bufferedCount, {
+    count: formatCount(bufferedCount),
+  });
 }
 
 function ShownCount() {
@@ -302,7 +319,9 @@ function LevelBar({
               onClick={() => onLevel(entry)}
               className={cn(
                 "flex flex-none items-center gap-[7px] font-wv-mono text-[11.5px] tracking-[0.1em] uppercase",
-                selected ? "text-wv-strong" : "text-wv-muted hover:text-wv-secondary",
+                selected
+                  ? "text-wv-strong"
+                  : "text-wv-muted hover:text-wv-secondary",
               )}
             >
               <span
@@ -317,7 +336,9 @@ function LevelBar({
         })}
       </div>
       <span
-        data-testid={runtimeIds.logsTail(paused ? "paused" : connected ? "following" : "disconnected")}
+        data-testid={runtimeIds.logsTail(
+          paused ? "paused" : connected ? "following" : "disconnected",
+        )}
         className="ml-auto hidden flex-none pl-3 font-wv-mono text-[11px] text-wv-faint sm:inline"
       >
         {paused
@@ -368,7 +389,8 @@ function LogList({ level, query }: { level: LogLevelFilter; query: string }) {
     setSelected(source);
   }, []);
   const onToggle = useCallback(
-    (line: LogLine) => select(selectedRef.current === line.source ? null : line.source),
+    (line: LogLine) =>
+      select(selectedRef.current === line.source ? null : line.source),
     [select],
   );
   const virtualizer = useVirtualizer({
@@ -407,7 +429,8 @@ function LogList({ level, query }: { level: LogLevelFilter; query: string }) {
     const scroller = scrollerRef.current;
     if (scroller) {
       const atTail =
-        scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight <= TAIL_SLACK_PX;
+        scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight <=
+        TAIL_SLACK_PX;
       if (selectedRef.current === null) {
         followingRef.current = atTail;
       } else {
@@ -423,14 +446,21 @@ function LogList({ level, query }: { level: LogLevelFilter; query: string }) {
       className="flex min-h-0 flex-1 flex-col overflow-y-auto bg-wv-list"
     >
       {lines.length === 0 && loading ? (
-        <EmptyState loading title={t("next.common.loading")} body={t("next.logs.loadingBody")} />
+        <EmptyState
+          loading
+          title={t("next.common.loading")}
+          body={t("next.logs.loadingBody")}
+        />
       ) : lines.length === 0 ? (
         <EmptyState
           title={t("next.logs.noMatch")}
           body={t("next.logs.noMatchBody")}
         />
       ) : (
-        <div className="relative w-full flex-none" style={{ height: totalSize }}>
+        <div
+          className="relative w-full flex-none"
+          style={{ height: totalSize }}
+        >
           {virtualizer.getVirtualItems().map((item) => (
             <div
               key={item.key}

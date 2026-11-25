@@ -60,20 +60,31 @@ export function installableUpgrade(
 }
 
 /** Temporary release-host failures have a retry message; other failures keep their details. */
-export function upgradeFailureKey(error: string | null):
-  "applicationUpgrade.githubUnavailable" | "applicationUpgrade.failed" {
-  const unavailable = error !== null
-    && /HTTP status server error \(5\d{2}\b/.test(error)
-    && /https:\/\/(?:github\.com|api\.github\.com|(?:release-assets|github-releases)\.githubusercontent\.com)[/)]/.test(error);
-  return unavailable ? "applicationUpgrade.githubUnavailable" : "applicationUpgrade.failed";
+export function upgradeFailureKey(
+  error: string | null,
+): "applicationUpgrade.githubUnavailable" | "applicationUpgrade.failed" {
+  const unavailable =
+    error !== null &&
+    /HTTP status server error \(5\d{2}\b/.test(error) &&
+    /https:\/\/(?:github\.com|api\.github\.com|(?:release-assets|github-releases)\.githubusercontent\.com)[/)]/.test(
+      error,
+    );
+  return unavailable
+    ? "applicationUpgrade.githubUnavailable"
+    : "applicationUpgrade.failed";
 }
 
 /** How far the download has got, or `undefined` while no size is known yet. */
-export function downloadPercent(run: ApplicationUpgradeRun): number | undefined {
+export function downloadPercent(
+  run: ApplicationUpgradeRun,
+): number | undefined {
   if (run.totalBytes <= 0) {
     return undefined;
   }
-  return Math.min(100, Math.round((run.downloadedBytes / run.totalBytes) * 100));
+  return Math.min(
+    100,
+    Math.round((run.downloadedBytes / run.totalBytes) * 100),
+  );
 }
 
 /**
@@ -81,6 +92,10 @@ export function downloadPercent(run: ApplicationUpgradeRun): number | undefined 
  * rather than the GitHub release page: this installation upgrades itself, and
  * there is a release to install or an install already under way.
  */
-export function upgradesInApp(status: ApplicationUpgradeStatus | undefined): boolean {
-  return Boolean(status?.eligible && (status.updateAvailable || status.activeRun));
+export function upgradesInApp(
+  status: ApplicationUpgradeStatus | undefined,
+): boolean {
+  return Boolean(
+    status?.eligible && (status.updateAvailable || status.activeRun),
+  );
 }

@@ -6,7 +6,6 @@ import { duplicateLocaleEntries } from "../duplicate-locales";
 import { nextPt } from "@/next/i18n/pt";
 
 const pt: LocaleDictionary = {
-
   // Navigation
   "nav.settings": "Configurações",
   "nav.sponsor": "Patrocinar",
@@ -15,19 +14,25 @@ const pt: LocaleDictionary = {
   "applicationUpgrade.upToDate": "O Weaver v{{version}} está atualizado.",
   "applicationUpgrade.available": "O Weaver v{{version}} está disponível.",
   "applicationUpgrade.install": "Instalar a v{{version}}",
-  "applicationUpgrade.notEligible": "O Weaver não pode atualizar esta instalação pelo aplicativo ({{reason}}).",
-  "applicationUpgrade.failed": "A atualização para a v{{version}} falhou: {{error}}",
-  "applicationUpgrade.githubUnavailable": "O GitHub está temporariamente indisponível. Tente atualizar novamente mais tarde.",
+  "applicationUpgrade.notEligible":
+    "O Weaver não pode atualizar esta instalação pelo aplicativo ({{reason}}).",
+  "applicationUpgrade.failed":
+    "A atualização para a v{{version}} falhou: {{error}}",
+  "applicationUpgrade.githubUnavailable":
+    "O GitHub está temporariamente indisponível. Tente atualizar novamente mais tarde.",
   "applicationUpgrade.completed": "Atualizado para a v{{version}}.",
   "applicationUpgrade.phase.checking": "Verificando a versão…",
   "applicationUpgrade.phase.downloading": "Baixando a v{{version}}…",
   "applicationUpgrade.phase.verifying": "Verificando o download…",
   "applicationUpgrade.phase.staging": "Descompactando a atualização…",
   "applicationUpgrade.phase.applying": "Instalando a v{{version}}…",
-  "applicationUpgrade.phase.awaiting_elevation": "Aguardando permissão para instalar…",
+  "applicationUpgrade.phase.awaiting_elevation":
+    "Aguardando permissão para instalar…",
   "applicationUpgrade.phase.restarting": "Reiniciando o Weaver…",
-  "applicationUpgrade.phase.reboot_required": "Reinicie este computador para concluir a atualização.",
-  "update.newVersionAria": "Abrir o Weaver v{{version}} no GitHub em uma nova aba",
+  "applicationUpgrade.phase.reboot_required":
+    "Reinicie este computador para concluir a atualização.",
+  "update.newVersionAria":
+    "Abrir o Weaver v{{version}} no GitHub em uma nova aba",
 
   // Status labels
   "status.queued": "Na fila",
@@ -69,7 +74,8 @@ const pt: LocaleDictionary = {
   "action.next": "Próximo",
 
   // Confirmation dialogs
-  "confirm.cancelSelectedMessage": "Esses downloads serão interrompidos e não poderão ser retomados.",
+  "confirm.cancelSelectedMessage":
+    "Esses downloads serão interrompidos e não poderão ser retomados.",
   "bulk.selected": "{{count}} selecionados",
   "bulk.editSelected": "Editar Selecionados",
   "bulk.pauseSelected": "Pausar Selecionados",
@@ -79,7 +85,8 @@ const pt: LocaleDictionary = {
   "action.deleteAll": "Excluir Tudo",
 
   // Upload page
-  "upload.invalidFiles": "Por favor, selecione apenas arquivos .nzb ou .nzb.xz.",
+  "upload.invalidFiles":
+    "Por favor, selecione apenas arquivos .nzb ou .nzb.xz.",
   "upload.noCategory": "Sem categoria",
   "upload.priorityLow": "Baixa",
   "upload.priorityNormal": "Normal",
@@ -152,10 +159,12 @@ const pt: LocaleDictionary = {
   "action.edit": "Editar",
   "action.save": "Salvar",
 
-  "upload.forceDesc": "Aceita este envio apesar da política de duplicados semântica e de artigos. Conflitos de idempotência continuam aplicáveis.",
+  "upload.forceDesc":
+    "Aceita este envio apesar da política de duplicados semântica e de artigos. Conflitos de idempotência continuam aplicáveis.",
 
   // System info
-  "systemInfo.diagnosticsFailed": "Não foi possível criar o pacote de diagnóstico.",
+  "systemInfo.diagnosticsFailed":
+    "Não foi possível criar o pacote de diagnóstico.",
   ...duplicateLocaleEntries.por,
   ...nextPt,
 };

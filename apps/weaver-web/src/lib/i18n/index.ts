@@ -7,15 +7,7 @@ import { DEFAULT_LANGUAGE, interpolate } from "./types";
 export { DEFAULT_LANGUAGE } from "./types";
 
 export type LocaleCode =
-  | "eng"
-  | "spa"
-  | "zho"
-  | "fra"
-  | "por"
-  | "jpn"
-  | "deu"
-  | "ita"
-  | "kor";
+  "eng" | "spa" | "zho" | "fra" | "por" | "jpn" | "deu" | "ita" | "kor";
 
 export type LanguageOption = {
   code: LocaleCode;
@@ -91,10 +83,15 @@ function cachedLocaleDictionary(code: LocaleCode): Promise<LocaleDictionary> {
 
 export function getLanguageLabel(code: string): string {
   const normalized = normalizeLocale(code);
-  return AVAILABLE_LANGUAGES.find((language) => language.code === normalized)?.label ?? normalized;
+  return (
+    AVAILABLE_LANGUAGES.find((language) => language.code === normalized)
+      ?.label ?? normalized
+  );
 }
 
-export async function loadLocaleDictionary(code: string | null | undefined): Promise<LocaleDictionary> {
+export async function loadLocaleDictionary(
+  code: string | null | undefined,
+): Promise<LocaleDictionary> {
   const key = normalizeLocale(code);
   if (key === DEFAULT_LANGUAGE) {
     try {

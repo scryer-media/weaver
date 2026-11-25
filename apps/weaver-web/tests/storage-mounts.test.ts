@@ -3,7 +3,10 @@
 
 import assert from "node:assert/strict";
 import test from "node:test";
-import { storageMounts, type StorageVolume } from "../src/next/data/storage-mounts.ts";
+import {
+  storageMounts,
+  type StorageVolume,
+} from "../src/next/data/storage-mounts.ts";
 
 function volume(
   path: string,
@@ -20,7 +23,8 @@ function volume(
   };
 }
 
-const PROBE_FAILED = "Filesystem capacity is unavailable for this path: No such file or directory";
+const PROBE_FAILED =
+  "Filesystem capacity is unavailable for this path: No such file or directory";
 
 test("paths with the same capacity are one disk", () => {
   const mounts = storageMounts([
@@ -71,7 +75,11 @@ test("a category directory that does not exist yet folds into its library", () =
   ]);
 
   assert.equal(mounts.length, 1, "one filesystem, one pie");
-  assert.equal(mounts[0].error, null, "the disk is fine; only the probe failed");
+  assert.equal(
+    mounts[0].error,
+    null,
+    "the disk is fine; only the probe failed",
+  );
   assert.deepEqual(mounts[0].paths, [
     "/srv/weaver",
     "/srv/weaver/complete",
@@ -98,7 +106,11 @@ test("a nested mount of its own stays its own disk", () => {
     volume("/srv/weaver/complete", { totalBytes: 80_000, usedBytes: 40_000 }),
   ]);
 
-  assert.equal(mounts.length, 2, "different capacity means a different filesystem");
+  assert.equal(
+    mounts.length,
+    2,
+    "different capacity means a different filesystem",
+  );
 });
 
 test("an unreadable path with no configured ancestor says why", () => {
@@ -133,14 +145,39 @@ test("windows paths fold on their own separator", () => {
 test("paths the daemon puts on one drive are one disk, even with drifting figures", () => {
   // A busy disk reads differently between two looks; the drive settles it.
   const mounts = storageMounts([
-    { ...volume("/data/weaver", { totalBytes: 4_000 * 1024 ** 2, usedBytes: 1_000 * 1024 ** 2 }), drive: "/data" },
-    { ...volume("/data/weaver/intermediate", { totalBytes: 4_000 * 1024 ** 2, usedBytes: 1_090 * 1024 ** 2 }), drive: "/data" },
-    { ...volume("/data/library/complete", { totalBytes: 4_000 * 1024 ** 2, usedBytes: 1_100 * 1024 ** 2 }), drive: "/data" },
-    { ...volume("/mnt/media", { totalBytes: 9_000, usedBytes: 1_000 }), drive: "/mnt/media" },
+    {
+      ...volume("/data/weaver", {
+        totalBytes: 4_000 * 1024 ** 2,
+        usedBytes: 1_000 * 1024 ** 2,
+      }),
+      drive: "/data",
+    },
+    {
+      ...volume("/data/weaver/intermediate", {
+        totalBytes: 4_000 * 1024 ** 2,
+        usedBytes: 1_090 * 1024 ** 2,
+      }),
+      drive: "/data",
+    },
+    {
+      ...volume("/data/library/complete", {
+        totalBytes: 4_000 * 1024 ** 2,
+        usedBytes: 1_100 * 1024 ** 2,
+      }),
+      drive: "/data",
+    },
+    {
+      ...volume("/mnt/media", { totalBytes: 9_000, usedBytes: 1_000 }),
+      drive: "/mnt/media",
+    },
   ]);
 
   assert.equal(mounts.length, 2);
   assert.equal(mounts[0].label, "/data");
-  assert.deepEqual([...mounts[0].paths].sort(), ["/data/library/complete", "/data/weaver", "/data/weaver/intermediate"]);
+  assert.deepEqual([...mounts[0].paths].sort(), [
+    "/data/library/complete",
+    "/data/weaver",
+    "/data/weaver/intermediate",
+  ]);
   assert.equal(mounts[1].label, "/mnt/media");
 });

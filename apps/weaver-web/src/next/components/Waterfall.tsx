@@ -124,18 +124,26 @@ export function Waterfall({
             <Icon
               name="expand"
               size={12}
-              className={cn("flex-none transition-transform", membersOpen && "rotate-90")}
+              className={cn(
+                "flex-none transition-transform",
+                membersOpen && "rotate-90",
+              )}
             />
             {t("next.waterfall.extractedFiles", { count: members.length })}
           </button>
           {membersOpen
-            ? members.map((member) => <StageRow key={member.id} stage={member} tone="member" />)
+            ? members.map((member) => (
+                <StageRow key={member.id} stage={member} tone="member" />
+              ))
             : null}
         </>
       )}
 
       <div
-        className={cn(COLS_CLASS, "grid h-[30px] items-center gap-[14px] border-t border-wv-axis")}
+        className={cn(
+          COLS_CLASS,
+          "grid h-[30px] items-center gap-[14px] border-t border-wv-axis",
+        )}
         style={columnStyle(COLUMNS)}
       >
         <span className="font-wv-mono text-[10.5px] tracking-[0.08em] text-wv-disabled uppercase">
@@ -143,14 +151,22 @@ export function Waterfall({
         </span>
         <div className="flex min-w-0 items-baseline gap-[10px] font-wv-mono text-[10.5px] text-wv-faint">
           <span className="truncate">{window}</span>
-          <span className="ml-auto flex-none whitespace-nowrap text-wv-muted">{total}</span>
+          <span className="ml-auto flex-none whitespace-nowrap text-wv-muted">
+            {total}
+          </span>
         </div>
       </div>
     </div>
   );
 }
 
-function StageRow({ stage, tone = "stage" }: { stage: WaterfallStage; tone?: "stage" | "member" }) {
+function StageRow({
+  stage,
+  tone = "stage",
+}: {
+  stage: WaterfallStage;
+  tone?: "stage" | "member";
+}) {
   const start = Math.max(0, Math.min(100, stage.start));
   const end = Math.max(start, Math.min(100, stage.end));
   // Where the label goes: after a span that finishes in the first two thirds,
@@ -164,11 +180,14 @@ function StageRow({ stage, tone = "stage" }: { stage: WaterfallStage; tone?: "st
   ];
   // A label inside the span sits on its longest run: anchored to the first one,
   // a download paused after a moment would paint its chip across the gap.
-  const anchor = inside && segments.length > 0
-    ? segments.reduce((widest, segment) =>
-        segment.end - segment.start > widest.end - widest.start ? segment : widest,
-      )
-    : null;
+  const anchor =
+    inside && segments.length > 0
+      ? segments.reduce((widest, segment) =>
+          segment.end - segment.start > widest.end - widest.start
+            ? segment
+            : widest,
+        )
+      : null;
   const anchorStart = anchor ? Math.max(0, Math.min(100, anchor.start)) : start;
 
   return (
@@ -181,7 +200,9 @@ function StageRow({ stage, tone = "stage" }: { stage: WaterfallStage; tone?: "st
       style={columnStyle(COLUMNS)}
       title={stage.title}
     >
-      <div className={cn("flex min-w-0 items-center gap-2", member && "pl-[14px]")}>
+      <div
+        className={cn("flex min-w-0 items-center gap-2", member && "pl-[14px]")}
+      >
         <span
           aria-hidden="true"
           className="size-1.5 flex-none"
@@ -191,7 +212,11 @@ function StageRow({ stage, tone = "stage" }: { stage: WaterfallStage; tone?: "st
           className={cn(
             "truncate",
             member ? "font-wv-mono text-[11px]" : "text-[12.5px]",
-            stage.pending ? "text-wv-disabled" : member ? "text-wv-secondary" : "text-wv-fg",
+            stage.pending
+              ? "text-wv-disabled"
+              : member
+                ? "text-wv-secondary"
+                : "text-wv-fg",
           )}
         >
           {member ? (
@@ -225,7 +250,12 @@ function StageRow({ stage, tone = "stage" }: { stage: WaterfallStage; tone?: "st
                     width: `${right - left}%`,
                     ...(segment.dashed
                       ? { border: `1px dashed ${segment.color}` }
-                      : { backgroundImage: blockFill(segment.color, blockPeriod(SPAN_HEIGHT)) }),
+                      : {
+                          backgroundImage: blockFill(
+                            segment.color,
+                            blockPeriod(SPAN_HEIGHT),
+                          ),
+                        }),
                   }}
                 />
               );

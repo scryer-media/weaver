@@ -29,7 +29,12 @@ import {
 } from "../../pages/settings/framework";
 import { useVisibleInterval } from "../../data/timers";
 import { useTorrentsShown } from "../../data/use-torrents-shown";
-import { egressInput, liveAddresses, type NetworkingAction, type NetworkingData } from "./data";
+import {
+  egressInput,
+  liveAddresses,
+  type NetworkingAction,
+  type NetworkingData,
+} from "./data";
 import {
   egressQuotaChanged,
   egressQuotaDraft,
@@ -41,7 +46,12 @@ import {
   quotaSearchText,
 } from "./egress-quota";
 import { LimitControl, SplitControl } from "./limits";
-import { bindingLabel, formatLimit, stateLabel, StatusMark } from "./presentation";
+import {
+  bindingLabel,
+  formatLimit,
+  stateLabel,
+  StatusMark,
+} from "./presentation";
 import { TestViaDialog } from "./TestViaDialog";
 import { testIds } from "../../testids";
 
@@ -70,22 +80,33 @@ const isSystem = (egress: Egress) => egress.id === 0;
  * Save and Revert. The status line they publish also carries what the egress
  * table last wrote, unless the limits have an edit pending.
  */
-function useGlobalBandwidth(busy: boolean, message: string | null, failed: boolean) {
+function useGlobalBandwidth(
+  busy: boolean,
+  message: string | null,
+  failed: boolean,
+) {
   const t = useTranslate();
-  const [{ data, fetching }, reexecute] = useQuery<{ networking: { bandwidth: Bandwidth } }>({
+  const [{ data, fetching }, reexecute] = useQuery<{
+    networking: { bandwidth: Bandwidth };
+  }>({
     query: BANDWIDTH_QUERY,
   });
   // The split shares the download limit between usenet and torrents, so it
   // shows, and its rates are read, only while torrents are on.
   const torrentsOn = useTorrentsShown();
-  const [{ data: splitData }, refreshSplit] = useQuery<{ networking: { bandwidthSplit: BandwidthSplitState } }>({
+  const [{ data: splitData }, refreshSplit] = useQuery<{
+    networking: { bandwidthSplit: BandwidthSplitState };
+  }>({
     query: BANDWIDTH_SPLIT_QUERY,
     pause: !torrentsOn,
   });
   const [updateState, setBandwidth] = useMutation(SET_BANDWIDTH);
   const [status, setStatus] = useState<string | null>(null);
 
-  useVisibleInterval(() => refreshSplit({ requestPolicy: "network-only" }), torrentsOn ? SPLIT_REFRESH_MS : null);
+  useVisibleInterval(
+    () => refreshSplit({ requestPolicy: "network-only" }),
+    torrentsOn ? SPLIT_REFRESH_MS : null,
+  );
   const [error, setError] = useState<string | null>(null);
 
   // A write to an egress takes the status line over from the limits' last save.
@@ -102,7 +123,9 @@ function useGlobalBandwidth(busy: boolean, message: string | null, failed: boole
       ? {
           downloadBps: bandwidth.downloadBps ?? null,
           uploadBps: bandwidth.uploadBps ?? null,
-          split: bandwidth.split ? { usenetPct: bandwidth.split.usenetPct } : null,
+          split: bandwidth.split
+            ? { usenetPct: bandwidth.split.usenetPct }
+            : null,
         }
       : null;
   }, [data?.networking?.bandwidth]);
@@ -118,7 +141,8 @@ function useGlobalBandwidth(busy: boolean, message: string | null, failed: boole
     dirty: draft.dirty,
     busy: updateState.fetching,
     status: error ?? status ?? actionMessage,
-    failed: error !== null || (status === null && actionMessage !== null && failed),
+    failed:
+      error !== null || (status === null && actionMessage !== null && failed),
     revert: () => {
       setError(null);
       draft.revert();
@@ -128,7 +152,11 @@ function useGlobalBandwidth(busy: boolean, message: string | null, failed: boole
         return;
       }
       setError(null);
-      const input = { downloadBps: values.downloadBps, uploadBps: values.uploadBps, split: values.split };
+      const input = {
+        downloadBps: values.downloadBps,
+        uploadBps: values.uploadBps,
+        split: values.split,
+      };
       void setBandwidth({ input }).then((result) => {
         if (result.error || !result.data?.setBandwidth) {
           setError(result.error?.message ?? t("next.bandwidth.saveFailed"));
@@ -142,7 +170,10 @@ function useGlobalBandwidth(busy: boolean, message: string | null, failed: boole
     },
   });
 
-  const limit = (id: "downloadBps" | "uploadBps", label: string): FieldSpec => ({
+  const limit = (
+    id: "downloadBps" | "uploadBps",
+    label: string,
+  ): FieldSpec => ({
     id,
     label,
     keywords: "speed limit throttle rate bandwidth",
@@ -170,7 +201,10 @@ function useGlobalBandwidth(busy: boolean, message: string | null, failed: boole
     id: "split",
     label: t("next.bandwidth.split"),
     // Without a download limit there is nothing to share yet, and the row says so.
-    help: values?.downloadBps === null ? t("next.bandwidth.needsDownloadLimit") : rates,
+    help:
+      values?.downloadBps === null
+        ? t("next.bandwidth.needsDownloadLimit")
+        : rates,
     keywords: "split share usenet torrents bandwidth",
     control: {
       kind: "custom",
@@ -192,7 +226,9 @@ function useGlobalBandwidth(busy: boolean, message: string | null, failed: boole
         fields: [
           limit("downloadBps", t("next.bandwidth.downloadLimit")),
           // Only torrents upload: a hidden upload limit is saved as it was.
-          ...(torrentsOn ? [split, limit("uploadBps", t("next.bandwidth.uploadLimit"))] : []),
+          ...(torrentsOn
+            ? [split, limit("uploadBps", t("next.bandwidth.uploadLimit"))]
+            : []),
         ],
       }
     : null;
@@ -211,7 +247,12 @@ function LimitCell({ egress }: { egress: Egress }) {
   return (
     <div className="flex min-w-0 flex-col gap-[3px]">
       {(torrentsOn ? lines : lines.slice(0, 1)).map(([arrow, value, label]) => (
-        <Cell key={arrow} mono className={value === null ? "text-wv-muted" : undefined} title={t(label)}>
+        <Cell
+          key={arrow}
+          mono
+          className={value === null ? "text-wv-muted" : undefined}
+          title={t(label)}
+        >
           {`${arrow} ${formatLimit(t, value)}`}
         </Cell>
       ))}
@@ -239,11 +280,19 @@ export const EgressPage = memo(function EgressPage({
   const [editing, setEditing] = useState<Egress | null>(null);
   const ceiling = useGlobalBandwidth(busy, message, failed);
   const kinds = data.platformNetworking.egressBindingKinds;
-  const listed = [...egresses.filter(isSystem), ...egresses.filter((egress) => !isSystem(egress))];
+  const listed = [
+    ...egresses.filter(isSystem),
+    ...egresses.filter((egress) => !isSystem(egress)),
+  ];
 
   const open = (egress: Egress | null) =>
     setEditing(
-      egress ?? { ...NEW_EGRESS, bindingKind: kinds.includes("INTERFACE") ? "INTERFACE" : "SOURCE_ADDRESS" },
+      egress ?? {
+        ...NEW_EGRESS,
+        bindingKind: kinds.includes("INTERFACE")
+          ? "INTERFACE"
+          : "SOURCE_ADDRESS",
+      },
     );
 
   const blocks: (SettingsBlock | null)[] = [
@@ -252,7 +301,8 @@ export const EgressPage = memo(function EgressPage({
       kind: "table",
       id: "egress",
       title: t("next.networking.egress.title"),
-      columns: "minmax(0, 1fr) minmax(0, 1.2fr) minmax(0, 0.8fr) 120px minmax(0, 1.6fr) 80px",
+      columns:
+        "minmax(0, 1fr) minmax(0, 1.2fr) minmax(0, 0.8fr) 120px minmax(0, 1.6fr) 80px",
       headers: [
         t("next.networking.egress.name"),
         t("next.networking.egress.bindingColumn"),
@@ -262,16 +312,24 @@ export const EgressPage = memo(function EgressPage({
         "",
       ],
       empty: t("next.networking.egress.empty"),
-      add: { label: t("next.networking.egress.add"), onClick: () => open(null) },
+      add: {
+        label: t("next.networking.egress.add"),
+        onClick: () => open(null),
+      },
       onRowClick: (id) => {
-        const egress = egresses.find((candidate) => String(candidate.id) === id);
+        const egress = egresses.find(
+          (candidate) => String(candidate.id) === id,
+        );
         if (egress) {
           open(egress);
         }
       },
       rows: listed.map((egress) => {
         const addresses = liveAddresses(egress, data).join(", ");
-        const binding = egress.interfaceName ?? egress.sourceAddress ?? bindingLabel(t, "SYSTEM");
+        const binding =
+          egress.interfaceName ??
+          egress.sourceAddress ??
+          bindingLabel(t, "SYSTEM");
         return {
           id: String(egress.id),
           searchText: [
@@ -291,21 +349,42 @@ export const EgressPage = memo(function EgressPage({
                 {binding}
               </Cell>
               {addresses ? (
-                <Cell mono className="text-[11px] text-wv-muted" title={addresses}>
+                <Cell
+                  mono
+                  className="text-[11px] text-wv-muted"
+                  title={addresses}
+                >
                   {addresses}
                 </Cell>
               ) : null}
             </div>,
-            <span key="health" title={egress.reason ?? undefined} className="flex min-w-0 flex-col gap-[3px]">
-              <StatusMark state={egress.health} label={stateLabel(t, egress.health)} />
+            <span
+              key="health"
+              title={egress.reason ?? undefined}
+              className="flex min-w-0 flex-col gap-[3px]"
+            >
+              <StatusMark
+                state={egress.health}
+                label={stateLabel(t, egress.health)}
+              />
               {egress.enabled ? null : (
-                <span className="font-wv-mono text-[11px] text-wv-muted">{t("next.networking.disabled")}</span>
+                <span className="font-wv-mono text-[11px] text-wv-muted">
+                  {t("next.networking.disabled")}
+                </span>
               )}
             </span>,
             <LimitCell key="limit" egress={egress} />,
             <QuotaCell key="quota" t={t} egress={egress} />,
-            <span key="edit" className="ml-auto" onClick={(event) => event.stopPropagation()}>
-              <SecondaryButton size="compact" icon="edit" onClick={() => open(egress)}>
+            <span
+              key="edit"
+              className="ml-auto"
+              onClick={(event) => event.stopPropagation()}
+            >
+              <SecondaryButton
+                size="compact"
+                icon="edit"
+                onClick={() => open(egress)}
+              >
                 {t("next.common.edit")}
               </SecondaryButton>
             </span>,
@@ -360,14 +439,16 @@ export function EgressEditor({
   const [deleting, setDeleting] = useState<Egress | null>(null);
   const [testing, setTesting] = useState<Egress | null>(null);
   const kinds = data.platformNetworking.egressBindingKinds;
-  const patch = (next: Partial<Egress>) => setEditing((current) => ({ ...current, ...next }));
+  const patch = (next: Partial<Egress>) =>
+    setEditing((current) => ({ ...current, ...next }));
 
   const save = async () => {
     const missing = !editing.name.trim()
       ? t("next.networking.egress.nameRequired")
       : editing.bindingKind === "INTERFACE" && !editing.interfaceName
         ? t("next.networking.egress.interfaceRequired")
-        : editing.bindingKind === "SOURCE_ADDRESS" && !editing.sourceAddress?.trim()
+        : editing.bindingKind === "SOURCE_ADDRESS" &&
+            !editing.sourceAddress?.trim()
           ? t("next.networking.egress.sourceRequired")
           : egressQuotaProblem(t, quota);
     if (missing) {
@@ -379,7 +460,9 @@ export function EgressEditor({
       editing.id < 0 ? CREATE_EGRESS : UPDATE_EGRESS,
       { id: editing.id, input: egressInput(editing) },
       (saved) => {
-        const created = (saved as { createEgressInterface?: { id: number } } | undefined)?.createEgressInterface;
+        const created = (
+          saved as { createEgressInterface?: { id: number } } | undefined
+        )?.createEgressInterface;
         if (created) {
           id = created.id;
         }
@@ -387,7 +470,8 @@ export function EgressEditor({
     );
     // The quota saves on its own, once the egress it caps exists.
     const quotaFailure =
-      failure ?? (egressQuotaChanged(quota, egress.quota) && id >= 0
+      failure ??
+      (egressQuotaChanged(quota, egress.quota) && id >= 0
         ? await action(SET_EGRESS_QUOTA, { id, input: egressQuotaInput(quota) })
         : null);
     if (quotaFailure) {
@@ -416,7 +500,12 @@ export function EgressEditor({
       label: t("next.networking.egress.name"),
       control: system
         ? { kind: "static", value: editing.name }
-        : { kind: "text", mono: false, value: editing.name, onChange: (name) => patch({ name }) },
+        : {
+            kind: "text",
+            mono: false,
+            value: editing.name,
+            onChange: (name) => patch({ name }),
+          },
     },
     {
       id: "binding",
@@ -430,7 +519,8 @@ export function EgressEditor({
             options: kinds
               .filter((kind) => kind !== "SYSTEM")
               .map((kind) => ({ value: kind, label: bindingLabel(t, kind) })),
-            onChange: (kind) => patch({ bindingKind: kind as Egress["bindingKind"] }),
+            onChange: (kind) =>
+              patch({ bindingKind: kind as Egress["bindingKind"] }),
           },
     },
     ...(editing.bindingKind === "INTERFACE"
@@ -443,12 +533,20 @@ export function EgressEditor({
               value: editing.interfaceName ?? "",
               className: "w-[268px] max-w-full",
               options: [
-                { value: "", label: t("next.networking.egress.chooseInterface") },
-                ...(editing.interfaceName && !discovered.some((candidate) => candidate.name === editing.interfaceName)
+                {
+                  value: "",
+                  label: t("next.networking.egress.chooseInterface"),
+                },
+                ...(editing.interfaceName &&
+                !discovered.some(
+                  (candidate) => candidate.name === editing.interfaceName,
+                )
                   ? [
                       {
                         value: editing.interfaceName,
-                        label: t("next.networking.egress.missingInterface", { name: editing.interfaceName }),
+                        label: t("next.networking.egress.missingInterface", {
+                          name: editing.interfaceName,
+                        }),
                       },
                     ]
                   : []),
@@ -456,8 +554,12 @@ export function EgressEditor({
                   value: candidate.name,
                   label: [
                     candidate.name,
-                    candidate.up ? t("next.networking.egress.linkUp") : t("next.networking.egress.linkDown"),
-                    ...(candidate.addresses.length ? [candidate.addresses.join(", ")] : []),
+                    candidate.up
+                      ? t("next.networking.egress.linkUp")
+                      : t("next.networking.egress.linkDown"),
+                    ...(candidate.addresses.length
+                      ? [candidate.addresses.join(", ")]
+                      : []),
                   ].join(" · "),
                 })),
               ],
@@ -486,7 +588,10 @@ export function EgressEditor({
                   <datalist id="network-source-addresses">
                     {discovered.flatMap((candidate) =>
                       candidate.addresses.map((address) => (
-                        <option key={`${candidate.name}:${address}`} value={address}>
+                        <option
+                          key={`${candidate.name}:${address}`}
+                          value={address}
+                        >
                           {candidate.name}
                         </option>
                       )),
@@ -538,7 +643,12 @@ export function EgressEditor({
       id: "enabled",
       label: t("next.networking.egress.enabled"),
       help: system ? t("next.networking.egress.systemHelp") : undefined,
-      control: { kind: "toggle", value: editing.enabled, disabled: system, onChange: (enabled) => patch({ enabled }) },
+      control: {
+        kind: "toggle",
+        value: editing.enabled,
+        disabled: system,
+        onChange: (enabled) => patch({ enabled }),
+      },
     },
   ];
 
@@ -548,7 +658,11 @@ export function EgressEditor({
         open
         testId={testIds.dialog("egress")}
         title={editing.id >= 0 ? editing.name : t("next.networking.egress.add")}
-        note={editing.id >= 0 ? bindingLabel(t, editing.bindingKind) : t("next.networking.egress.newNote")}
+        note={
+          editing.id >= 0
+            ? bindingLabel(t, editing.bindingKind)
+            : t("next.networking.egress.newNote")
+        }
         error={error}
         busy={busy}
         saveLabel={t("next.networking.egress.save")}
@@ -565,9 +679,11 @@ export function EgressEditor({
                   disabled={busy}
                   onClick={() => {
                     // `action` re-executes the networking and flow queries on success.
-                    void action(RESET_EGRESS_USAGE, { id: editing.id }).then((failure) => {
-                      setError(failure ?? null);
-                    });
+                    void action(RESET_EGRESS_USAGE, { id: editing.id }).then(
+                      (failure) => {
+                        setError(failure ?? null);
+                      },
+                    );
                   }}
                 >
                   {t("next.providers.resetUsage")}
@@ -598,13 +714,20 @@ export function EgressEditor({
         note={deleting?.name}
         busy={busy}
         confirmLabel={t("next.networking.egress.delete")}
-        body={t("next.networking.egress.deleteBody", { name: deleting?.name ?? "" })}
+        body={t("next.networking.egress.deleteBody", {
+          name: deleting?.name ?? "",
+        })}
         onConfirm={() => void remove()}
         onDismiss={() => setDeleting(null)}
       />
 
       {testing ? (
-        <TestViaDialog key={testing.id} subject={null} egressId={testing.id} onClose={() => setTesting(null)} />
+        <TestViaDialog
+          key={testing.id}
+          subject={null}
+          egressId={testing.id}
+          onClose={() => setTesting(null)}
+        />
       ) : null}
     </>
   );

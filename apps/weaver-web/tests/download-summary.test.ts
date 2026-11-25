@@ -32,12 +32,20 @@ const node = (id: number, parentId: number | null): DownloadNodeData => ({
 type Shape = [number, Shape[]] | number;
 const shape = (branches: DownloadTreeNode[]): Shape[] =>
   branches.map((branch) =>
-    branch.children.length === 0 ? branch.node.id : [branch.node.id, shape(branch.children)],
+    branch.children.length === 0
+      ? branch.node.id
+      : [branch.node.id, shape(branch.children)],
   );
 
 test("each node sits under its parent", () => {
   // Breadth first, as stored: two at the top, then their children.
-  const nodes = [node(2, null), node(5, null), node(9, 2), node(7, 5), node(11, 9)];
+  const nodes = [
+    node(2, null),
+    node(5, null),
+    node(9, 2),
+    node(7, 5),
+    node(11, 9),
+  ];
   assert.deepEqual(shape(downloadTree(nodes)), [
     [2, [[9, [11]]]],
     [5, [7]],
@@ -53,7 +61,10 @@ test("a node whose parent was cut off by the cap is a root", () => {
 });
 
 test("a loop of parents still shows every node once", () => {
-  assert.deepEqual(shape(downloadTree([node(3, 4), node(4, 3), node(1, null)])), [1, [3, [4]]]);
+  assert.deepEqual(
+    shape(downloadTree([node(3, 4), node(4, 3), node(1, null)])),
+    [1, [3, [4]]],
+  );
 });
 
 test("a flat download has no tree", () => {
@@ -61,7 +72,11 @@ test("a flat download has no tree", () => {
 });
 
 test("passwords group as NZB, API and password list", () => {
-  for (const origin of ["NZB_META", "FILENAME_CONVENTION", "DNZB_HEADER"] as const) {
+  for (const origin of [
+    "NZB_META",
+    "FILENAME_CONVENTION",
+    "DNZB_HEADER",
+  ] as const) {
     assert.equal(passwordOriginGroup(origin), "nzb", origin);
   }
   for (const origin of ["EXPLICIT", "INTEGRATION"] as const) {
@@ -75,8 +90,14 @@ test("passwords group as NZB, API and password list", () => {
 
 test("a node opened from a source a newer server names is not one that needs a password", () => {
   const locked = { ...node(1, null), encrypted: true, passwordNeeded: true };
-  assert.deepEqual(nodePassword({ ...locked, passwordOrigin: "SETTINGS" }), { state: "origin", group: "list" });
-  assert.deepEqual(nodePassword({ ...locked, passwordOrigin: "SOMETHING_NEW" }), { state: "opened" });
+  assert.deepEqual(nodePassword({ ...locked, passwordOrigin: "SETTINGS" }), {
+    state: "origin",
+    group: "list",
+  });
+  assert.deepEqual(
+    nodePassword({ ...locked, passwordOrigin: "SOMETHING_NEW" }),
+    { state: "opened" },
+  );
   assert.deepEqual(nodePassword(locked), { state: "needed" });
   assert.equal(nodePassword(node(2, null)), null);
 });

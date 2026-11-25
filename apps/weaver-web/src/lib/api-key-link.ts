@@ -49,7 +49,10 @@ export function mintsOnArrival(link: ApiKeyLink): boolean {
 }
 
 /** The first of these parameters the query string carries, if any. */
-function firstParam(params: URLSearchParams, names: readonly string[]): string | null {
+function firstParam(
+  params: URLSearchParams,
+  names: readonly string[],
+): string | null {
   for (const name of names) {
     const value = params.get(name);
     if (value !== null) return value;
@@ -62,7 +65,10 @@ function firstParam(params: URLSearchParams, names: readonly string[]): string |
  * string. A query string that asks for nothing, or names no key, is returned
  * untouched.
  */
-export function takeApiKeyLink(search: string): { link: ApiKeyLink | null; search: string } {
+export function takeApiKeyLink(search: string): {
+  link: ApiKeyLink | null;
+  search: string;
+} {
   const params = new URLSearchParams(search);
   const generate = firstParam(params, GENERATE_PARAMS);
   if (generate !== "1" && generate?.trim().toLowerCase() !== "true") {

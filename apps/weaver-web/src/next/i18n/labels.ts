@@ -32,7 +32,9 @@ export function aroundSlot(
   const text = t(key, values);
   const marker = `{{${slot}}}`;
   const at = text.indexOf(marker);
-  return at < 0 ? [text, ""] : [text.slice(0, at), text.slice(at + marker.length)];
+  return at < 0
+    ? [text, ""]
+    : [text.slice(0, at), text.slice(at + marker.length)];
 }
 
 /** Server health reports its state as a lowercase word; unknown ones pass through. */

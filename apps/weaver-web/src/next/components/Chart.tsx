@@ -32,7 +32,16 @@ function niceCeiling(max: number): number {
   if (!Number.isFinite(max) || max <= 0) return 1;
   const magnitude = 10 ** Math.floor(Math.log10(max));
   const normalised = max / magnitude;
-  const step = normalised <= 1 ? 1 : normalised <= 2 ? 2 : normalised <= 2.5 ? 2.5 : normalised <= 5 ? 5 : 10;
+  const step =
+    normalised <= 1
+      ? 1
+      : normalised <= 2
+        ? 2
+        : normalised <= 2.5
+          ? 2.5
+          : normalised <= 5
+            ? 5
+            : 10;
   return step * magnitude;
 }
 
@@ -81,7 +90,11 @@ export const Chart = memo(function Chart({
 }) {
   const t = useTranslate();
   const max = series.reduce(
-    (highest, entry) => entry.values.reduce((inner, value) => (value > inner ? value : inner), highest),
+    (highest, entry) =>
+      entry.values.reduce(
+        (inner, value) => (value > inner ? value : inner),
+        highest,
+      ),
     0,
   );
   const ceiling = niceCeiling(max);
@@ -109,9 +122,14 @@ export const Chart = memo(function Chart({
                 />
               ))}
               {loading ? (
-                <div role="status" className="absolute inset-0 flex items-center justify-center">
+                <div
+                  role="status"
+                  className="absolute inset-0 flex items-center justify-center"
+                >
                   {showLoader ? <LoadingMark className="h-8" /> : null}
-                  <span className="sr-only">{t("next.chart.loading", { title })}</span>
+                  <span className="sr-only">
+                    {t("next.chart.loading", { title })}
+                  </span>
                 </div>
               ) : null}
               {series.map((entry) => {
@@ -126,7 +144,10 @@ export const Chart = memo(function Chart({
                     aria-hidden="true"
                   >
                     {entry.fill === undefined ? null : (
-                      <polygon points={`${points} 100,100 0,100`} fill={entry.fill} />
+                      <polygon
+                        points={`${points} 100,100 0,100`}
+                        fill={entry.fill}
+                      />
                     )}
                     <polyline
                       points={points}

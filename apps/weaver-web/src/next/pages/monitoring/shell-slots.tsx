@@ -15,7 +15,13 @@ export const ShellHostsContext = createContext<ShellHosts | null>(null);
  * Puts `children` into one part of the shell Monitoring keeps up while its
  * dashboards change, so a dashboard fills the shell rather than drawing its own.
  */
-export function DashboardSlot({ slot, children }: { slot: ShellSlot; children: ReactNode }) {
+export function DashboardSlot({
+  slot,
+  children,
+}: {
+  slot: ShellSlot;
+  children: ReactNode;
+}) {
   const host = useContext(ShellHostsContext)?.[slot] ?? null;
   return host ? createPortal(children, host) : null;
 }

@@ -1517,6 +1517,12 @@ pub struct RootState {
     // of two readings at once, and one of them may have begun before its
     // failure.
     prior: Option<(u64, u64)>,
+    // How many probes have begun to read free space: a probe is counted
+    // here once its device and volume are looked up, as it reads. The read
+    // of the reading now published, and of the one before, by this count.
+    reads_begun: u64,
+    published_read: u64,
+    prior_read: Option<u64>,
     // How many times the root was pointed at another directory.
     retargets: u64,
     // A probe of `path` finished, and why the latest failed while it fails.
@@ -2041,6 +2047,9 @@ impl HeldPath {
             shown: self.free,
             good: self.good,
             prior: self.prior,
+            reads: None,
+            read: None,
+            prior_read: None,
             moved: 0,
         }
     }
@@ -2057,6 +2066,12 @@ pub struct DiskLook {
     pub shown: Option<u64>,
     pub good: bool,
     pub(crate) prior: Option<(u64, u64)>,
+    // A root's count of the probes that had begun to read free space, and
+    // which read took the figure shown and the one before: `None` for a
+    // path, which counts no reads.
+    pub(crate) reads: Option<u64>,
+    pub(crate) read: Option<u64>,
+    pub(crate) prior_read: Option<u64>,
     // How many times the root was pointed at another directory: a job that
     // waits on a root moved since then waits on another disk.
     pub(crate) moved: u64,
@@ -2072,6 +2087,18 @@ impl DiskLook {
             self.prior
                 .filter(|(prior, _)| *prior == probe)
                 .map(|(_, figure)| figure)
+        }
+    }
+
+    // Which read took the figure the probe counted `probe` published, while
+    // it is the latest or the one before: `None` when not known.
+    pub(crate) fn read_of(&self, probe: u64) -> Option<u64> {
+        if self.probe == probe {
+            self.read
+        } else {
+            self.prior
+                .filter(|(prior, _)| *prior == probe)
+                .and(self.prior_read)
         }
     }
 }
@@ -2292,6 +2319,9 @@ impl StorageCapacity {
                         completed_probes: 0,
                         published_probe: 0,
                         prior: None,
+                        reads_begun: 0,
+                        published_read: 0,
+                        prior_read: None,
                         retargets: 0,
                         probed: false,
                         error: None,
@@ -3048,6 +3078,7 @@ impl StorageCapacity {
             state.path = path;
             state.retargets += 1;
             state.prior = None;
+            state.prior_read = None;
             state.probed = false;
             state.error = None;
             state.device = None;
@@ -3067,6 +3098,12 @@ impl StorageCapacity {
         self.slot(root).lock().begun_probes
     }
 
+    // How many probes of `root` have begun to read free space.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn reads_begun(&self, root: StorageRoot) -> u64 {
+        self.slot(root).lock().reads_begun
+    }
+
     // What `root` shows now of its probes and its free space, for a job
     // that waits on it after a write found it full.
     pub(crate) fn look(&self, root: StorageRoot) -> DiskLook {
@@ -3079,6 +3116,9 @@ impl StorageCapacity {
             shown: reading.map(|reading| reading.available_bytes),
             good: reading.is_some_and(|reading| !reading.stale),
             prior: state.prior,
+            reads: Some(state.reads_begun),
+            read: Some(state.published_read),
+            prior_read: state.prior_read,
             moved: state.retargets,
         }
     }
@@ -3322,6 +3362,13 @@ fn run_root_sampler(
         let kind = wants_kind.then(|| read_storage_kind(&path));
         let mark = slot.ledger.mark();
         let sampler = sampler.as_mut().expect("a sampler for the current path");
+        // Counted as it reads free space: room made after this count was
+        // taken may show in what it reads.
+        let read = {
+            let mut state = slot.lock();
+            state.reads_begun += 1;
+            state.reads_begun
+        };
         let capacity = sampler.refresh();
         // The paths jobs wait on off the roots' disks are read in the same
         // pass: with none listed, this is one look at a count.
@@ -3339,9 +3386,11 @@ fn run_root_sampler(
                 .read()
                 .reading()
                 .map(|reading| (state.published_probe, reading.available_bytes));
+            state.prior_read = state.prior.map(|_| state.published_read);
             slot.capacity.publish(capacity);
             slot.ledger.published(mark, capacity);
             state.published_probe = state.begun_probes;
+            state.published_read = read;
             state.probed = true;
             state.device = Some(device);
             if kind.is_some() {

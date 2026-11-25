@@ -2001,7 +2001,7 @@ type InfoPage<'r> = Vec<(&'r TorrentRow, Map<String, Value>)>;
 // but its files and trackers: the rows `pick` and `ask` keep, in the order
 // the torrents were added or `ask` sorts them, of those the page `ask`
 // takes. Clock fields are run on to `now_ms` from the reading each row came
-// from. Only the rows a sort reads, or the page, are written out.
+// from. A sort reads each row's one column; only the page is written out.
 fn info_rows<'r>(
     rows: &'r [Arc<TorrentRow>],
     pick: &RowPick<'_>,
@@ -2019,41 +2019,62 @@ fn info_rows<'r>(
         let page = info_page(ask.limit, ask.offset, kept.len()).unwrap_or(0..kept.len());
         return Ok(kept[page].iter().map(|row| written(row)).collect());
     };
-    let mut list: Vec<_> = kept.into_iter().map(written).collect();
+    let mut list = kept;
     // The files and trackers a row lists are columns too: every row's are
     // lists, which order none before another.
     let listed = match column {
         "files" => list
             .first()
-            .is_some_and(|(row, _)| ask.with_files && row.view.pieces.is_some()),
+            .is_some_and(|row| ask.with_files && row.view.pieces.is_some()),
         "trackers" => ask.with_trackers,
         _ => false,
     };
     if !listed {
-        if list
-            .first()
-            .is_some_and(|(_, fields)| !fields.contains_key(column))
-        {
+        let mut sorted: Vec<(&'r TorrentRow, Option<Value>)> = list
+            .into_iter()
+            .map(|row| (row, info_field(row, scope, now_ms, column)))
+            .collect();
+        if sorted.first().is_some_and(|(_, value)| value.is_none()) {
             return Err(Box::new(text(
                 StatusCode::BAD_REQUEST,
                 "'sort' parameter is invalid",
             )));
         }
-        list.sort_by(|(_, left), (_, right)| {
-            let field =
-                |fields: &'_ Map<String, Value>| fields.get(column).unwrap_or(&Value::Null).clone();
-            info_order(&field(left), &field(right), ask.reverse)
+        sorted.sort_by(|(_, left), (_, right)| {
+            info_order(
+                left.as_ref().unwrap_or(&Value::Null),
+                right.as_ref().unwrap_or(&Value::Null),
+                ask.reverse,
+            )
         });
+        list = sorted.into_iter().map(|(row, _)| row).collect();
     }
-    if let Some(page) = info_page(ask.limit, ask.offset, list.len()) {
-        list = list.drain(page).collect();
-    }
-    Ok(list)
+    let page = info_page(ask.limit, ask.offset, list.len()).unwrap_or(0..list.len());
+    Ok(list[page].iter().map(|row| written(row)).collect())
 }
 
 // A published row's `torrents/info` fields, its files and trackers aside,
 // its clock fields run on to `now_ms`.
 fn info_fields(row: &TorrentRow, scope: CallerScope, now_ms: i64) -> Map<String, Value> {
+    info_field_list(row, scope, now_ms)
+        .map(|(name, value)| (name.to_owned(), value))
+        .collect()
+}
+
+// One of `info_fields`, its value as they give it: the last of that name.
+fn info_field(row: &TorrentRow, scope: CallerScope, now_ms: i64, column: &str) -> Option<Value> {
+    info_field_list(row, scope, now_ms)
+        .filter(|(name, _)| *name == column)
+        .last()
+        .map(|(_, value)| value)
+}
+
+// `info_fields` as named values, in order.
+fn info_field_list(
+    row: &TorrentRow,
+    scope: CallerScope,
+    now_ms: i64,
+) -> impl Iterator<Item = (&'static str, Value)> {
     let view = &row.view;
     steady_row(view, row.totals, &row.trackers, scope)
         .into_iter()
@@ -2062,8 +2083,6 @@ fn info_fields(row: &TorrentRow, scope: CallerScope, now_ms: i64) -> Map<String,
             view.clock_at(now_ms),
             now_ms.div_euclid(1000),
         ))
-        .map(|(name, value)| (name.to_owned(), value))
-        .collect()
 }
 
 // A row's files and trackers, as `ask` lists them: a torrent's files only
@@ -4733,7 +4752,10 @@ async fn export(ctx: &TorrentFacadeContext, params: &Params, scope: CallerScope)
     let metainfo = if scope.is_admin() {
         metainfo
     } else {
-        match without_web_seed_secrets(&metainfo) {
+        // A metainfo may be large: it is read off the async threads. A task
+        // that did not finish answers as a metainfo that does not parse.
+        let read = tokio::task::spawn_blocking(move || without_web_seed_secrets(&metainfo));
+        match read.await.ok().flatten() {
             Some(metainfo) => bytes::Bytes::from(metainfo),
             None => {
                 return text(
@@ -4761,7 +4783,9 @@ async fn export(ctx: &TorrentFacadeContext, params: &Params, scope: CallerScope)
 // The metainfo with its web seeds' (BEP 19 `url-list`, BEP 17
 // `httpseeds`) user names, passwords, queries and fragments taken out, and
 // a URL that does not parse left out. Every other byte is as added, so its
-// info hash is the torrent's. None when the metainfo does not parse.
+// info hash is the torrent's, and bytes after the root dictionary, which
+// the add ignored, follow it unchanged. None when the root dictionary does
+// not parse.
 //
 // The web seed's path stays in this export for every caller, on purpose:
 // the operator ruled on 2026-11-17 that user name, password, query and
@@ -4787,7 +4811,8 @@ fn without_web_seed_secrets(metainfo: &[u8]) -> Option<Vec<u8>> {
         at = value_end;
     }
     out.push(b'e');
-    (at + 1 == metainfo.len()).then_some(out)
+    out.extend_from_slice(&metainfo[at + 1..]);
+    Some(out)
 }
 
 // A web seed value as `without_web_seed_secrets` gives it: one URL stays

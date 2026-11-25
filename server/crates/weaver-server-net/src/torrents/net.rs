@@ -167,7 +167,8 @@ pub struct Exposure {
     /// Who resolves the names the session looks up.
     pub resolved_by: Option<ResolvedBy>,
     /// The address a tracker sees: the session's vote of its external
-    /// address, else a gateway's; none until one is known.
+    /// address, else a gateway's public one; none until one is known. Never
+    /// a private address: a gateway inside a tunnel gives the tunnel's own.
     pub address: Option<IpAddr>,
     /// The port the session announces, 0 when it announces none.
     pub announced_port: u16,
@@ -196,7 +197,7 @@ impl Exposure {
                 .external_ips()
                 .first()
                 .copied()
-                .or_else(|| mappings.iter().find_map(|mapping| mapping.external_ip)),
+                .or_else(|| mappings.iter().find_map(PortMapped::public_ip)),
             announced_port,
             inbound: reachable(announced_port, shape, mappings),
             udp_trackers: shape.datagrams,

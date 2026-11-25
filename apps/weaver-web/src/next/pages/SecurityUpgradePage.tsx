@@ -1,11 +1,25 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
-import { BIND_CHOICES, CONTAINER_BIND_NOTE, MODES, NO_LOGIN_NETWORK_WARNING } from "@/lib/setup-flow";
-import { useSecurityUpgradeForm, type SecurityUpgradeState } from "@/lib/security-upgrade";
+import {
+  BIND_CHOICES,
+  CONTAINER_BIND_NOTE,
+  MODES,
+  NO_LOGIN_NETWORK_WARNING,
+} from "@/lib/setup-flow";
+import {
+  useSecurityUpgradeForm,
+  type SecurityUpgradeState,
+} from "@/lib/security-upgrade";
 import { Eyebrow } from "../components/chrome";
 import { PrimaryButton, SecondaryButton } from "../components/controls";
-import { Choice, ErrorLine, RestartActions, SetupFrame, SetupHeading } from "./SetupPage";
+import {
+  Choice,
+  ErrorLine,
+  RestartActions,
+  SetupFrame,
+  SetupHeading,
+} from "./SetupPage";
 
 /**
  * The Next interface's page for an install that predates the security choices:
@@ -63,7 +77,9 @@ export default function SecurityUpgradePage({
       </fieldset>
 
       {form.containerized ? (
-        <p className="text-[12px] leading-[1.5] text-wv-muted">{CONTAINER_BIND_NOTE}</p>
+        <p className="text-[12px] leading-[1.5] text-wv-muted">
+          {CONTAINER_BIND_NOTE}
+        </p>
       ) : state.bindEditable ? (
         <fieldset className="flex flex-col gap-2">
           <legend className="mb-2.5">
@@ -80,7 +96,9 @@ export default function SecurityUpgradePage({
             />
           ))}
           {form.bindWide && form.mode === "no_login" ? (
-            <p className="pt-1 text-[12px] leading-[1.5] text-wv-warn">{NO_LOGIN_NETWORK_WARNING}</p>
+            <p className="pt-1 text-[12px] leading-[1.5] text-wv-warn">
+              {NO_LOGIN_NETWORK_WARNING}
+            </p>
           ) : null}
         </fieldset>
       ) : null}

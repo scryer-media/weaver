@@ -1,7 +1,13 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
-import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
+import {
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useRef,
+  useState,
+} from "react";
 import { useClient } from "urql";
 import {
   CANCEL_SCRIPT_TEST_MUTATION,
@@ -11,12 +17,19 @@ import {
 import { useTranslate } from "@/lib/context/translate-context";
 import { settingsIds, testIds } from "@/next/testids";
 import { Dialog } from "../../../components/Dialog";
-import { ScriptStatusMark, TruncatedTag } from "../../../components/JobScriptResults";
+import {
+  ScriptStatusMark,
+  TruncatedTag,
+} from "../../../components/JobScriptResults";
 import { SectionHeader, Square } from "../../../components/chrome";
 import { SecondaryButton } from "../../../components/controls";
 import { EM_DASH } from "../../../data/format";
 import { WV } from "../../../data/palette";
-import { formatTimeout, type ScriptInstance, type ScriptKind } from "../../../data/script-instances";
+import {
+  formatTimeout,
+  type ScriptInstance,
+  type ScriptKind,
+} from "../../../data/script-instances";
 import { formatRunDuration, triggerLabel } from "../../../data/script-runs";
 import { FieldRows, type FieldSpec } from "../framework";
 
@@ -61,10 +74,17 @@ interface ScriptTestRun {
 const POLL_MS = 1000;
 
 const BAND = "flex-none border-b border-wv-hairline px-4 py-3 sm:px-6";
-const LINE = "border-b border-wv-hairline px-4 py-2 font-wv-mono text-[12px] leading-[1.5] break-all sm:px-6";
+const LINE =
+  "border-b border-wv-hairline px-4 py-2 font-wv-mono text-[12px] leading-[1.5] break-all sm:px-6";
 const NOTE = "text-[12.5px] leading-[1.5] text-pretty text-wv-muted";
 
-export function ScriptTestDialog({ instance, onClose }: { instance: ScriptInstance; onClose: () => void }) {
+export function ScriptTestDialog({
+  instance,
+  onClose,
+}: {
+  instance: ScriptInstance;
+  onClose: () => void;
+}) {
   const t = useTranslate();
   const client = useClient();
   const [run, setRun] = useState<ScriptTestRun | null>(null);
@@ -81,7 +101,12 @@ export function ScriptTestDialog({ instance, onClose }: { instance: ScriptInstan
   }, [run]);
 
   const cancel = useCallback(
-    (id: string) => client.mutation<{ cancelScriptTest: boolean }>(CANCEL_SCRIPT_TEST_MUTATION, { id }).toPromise(),
+    (id: string) =>
+      client
+        .mutation<{ cancelScriptTest: boolean }>(CANCEL_SCRIPT_TEST_MUTATION, {
+          id,
+        })
+        .toPromise(),
     [client],
   );
 
@@ -90,7 +115,10 @@ export function ScriptTestDialog({ instance, onClose }: { instance: ScriptInstan
     setError(null);
     setRun(null);
     const result = await client
-      .mutation<{ testScriptInstance: ScriptTestRun }>(TEST_SCRIPT_INSTANCE_MUTATION, { id: instance.id })
+      .mutation<{ testScriptInstance: ScriptTestRun }>(
+        TEST_SCRIPT_INSTANCE_MUTATION,
+        { id: instance.id },
+      )
       .toPromise();
     const begun = result.data?.testScriptInstance ?? null;
     if (closed.current) {
@@ -142,7 +170,9 @@ export function ScriptTestDialog({ instance, onClose }: { instance: ScriptInstan
             return;
           }
           if (result.error) {
-            setError(result.error.graphQLErrors[0]?.message ?? result.error.message);
+            setError(
+              result.error.graphQLErrors[0]?.message ?? result.error.message,
+            );
             setMissed((count) => count + 1);
             return;
           }
@@ -192,7 +222,9 @@ export function ScriptTestDialog({ instance, onClose }: { instance: ScriptInstan
               </span>
             ) : run.status === null ? (
               // A run the daemon stopped keeping has no outcome to show.
-              <span className="font-wv-mono text-[12px] text-wv-muted">{EM_DASH}</span>
+              <span className="font-wv-mono text-[12px] text-wv-muted">
+                {EM_DASH}
+              </span>
             ) : (
               <ScriptStatusMark status={run.status} />
             ),
@@ -218,13 +250,19 @@ export function ScriptTestDialog({ instance, onClose }: { instance: ScriptInstan
           label: t("next.scriptRuns.duration"),
           control: {
             kind: "static",
-            value: run.durationMs === null ? EM_DASH : formatRunDuration(run.durationMs),
+            value:
+              run.durationMs === null
+                ? EM_DASH
+                : formatRunDuration(run.durationMs),
           },
         },
         {
           id: "adapter",
           label: t("next.postProcessing.adapter"),
-          control: { kind: "static", value: run.adapter === "SABNZBD" ? "SABnzbd" : "NZBGet" },
+          control: {
+            kind: "static",
+            value: run.adapter === "SABNZBD" ? "SABnzbd" : "NZBGet",
+          },
         },
       ]
     : [];
@@ -240,22 +278,42 @@ export function ScriptTestDialog({ instance, onClose }: { instance: ScriptInstan
       footer={
         <>
           {running ? (
-            <SecondaryButton icon="stopScripts" disabled={cancelling} onClick={() => void cancelRun()}>
+            <SecondaryButton
+              icon="stopScripts"
+              disabled={cancelling}
+              onClick={() => void cancelRun()}
+            >
               {t("next.postProcessing.cancelTest")}
             </SecondaryButton>
           ) : (
-            <SecondaryButton icon="test" disabled={starting} onClick={() => void start()} testId={settingsIds.ppTestAgain}>
+            <SecondaryButton
+              icon="test"
+              disabled={starting}
+              onClick={() => void start()}
+              testId={settingsIds.ppTestAgain}
+            >
               {t("next.postProcessing.testAgain")}
             </SecondaryButton>
           )}
-          <SecondaryButton onClick={onClose} testId={settingsIds.ppTestClose}>{t("next.networking.close")}</SecondaryButton>
+          <SecondaryButton onClick={onClose} testId={settingsIds.ppTestClose}>
+            {t("next.networking.close")}
+          </SecondaryButton>
         </>
       }
     >
-      <div className={`${BAND} ${NOTE}`}>{t("next.postProcessing.testNote")}</div>
-      {starting ? <div className={`${BAND} ${NOTE}`}>{t("next.postProcessing.testStarting")}</div> : null}
+      <div className={`${BAND} ${NOTE}`}>
+        {t("next.postProcessing.testNote")}
+      </div>
+      {starting ? (
+        <div className={`${BAND} ${NOTE}`}>
+          {t("next.postProcessing.testStarting")}
+        </div>
+      ) : null}
       {error ? (
-        <div role="alert" className={`${BAND} text-[12.5px] leading-[1.5] text-wv-error-text`}>
+        <div
+          role="alert"
+          className={`${BAND} text-[12.5px] leading-[1.5] text-wv-error-text`}
+        >
           {error}
         </div>
       ) : null}
@@ -264,10 +322,17 @@ export function ScriptTestDialog({ instance, onClose }: { instance: ScriptInstan
         <>
           <FieldRows fields={fields} />
           {run.errorMessage ? (
-            <div className={`${BAND} text-[12.5px] leading-[1.5] text-wv-error-text`}>{run.errorMessage}</div>
+            <div
+              className={`${BAND} text-[12.5px] leading-[1.5] text-wv-error-text`}
+            >
+              {run.errorMessage}
+            </div>
           ) : null}
 
-          <section aria-label={t("next.postProcessing.testInputs")} className="flex flex-none flex-col">
+          <section
+            aria-label={t("next.postProcessing.testInputs")}
+            className="flex flex-none flex-col"
+          >
             <SectionHeader
               label={t("next.postProcessing.testInputs")}
               count={run.inputs.length}
@@ -282,8 +347,12 @@ export function ScriptTestDialog({ instance, onClose }: { instance: ScriptInstan
                   key={input.name}
                   className="grid grid-cols-[minmax(0,0.9fr)_minmax(0,1.6fr)] gap-5 border-b border-wv-hairline px-4 py-2 font-wv-mono text-[12px] leading-[1.5] sm:px-6"
                 >
-                  <span className="min-w-0 break-all text-wv-secondary">{input.name}</span>
-                  <span className="min-w-0 break-all text-wv-fg">{input.value}</span>
+                  <span className="min-w-0 break-all text-wv-secondary">
+                    {input.name}
+                  </span>
+                  <span className="min-w-0 break-all text-wv-fg">
+                    {input.value}
+                  </span>
                 </div>
               ))
             )}
@@ -295,7 +364,11 @@ export function ScriptTestDialog({ instance, onClose }: { instance: ScriptInstan
               data-testid={settingsIds.ppTestArguments}
               className="flex flex-none flex-col"
             >
-              <SectionHeader label={t("next.postProcessing.testArguments")} count={run.arguments.length} sticky={false} />
+              <SectionHeader
+                label={t("next.postProcessing.testArguments")}
+                count={run.arguments.length}
+                sticky={false}
+              />
               {run.arguments.map((argument, index) => (
                 <div key={index} className={`${LINE} text-wv-fg`}>
                   {argument}
@@ -309,7 +382,10 @@ export function ScriptTestDialog({ instance, onClose }: { instance: ScriptInstan
             data-testid={settingsIds.ppTestLog}
             className="flex flex-none flex-col"
           >
-            <SectionHeader label={t("next.postProcessing.testLog")} sticky={false} />
+            <SectionHeader
+              label={t("next.postProcessing.testLog")}
+              sticky={false}
+            />
             <div className={`${BAND} flex flex-col gap-2`}>
               {run.log ? (
                 <pre className="max-h-80 overflow-auto bg-wv-input px-3 py-2 font-wv-mono text-[12px] leading-[1.55] break-words whitespace-pre-wrap text-wv-fg">
@@ -317,20 +393,29 @@ export function ScriptTestDialog({ instance, onClose }: { instance: ScriptInstan
                 </pre>
               ) : (
                 <span className={NOTE}>
-                  {t(running ? "next.postProcessing.testLogWaiting" : "next.postProcessing.testLogEmpty")}
+                  {t(
+                    running
+                      ? "next.postProcessing.testLogWaiting"
+                      : "next.postProcessing.testLogEmpty",
+                  )}
                 </span>
               )}
               {run.logTruncated ? (
                 <span className="flex flex-wrap items-center gap-x-[10px] gap-y-1">
                   <TruncatedTag />
-                  <span className="font-wv-mono text-[11px] text-wv-muted">{t("next.job.scriptOutputTruncated")}</span>
+                  <span className="font-wv-mono text-[11px] text-wv-muted">
+                    {t("next.job.scriptOutputTruncated")}
+                  </span>
                 </span>
               ) : null}
             </div>
           </section>
 
           {run.commands.length > 0 ? (
-            <section aria-label={t("next.postProcessing.testCommands")} className="flex flex-none flex-col">
+            <section
+              aria-label={t("next.postProcessing.testCommands")}
+              className="flex flex-none flex-col"
+            >
               <SectionHeader
                 label={t("next.postProcessing.testCommands")}
                 count={run.commands.length}
@@ -343,7 +428,9 @@ export function ScriptTestDialog({ instance, onClose }: { instance: ScriptInstan
                 </div>
               ))}
               {run.commandsTruncated ? (
-                <div className={`${BAND} font-wv-mono text-[11px] text-wv-muted`}>
+                <div
+                  className={`${BAND} font-wv-mono text-[11px] text-wv-muted`}
+                >
                   {t("next.postProcessing.testCommandsTruncated")}
                 </div>
               ) : null}

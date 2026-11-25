@@ -79,6 +79,15 @@ pub struct TrackerComms {
     /// it stops they are left to finish within the stop's bound (see
     /// [`StopOnDrop`]).
     in_flight: Mutex<FuturesUnordered<InFlightAnnounce>>,
+    /// Names this hash's run as the one that last wrote every row of the
+    /// table (see [`RowIndex::writer`]).
+    run: u64,
+}
+
+/// A run id no other run of the process has had.
+fn next_run() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
 /// An announce of the run, abortable when its tracker is removed: the
@@ -629,6 +638,10 @@ struct TrackerList {
     handed_over: bool,
     /// How the torrent's announces are written.
     shape: &'static AnnounceShape,
+    /// A tracker's failures or next announce changed since the list last
+    /// wrote every row of the table, other than by an answer written
+    /// since: the next write writes every row.
+    unpublished: bool,
 }
 
 impl TrackerList {
@@ -657,6 +670,7 @@ impl TrackerList {
             announcing: true,
             handed_over: false,
             shape,
+            unpublished: false,
         }
     }
 
@@ -934,10 +948,8 @@ impl TrackerList {
         accepted: Accepted,
         now: Instant,
         delay: &ReannounceDelay,
-    ) {
-        let Some(i) = self.position(tracker) else {
-            return;
-        };
+    ) -> Option<usize> {
+        let i = self.position(tracker)?;
         let entry = &mut self.entries[i];
         entry.updating = false;
         entry.fails = 0;
@@ -948,15 +960,19 @@ impl TrackerList {
             entry.complete_sent = true;
             self.completion.sent();
         }
+        Some(i)
     }
 
     /// An announce to `tracker` failed: it backs off (libtorrent
     /// `announce_infohash::failed`) and goes to the end of its tier
-    /// (`tracker_list::deprioritize_tracker`).
-    fn on_failure(&mut self, tracker: &SupportedTracker, now: Instant, retry_interval: Duration) {
-        let Some(i) = self.position(tracker) else {
-            return;
-        };
+    /// (`tracker_list::deprioritize_tracker`). Where it now is in the list.
+    fn on_failure(
+        &mut self,
+        tracker: &SupportedTracker,
+        now: Instant,
+        retry_interval: Duration,
+    ) -> Option<usize> {
+        let i = self.position(tracker)?;
         let mut entry = self.entries.remove(i);
         entry.updating = false;
         entry.fails = entry.fails.saturating_add(1).min(127);
@@ -967,6 +983,7 @@ impl TrackerList {
             .rposition(|e| e.tier == entry.tier)
             .map_or(i, |last| last + 1);
         self.entries.insert(end_of_tier, entry);
+        Some(end_of_tier)
     }
 
     /// The torrent became a seed: every tracker not yet told is due at once
@@ -976,6 +993,16 @@ impl TrackerList {
             entry.next_announce = now;
             entry.min_announce = now;
         }
+        self.unpublished = true;
+    }
+
+    /// The failures and next announce the table shows for `entry`, `now`
+    /// being `at` on the wall clock.
+    fn row_value(&self, entry: &Entry, now: Instant, at: SystemTime) -> (u8, Option<SystemTime>) {
+        let asked = entry.start_sent.any() || entry.fails > 0;
+        let next = (self.announcing && asked)
+            .then(|| wall(entry.next_announce.max(entry.min_announce), now, at));
+        (entry.fails, next)
     }
 
     /// The run stops announcing (libtorrent `torrent::stop_announcing`): no
@@ -1325,6 +1352,33 @@ struct StatusShared {
     counts: Arc<TrackerStats>,
     /// The announce loops of the tracker task, one per hash, while it runs.
     runs: Mutex<Vec<std::sync::Weak<TrackerComms>>>,
+    /// Where each tracker's row is. Locked only while the table is, after
+    /// it.
+    rows: Mutex<RowIndex>,
+}
+
+/// The row of each tracker in the table, rebuilt only when the table's
+/// trackers are replaced, and the run whose list the rows' failures and
+/// next announces show.
+#[derive(Debug, Default)]
+struct RowIndex {
+    /// The first row of each URL.
+    at: HashMap<String, usize>,
+    /// The run that last wrote every row; none since the trackers were
+    /// replaced. While it is the run writing, and its list has changed
+    /// since only by answers it wrote, every row but the answered one
+    /// already shows what its list holds.
+    writer: u64,
+}
+
+impl RowIndex {
+    fn of(rows: &[TrackerAnnounce]) -> Self {
+        let mut at = HashMap::with_capacity(rows.len());
+        for (i, row) in rows.iter().enumerate() {
+            at.entry(row.url.clone()).or_insert(i);
+        }
+        Self { at, writer: 0 }
+    }
 }
 
 /// One entry per tracker of `tiers` that the session can announce to over
@@ -1351,6 +1405,26 @@ fn unique<'a>(trackers: impl IntoIterator<Item = &'a SupportedTracker>) -> Vec<S
         .into_iter()
         .filter(|tracker| seen.insert(*tracker))
         .cloned()
+        .collect()
+}
+
+/// The table's rows for `trackers`, in their order: a tracker that has a
+/// row in `rows` keeps the first of them, and one that has none gets a new
+/// row. The rows are looked up in an index built once.
+fn replaced_rows(rows: &[TrackerAnnounce], trackers: &[SupportedTracker]) -> Vec<TrackerAnnounce> {
+    let index = RowIndex::of(rows);
+    trackers
+        .iter()
+        .map(|t| {
+            let url = t.url().as_str();
+            match index.at.get(url) {
+                Some(&i) => rows[i].clone(),
+                None => TrackerAnnounce {
+                    url: url.to_owned(),
+                    ..Default::default()
+                },
+            }
+        })
         .collect()
 }
 
@@ -1382,7 +1456,7 @@ impl TrackerStatus {
         protocols: TrackerProtocols,
         counts: Arc<TrackerStats>,
     ) -> Self {
-        let announces = unique(trackers)
+        let announces: Vec<TrackerAnnounce> = unique(trackers)
             .iter()
             .map(|t| TrackerAnnounce {
                 url: t.url().to_string(),
@@ -1391,7 +1465,9 @@ impl TrackerStatus {
             .collect();
         #[cfg(not(test))]
         let _ = counts;
+        let rows = Mutex::new(RowIndex::of(&announces));
         Self(Arc::new(StatusShared {
+            rows,
             announces: tokio::sync::watch::channel(announces).0,
             protocols,
             #[cfg(test)]
@@ -1479,20 +1555,8 @@ impl TrackerStatus {
     ) -> Vec<(Arc<TrackerComms>, StartedTrackers)> {
         let trackers = unique(tiers.iter().flatten());
         self.0.announces.send_modify(|announces| {
-            *announces = trackers
-                .iter()
-                .map(|t| {
-                    let url = t.url().as_str();
-                    announces
-                        .iter()
-                        .find(|a| a.url == url)
-                        .cloned()
-                        .unwrap_or_else(|| TrackerAnnounce {
-                            url: url.to_owned(),
-                            ..Default::default()
-                        })
-                })
-                .collect();
+            *announces = replaced_rows(announces, &trackers);
+            *self.0.rows.lock() = RowIndex::of(announces);
         });
         self.runs()
             .into_iter()
@@ -1620,8 +1684,8 @@ impl TrackerStatus {
     fn begin(&self, tracker: &SupportedTracker) -> InFlight<'_> {
         let url = tracker.url().to_string();
         self.0.announces.send_modify(|announces| {
-            if let Some(a) = announces.iter_mut().find(|a| a.url == url) {
-                a.in_flight = true;
+            if let Some(&i) = self.0.rows.lock().at.get(&url) {
+                announces[i].in_flight = true;
             }
         });
         InFlight {
@@ -1652,7 +1716,8 @@ impl Drop for InFlight<'_> {
     fn drop(&mut self) {
         let last = self.last.take();
         self.status.0.announces.send_modify(|announces| {
-            if let Some(a) = announces.iter_mut().find(|a| a.url == self.url) {
+            let row = self.status.0.rows.lock().at.get(&self.url).copied();
+            if let Some(a) = row.map(|i| &mut announces[i]) {
                 a.in_flight = false;
                 if last.is_some() {
                     a.last = last;
@@ -2212,6 +2277,7 @@ impl TrackerComms {
                     grow: grow.clone(),
                     counts: counts.clone(),
                     in_flight: Default::default(),
+                    run: next_run(),
                 })
             })
             .collect::<Vec<_>>();
@@ -2293,6 +2359,7 @@ impl TrackerComms {
             grow: self.grow.clone(),
             counts: self.counts.clone(),
             in_flight: Default::default(),
+            run: next_run(),
         });
         if self.grow.send(comms.clone()).is_err() {
             return;
@@ -2426,18 +2493,23 @@ impl TrackerComms {
     /// Writes each tracker's failures and next announce to the table, `now`
     /// being `at` on the wall clock.
     fn publish(&self, now: Instant, at: SystemTime) {
-        let list = self.list.lock();
+        self.publish_answered(now, at, None);
+    }
+
+    /// [`Self::publish`] after the announce to `answered` ended, which the
+    /// list holds at the index given: only its row is written when the
+    /// others already show what the list holds.
+    fn publish_answered(
+        &self,
+        now: Instant,
+        at: SystemTime,
+        answered: Option<(&SupportedTracker, usize)>,
+    ) {
+        let mut list = self.list.lock();
         self.status.0.announces.send_if_modified(|announces| {
-            write_rows(
-                announces,
-                &list.entries,
-                |entry| entry.tracker.url().as_str(),
-                |entry| {
-                    let asked = entry.start_sent.any() || entry.fails > 0;
-                    let next = (list.announcing && asked)
-                        .then(|| wall(entry.next_announce.max(entry.min_announce), now, at));
-                    (entry.fails, next)
-                },
+            let mut index = self.status.0.rows.lock();
+            write_answered(
+                announces, &mut index, self.run, &mut list, answered, now, at,
             )
         });
     }
@@ -2531,7 +2603,7 @@ impl TrackerComms {
         let in_flight = self.status.begin(&tracker);
         let result = self.announce(&tracker, events, &stats).await;
         let (now, at) = (Instant::now(), SystemTime::now());
-        let (result, peers) = match result {
+        let (result, peers, at_list) = match result {
             Ok(announced) => {
                 let delay = ReannounceDelay::new(
                     announced.interval,
@@ -2553,9 +2625,10 @@ impl TrackerComms {
                     ?delay,
                     "tracker answered"
                 );
-                self.list
-                    .lock()
-                    .on_success(&tracker, announced.accepted, now, &delay);
+                let at_list =
+                    self.list
+                        .lock()
+                        .on_success(&tracker, announced.accepted, now, &delay);
                 if let Some((ours, by)) = announced.seen_as {
                     (self.vote)(ours, by);
                 }
@@ -2568,16 +2641,16 @@ impl TrackerComms {
                     peers: announced.peers.clone(),
                     warning: announced.warning,
                 };
-                (Ok(ok), announced.peers)
+                (Ok(ok), announced.peers, at_list)
             }
             Err(e) => {
                 debug!(?tracker, "error calling tracker: {e:#}");
                 let retry_interval = Refused::retry_interval(&e);
-                self.list.lock().on_failure(&tracker, now, retry_interval);
-                (Err(AnnounceError::from(&e)), Vec::new())
+                let at_list = self.list.lock().on_failure(&tracker, now, retry_interval);
+                (Err(AnnounceError::from(&e)), Vec::new(), at_list)
             }
         };
-        self.publish(now, at);
+        self.publish_answered(now, at, at_list.map(|i| (&tracker, i)));
         in_flight.finish(LastAnnounce { at, result });
         (tracker, peers)
     }
@@ -2922,6 +2995,47 @@ impl UdpTracker {
             }
         }
     }
+}
+
+/// Writes what `list` holds to the table after the announce to `answered`
+/// ended, for the run `run`: that tracker's row alone when every other row
+/// already shows what the list holds (the run wrote every row last, and the
+/// list changed since only by answers written), else every row, as
+/// [`write_rows`] does. `answered` is passed over unless the list still
+/// holds it at the index given. Says whether a row changed.
+fn write_answered(
+    rows: &mut [TrackerAnnounce],
+    index: &mut RowIndex,
+    run: u64,
+    list: &mut TrackerList,
+    answered: Option<(&SupportedTracker, usize)>,
+    now: Instant,
+    at: SystemTime,
+) -> bool {
+    let one = answered
+        .filter(|&(tracker, i)| list.entries.get(i).is_some_and(|e| &e.tracker == tracker))
+        .filter(|_| index.writer == run && !list.unpublished);
+    if let Some((tracker, i)) = one {
+        let Some(&row) = index.at.get(tracker.url().as_str()) else {
+            return false;
+        };
+        let value = list.row_value(&list.entries[i], now, at);
+        let row = &mut rows[row];
+        if (row.fails, row.next_announce) == value {
+            return false;
+        }
+        (row.fails, row.next_announce) = value;
+        return true;
+    }
+    index.writer = run;
+    list.unpublished = false;
+    let list = &*list;
+    write_rows(
+        rows,
+        &list.entries,
+        |entry| entry.tracker.url().as_str(),
+        |entry| list.row_value(entry, now, at),
+    )
 }
 
 /// Writes each entry's failures and next announce to the first row of its

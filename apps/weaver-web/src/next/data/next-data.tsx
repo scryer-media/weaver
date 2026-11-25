@@ -16,8 +16,14 @@ import {
 } from "react";
 import { useQuery, useSubscription } from "urql";
 import type { DocumentNode } from "graphql";
-import { useGraphqlConnectionState, type GraphqlConnectionStatus } from "@/graphql/client";
-import { DNS_PROFILE_CHOICES_QUERY, DNS_PROFILE_NAMES_QUERY } from "@/graphql/dns";
+import {
+  useGraphqlConnectionState,
+  type GraphqlConnectionStatus,
+} from "@/graphql/client";
+import {
+  DNS_PROFILE_CHOICES_QUERY,
+  DNS_PROFILE_NAMES_QUERY,
+} from "@/graphql/dns";
 import type { DnsProfileChoice, DnsProfileName } from "@/lib/dns";
 import {
   CATEGORIES_QUERY,
@@ -29,7 +35,10 @@ import {
   UPDATE_STATUS_SUBSCRIPTION,
   VERSION_QUERY,
 } from "@/graphql/queries";
-import { releaseNotification, type UpdateStatus } from "@/next/features/updates/update-notification";
+import {
+  releaseNotification,
+  type UpdateStatus,
+} from "@/next/features/updates/update-notification";
 import { useReconnectPolling } from "@/lib/hooks/use-reconnect-polling";
 import { useTranslate } from "@/lib/context/translate-context";
 import {
@@ -40,8 +49,15 @@ import {
 import type { JobDownloadRate } from "@/lib/live-job-download-rates";
 import { formatRate } from "./format";
 import { sameItems, shallowEqual, useSettled } from "./settled";
-import { torrentsStateFrom, type TorrentPresence, type TorrentsState } from "./torrents-shown";
-import { withLiveConnections, type ProviderConnections } from "./provider-connections";
+import {
+  torrentsStateFrom,
+  type TorrentPresence,
+  type TorrentsState,
+} from "./torrents-shown";
+import {
+  withLiveConnections,
+  type ProviderConnections,
+} from "./provider-connections";
 import { useHistoryLiveRefresh } from "./use-history-live-refresh";
 import { useLiveQueue, type LiveQueue } from "./use-live-queue";
 import { usePageVisible, useVisibleInterval } from "./timers";
@@ -198,7 +214,11 @@ export interface NextData {
    */
   providersLoaded: boolean;
   holdoffs: ProviderHoldoff[];
-  connection: { status: GraphqlConnectionStatus; isDisconnected: boolean; isPolling: boolean };
+  connection: {
+    status: GraphqlConnectionStatus;
+    isDisconnected: boolean;
+    isPolling: boolean;
+  };
 }
 
 const DEFAULT_DOWNLOAD_BLOCK: DownloadBlockState = {
@@ -220,10 +240,17 @@ const EMPTY_CATEGORIES: ConfiguredCategory[] = [];
 const NO_DISK_VOLUMES: readonly DiskVolume[] = [];
 const NO_CLASSES: readonly string[] = [];
 const sameClasses = (left: readonly string[], right: readonly string[]) =>
-  left.length === right.length && left.every((held, index) => held === right[index]);
+  left.length === right.length &&
+  left.every((held, index) => held === right[index]);
 
-function sameTorrentPresence(left: TorrentPresence | undefined, right: TorrentPresence | undefined): boolean {
-  return left === right || (left !== undefined && right !== undefined && shallowEqual(left, right));
+function sameTorrentPresence(
+  left: TorrentPresence | undefined,
+  right: TorrentPresence | undefined,
+): boolean {
+  return (
+    left === right ||
+    (left !== undefined && right !== undefined && shallowEqual(left, right))
+  );
 }
 const EMPTY_PROVIDERS: ProviderHealth[] = [];
 const EMPTY_HOLDOFFS: ProviderHoldoff[] = [];
@@ -280,8 +307,12 @@ const subscribeNowhere = () => () => {};
  * when one of them changes, not on every speed tick.
  */
 export function useNextData(): NextData;
-export function useNextData<K extends keyof NextData>(...keys: K[]): Pick<NextData, K>;
-export function useNextData<K extends keyof NextData>(...keys: K[]): NextData | Pick<NextData, K> {
+export function useNextData<K extends keyof NextData>(
+  ...keys: K[]
+): Pick<NextData, K>;
+export function useNextData<K extends keyof NextData>(
+  ...keys: K[]
+): NextData | Pick<NextData, K> {
   const whole = keys.length === 0;
   const data = whole ? use(NextDataContext) : null;
   const picked = useNextDataSelector<Pick<NextData, K> | null>(
@@ -298,7 +329,10 @@ export function useNextData<K extends keyof NextData>(...keys: K[]): NextData | 
 }
 
 function samePick<T extends object>(left: T | null, right: T | null): boolean {
-  return left === right || (left !== null && right !== null && shallowEqual(left, right));
+  return (
+    left === right ||
+    (left !== null && right !== null && shallowEqual(left, right))
+  );
 }
 
 /**
@@ -328,10 +362,16 @@ export function useNextDataSelector<T>(
     last.current = { value };
     return value;
   };
-  return useSyncExternalStore(store?.subscribe ?? subscribeNowhere, getSnapshot);
+  return useSyncExternalStore(
+    store?.subscribe ?? subscribeNowhere,
+    getSnapshot,
+  );
 }
 
-function pick<K extends keyof NextData>(data: NextData, keys: readonly K[]): Pick<NextData, K> {
+function pick<K extends keyof NextData>(
+  data: NextData,
+  keys: readonly K[],
+): Pick<NextData, K> {
   const picked = {} as Pick<NextData, K>;
   for (const key of keys) {
     picked[key] = data[key];
@@ -350,10 +390,16 @@ export type DnsProfileRead = "ROUTE" | "PROXY_NAME";
  */
 function useWantedProfiles<T>(query: DocumentNode) {
   const [wanted, setWanted] = useState(false);
-  const [{ data, fetching }, reexecute] = useQuery<{ dnsProfiles: T[] }>({ query, pause: !wanted });
+  const [{ data, fetching }, reexecute] = useQuery<{ dnsProfiles: T[] }>({
+    query,
+    pause: !wanted,
+  });
   const state = useRef({ wanted, failed: false });
   useLayoutEffect(() => {
-    state.current = { wanted, failed: wanted && !fetching && data === undefined };
+    state.current = {
+      wanted,
+      failed: wanted && !fetching && data === undefined,
+    };
   }, [data, fetching, wanted]);
   const want = useCallback(() => {
     if (!state.current.wanted) {
@@ -376,7 +422,13 @@ function useWantedProfiles<T>(query: DocumentNode) {
  * The DNS profile reads the provider holds. Exported so a fixture that renders
  * an editor without the whole provider holds them the same way.
  */
-export function useDnsProfileReads(): Pick<NextData, "dnsRouteProfiles" | "dnsProfileNames" | "wantDnsProfiles" | "refreshDnsProfiles"> {
+export function useDnsProfileReads(): Pick<
+  NextData,
+  | "dnsRouteProfiles"
+  | "dnsProfileNames"
+  | "wantDnsProfiles"
+  | "refreshDnsProfiles"
+> {
   const route = useWantedProfiles<DnsProfileChoice>(DNS_PROFILE_CHOICES_QUERY);
   const names = useWantedProfiles<DnsProfileName>(DNS_PROFILE_NAMES_QUERY);
   const { want: wantRoute, refresh: refreshRoute } = route;
@@ -389,39 +441,65 @@ export function useDnsProfileReads(): Pick<NextData, "dnsRouteProfiles" | "dnsPr
     refreshRoute();
     refreshNames();
   }, [refreshNames, refreshRoute]);
-  return { dnsRouteProfiles: route.profiles, dnsProfileNames: names.profiles, wantDnsProfiles, refreshDnsProfiles };
+  return {
+    dnsRouteProfiles: route.profiles,
+    dnsProfileNames: names.profiles,
+    wantDnsProfiles,
+    refreshDnsProfiles,
+  };
 }
 
 export function NextDataProvider({ children }: { children: ReactNode }) {
   const connectionState = useGraphqlConnectionState();
   const queue = useLiveQueue();
 
-  const [{ data: versionData }] = useQuery<{ version: string }>({ query: VERSION_QUERY });
-  const [{ data: updateStatusData }] = useQuery<{ updateStatus: UpdateStatus }>({
-    query: UPDATE_STATUS_QUERY,
+  const [{ data: versionData }] = useQuery<{ version: string }>({
+    query: VERSION_QUERY,
   });
-  const [{ data: updateStatusLive }] = useSubscription<{ updateStatusUpdates: UpdateStatus }>({
+  const [{ data: updateStatusData }] = useQuery<{ updateStatus: UpdateStatus }>(
+    {
+      query: UPDATE_STATUS_QUERY,
+    },
+  );
+  const [{ data: updateStatusLive }] = useSubscription<{
+    updateStatusUpdates: UpdateStatus;
+  }>({
     query: UPDATE_STATUS_SUBSCRIPTION,
     pause: connectionState.status === "disconnected",
   });
-  const [{ data: historyCountData }, reexecuteHistoryCount] = useQuery<{ all: number }>({
+  const [{ data: historyCountData }, reexecuteHistoryCount] = useQuery<{
+    all: number;
+  }>({
     query: HISTORY_JOBS_COUNT_QUERY,
   });
-  const [{ data: categoryData }, reexecuteCategories] = useQuery<{ categories: ConfiguredCategory[] }>({
+  const [{ data: categoryData }, reexecuteCategories] = useQuery<{
+    categories: ConfiguredCategory[];
+  }>({
     query: CATEGORIES_QUERY,
   });
-  const { dnsRouteProfiles, dnsProfileNames, wantDnsProfiles, refreshDnsProfiles } = useDnsProfileReads();
+  const {
+    dnsRouteProfiles,
+    dnsProfileNames,
+    wantDnsProfiles,
+    refreshDnsProfiles,
+  } = useDnsProfileReads();
   const [{ data: providerData }, reexecuteProviders] = useQuery<{
     serverHealth: ProviderHealth[];
   }>({ query: SERVER_HEALTH_QUERY });
-  const [{ data: metricsQueryData, error: metricsQueryError }, reexecuteMetrics] = useQuery<LiveMetricsSnapshot>({
+  const [
+    { data: metricsQueryData, error: metricsQueryError },
+    reexecuteMetrics,
+  ] = useQuery<LiveMetricsSnapshot>({
     query: LIVE_METRICS_QUERY,
   });
-  const [{ data: metricsSubscriptionData, error: metricsSubscriptionError }] = useSubscription<{
-    systemMetricsUpdates: LiveMetricsSnapshot;
-  }>({ query: LIVE_METRICS_SUBSCRIPTION });
+  const [{ data: metricsSubscriptionData, error: metricsSubscriptionError }] =
+    useSubscription<{
+      systemMetricsUpdates: LiveMetricsSnapshot;
+    }>({ query: LIVE_METRICS_SUBSCRIPTION });
 
-  const [polledMetrics, setPolledMetrics] = useState<LiveMetricsSnapshot | undefined>();
+  const [polledMetrics, setPolledMetrics] = useState<
+    LiveMetricsSnapshot | undefined
+  >();
   const reconnectPolling = useReconnectPolling<LiveMetricsSnapshot>({
     enabled: connectionState.status === "disconnected",
     query: LIVE_METRICS_QUERY,
@@ -429,7 +507,10 @@ export function NextDataProvider({ children }: { children: ReactNode }) {
   });
 
   useEffect(() => {
-    if (connectionState.status === "connected" && metricsSubscriptionData?.systemMetricsUpdates) {
+    if (
+      connectionState.status === "connected" &&
+      metricsSubscriptionData?.systemMetricsUpdates
+    ) {
       setPolledMetrics(undefined);
     }
   }, [connectionState.status, metricsSubscriptionData]);
@@ -456,11 +537,12 @@ export function NextDataProvider({ children }: { children: ReactNode }) {
     void reexecuteProviders({ requestPolicy: "network-only" });
   }, 10_000);
 
-  const snapshot = polledMetrics
-    ?? (connectionState.status === "connected" && !metricsSubscriptionError
+  const snapshot =
+    polledMetrics ??
+    (connectionState.status === "connected" && !metricsSubscriptionError
       ? metricsSubscriptionData?.systemMetricsUpdates
-      : undefined)
-    ?? metricsQueryData;
+      : undefined) ??
+    metricsQueryData;
 
   useEffect(() => {
     if (!metricsSubscriptionError) {
@@ -502,9 +584,15 @@ export function NextDataProvider({ children }: { children: ReactNode }) {
     return block;
   }, [pushedBlock]);
   const downloadBlock = useSettled(blockOnly, shallowEqual);
-  const diskVolumes = useSettled(pushedBlock?.diskVolumes ?? NO_DISK_VOLUMES, sameItems);
+  const diskVolumes = useSettled(
+    pushedBlock?.diskVolumes ?? NO_DISK_VOLUMES,
+    sameItems,
+  );
   const isPaused = globalState?.isPaused ?? false;
-  const pausedClasses = useSettled(globalState?.pausedClasses ?? NO_CLASSES, sameClasses);
+  const pausedClasses = useSettled(
+    globalState?.pausedClasses ?? NO_CLASSES,
+    sameClasses,
+  );
   const resumeAt = globalState?.resumeAtEpochMs ?? null;
   const speedLimit = globalState?.speedLimitBytesPerSec ?? null;
   const categories = categoryData?.categories ?? EMPTY_CATEGORIES;
@@ -517,13 +605,20 @@ export function NextDataProvider({ children }: { children: ReactNode }) {
   const liveConnections = snapshot?.providerConnections;
   const providers = useSettled(
     useMemo(
-      () => withLiveConnections(providerData?.serverHealth ?? EMPTY_PROVIDERS, liveConnections),
+      () =>
+        withLiveConnections(
+          providerData?.serverHealth ?? EMPTY_PROVIDERS,
+          liveConnections,
+        ),
       [providerData, liveConnections],
     ),
     sameItems,
   );
   const providersLoaded = providerData !== undefined;
-  const holdoffs = useSettled(snapshot?.providerHoldoffs ?? EMPTY_HOLDOFFS, sameItems);
+  const holdoffs = useSettled(
+    snapshot?.providerHoldoffs ?? EMPTY_HOLDOFFS,
+    sameItems,
+  );
   const version = versionData?.version ?? "";
   const update = useMemo(
     () =>
@@ -654,7 +749,10 @@ function useDocumentTitle(speed: number, isPaused: boolean) {
     };
     // A held figure is applied once the hold runs out rather than dropped, or a
     // speed that then stays put would never reach the tab.
-    const wait = speed > 0 && !isPaused ? lastUpdate.current + TITLE_HOLD_MS - Date.now() : 0;
+    const wait =
+      speed > 0 && !isPaused
+        ? lastUpdate.current + TITLE_HOLD_MS - Date.now()
+        : 0;
     if (wait <= 0) {
       apply();
       return;

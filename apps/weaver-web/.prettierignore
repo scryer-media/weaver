@@ -1,0 +1,15 @@
+# Generated output and local assets
+dist/
+node_modules/
+*.tsbuildinfo
+public/
+
+# Fixtures, generated dependency records, and documentation
+**/__fixtures__/
+**/fixtures/
+package-lock.json
+**/*.md
+
+# The test ID modules are mirrored in e2e/playwright-weaver, and its
+# testids-pin check compares the two byte for byte.
+/src/next/testids/

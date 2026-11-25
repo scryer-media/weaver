@@ -41,8 +41,13 @@ export function RateCounter({
       >
         {value}
       </span>
-      <span className="ml-[2px] font-wv-mono text-[9.5px] text-wv-muted">{unit}</span>
-      <span aria-hidden className="ml-[4px] font-wv-mono text-[12px] font-semibold leading-none text-wv-fg">
+      <span className="ml-[2px] font-wv-mono text-[9.5px] text-wv-muted">
+        {unit}
+      </span>
+      <span
+        aria-hidden
+        className="ml-[4px] font-wv-mono text-[12px] font-semibold leading-none text-wv-fg"
+      >
         {arrow === "down" ? "↓" : "↑"}
       </span>
     </Tag>
@@ -54,14 +59,23 @@ export function RateCounter({
  * above (`58`, `999`). The scale starts at KB/s, so every unit is four letters
  * wide and nothing shifts as it climbs.
  */
-export function fixedSpeed(bytesPerSecond: number): { value: string; unit: string } {
+export function fixedSpeed(bytesPerSecond: number): {
+  value: string;
+  unit: string;
+} {
   const units = ["KB/s", "MB/s", "GB/s", "TB/s"];
-  let scaled = Number.isFinite(bytesPerSecond) && bytesPerSecond > 0 ? bytesPerSecond / 1024 : 0;
+  let scaled =
+    Number.isFinite(bytesPerSecond) && bytesPerSecond > 0
+      ? bytesPerSecond / 1024
+      : 0;
   let index = 0;
   // Past what rounds to 999, the next unit, so the value never needs a fourth place.
   while (scaled >= 999.5 && index < units.length - 1) {
     scaled /= 1024;
     index += 1;
   }
-  return { value: scaled < 9.95 ? scaled.toFixed(1) : Math.round(scaled).toFixed(0), unit: units[index] };
+  return {
+    value: scaled < 9.95 ? scaled.toFixed(1) : Math.round(scaled).toFixed(0),
+    unit: units[index],
+  };
 }

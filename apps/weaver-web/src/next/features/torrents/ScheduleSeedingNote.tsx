@@ -18,9 +18,15 @@ interface ScheduleSeeding {
  * tracker rules. Read again whenever the torrents move; draws nothing while
  * none are left seeding.
  */
-export function ScheduleSeedingNote({ torrents }: { torrents: ReadonlyMap<number, TorrentSummaryData> }) {
+export function ScheduleSeedingNote({
+  torrents,
+}: {
+  torrents: ReadonlyMap<number, TorrentSummaryData>;
+}) {
   const t = useTranslate();
-  const [{ data }, reexecute] = useQuery<{ scheduleSeeding: ScheduleSeeding[] }>({
+  const [{ data }, reexecute] = useQuery<{
+    scheduleSeeding: ScheduleSeeding[];
+  }>({
     query: SCHEDULE_SEEDING_QUERY,
     pause: torrents.size === 0,
   });
@@ -36,7 +42,12 @@ export function ScheduleSeedingNote({ torrents }: { torrents: ReadonlyMap<number
   return (
     <span className="font-wv-mono text-[11.5px] text-wv-muted">
       {seeding
-        .map((rule) => t("next.downloads.scheduleSeeding", { count: rule.torrents, rule: rule.name }))
+        .map((rule) =>
+          t("next.downloads.scheduleSeeding", {
+            count: rule.torrents,
+            rule: rule.name,
+          }),
+        )
         .join(" · ")}
     </span>
   );

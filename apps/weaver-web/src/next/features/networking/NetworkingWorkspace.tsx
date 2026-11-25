@@ -1,7 +1,14 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
-import { createContext, memo, useContext, useMemo, useState, type ReactNode } from "react";
+import {
+  createContext,
+  memo,
+  useContext,
+  useMemo,
+  useState,
+  type ReactNode,
+} from "react";
 import { Navigate, useLocation } from "react-router";
 import { useTranslate } from "@/lib/context/translate-context";
 import type { FlowDnsList, FlowDnsProfile } from "@/lib/dns";
@@ -36,7 +43,13 @@ import { NoticeBand } from "./presentation";
 export type { NetworkingData } from "./data";
 
 /** Publishes the last action's outcome to the settings status bar. */
-function ActionStatus({ message, failed }: { message: string | null; failed: boolean }) {
+function ActionStatus({
+  message,
+  failed,
+}: {
+  message: string | null;
+  failed: boolean;
+}) {
   usePanelStatus(message, failed);
   return null;
 }
@@ -90,7 +103,11 @@ export function NetworkingWorkspace({
   /** The stored proxies' table. It calls back when one is saved or removed. */
   proxies: (onChanged: () => void) => ReactNode;
   /** One stored proxy's editor, for a proxy picked in the flow. */
-  proxyEditor: (id: number, onClose: () => void, onChanged: () => void) => ReactNode;
+  proxyEditor: (
+    id: number,
+    onClose: () => void,
+    onChanged: () => void,
+  ) => ReactNode;
 }) {
   const t = useTranslate();
   const location = useLocation();
@@ -103,7 +120,20 @@ export function NetworkingWorkspace({
     : (location.pathname.split("/networking/")[1] ?? "overview");
   const workspace = useNetworkingWorkspace(page);
   const [editing, setEditing] = useState<FlowTarget | null>(null);
-  const { data, error, fetching, flow, consumers, egresses, profiles, pools, action, busy, message, failed } = workspace;
+  const {
+    data,
+    error,
+    fetching,
+    flow,
+    consumers,
+    egresses,
+    profiles,
+    pools,
+    action,
+    busy,
+    message,
+    failed,
+  } = workspace;
   // Where the flow's legs look names up. Only the overview draws it, once the settings are read.
   const { dns, refresh: refreshDns } = useFlowDns(page !== "overview" || !data);
   // The pages draw their blocks only once the data is here. The DNS page reads and reports its own.
@@ -115,7 +145,10 @@ export function NetworkingWorkspace({
         kind: "custom",
         id: "flow",
         title: t("next.networking.overview.flow"),
-        searchText: [...consumers.map((consumer) => consumer.name), ...egresses.map((egress) => egress.name)].join(" "),
+        searchText: [
+          ...consumers.map((consumer) => consumer.name),
+          ...egresses.map((egress) => egress.name),
+        ].join(" "),
         body: (
           <OverviewFlow
             egresses={egresses}
@@ -141,7 +174,9 @@ export function NetworkingWorkspace({
   return (
     <>
       {/* The egress page's download ceiling owns the status bar there, and reports these actions with its own. */}
-      {page === "egress" ? null : <ActionStatus message={message} failed={failed} />}
+      {page === "egress" ? null : (
+        <ActionStatus message={message} failed={failed} />
+      )}
       {error ? (
         <EmptyState
           title={t("next.networking.loadFailed")}
@@ -154,7 +189,11 @@ export function NetworkingWorkspace({
         />
       ) : null}
       {!data && fetching ? (
-        <EmptyState loading title={t("next.common.loading")} body={t("next.networking.loading")} />
+        <EmptyState
+          loading
+          title={t("next.common.loading")}
+          body={t("next.networking.loading")}
+        />
       ) : null}
       {data ? (
         <>
@@ -184,20 +223,49 @@ export function NetworkingWorkspace({
                   flow={flow}
                   action={action}
                   busy={busy}
-                  proxyEditor={(id, onClose) => proxyEditor(id, onClose, workspace.retry)}
+                  proxyEditor={(id, onClose) =>
+                    proxyEditor(id, onClose, workspace.retry)
+                  }
                   onDnsChanged={refreshDns}
                 />
               ) : null}
             </>
           ) : null}
           {page === "egress" ? (
-            <EgressPage data={data} egresses={egresses} action={action} busy={busy} message={message} failed={failed} />
+            <EgressPage
+              data={data}
+              egresses={egresses}
+              action={action}
+              busy={busy}
+              message={message}
+              failed={failed}
+            />
           ) : null}
-          {page === "proxies" ? <PoolsPage data={data} action={action} busy={busy} proxies={proxies(workspace.retry)} /> : null}
+          {page === "proxies" ? (
+            <PoolsPage
+              data={data}
+              action={action}
+              busy={busy}
+              proxies={proxies(workspace.retry)}
+            />
+          ) : null}
           {page === "routes" ? (
-            <RoutesPage key={location.search} data={data} consumers={consumers} flow={flow} action={action} busy={busy} />
+            <RoutesPage
+              key={location.search}
+              data={data}
+              consumers={consumers}
+              flow={flow}
+              action={action}
+              busy={busy}
+            />
           ) : null}
-          {page === "speed" ? <SpeedPage key={location.search} data={data} consumers={consumers} /> : null}
+          {page === "speed" ? (
+            <SpeedPage
+              key={location.search}
+              data={data}
+              consumers={consumers}
+            />
+          ) : null}
         </>
       ) : null}
     </>

@@ -430,18 +430,31 @@ async fn blocking_routed_tls_read_obeys_timeout_and_revocation() {
             ..ServerConfig::new(bridge_dialer(bridge.clone()))
         };
         let started = std::time::Instant::now();
-        let client = tokio::task::spawn_blocking(move || {
+        let mut client = tokio::task::spawn_blocking(move || {
             let mut client = BlockingNntpConnection::connect(&config).unwrap();
             client.send_command(&Command::Body(weaver_nntp::ArticleId::MessageId(
                 "stall@fixture".into(),
             )))
         });
-        // The server has decrypted the request and deliberately sends no reply.
-        origin.stalled.notified().await;
+        // Either the server decrypts the request and deliberately sends no
+        // reply, or the client ends first: its read may time out, or its
+        // close may end the routed stream, before the server reads the
+        // request. Waiting only for the server would wait forever then.
+        let ended = tokio::select! {
+            () = origin.stalled.notified() => None,
+            ended = &mut client => Some(ended.unwrap()),
+        };
         if revoke {
+            assert!(
+                ended.is_none(),
+                "the client ended before the server held its request: {ended:?}"
+            );
             bridge.revoke().await;
         }
-        let result = client.await.unwrap();
+        let result = match ended {
+            Some(result) => result,
+            None => client.await.unwrap(),
+        };
         assert!(result.is_err());
         if !revoke {
             assert!(started.elapsed() >= Duration::from_millis(500));

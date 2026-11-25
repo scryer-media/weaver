@@ -1,7 +1,14 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
-import { useCallback, useEffect, useRef, useState, type ChangeEvent, type DragEvent } from "react";
+import {
+  useCallback,
+  useEffect,
+  useRef,
+  useState,
+  type ChangeEvent,
+  type DragEvent,
+} from "react";
 import { useQuery } from "urql";
 import { authHeaders, fetchWithSessionRetry } from "@/graphql/client";
 import { CATEGORIES_QUERY } from "@/graphql/queries";
@@ -73,12 +80,7 @@ const DISCARD_STAGED_NZBS_OPERATION = `
 `;
 
 export type UploadNzbEntryStatus =
-  | "queued"
-  | "staging"
-  | "staged"
-  | "failed"
-  | "submitting"
-  | "submitted";
+  "queued" | "staging" | "staged" | "failed" | "submitting" | "submitted";
 
 /** What the daemon read a file as. */
 export type SubmissionKind = "NZB" | "TORRENT";
@@ -155,7 +157,9 @@ function graphqlErrorMessage(
   return payload?.errors?.find((entry) => entry.message)?.message ?? null;
 }
 
-async function parseJsonResponse<T>(response: Response): Promise<T | undefined> {
+async function parseJsonResponse<T>(
+  response: Response,
+): Promise<T | undefined> {
   const text = await response.text();
   if (!text.trim()) {
     return undefined;
@@ -194,7 +198,10 @@ async function stageNzbUpload(
 
   const payload = await parseJsonResponse<StageNzbUploadResponse>(response);
   if (!response.ok) {
-    throw new Error(graphqlErrorMessage(payload) ?? `Upload failed with status ${response.status}`);
+    throw new Error(
+      graphqlErrorMessage(payload) ??
+        `Upload failed with status ${response.status}`,
+    );
   }
   if (!payload) {
     throw new Error("Upload failed: empty response body");
@@ -239,7 +246,10 @@ async function submitStagedNzbs(input: {
 
   const payload = await parseJsonResponse<SubmitStagedNzbsResponse>(response);
   if (!response.ok) {
-    throw new Error(graphqlErrorMessage(payload) ?? `Submit failed with status ${response.status}`);
+    throw new Error(
+      graphqlErrorMessage(payload) ??
+        `Submit failed with status ${response.status}`,
+    );
   }
   if (!payload) {
     throw new Error("Submit failed: empty response body");
@@ -249,7 +259,11 @@ async function submitStagedNzbs(input: {
 
 type SubmitResponse = {
   data?: {
-    submit?: { accepted: boolean; status: string; message?: string | null } | null;
+    submit?: {
+      accepted: boolean;
+      status: string;
+      message?: string | null;
+    } | null;
   };
   errors?: Array<{ message: string }>;
 };
@@ -275,7 +289,9 @@ async function submitOne(input: {
         text: input.text ?? null,
         upload: null,
         category:
-          input.category.trim() && input.category !== NO_CATEGORY_VALUE ? input.category : null,
+          input.category.trim() && input.category !== NO_CATEGORY_VALUE
+            ? input.category
+            : null,
         tags: input.tags,
         paused: input.paused,
         password: input.password.trim() || null,
@@ -297,12 +313,16 @@ async function submitOne(input: {
       body: JSON.stringify(operations),
     };
   }
-  const response = await fetchWithSessionRetry(graphqlUrl(), { ...request, credentials: "same-origin" });
+  const response = await fetchWithSessionRetry(graphqlUrl(), {
+    ...request,
+    credentials: "same-origin",
+  });
   const payload = await parseJsonResponse<SubmitResponse>(response);
   const refusal = graphqlErrorMessage(payload);
   if (refusal) return refusal;
   const result = payload?.data?.submit;
-  if (!response.ok || !result) return `Submit failed with status ${response.status}`;
+  if (!response.ok || !result)
+    return `Submit failed with status ${response.status}`;
   return result.accepted ? null : (result.message ?? result.status);
 }
 
@@ -338,7 +358,9 @@ function fileIdentity(file: File): string {
 }
 
 function makeLocalId(): string {
-  return globalThis.crypto?.randomUUID?.() ?? `upload-${Date.now()}-${Math.random()}`;
+  return (
+    globalThis.crypto?.randomUUID?.() ?? `upload-${Date.now()}-${Math.random()}`
+  );
 }
 
 export function useUploadNzb(options?: {
@@ -363,7 +385,8 @@ export function useUploadNzb(options?: {
   const [text, setTextState] = useState("");
   const [textError, setTextError] = useState<string | null>(null);
   const [force, setForce] = useState(false);
-  const [duplicateMode, setDuplicateMode] = useState<DuplicateSubmissionMode>("ENFORCE");
+  const [duplicateMode, setDuplicateMode] =
+    useState<DuplicateSubmissionMode>("ENFORCE");
   const [duplicateKey, setDuplicateKey] = useState("");
   const [duplicateScore, setDuplicateScore] = useState("");
   const [dragging, setDragging] = useState(false);
@@ -371,10 +394,15 @@ export function useUploadNzb(options?: {
   const [{ data: categoryData }] = useQuery({ query: CATEGORIES_QUERY });
 
   const setEntriesState = useCallback(
-    (updater: UploadNzbEntry[] | ((current: UploadNzbEntry[]) => UploadNzbEntry[])) => {
+    (
+      updater:
+        UploadNzbEntry[] | ((current: UploadNzbEntry[]) => UploadNzbEntry[]),
+    ) => {
       const next =
         typeof updater === "function"
-          ? (updater as (current: UploadNzbEntry[]) => UploadNzbEntry[])(entriesRef.current)
+          ? (updater as (current: UploadNzbEntry[]) => UploadNzbEntry[])(
+              entriesRef.current,
+            )
           : updater;
       entriesRef.current = next;
       setEntries(next);
@@ -382,12 +410,15 @@ export function useUploadNzb(options?: {
     [],
   );
 
-  const discardKnownStageIds = useCallback((ids: string[], keepalive = false) => {
-    if (ids.length === 0) {
-      return;
-    }
-    void discardStagedNzbs(ids, { keepalive }).catch(() => {});
-  }, []);
+  const discardKnownStageIds = useCallback(
+    (ids: string[], keepalive = false) => {
+      if (ids.length === 0) {
+        return;
+      }
+      void discardStagedNzbs(ids, { keepalive }).catch(() => {});
+    },
+    [],
+  );
 
   const cleanupEntries = useCallback(
     (currentEntries: UploadNzbEntry[], keepalive = false) => {
@@ -438,7 +469,12 @@ export function useUploadNzb(options?: {
             setEntriesState((current) =>
               current.map((candidate) =>
                 candidate.localId === entry.localId
-                  ? { ...candidate, status: "staged", kind: "TORRENT", error: undefined }
+                  ? {
+                      ...candidate,
+                      status: "staged",
+                      kind: "TORRENT",
+                      error: undefined,
+                    }
                   : candidate,
               ),
             );
@@ -448,9 +484,12 @@ export function useUploadNzb(options?: {
         const stageError =
           graphqlErrorMessage(payload) ??
           payload.data?.stageNzbUpload?.error ??
-          (!payload.data?.stageNzbUpload?.accepted ? t("upload.rejected") : null);
+          (!payload.data?.stageNzbUpload?.accepted
+            ? t("upload.rejected")
+            : null);
 
-        const stagedUploadId = payload.data?.stageNzbUpload?.stagedUploadId ?? undefined;
+        const stagedUploadId =
+          payload.data?.stageNzbUpload?.stagedUploadId ?? undefined;
         if (!isEntryCurrent(entry.localId, generation)) {
           if (stagedUploadId) {
             discardKnownStageIds([stagedUploadId], !mountedRef.current);
@@ -484,9 +523,12 @@ export function useUploadNzb(options?: {
                   stagedUploadId,
                   error: undefined,
                   displayName:
-                    payload.data?.stageNzbUpload?.displayName ?? candidate.displayName,
-                  totalFiles: payload.data?.stageNzbUpload?.totalFiles ?? undefined,
-                  totalBytes: payload.data?.stageNzbUpload?.totalBytes ?? undefined,
+                    payload.data?.stageNzbUpload?.displayName ??
+                    candidate.displayName,
+                  totalFiles:
+                    payload.data?.stageNzbUpload?.totalFiles ?? undefined,
+                  totalBytes:
+                    payload.data?.stageNzbUpload?.totalBytes ?? undefined,
                 }
               : candidate,
           ),
@@ -509,7 +551,9 @@ export function useUploadNzb(options?: {
                   status: "failed",
                   stagedUploadId: undefined,
                   error:
-                    stageError instanceof Error ? stageError.message : t("upload.rejected"),
+                    stageError instanceof Error
+                      ? stageError.message
+                      : t("upload.rejected"),
                 }
               : candidate,
           ),
@@ -589,10 +633,16 @@ export function useUploadNzb(options?: {
       setError(null);
       // Picking the same file a second time adds nothing: it is already listed.
       // What a file is, the daemon reads from its bytes as it stages it.
-      const listed = new Set(entriesRef.current.map((entry) => fileIdentity(entry.file)));
+      const listed = new Set(
+        entriesRef.current.map((entry) => fileIdentity(entry.file)),
+      );
       const added = nextFiles
         .filter((file) => !listed.has(fileIdentity(file)))
-        .map<UploadNzbEntry>((file) => ({ localId: makeLocalId(), file, status: "queued" }));
+        .map<UploadNzbEntry>((file) => ({
+          localId: makeLocalId(),
+          file,
+          status: "queued",
+        }));
       if (added.length === 0) {
         return;
       }
@@ -613,7 +663,9 @@ export function useUploadNzb(options?: {
   const removeFile = useCallback(
     (localId: string) => {
       setError(null);
-      const target = entriesRef.current.find((entry) => entry.localId === localId);
+      const target = entriesRef.current.find(
+        (entry) => entry.localId === localId,
+      );
       if (!target) {
         return;
       }
@@ -622,14 +674,18 @@ export function useUploadNzb(options?: {
       if (target.stagedUploadId) {
         discardKnownStageIds([target.stagedUploadId]);
       }
-      setEntriesState((current) => current.filter((entry) => entry.localId !== localId));
+      setEntriesState((current) =>
+        current.filter((entry) => entry.localId !== localId),
+      );
     },
     [discardKnownStageIds, setEntriesState],
   );
 
   const retryFile = useCallback(
     (localId: string) => {
-      const existing = entriesRef.current.find((entry) => entry.localId === localId);
+      const existing = entriesRef.current.find(
+        (entry) => entry.localId === localId,
+      );
       if (!existing) {
         return;
       }
@@ -648,7 +704,9 @@ export function useUploadNzb(options?: {
         error: undefined,
       };
       setEntriesState((current) =>
-        current.map((entry) => (entry.localId === localId ? retryEntry : entry)),
+        current.map((entry) =>
+          entry.localId === localId ? retryEntry : entry,
+        ),
       );
       void stageEntry(retryEntry, generation);
     },
@@ -664,218 +722,262 @@ export function useUploadNzb(options?: {
     [handleFiles],
   );
 
-  const submit = useCallback(async (submitOptions?: { force?: boolean; localIds?: string[] }) => {
-    const selectedIds = submitOptions?.localIds ? new Set(submitOptions.localIds) : null;
-    const readyEntries = entriesRef.current.filter(
-      (entry) =>
-        entry.status === "staged" &&
-        (entry.stagedUploadId || entry.kind === "TORRENT") &&
-        (!selectedIds || selectedIds.has(entry.localId)),
-    );
-    const nzbEntries = readyEntries.filter((entry) => entry.stagedUploadId);
-    const torrentEntries = readyEntries.filter((entry) => entry.kind === "TORRENT");
-    // A forced resubmit of chosen files leaves the text alone.
-    const sentText = selectedIds ? "" : text.trim();
-    const hasPendingStages = entriesRef.current.some(
-      (entry) => entry.status === "queued" || entry.status === "staging",
-    );
-    if ((readyEntries.length === 0 && sentText === "") || hasPendingStages) {
-      return false;
-    }
-
-    setError(null);
-    const readyIds = new Set(readyEntries.map((entry) => entry.localId));
-    setEntriesState((current) =>
-      current.map((entry) =>
-        readyIds.has(entry.localId)
-          ? { ...entry, status: "submitting", error: undefined }
-          : entry,
-      ),
-    );
-
-    // The text and each torrent go on their own; a refusal stays on its row for another try.
-    const shared = { category, tags: splitTags(tags), paused, password, unpack };
-    let anyAccepted = false;
-    const textOutcome: UploadNzbEntryStatus[] = [];
-    if (sentText !== "") {
-      const refusal = await submitOne({ ...shared, text: sentText }).catch((cause: unknown) =>
-        cause instanceof Error ? cause.message : t("upload.rejected"),
+  const submit = useCallback(
+    async (submitOptions?: { force?: boolean; localIds?: string[] }) => {
+      const selectedIds = submitOptions?.localIds
+        ? new Set(submitOptions.localIds)
+        : null;
+      const readyEntries = entriesRef.current.filter(
+        (entry) =>
+          entry.status === "staged" &&
+          (entry.stagedUploadId || entry.kind === "TORRENT") &&
+          (!selectedIds || selectedIds.has(entry.localId)),
       );
-      if (refusal === null) {
-        anyAccepted = true;
-        setTextState("");
-      } else {
-        setTextError(refusal);
+      const nzbEntries = readyEntries.filter((entry) => entry.stagedUploadId);
+      const torrentEntries = readyEntries.filter(
+        (entry) => entry.kind === "TORRENT",
+      );
+      // A forced resubmit of chosen files leaves the text alone.
+      const sentText = selectedIds ? "" : text.trim();
+      const hasPendingStages = entriesRef.current.some(
+        (entry) => entry.status === "queued" || entry.status === "staging",
+      );
+      if ((readyEntries.length === 0 && sentText === "") || hasPendingStages) {
+        return false;
       }
-      textOutcome.push(refusal === null ? "submitted" : "failed");
-    }
-    for (const entry of torrentEntries) {
-      const refusal = await submitOne({ ...shared, file: entry.file }).catch((cause: unknown) =>
-        cause instanceof Error ? cause.message : t("upload.rejected"),
-      );
-      anyAccepted ||= refusal === null;
+
+      setError(null);
+      const readyIds = new Set(readyEntries.map((entry) => entry.localId));
       setEntriesState((current) =>
-        current.map((candidate) =>
-          candidate.localId === entry.localId
-            ? refusal === null
-              ? { ...candidate, status: "submitted", error: undefined }
-              : { ...candidate, status: "staged", error: refusal }
-            : candidate,
+        current.map((entry) =>
+          readyIds.has(entry.localId)
+            ? { ...entry, status: "submitting", error: undefined }
+            : entry,
         ),
       );
-    }
 
-    const closeIfDone = () => {
-      // The text counts as one more item: the dialog closes once everything sent is in.
-      const statuses = [...entriesRef.current.map((entry) => entry.status), ...textOutcome];
-      if (shouldCloseAfterSubmit(statuses)) {
-        if (fileInputRef.current) {
-          fileInputRef.current.value = "";
-        }
-        options?.onSubmitted?.();
-      }
-    };
-    if (nzbEntries.length === 0) {
-      closeIfDone();
-      return anyAccepted;
-    }
-
-    try {
-      const payload = await submitStagedNzbs({
-        stagedUploadIds: nzbEntries
-          .map((entry) => entry.stagedUploadId)
-          .filter((value): value is string => !!value),
-        password,
+      // The text and each torrent go on their own; a refusal stays on its row for another try.
+      const shared = {
         category,
         tags: splitTags(tags),
-        priority,
         paused,
-        duplicate: duplicateSubmissionInput({
-          force: submitOptions?.force || force,
-          mode: duplicateMode,
-          key: duplicateKey,
-          score: duplicateScore,
-        }),
-      });
+        password,
+        unpack,
+      };
+      let anyAccepted = false;
+      const textOutcome: UploadNzbEntryStatus[] = [];
+      if (sentText !== "") {
+        const refusal = await submitOne({ ...shared, text: sentText }).catch(
+          (cause: unknown) =>
+            cause instanceof Error ? cause.message : t("upload.rejected"),
+        );
+        if (refusal === null) {
+          anyAccepted = true;
+          setTextState("");
+        } else {
+          setTextError(refusal);
+        }
+        textOutcome.push(refusal === null ? "submitted" : "failed");
+      }
+      for (const entry of torrentEntries) {
+        const refusal = await submitOne({ ...shared, file: entry.file }).catch(
+          (cause: unknown) =>
+            cause instanceof Error ? cause.message : t("upload.rejected"),
+        );
+        anyAccepted ||= refusal === null;
+        setEntriesState((current) =>
+          current.map((candidate) =>
+            candidate.localId === entry.localId
+              ? refusal === null
+                ? { ...candidate, status: "submitted", error: undefined }
+                : { ...candidate, status: "staged", error: refusal }
+              : candidate,
+          ),
+        );
+      }
 
-      const submitError = graphqlErrorMessage(payload);
-      if (submitError) {
-        setError(submitError);
+      const closeIfDone = () => {
+        // The text counts as one more item: the dialog closes once everything sent is in.
+        const statuses = [
+          ...entriesRef.current.map((entry) => entry.status),
+          ...textOutcome,
+        ];
+        if (shouldCloseAfterSubmit(statuses)) {
+          if (fileInputRef.current) {
+            fileInputRef.current.value = "";
+          }
+          options?.onSubmitted?.();
+        }
+      };
+      if (nzbEntries.length === 0) {
+        closeIfDone();
+        return anyAccepted;
+      }
+
+      try {
+        const payload = await submitStagedNzbs({
+          stagedUploadIds: nzbEntries
+            .map((entry) => entry.stagedUploadId)
+            .filter((value): value is string => !!value),
+          password,
+          category,
+          tags: splitTags(tags),
+          priority,
+          paused,
+          duplicate: duplicateSubmissionInput({
+            force: submitOptions?.force || force,
+            mode: duplicateMode,
+            key: duplicateKey,
+            score: duplicateScore,
+          }),
+        });
+
+        const submitError = graphqlErrorMessage(payload);
+        if (submitError) {
+          setError(submitError);
+          setEntriesState((current) =>
+            current.map((entry) =>
+              entry.status === "submitting"
+                ? { ...entry, status: "staged", error: submitError }
+                : entry,
+            ),
+          );
+          return false;
+        }
+
+        const resultMap = new Map(
+          (payload.data?.submitStagedNzbs?.results ?? []).map((result) => [
+            result.stagedUploadId,
+            result,
+          ]),
+        );
+
+        setEntriesState((current) => {
+          const nextEntries: UploadNzbEntry[] = [];
+          for (const entry of current) {
+            if (entry.status !== "submitting") {
+              nextEntries.push(entry);
+              continue;
+            }
+
+            const stagedUploadId = entry.stagedUploadId;
+            if (!stagedUploadId) {
+              nextEntries.push({
+                ...entry,
+                status: "failed",
+                error: t("upload.stageExpired"),
+              });
+              continue;
+            }
+
+            const result = resultMap.get(stagedUploadId);
+            if (!result) {
+              nextEntries.push({
+                ...entry,
+                status: "staged",
+                error: t("upload.rejected"),
+              });
+              continue;
+            }
+
+            const submissionStatus =
+              result.status ?? (result.accepted ? "ACCEPTED" : undefined);
+            const outcome = {
+              submissionStatus,
+              semanticDuplicate: result.semanticDuplicate ?? undefined,
+            };
+
+            if (
+              submissionStatusIsDurable(submissionStatus) ||
+              result.accepted
+            ) {
+              nextEntries.push({
+                ...entry,
+                status: "submitted",
+                error: undefined,
+                ...outcome,
+              });
+              continue;
+            }
+
+            if (result.retained) {
+              nextEntries.push({
+                ...entry,
+                status: "staged",
+                error: result.error ?? undefined,
+                ...outcome,
+              });
+              continue;
+            }
+
+            nextEntries.push({
+              ...entry,
+              status: "failed",
+              stagedUploadId: undefined,
+              error: result.error ?? undefined,
+              ...outcome,
+            });
+          }
+          return nextEntries;
+        });
+
+        // Close once every entry reached a successful terminal state (see
+        // shouldCloseAfterSubmit). Submitted entries are retained in the list so
+        // the queue-duplicate "accepted with warning" outcome can render.
+        closeIfDone();
+
+        return (
+          anyAccepted ||
+          (payload.data?.submitStagedNzbs?.acceptedCount ?? 0) > 0
+        );
+      } catch (submissionError) {
+        const message =
+          submissionError instanceof Error
+            ? submissionError.message
+            : t("upload.rejected");
+        setError(message);
         setEntriesState((current) =>
           current.map((entry) =>
             entry.status === "submitting"
-              ? { ...entry, status: "staged", error: submitError }
+              ? {
+                  ...entry,
+                  status: entry.stagedUploadId ? "staged" : "failed",
+                  error: message,
+                }
               : entry,
           ),
         );
         return false;
       }
+    },
+    [
+      category,
+      duplicateKey,
+      duplicateMode,
+      duplicateScore,
+      force,
+      options,
+      password,
+      paused,
+      priority,
+      setEntriesState,
+      t,
+      tags,
+      text,
+      unpack,
+    ],
+  );
 
-      const resultMap = new Map(
-        (payload.data?.submitStagedNzbs?.results ?? []).map((result) => [result.stagedUploadId, result]),
-      );
-
-      setEntriesState((current) => {
-        const nextEntries: UploadNzbEntry[] = [];
-        for (const entry of current) {
-          if (entry.status !== "submitting") {
-            nextEntries.push(entry);
-            continue;
-          }
-
-          const stagedUploadId = entry.stagedUploadId;
-          if (!stagedUploadId) {
-            nextEntries.push({ ...entry, status: "failed", error: t("upload.stageExpired") });
-            continue;
-          }
-
-          const result = resultMap.get(stagedUploadId);
-          if (!result) {
-            nextEntries.push({
-              ...entry,
-              status: "staged",
-              error: t("upload.rejected"),
-            });
-            continue;
-          }
-
-          const submissionStatus = result.status ?? (result.accepted ? "ACCEPTED" : undefined);
-          const outcome = {
-            submissionStatus,
-            semanticDuplicate: result.semanticDuplicate ?? undefined,
-          };
-
-          if (submissionStatusIsDurable(submissionStatus) || result.accepted) {
-            nextEntries.push({ ...entry, status: "submitted", error: undefined, ...outcome });
-            continue;
-          }
-
-          if (result.retained) {
-            nextEntries.push({
-              ...entry,
-              status: "staged",
-              error: result.error ?? undefined,
-              ...outcome,
-            });
-            continue;
-          }
-
-          nextEntries.push({
-            ...entry,
-            status: "failed",
-            stagedUploadId: undefined,
-            error: result.error ?? undefined,
-            ...outcome,
-          });
-        }
-        return nextEntries;
-      });
-
-      // Close once every entry reached a successful terminal state (see
-      // shouldCloseAfterSubmit). Submitted entries are retained in the list so
-      // the queue-duplicate "accepted with warning" outcome can render.
-      closeIfDone();
-
-      return anyAccepted || (payload.data?.submitStagedNzbs?.acceptedCount ?? 0) > 0;
-    } catch (submissionError) {
-      const message =
-        submissionError instanceof Error ? submissionError.message : t("upload.rejected");
-      setError(message);
-      setEntriesState((current) =>
-        current.map((entry) =>
-          entry.status === "submitting"
-            ? {
-                ...entry,
-                status: entry.stagedUploadId ? "staged" : "failed",
-                error: message,
-              }
-            : entry,
-        ),
-      );
-      return false;
-    }
-  }, [
-    category,
-    duplicateKey,
-    duplicateMode,
-    duplicateScore,
-    force,
-    options,
-    password,
-    paused,
-    priority,
-    setEntriesState,
-    t,
-    tags,
-    text,
-    unpack,
-  ]);
-
-  const staging = entries.some((entry) => entry.status === "queued" || entry.status === "staging");
+  const staging = entries.some(
+    (entry) => entry.status === "queued" || entry.status === "staging",
+  );
   const fetching = entries.some((entry) => entry.status === "submitting");
   const readyCount =
-    entries.filter((entry) => entry.status === "staged").length + (text.trim() === "" ? 0 : 1);
-  const failedCount = entries.filter((entry) => entry.status === "failed").length;
+    entries.filter((entry) => entry.status === "staged").length +
+    (text.trim() === "" ? 0 : 1);
+  const failedCount = entries.filter(
+    (entry) => entry.status === "failed",
+  ).length;
   const totalBytes = entries.reduce((sum, entry) => sum + entry.file.size, 0);
 
   return {
@@ -918,7 +1020,8 @@ export function useUploadNzb(options?: {
     addFiles,
     removeFile,
     retryFile,
-    forceSubmitFile: (localId: string) => submit({ force: true, localIds: [localId] }),
+    forceSubmitFile: (localId: string) =>
+      submit({ force: true, localIds: [localId] }),
     openPicker: () => fileInputRef.current?.click(),
     submit,
     onFileInputChange: (event: ChangeEvent<HTMLInputElement>) => {

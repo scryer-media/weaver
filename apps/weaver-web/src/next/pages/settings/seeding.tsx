@@ -3,7 +3,13 @@
 
 import { useState, type ReactNode } from "react";
 import { useTranslate, type Translate } from "@/lib/context/translate-context";
-import { CheckBox, NumberField, Segmented, Toggle, UnitStrip } from "../../components/controls";
+import {
+  CheckBox,
+  NumberField,
+  Segmented,
+  Toggle,
+  UnitStrip,
+} from "../../components/controls";
 import { LimitControl } from "../../features/networking/limits";
 import { testIds } from "../../testids";
 import type { FieldSpec } from "./framework";
@@ -36,15 +42,22 @@ export const OFF: Leaf<never> = { state: "OFF", value: null };
 export const leafSet = <T,>(value: T): Leaf<T> => ({ state: "SET", value });
 
 /** The value while the leaf is set here. */
-export const leafValue = <T,>(leaf: Leaf<T>): T | null => (leaf.state === "SET" ? leaf.value : null);
+export const leafValue = <T,>(leaf: Leaf<T>): T | null =>
+  leaf.state === "SET" ? leaf.value : null;
 
 /** A leaf as the daemon sent it, inheriting while it sent none. */
 export const leafFrom = <T,>(leaf: Leaf<T> | null | undefined): Leaf<T> =>
-  leaf ? { state: leaf.state, value: leaf.state === "SET" ? leaf.value : null } : INHERIT;
+  leaf
+    ? { state: leaf.state, value: leaf.state === "SET" ? leaf.value : null }
+    : INHERIT;
 
 /** A leaf as a `*LeafInput` takes it: a value with `SET` and only then. */
-export const leafInput = <T,>(leaf: Leaf<T>): { state: LeafState; value?: T | null } =>
-  leaf.state === "SET" ? { state: "SET", value: leaf.value } : { state: leaf.state };
+export const leafInput = <T,>(
+  leaf: Leaf<T>,
+): { state: LeafState; value?: T | null } =>
+  leaf.state === "SET"
+    ? { state: "SET", value: leaf.value }
+    : { state: leaf.state };
 
 /** When a torrent has seeded enough, and what is done with it then, at one level. */
 export interface SeedingPolicy {
@@ -98,7 +111,9 @@ export function seedingInput(policy: SeedingPolicy) {
 }
 
 /** Terms as the daemon sent them; a term it left out inherits. */
-export function seedingFrom(policy: Partial<SeedingPolicy> | null | undefined): SeedingPolicy {
+export function seedingFrom(
+  policy: Partial<SeedingPolicy> | null | undefined,
+): SeedingPolicy {
   return {
     ratioGoal: leafFrom(policy?.ratioGoal),
     seedTimeGoalMinutes: leafFrom(policy?.seedTimeGoalMinutes),
@@ -117,9 +132,12 @@ export function seedingAtGlobal(policy: SeedingPolicy): SeedingPolicy {
     seedTimeGoalMinutes: goal(policy.seedTimeGoalMinutes),
     inactiveGoalMinutes: goal(policy.inactiveGoalMinutes),
     mode: policy.mode.state === "SET" ? policy.mode : GLOBAL_SEEDING.mode,
-    action: policy.action.state === "SET" ? policy.action : GLOBAL_SEEDING.action,
+    action:
+      policy.action.state === "SET" ? policy.action : GLOBAL_SEEDING.action,
     seedTimeCounting:
-      policy.seedTimeCounting.state === "SET" ? policy.seedTimeCounting : GLOBAL_SEEDING.seedTimeCounting,
+      policy.seedTimeCounting.state === "SET"
+        ? policy.seedTimeCounting
+        : GLOBAL_SEEDING.seedTimeCounting,
   };
 }
 
@@ -158,7 +176,9 @@ export function GoalControl({
       {value !== null ? (
         <NumberField
           label={label}
-          testId={fieldId === undefined ? undefined : testIds.fieldValue(fieldId)}
+          testId={
+            fieldId === undefined ? undefined : testIds.fieldValue(fieldId)
+          }
           value={value}
           min={0}
           step={step}
@@ -177,7 +197,11 @@ export function GoalControl({
         onChange={(on) => onChange(on ? last : null)}
         testId={fieldId === undefined ? undefined : testIds.field(fieldId)}
       />
-      {value === null && offLabel ? <span className="font-wv-mono text-[11.5px] text-wv-muted">{offLabel}</span> : null}
+      {value === null && offLabel ? (
+        <span className="font-wv-mono text-[11.5px] text-wv-muted">
+          {offLabel}
+        </span>
+      ) : null}
     </div>
   );
 }
@@ -230,25 +254,35 @@ export function DurationGoalControl({
 }) {
   const t = useTranslate();
   const [last, setLast] = useState(value ?? fallback);
-  const [unit, setUnit] = useState<DurationUnit>(() => durationUnit(value ?? fallback));
+  const [unit, setUnit] = useState<DurationUnit>(() =>
+    durationUnit(value ?? fallback),
+  );
   return (
     <div className="flex items-center gap-[10px]">
       {value !== null ? (
         <>
           <NumberField
             label={label}
-            testId={fieldId === undefined ? undefined : testIds.fieldValue(fieldId)}
+            testId={
+              fieldId === undefined ? undefined : testIds.fieldValue(fieldId)
+            }
             value={value / UNIT_MINUTES[unit]}
             min={0}
             precision={2}
             onChange={(next) => {
-              const minutes = Math.max(0, Math.round(next * UNIT_MINUTES[unit]));
+              const minutes = Math.max(
+                0,
+                Math.round(next * UNIT_MINUTES[unit]),
+              );
               setLast(minutes);
               onChange(minutes);
             }}
           />
           <UnitStrip
-            options={DURATION_UNITS.map((option) => ({ value: option, label: t(UNIT_KEYS[option]) }))}
+            options={DURATION_UNITS.map((option) => ({
+              value: option,
+              label: t(UNIT_KEYS[option]),
+            }))}
             value={unit}
             onChange={setUnit}
           />
@@ -260,7 +294,11 @@ export function DurationGoalControl({
         onChange={(on) => onChange(on ? last : null)}
         testId={fieldId === undefined ? undefined : testIds.field(fieldId)}
       />
-      {value === null && offLabel ? <span className="font-wv-mono text-[11.5px] text-wv-muted">{offLabel}</span> : null}
+      {value === null && offLabel ? (
+        <span className="font-wv-mono text-[11.5px] text-wv-muted">
+          {offLabel}
+        </span>
+      ) : null}
     </div>
   );
 }
@@ -319,7 +357,9 @@ export function LeafControl<T>({
         testId={fieldId === undefined ? undefined : testIds.field(fieldId)}
         value={leaf.state}
         options={states}
-        onChange={(state) => onChange(state === "SET" ? leafSet(last) : { state, value: null })}
+        onChange={(state) =>
+          onChange(state === "SET" ? leafSet(last) : { state, value: null })
+        }
       />
       {value !== null
         ? input(value, (next) => {
@@ -353,10 +393,15 @@ function DurationField({
         value={value / UNIT_MINUTES[unit]}
         min={0}
         precision={2}
-        onChange={(next) => onChange(Math.max(0, Math.round(next * UNIT_MINUTES[unit])))}
+        onChange={(next) =>
+          onChange(Math.max(0, Math.round(next * UNIT_MINUTES[unit])))
+        }
       />
       <UnitStrip
-        options={DURATION_UNITS.map((option) => ({ value: option, label: t(UNIT_KEYS[option]) }))}
+        options={DURATION_UNITS.map((option) => ({
+          value: option,
+          label: t(UNIT_KEYS[option]),
+        }))}
         value={unit}
         onChange={setUnit}
       />
@@ -364,21 +409,30 @@ function DurationField({
   );
 }
 
-const ratioField = (label: string, fieldId: string) => (value: number, onValue: (next: number) => void) => (
-  <NumberField
-    label={label}
-    testId={testIds.fieldValue(fieldId)}
-    value={value}
-    min={0}
-    step={0.1}
-    precision={2}
-    onChange={(next) => onValue(Math.max(0, next))}
-  />
-);
+const ratioField =
+  (label: string, fieldId: string) =>
+  (value: number, onValue: (next: number) => void) => (
+    <NumberField
+      label={label}
+      testId={testIds.fieldValue(fieldId)}
+      value={value}
+      min={0}
+      step={0.1}
+      precision={2}
+      onChange={(next) => onValue(Math.max(0, next))}
+    />
+  );
 
-const durationField = (label: string, fieldId: string) => (value: number, onValue: (next: number) => void) => (
-  <DurationField label={label} testId={testIds.fieldValue(fieldId)} value={value} onChange={onValue} />
-);
+const durationField =
+  (label: string, fieldId: string) =>
+  (value: number, onValue: (next: number) => void) => (
+    <DurationField
+      label={label}
+      testId={testIds.fieldValue(fieldId)}
+      value={value}
+      onChange={onValue}
+    />
+  );
 
 /**
  * Whether the seed-time goal counts only the current unbroken run: checked is
@@ -402,7 +456,9 @@ function ContinuousBox({
         label={label}
         testId={testId}
         checked={leafValue(counting) === "CONSECUTIVE"}
-        onChange={(continuous) => onChange(leafSet(continuous ? "CONSECUTIVE" : "CUMULATIVE"))}
+        onChange={(continuous) =>
+          onChange(leafSet(continuous ? "CONSECUTIVE" : "CUMULATIVE"))
+        }
       />
       <span>{label}</span>
     </label>
@@ -422,7 +478,8 @@ export function seedingFields(
 ): FieldSpec[] {
   const prefix = options.idPrefix ?? "seeding";
   const noGoal = t("next.seeding.noGoal");
-  const patch = (next: Partial<SeedingPolicy>) => onChange({ ...policy, ...next });
+  const patch = (next: Partial<SeedingPolicy>) =>
+    onChange({ ...policy, ...next });
   const ratioId = `${prefix}-ratioGoal`;
   const seedTimeId = `${prefix}-seedTimeGoalMinutes`;
   const inactiveId = `${prefix}-inactiveGoalMinutes`;
@@ -433,12 +490,17 @@ export function seedingFields(
     control: { kind: "custom", control },
   });
   // At the global level a goal is on or off.
-  const globalGoal = (leaf: Leaf<number>) => (leaf.state === "SET" ? leaf.value : null);
-  const fromGlobal = (value: number | null): Leaf<number> => (value === null ? OFF : leafSet(value));
+  const globalGoal = (leaf: Leaf<number>) =>
+    leaf.state === "SET" ? leaf.value : null;
+  const fromGlobal = (value: number | null): Leaf<number> =>
+    value === null ? OFF : leafSet(value);
   const ratioLabel = t("next.seeding.ratioGoal");
   const seedTimeLabel = t("next.seeding.seedTimeGoal");
   const inactiveLabel = t("next.seeding.inactiveGoal");
-  const inherit = { value: INHERIT_CHOICE, label: t("next.seeding.leafInherit") };
+  const inherit = {
+    value: INHERIT_CHOICE,
+    label: t("next.seeding.leafInherit"),
+  };
   // The counting rides on the seed-time goal, shown while this level sets it.
   const continuous = (
     <ContinuousBox
@@ -448,8 +510,13 @@ export function seedingFields(
     />
   );
   const choice = <T extends string>(leaf: Leaf<T>, fallback: T) =>
-    leaf.state === "SET" && leaf.value !== null ? leaf.value : options.inherits ? INHERIT_CHOICE : fallback;
-  const fromChoice = <T extends string>(value: string): Leaf<T> => (value === INHERIT_CHOICE ? INHERIT : leafSet(value as T));
+    leaf.state === "SET" && leaf.value !== null
+      ? leaf.value
+      : options.inherits
+        ? INHERIT_CHOICE
+        : fallback;
+  const fromChoice = <T extends string>(value: string): Leaf<T> =>
+    value === INHERIT_CHOICE ? INHERIT : leafSet(value as T);
   return [
     goal(
       ratioId,
@@ -502,7 +569,9 @@ export function seedingFields(
             fieldId={seedTimeId}
             value={globalGoal(policy.seedTimeGoalMinutes)}
             offLabel={noGoal}
-            onChange={(minutes) => patch({ seedTimeGoalMinutes: fromGlobal(minutes) })}
+            onChange={(minutes) =>
+              patch({ seedTimeGoalMinutes: fromGlobal(minutes) })
+            }
             fallback={1440}
           />
           {globalGoal(policy.seedTimeGoalMinutes) === null ? null : continuous}
@@ -528,7 +597,9 @@ export function seedingFields(
           fieldId={inactiveId}
           value={globalGoal(policy.inactiveGoalMinutes)}
           offLabel={noGoal}
-          onChange={(minutes) => patch({ inactiveGoalMinutes: fromGlobal(minutes) })}
+          onChange={(minutes) =>
+            patch({ inactiveGoalMinutes: fromGlobal(minutes) })
+          }
           fallback={60}
         />
       ),
@@ -555,7 +626,8 @@ export function seedingFields(
           ...(options.inherits ? [inherit] : []),
           ...ACTIONS.map((option) => ({ ...option, label: t(option.label) })),
         ],
-        onChange: (action) => patch({ action: fromChoice<SeedingAction>(action) }),
+        onChange: (action) =>
+          patch({ action: fromChoice<SeedingAction>(action) }),
       },
     },
   ];
@@ -571,7 +643,12 @@ const DEFAULT_UPLOAD_CAP = 10 * 1024 * 1024;
  * An upload cap below the global level, each torrent's in bytes per second:
  * inherited, unlimited, or a rate in MB/s.
  */
-export function uploadCapField(t: Translate, cap: Leaf<number>, onChange: (next: Leaf<number>) => void, idPrefix: string): FieldSpec {
+export function uploadCapField(
+  t: Translate,
+  cap: Leaf<number>,
+  onChange: (next: Leaf<number>) => void,
+  idPrefix: string,
+): FieldSpec {
   const label = t("next.seeding.uploadCap");
   return {
     id: `${idPrefix}-uploadCap`,
@@ -594,7 +671,9 @@ export function uploadCapField(t: Translate, cap: Leaf<number>, onChange: (next:
               step={0.1}
               precision={1}
               suffix="MB/s"
-              onChange={(next) => onValue(Math.round(Math.max(0, next) * 1024 * 1024))}
+              onChange={(next) =>
+                onValue(Math.round(Math.max(0, next) * 1024 * 1024))
+              }
             />
           )}
         />
@@ -604,13 +683,28 @@ export function uploadCapField(t: Translate, cap: Leaf<number>, onChange: (next:
 }
 
 /** The global upload cap, each torrent's in bytes per second; null is none. */
-export function globalUploadCapField(t: Translate, cap: number | null, onChange: (next: number | null) => void): FieldSpec {
+export function globalUploadCapField(
+  t: Translate,
+  cap: number | null,
+  onChange: (next: number | null) => void,
+): FieldSpec {
   const label = t("next.seeding.uploadCap");
   return {
     id: "seeding-uploadCap",
     label,
     keywords: "upload speed limit rate",
-    control: { kind: "custom", control: <LimitControl label={label} fieldId="seeding-uploadCap" value={cap} suffix="MB/s" onChange={onChange} /> },
+    control: {
+      kind: "custom",
+      control: (
+        <LimitControl
+          label={label}
+          fieldId="seeding-uploadCap"
+          value={cap}
+          suffix="MB/s"
+          onChange={onChange}
+        />
+      ),
+    },
   };
 }
 
@@ -630,16 +724,29 @@ export function seedingEffectiveText(
   const noGoal = t("next.seeding.noGoal");
   const goal = (leaf: Leaf<number>, text: (value: number) => string) =>
     leaf.state === "SET" && leaf.value !== null ? text(leaf.value) : noGoal;
-  const pick = <T extends string>(leaf: Leaf<T>, options: { value: T; label: string }[]) => {
+  const pick = <T extends string>(
+    leaf: Leaf<T>,
+    options: { value: T; label: string }[],
+  ) => {
     const option = options.find((entry) => entry.value === leaf.value);
     return option ? t(option.label) : "";
   };
   return {
-    [`${prefix}-ratioGoal`]: goal(policy.ratioGoal, (ratio) => ratio.toFixed(2)),
-    [`${prefix}-seedTimeGoalMinutes`]: goal(policy.seedTimeGoalMinutes, (minutes) => durationText(t, minutes)),
-    [`${prefix}-inactiveGoalMinutes`]: goal(policy.inactiveGoalMinutes, (minutes) => durationText(t, minutes)),
+    [`${prefix}-ratioGoal`]: goal(policy.ratioGoal, (ratio) =>
+      ratio.toFixed(2),
+    ),
+    [`${prefix}-seedTimeGoalMinutes`]: goal(
+      policy.seedTimeGoalMinutes,
+      (minutes) => durationText(t, minutes),
+    ),
+    [`${prefix}-inactiveGoalMinutes`]: goal(
+      policy.inactiveGoalMinutes,
+      (minutes) => durationText(t, minutes),
+    ),
     [`${prefix}-action`]: pick(policy.action, ACTIONS),
     [`${capPrefix}-uploadCap`]:
-      uploadCap === null ? t("next.networking.unlimited") : `${Math.round((uploadCap / (1024 * 1024)) * 10) / 10} MB/s`,
+      uploadCap === null
+        ? t("next.networking.unlimited")
+        : `${Math.round((uploadCap / (1024 * 1024)) * 10) / 10} MB/s`,
   };
 }

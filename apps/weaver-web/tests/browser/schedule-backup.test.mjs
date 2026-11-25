@@ -5,21 +5,31 @@ import assert from "node:assert/strict";
 import { after, before, test } from "node:test";
 import { join } from "node:path";
 import { createServer } from "vite";
-const { chromium } = await import(process.env.PLAYWRIGHT_MODULE_PATH ?? "playwright");
+const { chromium } = await import(
+  process.env.PLAYWRIGHT_MODULE_PATH ?? "playwright"
+);
 let server, browser, baseUrl;
 before(async () => {
-  server = await createServer({ cacheDir: "node_modules/.vite/browser-schedule-backup", server: { host: "127.0.0.1", port: 0 } });
+  server = await createServer({
+    cacheDir: "node_modules/.vite/browser-schedule-backup",
+    server: { host: "127.0.0.1", port: 0 },
+  });
   await server.listen();
   baseUrl = `http://127.0.0.1:${server.httpServer.address().port}`;
   browser = await chromium.launch({ headless: true });
 });
-after(async () => { await browser?.close(); await server?.close(); });
+after(async () => {
+  await browser?.close();
+  await server?.close();
+});
 /** With `SCHEDULES_SCREENSHOT_DIR` set to a directory, the page as it stands is saved there as `name`.png. */
 async function shot(page, name) {
   if (!process.env.SCHEDULES_SCREENSHOT_DIR) return;
   // A dialog's body scrolls inside the window; a taller one holds the whole of it.
   await page.setViewportSize({ width: 1600, height: 1500 });
-  await page.screenshot({ path: join(process.env.SCHEDULES_SCREENSHOT_DIR, `${name}.png`) });
+  await page.screenshot({
+    path: join(process.env.SCHEDULES_SCREENSHOT_DIR, `${name}.png`),
+  });
   await page.setViewportSize({ width: 1600, height: 1000 });
 }
 // The shared controls: a select is a button that opens a menu, and a toggle is a switch.
@@ -27,18 +37,28 @@ async function choose(page, scope, name, option) {
   await scope.getByRole("button", { name, exact: true }).click();
   await page.getByRole("menuitemradio", { name: option, exact: true }).click();
 }
-const toggle = (scope, name) => scope.getByRole("switch", { name, exact: true });
+const toggle = (scope, name) =>
+  scope.getByRole("switch", { name, exact: true });
 // The list's own Add, centred under its table.
-const addSchedule = (page) => page.locator("main").getByRole("button", { name: "Add schedule", exact: true });
+const addSchedule = (page) =>
+  page
+    .locator("main")
+    .getByRole("button", { name: "Add schedule", exact: true });
 async function open(query = "") {
-  const page = await browser.newPage({ viewport: { width: 1600, height: 1000 } });
+  const page = await browser.newPage({
+    viewport: { width: 1600, height: 1000 },
+  });
   if (query.includes("automatic")) {
     await page.clock.install({ time: new Date("2026-01-03T03:00:00Z") });
     await page.clock.pauseAt(new Date("2026-01-03T03:00:00Z"));
   }
   page.setDefaultTimeout(0);
   page.on("pageerror", (error) => console.error(error));
-  await page.route("**/*", (route) => new URL(route.request().url()).origin === baseUrl ? route.continue() : route.abort());
+  await page.route("**/*", (route) =>
+    new URL(route.request().url()).origin === baseUrl
+      ? route.continue()
+      : route.abort(),
+  );
   await page.goto(`${baseUrl}/tests/browser/schedule-backup.html${query}`);
   return page;
 }
@@ -46,57 +66,137 @@ async function open(query = "") {
 test("backup settings, retained create, token download and delete use the rendered controls", async () => {
   const page = await open();
   try {
-    const automatic = page.getByRole("region", { name: "Automatic backups", exact: true });
+    const automatic = page.getByRole("region", {
+      name: "Automatic backups",
+      exact: true,
+    });
     await automatic.waitFor();
-    await automatic.getByRole("switch", { name: "Enable automatic backups", exact: true }).click();
-    await automatic.getByRole("button", { name: "Save changes", exact: true }).click();
-    await page.getByRole("alert").filter({ hasText: "automatic backup key is required" }).waitFor();
-    await automatic.getByLabel("Automatic backup key", { exact: true }).fill("fixture archive key");
-    await automatic.getByRole("button", { name: "Save changes", exact: true }).click();
-    await automatic.getByText("A key is stored. Enter a new key to replace it.", { exact: true }).waitFor();
-    assert.equal(await automatic.getByLabel("Automatic backup key", { exact: true }).inputValue(), "");
-    await automatic.getByRole("switch", { name: "Enable automatic backups", exact: true }).click();
-    await automatic.getByRole("switch", { name: "Clear automatic backup key", exact: true }).click();
-    await automatic.getByRole("button", { name: "Save changes", exact: true }).click();
-    await automatic.getByText("Set a key with at least 8 non-whitespace characters before enabling.", { exact: true }).waitFor();
+    await automatic
+      .getByRole("switch", { name: "Enable automatic backups", exact: true })
+      .click();
+    await automatic
+      .getByRole("button", { name: "Save changes", exact: true })
+      .click();
+    await page
+      .getByRole("alert")
+      .filter({ hasText: "automatic backup key is required" })
+      .waitFor();
+    await automatic
+      .getByLabel("Automatic backup key", { exact: true })
+      .fill("fixture archive key");
+    await automatic
+      .getByRole("button", { name: "Save changes", exact: true })
+      .click();
+    await automatic
+      .getByText("A key is stored. Enter a new key to replace it.", {
+        exact: true,
+      })
+      .waitFor();
+    assert.equal(
+      await automatic
+        .getByLabel("Automatic backup key", { exact: true })
+        .inputValue(),
+      "",
+    );
+    await automatic
+      .getByRole("switch", { name: "Enable automatic backups", exact: true })
+      .click();
+    await automatic
+      .getByRole("switch", { name: "Clear automatic backup key", exact: true })
+      .click();
+    await automatic
+      .getByRole("button", { name: "Save changes", exact: true })
+      .click();
+    await automatic
+      .getByText(
+        "Set a key with at least 8 non-whitespace characters before enabling.",
+        { exact: true },
+      )
+      .waitFor();
     const manual = page.getByRole("region", { name: "Backup", exact: true });
-    await manual.getByLabel("Password", { exact: true }).fill("manual archive key");
-    await manual.getByLabel("Confirm password", { exact: true }).fill("manual archive key");
-    await page.getByRole("button", { name: "Create without downloading", exact: true }).click();
-    const stored = page.getByRole("region", { name: "Stored backups", exact: true });
+    await manual
+      .getByLabel("Password", { exact: true })
+      .fill("manual archive key");
+    await manual
+      .getByLabel("Confirm password", { exact: true })
+      .fill("manual archive key");
+    await page
+      .getByRole("button", { name: "Create without downloading", exact: true })
+      .click();
+    const stored = page.getByRole("region", {
+      name: "Stored backups",
+      exact: true,
+    });
     await stored.getByText("Ready", { exact: true }).waitFor();
     const download = page.waitForEvent("download");
     await stored.getByRole("button", { name: "Download", exact: true }).click();
-    assert.match((await download).suggestedFilename(), /^weaver_backup_fixture_/);
-    await stored.getByRole("button", { name: "Delete backup", exact: true }).click();
-    const confirmation = page.getByRole("dialog", { name: "Delete backup", exact: true });
-    await confirmation.getByRole("button", { name: "Delete backup", exact: true }).click();
-    await stored.getByText("Nothing configured yet.", { exact: true }).waitFor();
-  } finally { await page.close(); }
+    assert.match(
+      (await download).suggestedFilename(),
+      /^weaver_backup_fixture_/,
+    );
+    await stored
+      .getByRole("button", { name: "Delete backup", exact: true })
+      .click();
+    const confirmation = page.getByRole("dialog", {
+      name: "Delete backup",
+      exact: true,
+    });
+    await confirmation
+      .getByRole("button", { name: "Delete backup", exact: true })
+      .click();
+    await stored
+      .getByText("Nothing configured yet.", { exact: true })
+      .waitFor();
+  } finally {
+    await page.close();
+  }
 });
 
 test("all new schedule actions support disabled create, edit, draft and list toggles, and delete", async () => {
   const page = await open("?schedules");
   try {
-    for (const [action, group] of [["Pause all intake", "Downloads"], ["Pause torrents", "Torrents"], ["Resume torrents", "Torrents"], ["Pause post-processing", "Post-processing"], ["Resume post-processing", "Post-processing"], ["Set server availability", "Servers"], ["Set quota metering", "Quota metering"], ["Pause RSS", "RSS"], ["Resume RSS", "RSS"], ["Prune history", "One-shot actions"]]) {
+    for (const [action, group] of [
+      ["Pause all intake", "Downloads"],
+      ["Pause torrents", "Torrents"],
+      ["Resume torrents", "Torrents"],
+      ["Pause post-processing", "Post-processing"],
+      ["Resume post-processing", "Post-processing"],
+      ["Set server availability", "Servers"],
+      ["Set quota metering", "Quota metering"],
+      ["Pause RSS", "RSS"],
+      ["Resume RSS", "RSS"],
+      ["Prune history", "One-shot actions"],
+    ]) {
       await addSchedule(page).click();
-      const form = page.getByRole("dialog", { name: "Add schedule", exact: true });
+      const form = page.getByRole("dialog", {
+        name: "Add schedule",
+        exact: true,
+      });
       await form.getByLabel("Label", { exact: true }).fill(`fixture ${action}`);
       await form.getByRole("switch", { name: "Enabled", exact: true }).click();
       await form.getByRole("button", { name: "Action", exact: true }).click();
-      await page.getByRole("menuitemradio", { name: action, exact: true }).click();
-      if (action === "Set server availability") await choose(page, form, "Server", "fixture-provider");
+      await page
+        .getByRole("menuitemradio", { name: action, exact: true })
+        .click();
+      if (action === "Set server availability")
+        await choose(page, form, "Server", "fixture-provider");
       if (action === "Prune history") {
         await toggle(form, "Completed").check();
         await toggle(form, "Every hour").click();
         // A number field commits what was typed when focus leaves it.
-        const minute = form.getByRole("spinbutton", { name: "Minute of the hour", exact: true });
+        const minute = form.getByRole("spinbutton", {
+          name: "Minute of the hour",
+          exact: true,
+        });
         await minute.fill("15");
         await minute.blur();
       }
       await form.getByRole("button", { name: "Save", exact: true }).click();
       await form.waitFor({ state: "hidden" });
-      const row = page.getByRole("region", { name: group, exact: true }).getByRole("button").filter({ has: page.getByText(`fixture ${action}`, { exact: true }) });
+      const row = page
+        .getByRole("region", { name: group, exact: true })
+        .getByRole("button")
+        .filter({ has: page.getByText(`fixture ${action}`, { exact: true }) });
       await row.waitFor();
       assert.equal(await row.getByRole("switch").isChecked(), false);
       if (action === "Pause RSS") {
@@ -107,16 +207,33 @@ test("all new schedule actions support disabled create, edit, draft and list tog
         await row.locator('[role="switch"][aria-checked="false"]').waitFor();
       }
       const description = {
-        "Set server availability": "Set server availability: fixture-provider (On)",
+        "Set server availability":
+          "Set server availability: fixture-provider (On)",
         "Set quota metering": "Count downloads against the quota",
         "Prune history": "Prune history: Completed (Delete files too: Off)",
       }[action];
-      if (description) await row.getByText(description, { exact: true }).waitFor();
+      if (description)
+        await row.getByText(description, { exact: true }).waitFor();
       await row.click();
-      const edit = page.getByRole("dialog", { name: `fixture ${action}`, exact: true });
-      if (action === "Set server availability") await edit.getByRole("button", { name: "Server", exact: true }).getByText("fixture-provider", { exact: true }).waitFor();
+      const edit = page.getByRole("dialog", {
+        name: `fixture ${action}`,
+        exact: true,
+      });
+      if (action === "Set server availability")
+        await edit
+          .getByRole("button", { name: "Server", exact: true })
+          .getByText("fixture-provider", { exact: true })
+          .waitFor();
       if (action === "Prune history") {
-        assert.equal(await edit.getByRole("spinbutton", { name: "Minute of the hour", exact: true }).inputValue(), "15");
+        assert.equal(
+          await edit
+            .getByRole("spinbutton", {
+              name: "Minute of the hour",
+              exact: true,
+            })
+            .inputValue(),
+          "15",
+        );
         assert.equal(await toggle(edit, "Completed").isChecked(), true);
       }
       await edit.getByLabel("Label", { exact: true }).fill(`edited ${action}`);
@@ -124,39 +241,73 @@ test("all new schedule actions support disabled create, edit, draft and list tog
       await edit.getByRole("switch", { name: "Enabled", exact: true }).click();
       await edit.getByRole("button", { name: "Save", exact: true }).click();
       await edit.waitFor({ state: "hidden" });
-      const updated = page.getByRole("region", { name: group, exact: true }).getByRole("button").filter({ has: page.getByText(`edited ${action}`, { exact: true }) });
+      const updated = page
+        .getByRole("region", { name: group, exact: true })
+        .getByRole("button")
+        .filter({ has: page.getByText(`edited ${action}`, { exact: true }) });
       await updated.waitFor();
       assert.equal(await updated.getByRole("switch").isChecked(), false);
       await updated.click();
-      await page.getByRole("dialog", { name: `edited ${action}`, exact: true }).getByRole("button", { name: "Remove schedule", exact: true }).click();
-      await page.getByRole("dialog", { name: "Remove schedule", exact: true }).getByRole("button", { name: "Remove schedule", exact: true }).click();
+      await page
+        .getByRole("dialog", { name: `edited ${action}`, exact: true })
+        .getByRole("button", { name: "Remove schedule", exact: true })
+        .click();
+      await page
+        .getByRole("dialog", { name: "Remove schedule", exact: true })
+        .getByRole("button", { name: "Remove schedule", exact: true })
+        .click();
       await updated.waitFor({ state: "hidden" });
     }
-  } finally { await page.close(); }
+  } finally {
+    await page.close();
+  }
 });
 
 test("editing another action into server and quota rules saves the displayed defaults", async () => {
   const page = await open("?schedules");
   try {
-    for (const [action, group] of [["Set server availability", "Servers"], ["Set quota metering", "Quota metering"]]) {
+    for (const [action, group] of [
+      ["Set server availability", "Servers"],
+      ["Set quota metering", "Quota metering"],
+    ]) {
       const label = `converted ${group}`;
       await addSchedule(page).click();
-      const form = page.getByRole("dialog", { name: "Add schedule", exact: true });
+      const form = page.getByRole("dialog", {
+        name: "Add schedule",
+        exact: true,
+      });
       await form.getByLabel("Label", { exact: true }).fill(label);
       await form.getByRole("switch", { name: "Enabled", exact: true }).click();
       await form.getByRole("button", { name: "Save", exact: true }).click();
       await form.waitFor({ state: "hidden" });
-      await page.getByRole("region", { name: "Downloads", exact: true }).getByRole("button").filter({ has: page.getByText(label, { exact: true }) }).click();
+      await page
+        .getByRole("region", { name: "Downloads", exact: true })
+        .getByRole("button")
+        .filter({ has: page.getByText(label, { exact: true }) })
+        .click();
       const edit = page.getByRole("dialog", { name: label, exact: true });
       await edit.getByRole("button", { name: "Action", exact: true }).click();
-      await page.getByRole("menuitemradio", { name: action, exact: true }).click();
-      const reopen = () => page.getByRole("region", { name: group, exact: true }).getByRole("button").filter({ has: page.getByText(label, { exact: true }) }).click();
+      await page
+        .getByRole("menuitemradio", { name: action, exact: true })
+        .click();
+      const reopen = () =>
+        page
+          .getByRole("region", { name: group, exact: true })
+          .getByRole("button")
+          .filter({ has: page.getByText(label, { exact: true }) })
+          .click();
       if (group === "Servers") {
         await choose(page, edit, "Server", "fixture-provider");
         assert.equal(await toggle(edit, "Server active").isChecked(), true);
       } else {
-        await edit.getByRole("button", { name: "Downloads", exact: true }).getByText("Count downloads against the quota", { exact: true }).waitFor();
-        await edit.getByRole("button", { name: "Egress", exact: true }).getByText("Every egress", { exact: true }).waitFor();
+        await edit
+          .getByRole("button", { name: "Downloads", exact: true })
+          .getByText("Count downloads against the quota", { exact: true })
+          .waitFor();
+        await edit
+          .getByRole("button", { name: "Egress", exact: true })
+          .getByText("Every egress", { exact: true })
+          .waitFor();
       }
       await edit.getByRole("button", { name: "Save", exact: true }).click();
       await edit.waitFor({ state: "hidden" });
@@ -165,92 +316,191 @@ test("editing another action into server and quota rules saves the displayed def
         assert.equal(await toggle(edit, "Server active").isChecked(), true);
         await toggle(edit, "Server active").uncheck();
       } else {
-        await choose(page, edit, "Downloads", "Stop counting downloads against the quota");
+        await choose(
+          page,
+          edit,
+          "Downloads",
+          "Stop counting downloads against the quota",
+        );
       }
       await edit.getByRole("button", { name: "Save", exact: true }).click();
       await edit.waitFor({ state: "hidden" });
-      await page.getByRole("region", { name: group, exact: true }).getByText(group === "Servers" ? "Set server availability: fixture-provider (Off)" : "Stop counting downloads against the quota", { exact: true }).waitFor();
+      await page
+        .getByRole("region", { name: group, exact: true })
+        .getByText(
+          group === "Servers"
+            ? "Set server availability: fixture-provider (Off)"
+            : "Stop counting downloads against the quota",
+          { exact: true },
+        )
+        .waitFor();
       await reopen();
-      if (group === "Servers") assert.equal(await toggle(edit, "Server active").isChecked(), false);
-      else await edit.getByRole("button", { name: "Downloads", exact: true }).getByText("Stop counting downloads against the quota", { exact: true }).waitFor();
+      if (group === "Servers")
+        assert.equal(await toggle(edit, "Server active").isChecked(), false);
+      else
+        await edit
+          .getByRole("button", { name: "Downloads", exact: true })
+          .getByText("Stop counting downloads against the quota", {
+            exact: true,
+          })
+          .waitFor();
       await edit.getByRole("button", { name: "Cancel", exact: true }).click();
     }
-  } finally { await page.close(); }
+  } finally {
+    await page.close();
+  }
 });
 
 test("the schedules are one list with one Add, headed only by the groups that hold a rule", async () => {
   const page = await open("?schedules");
   try {
     const list = page.getByRole("region", { name: "Schedules", exact: true });
-    await list.getByText("No schedules yet. Weaver downloads whenever there is work.", { exact: true }).waitFor();
+    await list
+      .getByText("No schedules yet. Weaver downloads whenever there is work.", {
+        exact: true,
+      })
+      .waitFor();
     assert.equal(await list.getByRole("region").count(), 0);
     // The Add under the table is the only one, with rules listed or without, and the top bar has none.
-    const everyAdd = page.getByRole("button", { name: "Add schedule", exact: true });
+    const everyAdd = page.getByRole("button", {
+      name: "Add schedule",
+      exact: true,
+    });
     assert.equal(await everyAdd.count(), 1);
-    assert.equal(await page.locator("#controls").getByRole("button").count(), 0);
+    assert.equal(
+      await page.locator("#controls").getByRole("button").count(),
+      0,
+    );
     await addSchedule(page).click();
-    const form = page.getByRole("dialog", { name: "Add schedule", exact: true });
+    const form = page.getByRole("dialog", {
+      name: "Add schedule",
+      exact: true,
+    });
     await form.getByLabel("Label", { exact: true }).fill("fixture hold");
     await form.getByRole("button", { name: "Save", exact: true }).click();
     await form.waitFor({ state: "hidden" });
-    await list.getByRole("region", { name: "Downloads", exact: true }).getByText("fixture hold", { exact: true }).waitFor();
+    await list
+      .getByRole("region", { name: "Downloads", exact: true })
+      .getByText("fixture hold", { exact: true })
+      .waitFor();
     assert.equal(await list.getByRole("region").count(), 1);
     assert.equal(await list.getByText("Time", { exact: true }).count(), 1);
     assert.equal(await everyAdd.count(), 1);
     assert.equal(await addSchedule(page).count(), 1);
-  } finally { await page.close(); }
+  } finally {
+    await page.close();
+  }
 });
 
 // The rules as the fixture's daemon holds them.
-const storedSchedules = (page) => page.evaluate(() => fetch("/graphql", {
-  method: "POST", body: JSON.stringify({ operationName: "Schedules", variables: {} }),
-}).then((response) => response.json()).then((payload) => payload.data.schedules));
-const groupRow = (page, group, label) => page.getByRole("region", { name: group, exact: true })
-  .getByRole("button").filter({ has: page.getByText(label, { exact: true }) });
+const storedSchedules = (page) =>
+  page.evaluate(() =>
+    fetch("/graphql", {
+      method: "POST",
+      body: JSON.stringify({ operationName: "Schedules", variables: {} }),
+    })
+      .then((response) => response.json())
+      .then((payload) => payload.data.schedules),
+  );
+const groupRow = (page, group, label) =>
+  page
+    .getByRole("region", { name: group, exact: true })
+    .getByRole("button")
+    .filter({ has: page.getByText(label, { exact: true }) });
 
 test("the action picker offers the holds, then the settings a rule switches, and never a script", async () => {
   const page = await open("?schedules");
   try {
     await addSchedule(page).click();
-    const form = page.getByRole("dialog", { name: "Add schedule", exact: true });
+    const form = page.getByRole("dialog", {
+      name: "Add schedule",
+      exact: true,
+    });
     await form.getByRole("button", { name: "Action", exact: true }).click();
     assert.deepEqual(await page.getByRole("menuitemradio").allTextContents(), [
-      "Pause downloads", "Resume downloads", "Pause all intake", "Pause torrents", "Resume torrents",
-      "Pause post-processing", "Resume post-processing",
-      "Pause watch folder scanning", "Resume watch folder scanning", "Pause RSS", "Resume RSS", "Set a speed limit",
-      "Bandwidth split", "Switch the hardware profile", "Set server availability", "Prune history", "Set quota metering",
+      "Pause downloads",
+      "Resume downloads",
+      "Pause all intake",
+      "Pause torrents",
+      "Resume torrents",
+      "Pause post-processing",
+      "Resume post-processing",
+      "Pause watch folder scanning",
+      "Resume watch folder scanning",
+      "Pause RSS",
+      "Resume RSS",
+      "Set a speed limit",
+      "Bandwidth split",
+      "Switch the hardware profile",
+      "Set server availability",
+      "Prune history",
+      "Set quota metering",
     ]);
     await page.keyboard.press("Escape");
-    assert.equal(await form.getByRole("button", { name: "Script job", exact: true }).count(), 0);
-  } finally { await page.close(); }
+    assert.equal(
+      await form
+        .getByRole("button", { name: "Script job", exact: true })
+        .count(),
+      0,
+    );
+  } finally {
+    await page.close();
+  }
 });
 
 test("a speed rule sets the global limits, each egress and each provider on its own, and as is leaves one alone", async () => {
   const page = await open("?schedules");
   try {
     await addSchedule(page).click();
-    const form = page.getByRole("dialog", { name: "Add schedule", exact: true });
+    const form = page.getByRole("dialog", {
+      name: "Add schedule",
+      exact: true,
+    });
     await form.getByLabel("Label", { exact: true }).fill("fixture evening");
     await choose(page, form, "Action", "Set a speed limit");
     // One time of day: there is no list of further times for a speed rule.
-    assert.equal(await form.getByLabel("Several times", { exact: true }).count(), 0);
-    for (const heading of ["Global", "Egresses", "Providers"]) await form.getByText(heading, { exact: true }).first().waitFor();
+    assert.equal(
+      await form.getByLabel("Several times", { exact: true }).count(),
+      0,
+    );
+    for (const heading of ["Global", "Egresses", "Providers"])
+      await form.getByText(heading, { exact: true }).first().waitFor();
     const choice = (scope, target, option) =>
-      scope.getByRole("radiogroup", { name: target, exact: true }).getByRole("radio", { name: option, exact: true });
-    const rate = (scope, target) => scope.getByRole("textbox", { name: target, exact: true });
+      scope
+        .getByRole("radiogroup", { name: target, exact: true })
+        .getByRole("radio", { name: option, exact: true });
+    const rate = (scope, target) =>
+      scope.getByRole("textbox", { name: target, exact: true });
     // A rule that sets nothing is refused.
     await form.getByRole("button", { name: "Save", exact: true }).click();
     await form.getByText("Set at least one limit.", { exact: true }).waitFor();
     await choice(form, "fixture-egress", "Limit").click();
     await rate(form, "fixture-egress").fill("fast");
-    await form.getByText("A speed limit is a number of MB/s, 0 or more.", { exact: true }).waitFor();
+    await form
+      .getByText("A speed limit is a number of MB/s, 0 or more.", {
+        exact: true,
+      })
+      .waitFor();
     // The global target sets both directions: its upload rate shows once it is set.
-    assert.equal(await form.getByRole("radiogroup", { name: "Global upload limit", exact: true }).count(), 0);
+    assert.equal(
+      await form
+        .getByRole("radiogroup", { name: "Global upload limit", exact: true })
+        .count(),
+      0,
+    );
     await choice(form, "Global limit", "Limit").click();
     await rate(form, "Global limit").fill("5");
     // Typing a rate takes back what a refused save said.
-    assert.equal(await form.getByText("Set at least one limit.", { exact: true }).count(), 0);
-    assert.equal(await choice(form, "Global upload limit", "unlimited").getAttribute("aria-checked"), "true");
+    assert.equal(
+      await form.getByText("Set at least one limit.", { exact: true }).count(),
+      0,
+    );
+    assert.equal(
+      await choice(form, "Global upload limit", "unlimited").getAttribute(
+        "aria-checked",
+      ),
+      "true",
+    );
     assert.equal(await choice(form, "Global upload limit", "as is").count(), 0);
     await choice(form, "Global upload limit", "Limit").click();
     await rate(form, "Global upload limit").fill("1");
@@ -270,32 +520,62 @@ test("a speed rule sets the global limits, each egress and each provider on its 
     assert.deepEqual(rule.times, []);
     const row = groupRow(page, "Speed limit", "fixture evening");
     const line = await row.getByText(/^Global /).textContent();
-    assert.match(line, /^Global ↓ 5(\.0+)? MB\/s ↑ 1(\.0+)? MB\/s, fixture-egress 0(\.0+)? \S+\/s, fixture-provider unlimited$/);
+    assert.match(
+      line,
+      /^Global ↓ 5(\.0+)? MB\/s ↑ 1(\.0+)? MB\/s, fixture-egress 0(\.0+)? \S+\/s, fixture-provider unlimited$/,
+    );
 
     // Reopened, the stored rates are shown, and the target left as it is stays out of the rule.
     await row.click();
-    const edit = page.getByRole("dialog", { name: "fixture evening", exact: true });
+    const edit = page.getByRole("dialog", {
+      name: "fixture evening",
+      exact: true,
+    });
     assert.equal(await rate(edit, "Global limit").inputValue(), "5");
     assert.equal(await rate(edit, "Global upload limit").inputValue(), "1");
     assert.equal(await rate(edit, "fixture-egress").inputValue(), "0");
-    assert.equal(await choice(edit, "fixture-vpn", "as is").getAttribute("aria-checked"), "true");
-    assert.equal(await choice(edit, "fixture-provider", "unlimited").getAttribute("aria-checked"), "true");
+    assert.equal(
+      await choice(edit, "fixture-vpn", "as is").getAttribute("aria-checked"),
+      "true",
+    );
+    assert.equal(
+      await choice(edit, "fixture-provider", "unlimited").getAttribute(
+        "aria-checked",
+      ),
+      "true",
+    );
     await choice(edit, "fixture-provider", "as is").click();
     await edit.getByRole("button", { name: "Save", exact: true }).click();
     await edit.waitFor({ state: "hidden" });
-    assert.deepEqual((await storedSchedules(page))[0].speedLimits.map((limit) => limit.kind), ["GLOBAL", "EGRESS"]);
-  } finally { await page.close(); }
+    assert.deepEqual(
+      (await storedSchedules(page))[0].speedLimits.map((limit) => limit.kind),
+      ["GLOBAL", "EGRESS"],
+    );
+  } finally {
+    await page.close();
+  }
 });
 
 test("a split rule puts a percentage in force, or lifts back to the stored split", async () => {
   const page = await open("?schedules");
   try {
     await addSchedule(page).click();
-    const form = page.getByRole("dialog", { name: "Add schedule", exact: true });
-    await form.getByLabel("Label", { exact: true }).fill("fixture evening split");
+    const form = page.getByRole("dialog", {
+      name: "Add schedule",
+      exact: true,
+    });
+    await form
+      .getByLabel("Label", { exact: true })
+      .fill("fixture evening split");
     await choose(page, form, "Action", "Bandwidth split");
-    const usenet = form.getByRole("spinbutton", { name: "Usenet", exact: true });
-    assert.equal(await toggle(form, "Lift").getAttribute("aria-checked"), "false");
+    const usenet = form.getByRole("spinbutton", {
+      name: "Usenet",
+      exact: true,
+    });
+    assert.equal(
+      await toggle(form, "Lift").getAttribute("aria-checked"),
+      "false",
+    );
     assert.equal(await usenet.inputValue(), "50");
     await usenet.fill("80");
     await usenet.press("Tab");
@@ -304,114 +584,281 @@ test("a split rule puts a percentage in force, or lifts back to the stored split
     await form.getByRole("button", { name: "Save", exact: true }).click();
     await form.waitFor({ state: "hidden" });
     const [rule] = await storedSchedules(page);
-    assert.deepEqual([rule.actionType, rule.splitUsenetPct], ["bandwidth_split", 80]);
+    assert.deepEqual(
+      [rule.actionType, rule.splitUsenetPct],
+      ["bandwidth_split", 80],
+    );
     // A split rule holds its own group, apart from the speed limits.
     const row = groupRow(page, "Bandwidth split", "fixture evening split");
-    await row.getByText("Bandwidth split: usenet 80%, torrents 20%", { exact: true }).waitFor();
+    await row
+      .getByText("Bandwidth split: usenet 80%, torrents 20%", { exact: true })
+      .waitFor();
 
     // Lift sends no percentage; reopened, the rule still reads as a lift.
     await row.click();
-    const edit = page.getByRole("dialog", { name: "fixture evening split", exact: true });
-    assert.equal(await edit.getByRole("spinbutton", { name: "Usenet", exact: true }).inputValue(), "80");
+    const edit = page.getByRole("dialog", {
+      name: "fixture evening split",
+      exact: true,
+    });
+    assert.equal(
+      await edit
+        .getByRole("spinbutton", { name: "Usenet", exact: true })
+        .inputValue(),
+      "80",
+    );
     await toggle(edit, "Lift").click();
-    assert.equal(await edit.getByRole("spinbutton", { name: "Usenet", exact: true }).count(), 0);
+    assert.equal(
+      await edit
+        .getByRole("spinbutton", { name: "Usenet", exact: true })
+        .count(),
+      0,
+    );
     await edit.getByRole("button", { name: "Save", exact: true }).click();
     await edit.waitFor({ state: "hidden" });
     assert.equal((await storedSchedules(page))[0].splitUsenetPct, null);
     await row.getByText("Bandwidth split: lift", { exact: true }).waitFor();
     await row.click();
-    assert.equal(await toggle(page.getByRole("dialog", { name: "fixture evening split", exact: true }), "Lift").getAttribute("aria-checked"), "true");
-  } finally { await page.close(); }
+    assert.equal(
+      await toggle(
+        page.getByRole("dialog", {
+          name: "fixture evening split",
+          exact: true,
+        }),
+        "Lift",
+      ).getAttribute("aria-checked"),
+      "true",
+    );
+  } finally {
+    await page.close();
+  }
 });
 
 test("a quota rule counts downloads against the quota on every egress or on one", async () => {
   const page = await open("?schedules");
   try {
     await addSchedule(page).click();
-    const form = page.getByRole("dialog", { name: "Add schedule", exact: true });
+    const form = page.getByRole("dialog", {
+      name: "Add schedule",
+      exact: true,
+    });
     await form.getByLabel("Label", { exact: true }).fill("fixture unmetered");
     await choose(page, form, "Action", "Set quota metering");
-    await choose(page, form, "Downloads", "Stop counting downloads against the quota");
+    await choose(
+      page,
+      form,
+      "Downloads",
+      "Stop counting downloads against the quota",
+    );
     await form.getByRole("button", { name: "Egress", exact: true }).click();
-    assert.deepEqual(await page.getByRole("menuitemradio").allTextContents(), ["Every egress", "fixture-egress", "fixture-vpn"]);
-    await page.getByRole("menuitemradio", { name: "fixture-vpn", exact: true }).click();
+    assert.deepEqual(await page.getByRole("menuitemradio").allTextContents(), [
+      "Every egress",
+      "fixture-egress",
+      "fixture-vpn",
+    ]);
+    await page
+      .getByRole("menuitemradio", { name: "fixture-vpn", exact: true })
+      .click();
     await shot(page, "quota-metering-editor");
     await form.getByRole("button", { name: "Save", exact: true }).click();
     await form.waitFor({ state: "hidden" });
     const [rule] = await storedSchedules(page);
-    assert.deepEqual([rule.quotaMeteringEnabled, rule.quotaEgressId], [false, 8]);
-    await groupRow(page, "Quota metering", "fixture unmetered").getByText("Stop counting downloads against the quota: fixture-vpn", { exact: true }).waitFor();
-  } finally { await page.close(); }
+    assert.deepEqual(
+      [rule.quotaMeteringEnabled, rule.quotaEgressId],
+      [false, 8],
+    );
+    await groupRow(page, "Quota metering", "fixture unmetered")
+      .getByText("Stop counting downloads against the quota: fixture-vpn", {
+        exact: true,
+      })
+      .waitFor();
+  } finally {
+    await page.close();
+  }
 });
 
 test("an automatic backup and next run update while the backup panel stays open", async () => {
   const page = await open("?automatic");
   try {
-    const automatic = page.getByRole("region", { name: "Automatic backups", exact: true });
-    const stored = page.getByRole("region", { name: "Stored backups", exact: true });
-    await automatic.getByText("A key is stored. Enter a new key to replace it.", { exact: true }).waitFor();
-    await stored.getByText("Nothing configured yet.", { exact: true }).waitFor();
+    const automatic = page.getByRole("region", {
+      name: "Automatic backups",
+      exact: true,
+    });
+    const stored = page.getByRole("region", {
+      name: "Stored backups",
+      exact: true,
+    });
+    await automatic
+      .getByText("A key is stored. Enter a new key to replace it.", {
+        exact: true,
+      })
+      .waitFor();
+    await stored
+      .getByText("Nothing configured yet.", { exact: true })
+      .waitFor();
     const before = await automatic.innerText();
     await page.evaluate(() => fetch("/fixture/complete-automatic-backup"));
     await page.clock.runFor(30_000);
     await stored.getByText("Ready", { exact: true }).waitFor();
     await stored.getByText("Automatic", { exact: true }).waitFor();
     assert.notEqual(await automatic.innerText(), before);
-  } finally { await page.close(); }
+  } finally {
+    await page.close();
+  }
 });
 
 test("an export downloads without creating a stored backup", async () => {
   const page = await open("");
   try {
     const manual = page.getByRole("region", { name: "Backup", exact: true });
-    await manual.getByLabel("Password", { exact: true }).fill("fixture archive key");
-    await manual.getByLabel("Confirm password", { exact: true }).fill("fixture archive key");
+    await manual
+      .getByLabel("Password", { exact: true })
+      .fill("fixture archive key");
+    await manual
+      .getByLabel("Confirm password", { exact: true })
+      .fill("fixture archive key");
     const download = page.waitForEvent("download");
-    await page.getByRole("button", { name: "Download backup", exact: true }).click();
-    assert.match((await download).suggestedFilename(), /^weaver_backup_fixture_/);
-    const payload = await page.evaluate(() => fetch("/graphql", {
-      method: "POST", body: JSON.stringify({ operationName: "Backups", variables: {} }),
-    }).then((response) => response.json()));
+    await page
+      .getByRole("button", { name: "Download backup", exact: true })
+      .click();
+    assert.match(
+      (await download).suggestedFilename(),
+      /^weaver_backup_fixture_/,
+    );
+    const payload = await page.evaluate(() =>
+      fetch("/graphql", {
+        method: "POST",
+        body: JSON.stringify({ operationName: "Backups", variables: {} }),
+      }).then((response) => response.json()),
+    );
     assert.deepEqual(payload.data.backups, []);
-    await page.getByRole("region", { name: "Stored backups", exact: true }).getByText("Nothing configured yet.", { exact: true }).waitFor();
-  } finally { await page.close(); }
+    await page
+      .getByRole("region", { name: "Stored backups", exact: true })
+      .getByText("Nothing configured yet.", { exact: true })
+      .waitFor();
+  } finally {
+    await page.close();
+  }
 });
 
 test("expired backup administration verifies the account password before replaying the mutation", async () => {
   const page = await open("?expired");
   try {
-    const automatic = page.getByRole("region", { name: "Automatic backups", exact: true });
-    await automatic.getByLabel("Automatic backup key", { exact: true }).fill("fixture archive key");
-    await automatic.getByRole("switch", { name: "Enable automatic backups", exact: true }).click();
-    await automatic.getByRole("button", { name: "Save changes", exact: true }).click();
-    const verification = page.getByRole("dialog", { name: "Current password", exact: true });
-    await verification.getByLabel("Current password", { exact: true }).fill("wrong password");
-    await verification.getByRole("button", { name: "Continue", exact: true }).click();
-    await verification.getByRole("alert").filter({ hasText: "invalid password" }).waitFor();
-    assert.equal((await page.evaluate(() => fetch("/fixture/auth-state").then((response) => response.json()))).acceptedBackupMutations, 0);
-    await verification.getByLabel("Current password", { exact: true }).fill("fixture account password");
-    await verification.getByRole("button", { name: "Continue", exact: true }).click();
+    const automatic = page.getByRole("region", {
+      name: "Automatic backups",
+      exact: true,
+    });
+    await automatic
+      .getByLabel("Automatic backup key", { exact: true })
+      .fill("fixture archive key");
+    await automatic
+      .getByRole("switch", { name: "Enable automatic backups", exact: true })
+      .click();
+    await automatic
+      .getByRole("button", { name: "Save changes", exact: true })
+      .click();
+    const verification = page.getByRole("dialog", {
+      name: "Current password",
+      exact: true,
+    });
+    await verification
+      .getByLabel("Current password", { exact: true })
+      .fill("wrong password");
+    await verification
+      .getByRole("button", { name: "Continue", exact: true })
+      .click();
+    await verification
+      .getByRole("alert")
+      .filter({ hasText: "invalid password" })
+      .waitFor();
+    assert.equal(
+      (
+        await page.evaluate(() =>
+          fetch("/fixture/auth-state").then((response) => response.json()),
+        )
+      ).acceptedBackupMutations,
+      0,
+    );
+    await verification
+      .getByLabel("Current password", { exact: true })
+      .fill("fixture account password");
+    await verification
+      .getByRole("button", { name: "Continue", exact: true })
+      .click();
     await verification.waitFor({ state: "hidden" });
-    await automatic.getByText("A key is stored. Enter a new key to replace it.", { exact: true }).waitFor();
-    assert.deepEqual(await page.evaluate(() => fetch("/fixture/auth-state").then((response) => response.json())), { verificationRequests: 2, acceptedBackupMutations: 1, acceptedBackupCreates: 0 });
-    assert.equal(await automatic.getByLabel("Automatic backup key", { exact: true }).inputValue(), "");
-  } finally { await page.close(); }
+    await automatic
+      .getByText("A key is stored. Enter a new key to replace it.", {
+        exact: true,
+      })
+      .waitFor();
+    assert.deepEqual(
+      await page.evaluate(() =>
+        fetch("/fixture/auth-state").then((response) => response.json()),
+      ),
+      {
+        verificationRequests: 2,
+        acceptedBackupMutations: 1,
+        acceptedBackupCreates: 0,
+      },
+    );
+    assert.equal(
+      await automatic
+        .getByLabel("Automatic backup key", { exact: true })
+        .inputValue(),
+      "",
+    );
+  } finally {
+    await page.close();
+  }
 });
 
 test("expired REST backup creation verifies the account password and retries once", async () => {
   const page = await open("?expired");
   try {
     const manual = page.getByRole("region", { name: "Backup", exact: true });
-    await manual.getByLabel("Password", { exact: true }).fill("fixture archive key");
-    await manual.getByLabel("Confirm password", { exact: true }).fill("fixture archive key");
-    await page.getByRole("button", { name: "Create without downloading", exact: true }).click();
-    const verification = page.getByRole("dialog", { name: "Current password", exact: true });
+    await manual
+      .getByLabel("Password", { exact: true })
+      .fill("fixture archive key");
+    await manual
+      .getByLabel("Confirm password", { exact: true })
+      .fill("fixture archive key");
+    await page
+      .getByRole("button", { name: "Create without downloading", exact: true })
+      .click();
+    const verification = page.getByRole("dialog", {
+      name: "Current password",
+      exact: true,
+    });
     await verification.waitFor();
-    assert.equal((await page.evaluate(() => fetch("/fixture/auth-state").then((response) => response.json()))).acceptedBackupCreates, 0);
-    await verification.getByLabel("Current password", { exact: true }).fill("fixture account password");
-    await verification.getByRole("button", { name: "Continue", exact: true }).click();
+    assert.equal(
+      (
+        await page.evaluate(() =>
+          fetch("/fixture/auth-state").then((response) => response.json()),
+        )
+      ).acceptedBackupCreates,
+      0,
+    );
+    await verification
+      .getByLabel("Current password", { exact: true })
+      .fill("fixture account password");
+    await verification
+      .getByRole("button", { name: "Continue", exact: true })
+      .click();
     await verification.waitFor({ state: "hidden" });
-    await page.getByRole("region", { name: "Stored backups", exact: true }).getByText("Ready", { exact: true }).waitFor();
-    assert.deepEqual(await page.evaluate(() => fetch("/fixture/auth-state").then((response) => response.json())), { verificationRequests: 1, acceptedBackupMutations: 0, acceptedBackupCreates: 1 });
-  } finally { await page.close(); }
+    await page
+      .getByRole("region", { name: "Stored backups", exact: true })
+      .getByText("Ready", { exact: true })
+      .waitFor();
+    assert.deepEqual(
+      await page.evaluate(() =>
+        fetch("/fixture/auth-state").then((response) => response.json()),
+      ),
+      {
+        verificationRequests: 1,
+        acceptedBackupMutations: 0,
+        acceptedBackupCreates: 1,
+      },
+    );
+  } finally {
+    await page.close();
+  }
 });

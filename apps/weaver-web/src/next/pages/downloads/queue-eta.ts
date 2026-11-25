@@ -8,4 +8,6 @@ import { createContext } from "react";
  * latest render. Only the rows' time-left text reads it, so a new estimate
  * redraws that text and not the rows around it.
  */
-export const QueueEtaContext = createContext<ReadonlyMap<number, string>>(new Map());
+export const QueueEtaContext = createContext<ReadonlyMap<number, string>>(
+  new Map(),
+);

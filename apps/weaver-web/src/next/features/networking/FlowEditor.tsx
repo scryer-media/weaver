@@ -48,21 +48,46 @@ export function FlowEditor({
     return proxyEditor(target.id, onClose);
   }
   if (target.kind === "dnsProfile" || target.kind === "dnsList") {
-    return <DnsFlowEditor key={`${target.kind}:${target.id}`} target={target} onClose={onClose} onChanged={onDnsChanged} />;
+    return (
+      <DnsFlowEditor
+        key={`${target.kind}:${target.id}`}
+        target={target}
+        onClose={onClose}
+        onChanged={onDnsChanged}
+      />
+    );
   }
   if (target.kind === "egress") {
     const egress = egresses.find((candidate) => candidate.id === target.id);
     return egress ? (
-      <EgressEditor key={egress.id} data={data} egress={egress} action={action} busy={busy} onClose={onClose} />
+      <EgressEditor
+        key={egress.id}
+        data={data}
+        egress={egress}
+        action={action}
+        busy={busy}
+        onClose={onClose}
+      />
     ) : null;
   }
   if (target.kind === "pool") {
-    const pool = data.proxyPools.find((candidate) => candidate.id === target.id);
+    const pool = data.proxyPools.find(
+      (candidate) => candidate.id === target.id,
+    );
     return pool ? (
-      <PoolEditor key={pool.id} data={data} pool={pool} action={action} busy={busy} onClose={onClose} />
+      <PoolEditor
+        key={pool.id}
+        data={data}
+        pool={pool}
+        action={action}
+        busy={busy}
+        onClose={onClose}
+      />
     ) : null;
   }
-  const consumer = consumers.find((candidate) => candidate.key === target.consumer);
+  const consumer = consumers.find(
+    (candidate) => candidate.key === target.consumer,
+  );
   return consumer ? (
     <RouteDialog
       key={consumer.key}

@@ -22,11 +22,18 @@ const OUTCOME_KEYS: Record<DuplicateSubmissionStatus, string> = {
   FORCE_ACCEPTED: "upload.outcomeForceAccepted",
 };
 
-export function submissionOutcomeI18nKey(status: string | null | undefined): string {
-  return OUTCOME_KEYS[status as DuplicateSubmissionStatus] ?? "upload.outcomeAccepted";
+export function submissionOutcomeI18nKey(
+  status: string | null | undefined,
+): string {
+  return (
+    OUTCOME_KEYS[status as DuplicateSubmissionStatus] ??
+    "upload.outcomeAccepted"
+  );
 }
 
-export function submissionStatusIsDurable(status: string | null | undefined): boolean {
+export function submissionStatusIsDurable(
+  status: string | null | undefined,
+): boolean {
   return matchesSubmissionStatus(status, [
     "ACCEPTED",
     "WARNED",
@@ -37,7 +44,9 @@ export function submissionStatusIsDurable(status: string | null | undefined): bo
   ]);
 }
 
-export function submissionStatusCanForceRetry(status: string | null | undefined): boolean {
+export function submissionStatusCanForceRetry(
+  status: string | null | undefined,
+): boolean {
   return matchesSubmissionStatus(status, ["BLOCKED"]);
 }
 
@@ -45,23 +54,33 @@ export function semanticStateI18nKey(state: string | null | undefined): string {
   return `duplicate.semanticState.${normalizeEnumValue(state)}`;
 }
 
-export function duplicateLifecycleI18nKey(lifecycle: string | null | undefined): string {
+export function duplicateLifecycleI18nKey(
+  lifecycle: string | null | undefined,
+): string {
   return `duplicate.lifecycle.${normalizeEnumValue(lifecycle)}`;
 }
 
-export function duplicateTerminalCauseI18nKey(cause: string | null | undefined): string {
+export function duplicateTerminalCauseI18nKey(
+  cause: string | null | undefined,
+): string {
   return `duplicate.terminalCause.${normalizeEnumValue(cause)}`;
 }
 
-export function duplicatePromotionStateI18nKey(state: string | null | undefined): string {
+export function duplicatePromotionStateI18nKey(
+  state: string | null | undefined,
+): string {
   return `duplicate.promotionState.${normalizeEnumValue(state)}`;
 }
 
-export function duplicateActionI18nKey(action: string | null | undefined): string {
+export function duplicateActionI18nKey(
+  action: string | null | undefined,
+): string {
   return `duplicate.action.${normalizeEnumValue(action)}`;
 }
 
-export function duplicateFingerprintKindI18nKey(kind: string | null | undefined): string {
+export function duplicateFingerprintKindI18nKey(
+  kind: string | null | undefined,
+): string {
   return `duplicate.match.${normalizeEnumValue(kind)}`;
 }
 

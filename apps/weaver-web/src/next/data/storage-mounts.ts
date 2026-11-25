@@ -68,7 +68,9 @@ const MIB = 1024 * 1024;
  * mount nested under another reports its own figures, which keeps it apart on
  * the fingerprint, and this pass never looks at a path that reported any.
  */
-export function storageMounts(volumes: readonly StorageVolume[]): StorageMount[] {
+export function storageMounts(
+  volumes: readonly StorageVolume[],
+): StorageMount[] {
   const mounts = new Map<string, StorageMount>();
   const probed: { path: string; key: string }[] = [];
   const unprobed: StorageVolume[] = [];
@@ -76,7 +78,9 @@ export function storageMounts(volumes: readonly StorageVolume[]): StorageMount[]
   // Shallowest first, so a parent is on its disk before the folders under it
   // look for one and two siblings meet through it.
   const byDepth = [...volumes].sort(
-    (left, right) => normalizeSeparators(left.path).length - normalizeSeparators(right.path).length,
+    (left, right) =>
+      normalizeSeparators(left.path).length -
+      normalizeSeparators(right.path).length,
   );
   for (const volume of byDepth) {
     if (!volume.capacity) {
@@ -90,7 +94,10 @@ export function storageMounts(volumes: readonly StorageVolume[]): StorageMount[]
           (mount) =>
             mount.capacity !== null &&
             fingerprint(mount.capacity) === print &&
-            mount.paths.some((path) => contains(path, volume.path) || contains(volume.path, path)),
+            mount.paths.some(
+              (path) =>
+                contains(path, volume.path) || contains(volume.path, path),
+            ),
         );
     if (existing) {
       probed.push({ path: volume.path, key: existing.key });
@@ -98,7 +105,9 @@ export function storageMounts(volumes: readonly StorageVolume[]): StorageMount[]
       existing.label = sharedPath(existing.paths);
       continue;
     }
-    const key = volume.drive ? `drive:${volume.drive}` : `${print}#${volume.path}`;
+    const key = volume.drive
+      ? `drive:${volume.drive}`
+      : `${print}#${volume.path}`;
     probed.push({ path: volume.path, key });
     mounts.set(key, {
       key,
@@ -133,7 +142,9 @@ export function storageMounts(volumes: readonly StorageVolume[]): StorageMount[]
   // Back in the order the daemon listed the paths.
   const order = new Map(volumes.map((volume, index) => [volume.path, index]));
   const first = (mount: StorageMount) =>
-    Math.min(...mount.paths.map((path) => order.get(path) ?? Number.MAX_SAFE_INTEGER));
+    Math.min(
+      ...mount.paths.map((path) => order.get(path) ?? Number.MAX_SAFE_INTEGER),
+    );
   return [...mounts.values()].sort((left, right) => first(left) - first(right));
 }
 
@@ -146,7 +157,10 @@ function fingerprint(capacity: NonNullable<StorageVolume["capacity"]>): string {
 function contains(parent: string, child: string): boolean {
   const outer = normalizeSeparators(parent);
   const inner = normalizeSeparators(child);
-  return inner.length > outer.length && inner.startsWith(outer.endsWith("/") ? outer : `${outer}/`);
+  return (
+    inner.length > outer.length &&
+    inner.startsWith(outer.endsWith("/") ? outer : `${outer}/`)
+  );
 }
 
 /** Windows paths arrive with backslashes; only the comparison cares. */

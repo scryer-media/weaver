@@ -803,7 +803,7 @@ impl TorrentService {
                 let starting = starting || (run && self.start_unjudged(torrent));
                 if checks_start(run, starting, torrent.disk_held) {
                     let looks = gathered.looks.get_or_insert_with(|| PlaceBatch::new(self));
-                    match self.start_hold_in(torrent, Some(looks), false) {
+                    match self.start_hold_in(torrent, Some(looks)) {
                         // One running that holds verified data has its
                         // download held and seeds; one yet to run, or with
                         // nothing to seed, stays paused.

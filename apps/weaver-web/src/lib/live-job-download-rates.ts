@@ -54,7 +54,9 @@ export function createLiveJobDownloadRatesStore(): LiveJobDownloadRatesStore {
         return;
       }
       current = rates;
-      ratesById = new Map((rates ?? []).map((rate) => [rate.jobId, rate.rateBps] as const));
+      ratesById = new Map(
+        (rates ?? []).map((rate) => [rate.jobId, rate.rateBps] as const),
+      );
       for (const listener of listeners) {
         listener();
       }

@@ -27,9 +27,11 @@ function readStorage(storage: () => Storage): string | null {
 
 function readStoredLanguageCode(): LocaleCode {
   const stored =
-    readStorage(() => window.localStorage) ?? readStorage(() => window.sessionStorage);
+    readStorage(() => window.localStorage) ??
+    readStorage(() => window.sessionStorage);
   if (!stored) {
-    const browserLanguage = navigator.language.split("-")[0] ?? DEFAULT_LANGUAGE;
+    const browserLanguage =
+      navigator.language.split("-")[0] ?? DEFAULT_LANGUAGE;
     return normalizeLocale(browserLanguage);
   }
   return normalizeLocale(stored);
@@ -44,7 +46,9 @@ function writeStoredLanguageCode(code: LocaleCode) {
 }
 
 export function useLanguage() {
-  const [uiLanguage, setUiLanguage] = useState<LocaleCode>(readStoredLanguageCode);
+  const [uiLanguage, setUiLanguage] = useState<LocaleCode>(
+    readStoredLanguageCode,
+  );
   const [dictionary, setDictionary] = useState<LocaleDictionary | null>(null);
   const [isReady, setIsReady] = useState(false);
   const initialLanguageRef = useRef(uiLanguage);
@@ -75,19 +79,26 @@ export function useLanguage() {
   }, [loadLanguage]);
 
   const t = useCallback(
-    (key: string, values?: Record<string, string | number | boolean | null | undefined>) =>
-      translateDictionary(dictionary, key, values),
+    (
+      key: string,
+      values?: Record<string, string | number | boolean | null | undefined>,
+    ) => translateDictionary(dictionary, key, values),
     [dictionary],
   );
 
   const selectedLanguage = useMemo(
-    () => AVAILABLE_LANGUAGES.find((language) => language.code === uiLanguage) ?? AVAILABLE_LANGUAGES[0],
+    () =>
+      AVAILABLE_LANGUAGES.find((language) => language.code === uiLanguage) ??
+      AVAILABLE_LANGUAGES[0],
     [uiLanguage],
   );
 
-  const setLanguagePreference = useCallback((code: string) => {
-    void loadLanguage(code, true);
-  }, [loadLanguage]);
+  const setLanguagePreference = useCallback(
+    (code: string) => {
+      void loadLanguage(code, true);
+    },
+    [loadLanguage],
+  );
 
   return {
     isReady,

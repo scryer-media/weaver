@@ -40,7 +40,13 @@ export interface DiskVolume {
 }
 
 export interface DownloadBlockState {
-  kind: "NONE" | "MANUAL_PAUSE" | "SPEED_TEST" | "SCHEDULED" | "EGRESS_QUOTA" | "SERVER_QUOTA";
+  kind:
+    | "NONE"
+    | "MANUAL_PAUSE"
+    | "SPEED_TEST"
+    | "SCHEDULED"
+    | "EGRESS_QUOTA"
+    | "SERVER_QUOTA";
   /** The egress whose download quota is holding downloads, while one is. */
   egressId?: number | null;
   egressName?: string | null;
@@ -97,7 +103,9 @@ const DEFAULT_CONNECTION: LiveConnectionState = {
   isPolling: false,
 };
 
-function createLiveJobsStore(initialJobs: JobData[] = EMPTY_JOBS): LiveJobsStore {
+function createLiveJobsStore(
+  initialJobs: JobData[] = EMPTY_JOBS,
+): LiveJobsStore {
   let jobs = initialJobs;
   let jobsById = new Map(initialJobs.map((job) => [job.id, job] as const));
   const listeners = new Set<() => void>();
@@ -123,15 +131,19 @@ function createLiveJobsStore(initialJobs: JobData[] = EMPTY_JOBS): LiveJobsStore
   };
 }
 
-const LiveJobsStoreContext = createContext<LiveJobsStore>(createLiveJobsStore());
-const LiveJobDownloadRatesStoreContext = createContext<LiveJobDownloadRatesStore>(
-  createLiveJobDownloadRatesStore(),
+const LiveJobsStoreContext = createContext<LiveJobsStore>(
+  createLiveJobsStore(),
 );
+const LiveJobDownloadRatesStoreContext =
+  createContext<LiveJobDownloadRatesStore>(createLiveJobDownloadRatesStore());
 const LiveJobsContext = createContext<JobData[]>(EMPTY_JOBS);
 const LiveSpeedContext = createContext(0);
 const LivePauseStateContext = createContext(false);
-const LiveDownloadBlockContext = createContext<DownloadBlockState>(DEFAULT_DOWNLOAD_BLOCK);
-const LiveConnectionContext = createContext<LiveConnectionState>(DEFAULT_CONNECTION);
+const LiveDownloadBlockContext = createContext<DownloadBlockState>(
+  DEFAULT_DOWNLOAD_BLOCK,
+);
+const LiveConnectionContext =
+  createContext<LiveConnectionState>(DEFAULT_CONNECTION);
 
 export function LiveDataProvider({
   jobs,
@@ -222,7 +234,10 @@ export function useLiveSpeed(): number {
  * `useLiveSpeed`; `fallback` while the push in hand carries no rates, and 0
  * when it carries none for this job. Re-renders only when the figure changes.
  */
-export function useLiveJobDownloadRate(jobId: number | null | undefined, fallback: number): number {
+export function useLiveJobDownloadRate(
+  jobId: number | null | undefined,
+  fallback: number,
+): number {
   const ratesStore = useContext(LiveJobDownloadRatesStoreContext);
   const read = () => resolveRate(ratesStore.getRate(jobId), fallback);
 

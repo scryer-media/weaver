@@ -19,79 +19,301 @@ import "@/next/theme.css";
 
 const params = new URLSearchParams(location.search);
 const screen = params.get("screen") ?? "providers";
-const quota = { enabled: false, period: "MONTHLY", limitBytes: 1000, resetTimeMinutesLocal: 0,
-  weeklyResetWeekday: "MON", monthlyResetDay: 1, usedBytes: 0, reservedBytes: 0,
-  remainingBytes: 1000, blocked: false, timezoneName: "UTC" };
-const servers = [1, 2].map((id) => ({ id, host: `provider-${id}.example`, username: `account-${id}`,
-  port: 563, tls: true, connections: id * 10, active: true, priority: 0, backfill: false,
-  retentionDays: 0, maxDownloadSpeed: 0, downloadQuota: quota,
+const quota = {
+  enabled: false,
+  period: "MONTHLY",
+  limitBytes: 1000,
+  resetTimeMinutesLocal: 0,
+  weeklyResetWeekday: "MON",
+  monthlyResetDay: 1,
+  usedBytes: 0,
+  reservedBytes: 0,
+  remainingBytes: 1000,
+  blocked: false,
+  timezoneName: "UTC",
+};
+const servers = [1, 2].map((id) => ({
+  id,
+  host: `provider-${id}.example`,
+  username: `account-${id}`,
+  port: 563,
+  tls: true,
+  connections: id * 10,
+  active: true,
+  priority: 0,
+  backfill: false,
+  retentionDays: 0,
+  maxDownloadSpeed: 0,
+  downloadQuota: quota,
   routing: { proxyIds: [], allowDirect: true },
-  tlsNameMismatchCertificateDerBase64: null, tlsNameMismatchCertificateFingerprint: null }));
+  tlsNameMismatchCertificateDerBase64: null,
+  tlsNameMismatchCertificateFingerprint: null,
+}));
 // A provider saved behind a kill switch and not given a route since, as its route reads back.
-servers.push({ ...servers[0], id: 3, host: "provider-3.example", username: "account-3", active: false, priority: 1,
-  routing: { failover: "REDISTRIBUTE", legs: [{ egressId: 0, weight: 100, path: { kind: "LADDER", directFallback: false, rungs: [] } }] } as never });
+servers.push({
+  ...servers[0],
+  id: 3,
+  host: "provider-3.example",
+  username: "account-3",
+  active: false,
+  priority: 1,
+  routing: {
+    failover: "REDISTRIBUTE",
+    legs: [
+      {
+        egressId: 0,
+        weight: 100,
+        path: { kind: "LADDER", directFallback: false, rungs: [] },
+      },
+    ],
+  } as never,
+});
 function snapshot(id: number) {
-  return { queueItem: null, historyItem: { id, name: `Job-${id}`, displayTitle: `Job-${id}`,
-    originalTitle: `Job-${id}`, status: "COMPLETED", progressPercent: 100, totalBytes: 100,
-    downloadedBytes: 100, failedBytes: 0, health: 1000, category: null, metadata: [],
-    phaseProgress: [], hasPassword: false, outputDir: `/job-${id}` },
-    jobEvents: [], jobTimeline: null, serverAttribution: [] };
+  return {
+    queueItem: null,
+    historyItem: {
+      id,
+      name: `Job-${id}`,
+      displayTitle: `Job-${id}`,
+      originalTitle: `Job-${id}`,
+      status: "COMPLETED",
+      progressPercent: 100,
+      totalBytes: 100,
+      downloadedBytes: 100,
+      failedBytes: 0,
+      health: 1000,
+      category: null,
+      metadata: [],
+      phaseProgress: [],
+      hasPassword: false,
+      outputDir: `/job-${id}`,
+    },
+    jobEvents: [],
+    jobTimeline: null,
+    serverAttribution: [],
+  };
 }
-const listing = (path: string) => ({ currentPath: path, parentPath: "/", entries: [] });
+const listing = (path: string) => ({
+  currentPath: path,
+  parentPath: "/",
+  entries: [],
+});
 // One folder that holds a folder and two files; anything with an extension is a file, which is no folder to list.
-const fileListing = (path: string) => ({ currentPath: path, parentPath: "/",
+const fileListing = (path: string) => ({
+  currentPath: path,
+  parentPath: "/",
   entries: [{ name: "keys", path: `${path}/keys` }],
-  files: ["archive-passwords.txt", "notes.txt"].map((name) => ({ name, path: `${path}/${name}` })) });
+  files: ["archive-passwords.txt", "notes.txt"].map((name) => ({
+    name,
+    path: `${path}/${name}`,
+  })),
+});
 const isFile = (path: unknown) => /\.[a-z]+$/.test(String(path));
-const pending: { name: string; variables: Record<string, unknown>; deliver: () => void }[] = [];
+const pending: {
+  name: string;
+  variables: Record<string, unknown>;
+  deliver: () => void;
+}[] = [];
 const mutations: { name: string; variables: Record<string, unknown> }[] = [];
 const delivered: string[] = [];
 const held = new Set<string>();
 const registry = new SearchRegistry();
-const client = new Client({ url: "http://fixture.invalid/graphql", exchanges: [() => (operations) =>
-  pipe(operations, mergeMap((operation) => {
-    const definition = operation.query.definitions.find((entry) => entry.kind === "OperationDefinition");
-    const name = definition?.kind === "OperationDefinition" ? definition.name?.value ?? "" : "";
-    if (operation.kind === "teardown") return make<OperationResult>((observer) => { observer.complete(); return () => {}; });
-    const variables: Record<string, unknown> = operation.variables ?? {};
-    if (operation.kind === "mutation") mutations.push({ name, variables });
-    const id = Number(variables.id ?? variables.jobId ?? 1);
-    if (name === "BrowseFiles" && isFile(variables.path)) {
-      return fromValue({ operation, error: new CombinedError({ graphQLErrors: [{ message: "Path is not a directory" }] }) } as OperationResult);
-    }
-    const data = name === "Server" ? { server: servers.find((server) => server.id === id) }
-      : name === "UpdateServer" ? { updateServer: { ...servers[id - 1], ...variables.input as object } }
-      : name === "AddServer" ? { addServer: { ...servers[0], ...variables.input as object, id: 4 } }
-      : name === "AddRssFeed" ? { addRssFeed: { id: 1, rules: [], ...variables.input as object } }
-      : name === "TestConnection" ? { testConnection: { success: false, message: "Result for provider 1", latencyMs: null,
-          adoptableTlsNameMismatchCertificate: { derBase64: "old-certificate", sha256Fingerprint: "old-fingerprint", names: ["provider-1.example"] } } }
-      : name === "BrowseDirectories" ? { browseDirectories: listing(String(variables.path)) }
-      : name === "BrowseFiles" ? { browseDirectories: fileListing(String(variables.path)) }
-      : name === "CreateDirectory" ? { createDirectory: listing(`${variables.path}/${variables.name}`) }
-      : name === "JobDetailUpdates" ? { jobDetailUpdates: snapshot(id) }
-      : name === "Job" ? { jobDetailSnapshot: snapshot(id) }
-      : name === "JobOutputFiles" ? { jobOutputFiles: { outputDir: `/job-${id}`, files: [], totalBytes: 0 } }
-      : name === "DuplicateSnapshot" ? { duplicateSnapshot: null }
-      : name === "Networking" || name === "DraftRoute" ? { egressInterfaces: [{ id: 0, name: "System", bindingKind: "SYSTEM", interfaceName: null, sourceAddress: null, addresses: [], enabled: true, downloadBps: null, uploadBps: null, health: "UP", reason: null }], proxyProfiles: [], proxyPools: [], servers: [], rssFeeds: [], discoverNetworkInterfaces: [], platformNetworking: { platform: "fixture", egressBindingKinds: ["SYSTEM"], sourceAddressHint: null, container: false, bridgeNetworkSuspected: false, maxWireguardInstances: 1, notes: [] } }
-      : name === "NetworkFlow" || name === "NetworkFlowUpdates" ? { networkFlow: { legs: [], sampledAt: 1767225600, consumers: [], proxies: [], proxyPools: [], egresses: [], pools: [] } }
-      : { servers, proxies: [], categories: [], schedules: [], generalSettings: {}, rssFeeds: [], rssSeenItems: [] };
-    // Real urql hooks receive no new result until the test explicitly delivers it.
-    if (held.has(name) || (id === 2 && ["Server", "Job", "JobDetailUpdates", "JobOutputFiles", "DuplicateSnapshot"].includes(name))) {
-      return make<OperationResult>((observer) => {
-        pending.push({ name, variables, deliver: () => {
-          delivered.push(name);
-          observer.next({ operation, data, stale: false, hasNext: operation.kind === "subscription" });
-          if (operation.kind !== "subscription") observer.complete();
-        } });
-        return () => {};
-      });
-    }
-    return fromValue({ operation, data, stale: false, hasNext: false });
-  }))],
+const client = new Client({
+  url: "http://fixture.invalid/graphql",
+  exchanges: [
+    () => (operations) =>
+      pipe(
+        operations,
+        mergeMap((operation) => {
+          const definition = operation.query.definitions.find(
+            (entry) => entry.kind === "OperationDefinition",
+          );
+          const name =
+            definition?.kind === "OperationDefinition"
+              ? (definition.name?.value ?? "")
+              : "";
+          if (operation.kind === "teardown")
+            return make<OperationResult>((observer) => {
+              observer.complete();
+              return () => {};
+            });
+          const variables: Record<string, unknown> = operation.variables ?? {};
+          if (operation.kind === "mutation")
+            mutations.push({ name, variables });
+          const id = Number(variables.id ?? variables.jobId ?? 1);
+          if (name === "BrowseFiles" && isFile(variables.path)) {
+            return fromValue({
+              operation,
+              error: new CombinedError({
+                graphQLErrors: [{ message: "Path is not a directory" }],
+              }),
+            } as OperationResult);
+          }
+          const data =
+            name === "Server"
+              ? { server: servers.find((server) => server.id === id) }
+              : name === "UpdateServer"
+                ? {
+                    updateServer: {
+                      ...servers[id - 1],
+                      ...(variables.input as object),
+                    },
+                  }
+                : name === "AddServer"
+                  ? {
+                      addServer: {
+                        ...servers[0],
+                        ...(variables.input as object),
+                        id: 4,
+                      },
+                    }
+                  : name === "AddRssFeed"
+                    ? {
+                        addRssFeed: {
+                          id: 1,
+                          rules: [],
+                          ...(variables.input as object),
+                        },
+                      }
+                    : name === "TestConnection"
+                      ? {
+                          testConnection: {
+                            success: false,
+                            message: "Result for provider 1",
+                            latencyMs: null,
+                            adoptableTlsNameMismatchCertificate: {
+                              derBase64: "old-certificate",
+                              sha256Fingerprint: "old-fingerprint",
+                              names: ["provider-1.example"],
+                            },
+                          },
+                        }
+                      : name === "BrowseDirectories"
+                        ? { browseDirectories: listing(String(variables.path)) }
+                        : name === "BrowseFiles"
+                          ? {
+                              browseDirectories: fileListing(
+                                String(variables.path),
+                              ),
+                            }
+                          : name === "CreateDirectory"
+                            ? {
+                                createDirectory: listing(
+                                  `${variables.path}/${variables.name}`,
+                                ),
+                              }
+                            : name === "JobDetailUpdates"
+                              ? { jobDetailUpdates: snapshot(id) }
+                              : name === "Job"
+                                ? { jobDetailSnapshot: snapshot(id) }
+                                : name === "JobOutputFiles"
+                                  ? {
+                                      jobOutputFiles: {
+                                        outputDir: `/job-${id}`,
+                                        files: [],
+                                        totalBytes: 0,
+                                      },
+                                    }
+                                  : name === "DuplicateSnapshot"
+                                    ? { duplicateSnapshot: null }
+                                    : name === "Networking" ||
+                                        name === "DraftRoute"
+                                      ? {
+                                          egressInterfaces: [
+                                            {
+                                              id: 0,
+                                              name: "System",
+                                              bindingKind: "SYSTEM",
+                                              interfaceName: null,
+                                              sourceAddress: null,
+                                              addresses: [],
+                                              enabled: true,
+                                              downloadBps: null,
+                                              uploadBps: null,
+                                              health: "UP",
+                                              reason: null,
+                                            },
+                                          ],
+                                          proxyProfiles: [],
+                                          proxyPools: [],
+                                          servers: [],
+                                          rssFeeds: [],
+                                          discoverNetworkInterfaces: [],
+                                          platformNetworking: {
+                                            platform: "fixture",
+                                            egressBindingKinds: ["SYSTEM"],
+                                            sourceAddressHint: null,
+                                            container: false,
+                                            bridgeNetworkSuspected: false,
+                                            maxWireguardInstances: 1,
+                                            notes: [],
+                                          },
+                                        }
+                                      : name === "NetworkFlow" ||
+                                          name === "NetworkFlowUpdates"
+                                        ? {
+                                            networkFlow: {
+                                              legs: [],
+                                              sampledAt: 1767225600,
+                                              consumers: [],
+                                              proxies: [],
+                                              proxyPools: [],
+                                              egresses: [],
+                                              pools: [],
+                                            },
+                                          }
+                                        : {
+                                            servers,
+                                            proxies: [],
+                                            categories: [],
+                                            schedules: [],
+                                            generalSettings: {},
+                                            rssFeeds: [],
+                                            rssSeenItems: [],
+                                          };
+          // Real urql hooks receive no new result until the test explicitly delivers it.
+          if (
+            held.has(name) ||
+            (id === 2 &&
+              [
+                "Server",
+                "Job",
+                "JobDetailUpdates",
+                "JobOutputFiles",
+                "DuplicateSnapshot",
+              ].includes(name))
+          ) {
+            return make<OperationResult>((observer) => {
+              pending.push({
+                name,
+                variables,
+                deliver: () => {
+                  delivered.push(name);
+                  observer.next({
+                    operation,
+                    data,
+                    stale: false,
+                    hasNext: operation.kind === "subscription",
+                  });
+                  if (operation.kind !== "subscription") observer.complete();
+                },
+              });
+              return () => {};
+            });
+          }
+          return fromValue({ operation, data, stale: false, hasNext: false });
+        }),
+      ),
+  ],
 });
 
 const fixture = {
-  ready: false, pending, mutations, delivered, chosen: "", navigate: (_path: string) => {},
+  ready: false,
+  pending,
+  mutations,
+  delivered,
+  chosen: "",
+  navigate: (_path: string) => {},
   openFolder: (_path: string) => {},
   hold: (name: string) => held.add(name),
   async release(name: string) {
@@ -99,7 +321,8 @@ const fixture = {
     await act(async () => {
       held.delete(name);
       for (const request of pending.splice(0)) {
-        if (request.name === name) request.deliver(); else pending.push(request);
+        if (request.name === name) request.deliver();
+        else pending.push(request);
       }
     });
     Object.assign(globalThis, { IS_REACT_ACT_ENVIRONMENT: false });
@@ -115,15 +338,56 @@ function Fixture() {
     fixture.ready = true;
   }, [navigate]);
   if (screen === "folders" || screen === "files") {
-    const choose = (path: string) => { fixture.chosen = path; setFolder(null); };
-    return <DirectoryBrowserDialog open={folder !== null} initialPath={folder} pick={screen === "files" ? "file" : undefined} onClose={() => setFolder(null)} onChoose={choose} />;
+    const choose = (path: string) => {
+      fixture.chosen = path;
+      setFolder(null);
+    };
+    return (
+      <DirectoryBrowserDialog
+        open={folder !== null}
+        initialPath={folder}
+        pick={screen === "files" ? "file" : undefined}
+        onClose={() => setFolder(null)}
+        onChoose={choose}
+      />
+    );
   }
-  if (screen === "jobs") return <Routes><Route path="/jobs/:id" element={<JobDetailPage />} /></Routes>;
-  return <SettingsShellProvider search="" actionsRef={{ current: null }} setFlags={() => {}} registry={registry} controlsHost={document.getElementById("controls")}>{screen === "feeds" ? <RssPanel /> : <ProvidersPanel />}</SettingsShellProvider>;
+  if (screen === "jobs")
+    return (
+      <Routes>
+        <Route path="/jobs/:id" element={<JobDetailPage />} />
+      </Routes>
+    );
+  return (
+    <SettingsShellProvider
+      search=""
+      actionsRef={{ current: null }}
+      setFlags={() => {}}
+      registry={registry}
+      controlsHost={document.getElementById("controls")}
+    >
+      {screen === "feeds" ? <RssPanel /> : <ProvidersPanel />}
+    </SettingsShellProvider>
+  );
 }
 createRoot(document.getElementById("root")!).render(
-  <Provider value={client}><TranslateContext.Provider value={{
-    t: (key, values) => Object.entries(values ?? {}).reduce((text, [name, value]) => text.replaceAll(`{${name}}`, String(value)), en[key] ?? key),
-    uiLanguage: "eng", selectedLanguage: { code: "eng", label: "English" }, setLanguagePreference: () => {},
-  }}><MemoryRouter initialEntries={["/jobs/1"]}><Fixture /></MemoryRouter></TranslateContext.Provider></Provider>,
+  <Provider value={client}>
+    <TranslateContext.Provider
+      value={{
+        t: (key, values) =>
+          Object.entries(values ?? {}).reduce(
+            (text, [name, value]) =>
+              text.replaceAll(`{${name}}`, String(value)),
+            en[key] ?? key,
+          ),
+        uiLanguage: "eng",
+        selectedLanguage: { code: "eng", label: "English" },
+        setLanguagePreference: () => {},
+      }}
+    >
+      <MemoryRouter initialEntries={["/jobs/1"]}>
+        <Fixture />
+      </MemoryRouter>
+    </TranslateContext.Provider>
+  </Provider>,
 );

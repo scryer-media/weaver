@@ -29,13 +29,17 @@ const common: LocaleDictionary = {
   "duplicate.promotionState.claimed": "Claimed",
   "duplicate.promotionState.unknown": "Unknown",
   "duplicate.terminalCause.success": "Success",
-  "duplicate.terminalCause.missing-articles-or-low-health": "Missing articles or low health",
+  "duplicate.terminalCause.missing-articles-or-low-health":
+    "Missing articles or low health",
   "duplicate.terminalCause.decode-or-corrupt-data": "Decode or corrupt data",
   "duplicate.terminalCause.repair-failure": "Repair failure",
-  "duplicate.terminalCause.archive-or-unpack-failure": "Archive or unpack failure",
+  "duplicate.terminalCause.archive-or-unpack-failure":
+    "Archive or unpack failure",
   "duplicate.terminalCause.password-failure": "Password failure",
-  "duplicate.terminalCause.disk-or-permission-failure": "Disk or permission failure",
-  "duplicate.terminalCause.server-auth-quota-or-outage": "Server auth, quota, or outage",
+  "duplicate.terminalCause.disk-or-permission-failure":
+    "Disk or permission failure",
+  "duplicate.terminalCause.server-auth-quota-or-outage":
+    "Server auth, quota, or outage",
   "duplicate.terminalCause.shutdown": "Shutdown",
   "duplicate.terminalCause.user-cancelled": "User cancelled",
   "duplicate.terminalCause.unknown-failure": "Unknown failure",

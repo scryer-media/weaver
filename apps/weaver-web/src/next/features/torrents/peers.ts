@@ -7,7 +7,13 @@ import type { TorrentPeerData, TorrentState } from "@/lib/torrents";
 export const PEER_PAGE_SIZE = 25;
 
 /** A column the peers sort by. */
-export type PeerSortKey = "address" | "client" | "connection" | "progress" | "downloadBps" | "uploadBps";
+export type PeerSortKey =
+  | "address"
+  | "client"
+  | "connection"
+  | "progress"
+  | "downloadBps"
+  | "uploadBps";
 
 export interface PeerSort {
   key: PeerSortKey;
@@ -15,14 +21,20 @@ export interface PeerSort {
 }
 
 /** Addresses in order. */
-export const DEFAULT_PEER_SORT: PeerSort = { key: "address", descending: false };
+export const DEFAULT_PEER_SORT: PeerSort = {
+  key: "address",
+  descending: false,
+};
 
 /**
  * The order the peers take until a heading is clicked: the fastest sender
  * first while the torrent downloads, the fastest receiver first once it has
  * all it wants and uploads.
  */
-export function peerSortFor(torrent: { state: TorrentState; progress: number }): PeerSort {
+export function peerSortFor(torrent: {
+  state: TorrentState;
+  progress: number;
+}): PeerSort {
   const uploading = torrent.state === "SEEDING" || torrent.progress >= 1;
   return { key: uploading ? "uploadBps" : "downloadBps", descending: true };
 }
@@ -33,14 +45,23 @@ export function peerSortFor(torrent: { state: TorrentState; progress: number }):
  */
 export function nextPeerSort(sort: PeerSort, key: PeerSortKey): PeerSort {
   if (sort.key === key) return { key, descending: !sort.descending };
-  return { key, descending: key !== "address" && key !== "client" && key !== "connection" };
+  return {
+    key,
+    descending: key !== "address" && key !== "client" && key !== "connection",
+  };
 }
 
 // Numbers inside the text count as numbers, so 5.79.x comes before 5.180.x.
-const words = new Intl.Collator(undefined, { numeric: true, sensitivity: "base" });
+const words = new Intl.Collator(undefined, {
+  numeric: true,
+  sensitivity: "base",
+});
 
 /** `peers` in `sort`'s order, peers alike in it by address; `peers` itself is left as it is. */
-export function sortPeers(peers: readonly TorrentPeerData[], sort: PeerSort): TorrentPeerData[] {
+export function sortPeers(
+  peers: readonly TorrentPeerData[],
+  sort: PeerSort,
+): TorrentPeerData[] {
   const way = sort.descending ? -1 : 1;
   const by = (a: TorrentPeerData, b: TorrentPeerData): number => {
     switch (sort.key) {
@@ -54,7 +75,9 @@ export function sortPeers(peers: readonly TorrentPeerData[], sort: PeerSort): To
         return a[sort.key] - b[sort.key];
     }
   };
-  return [...peers].sort((a, b) => by(a, b) * way || words.compare(a.address, b.address));
+  return [...peers].sort(
+    (a, b) => by(a, b) * way || words.compare(a.address, b.address),
+  );
 }
 
 /** How many pages `count` peers take: one at least, so an empty list has a page to be on. */
@@ -68,7 +91,10 @@ export function peerPage(page: number, count: number): number {
 }
 
 /** The peers of `page`, of `sorted`. */
-export function peersOfPage(sorted: readonly TorrentPeerData[], page: number): TorrentPeerData[] {
+export function peersOfPage(
+  sorted: readonly TorrentPeerData[],
+  page: number,
+): TorrentPeerData[] {
   const at = peerPage(page, sorted.length) * PEER_PAGE_SIZE;
   return sorted.slice(at, at + PEER_PAGE_SIZE);
 }

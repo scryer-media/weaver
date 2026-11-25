@@ -9,7 +9,11 @@ export const LIST_PAGE_SIZE = 100;
  * so it looks as it always has; a longer one does while entries remain.
  * `more` is the server's word that another page exists.
  */
-export function showsMore(total: number, loaded: number, more: boolean): boolean {
+export function showsMore(
+  total: number,
+  loaded: number,
+  more: boolean,
+): boolean {
   return more && total > LIST_PAGE_SIZE && loaded < total;
 }
 
@@ -28,11 +32,18 @@ export interface Keyed {
  * past the kept list, so entries between the two are unknown and the kept
  * list can no longer be extended without a hole.
  */
-export function extendKept<T extends Keyed>(kept: readonly T[], snapshot: readonly T[]): T[] | null {
+export function extendKept<T extends Keyed>(
+  kept: readonly T[],
+  snapshot: readonly T[],
+): T[] | null {
   const seen = new Set(kept.map((entry) => entry.cursor));
-  const added = snapshot.filter((entry) => entry.cursor && !seen.has(entry.cursor));
+  const added = snapshot.filter(
+    (entry) => entry.cursor && !seen.has(entry.cursor),
+  );
   if (added.length === 0) return kept as T[];
-  const overlaps = snapshot.some((entry) => entry.cursor && seen.has(entry.cursor));
+  const overlaps = snapshot.some(
+    (entry) => entry.cursor && seen.has(entry.cursor),
+  );
   if (kept.length > 0 && !overlaps) return null;
   return [...kept, ...added];
 }
@@ -41,7 +52,13 @@ export function extendKept<T extends Keyed>(kept: readonly T[], snapshot: readon
  * Older entries in front of the kept ones, oldest first, dropping any the
  * list already holds.
  */
-export function prependOlder<T extends Keyed>(kept: readonly T[], older: readonly T[]): T[] {
+export function prependOlder<T extends Keyed>(
+  kept: readonly T[],
+  older: readonly T[],
+): T[] {
   const seen = new Set(kept.map((entry) => entry.cursor));
-  return [...older.filter((entry) => !entry.cursor || !seen.has(entry.cursor)), ...kept];
+  return [
+    ...older.filter((entry) => !entry.cursor || !seen.has(entry.cursor)),
+    ...kept,
+  ];
 }

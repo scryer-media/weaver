@@ -6,7 +6,6 @@ import { duplicateLocaleEntries } from "../duplicate-locales";
 import { nextKo } from "@/next/i18n/ko";
 
 const ko: LocaleDictionary = {
-
   // Navigation
   "nav.settings": "설정",
   "nav.sponsor": "후원하기",
@@ -15,18 +14,24 @@ const ko: LocaleDictionary = {
   "applicationUpgrade.upToDate": "Weaver v{{version}}은 최신입니다.",
   "applicationUpgrade.available": "Weaver v{{version}}을 사용할 수 있습니다.",
   "applicationUpgrade.install": "v{{version}} 설치",
-  "applicationUpgrade.notEligible": "Weaver 앱에서 이 설치를 업데이트할 수 없습니다 ({{reason}}).",
-  "applicationUpgrade.failed": "v{{version}} 업데이트가 실패했습니다: {{error}}",
-  "applicationUpgrade.githubUnavailable": "현재 GitHub를 일시적으로 이용할 수 없습니다. 나중에 업데이트를 다시 시도해 주세요.",
+  "applicationUpgrade.notEligible":
+    "Weaver 앱에서 이 설치를 업데이트할 수 없습니다 ({{reason}}).",
+  "applicationUpgrade.failed":
+    "v{{version}} 업데이트가 실패했습니다: {{error}}",
+  "applicationUpgrade.githubUnavailable":
+    "현재 GitHub를 일시적으로 이용할 수 없습니다. 나중에 업데이트를 다시 시도해 주세요.",
   "applicationUpgrade.completed": "v{{version}}으로 업데이트했습니다.",
   "applicationUpgrade.phase.checking": "릴리스를 확인하고 있습니다…",
-  "applicationUpgrade.phase.downloading": "v{{version}}을 다운로드하고 있습니다…",
+  "applicationUpgrade.phase.downloading":
+    "v{{version}}을 다운로드하고 있습니다…",
   "applicationUpgrade.phase.verifying": "다운로드를 검증하고 있습니다…",
   "applicationUpgrade.phase.staging": "업데이트를 압축 해제하고 있습니다…",
   "applicationUpgrade.phase.applying": "v{{version}}을 설치하고 있습니다…",
-  "applicationUpgrade.phase.awaiting_elevation": "설치 권한을 기다리고 있습니다…",
+  "applicationUpgrade.phase.awaiting_elevation":
+    "설치 권한을 기다리고 있습니다…",
   "applicationUpgrade.phase.restarting": "Weaver를 다시 시작하고 있습니다…",
-  "applicationUpgrade.phase.reboot_required": "업데이트를 마치려면 이 컴퓨터를 다시 시작하세요.",
+  "applicationUpgrade.phase.reboot_required":
+    "업데이트를 마치려면 이 컴퓨터를 다시 시작하세요.",
   "update.newVersionAria": "GitHub에서 Weaver v{{version}}을 새 탭으로 열기",
 
   // Status labels
@@ -69,7 +74,8 @@ const ko: LocaleDictionary = {
   "action.next": "다음",
 
   // Confirmation dialogs
-  "confirm.cancelSelectedMessage": "이 다운로드들이 중단되며 재개할 수 없습니다.",
+  "confirm.cancelSelectedMessage":
+    "이 다운로드들이 중단되며 재개할 수 없습니다.",
   "bulk.selected": "{{count}}개 선택됨",
   "bulk.editSelected": "선택 항목 편집",
   "bulk.pauseSelected": "선택 항목 일시정지",
@@ -152,7 +158,8 @@ const ko: LocaleDictionary = {
   "action.edit": "편집",
   "action.save": "저장",
 
-  "upload.forceDesc": "의미 및 아티클 지문 중복 정책에도 이 제출을 수락합니다. 멱등성 충돌은 계속 적용됩니다.",
+  "upload.forceDesc":
+    "의미 및 아티클 지문 중복 정책에도 이 제출을 수락합니다. 멱등성 충돌은 계속 적용됩니다.",
 
   // System info
   "systemInfo.diagnosticsFailed": "진단 패키지를 만들 수 없습니다.",

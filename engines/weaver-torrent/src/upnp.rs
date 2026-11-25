@@ -75,6 +75,20 @@ pub struct PortMapped {
     pub error: Option<String>,
 }
 
+impl PortMapped {
+    /// The gateway's external address when it is one the internet can see.
+    /// A gateway inside a tunnel may give the tunnel's own private address,
+    /// which is no address of ours out there; the vote on our external
+    /// address counts it for nothing too.
+    pub fn public_ip(&self) -> Option<IpAddr> {
+        self.external_ip.filter(|ip| {
+            !ip.is_unspecified()
+                && !ip.is_loopback()
+                && !crate::torrent_state::live::peers::holepunch::is_local(*ip)
+        })
+    }
+}
+
 /// Where a mapper sends its reports. A mapper keeps working when nobody listens.
 pub type PortMapEvents = UnboundedSender<PortMapped>;
 
@@ -1077,6 +1091,36 @@ pub(crate) mod tests {
     };
     use crate::route_interface::RouteInterface;
     use crate::test_support::Loopback;
+
+    // A gateway inside a tunnel gives the tunnel's own address as its
+    // external one: it is told as the gateway said it, and is no public
+    // address of ours.
+    #[test]
+    fn a_gateways_private_address_is_no_public_one() {
+        let told = |ip: &str| PortMapped {
+            transport: PortmapTransport::NatPmp,
+            protocol: PortmapProtocol::Tcp,
+            local_port: 40_001,
+            external_port: Some(40_001),
+            external_ip: Some(ip.parse().unwrap()),
+            error: None,
+        };
+        for private in [
+            "10.2.0.2",
+            "192.168.1.1",
+            "100.64.0.9",
+            "127.0.0.1",
+            "0.0.0.0",
+            "fe80::1",
+        ] {
+            let report = told(private);
+            assert_eq!(report.external_ip, Some(private.parse().unwrap()));
+            assert_eq!(report.public_ip(), None, "{private}");
+        }
+        for public in ["203.0.113.7", "2001:db8::7"] {
+            assert_eq!(told(public).public_ip(), Some(public.parse().unwrap()));
+        }
+    }
 
     /// The loopback interface, as the route's interface.
     fn loopback() -> RouteInterface {
