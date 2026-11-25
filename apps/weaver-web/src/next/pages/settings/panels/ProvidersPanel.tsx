@@ -114,12 +114,11 @@ interface ServerForm {
 }
 
 /**
- * What a save says when the provider's certificate names another host. Saving
- * probes the connection, and the probe's message is fixed English text, so the
- * editor recognises it and runs a test, whose result carries the certificate
- * to trust.
+ * The code a save answers with when the provider's certificate names another
+ * host. The editor recognises it and runs a test, whose result carries the
+ * certificate to trust.
  */
-const CERTIFICATE_NAME_MISMATCH = "certificate belongs to a different hostname";
+const TLS_NAME_MISMATCH = "TLS_NAME_MISMATCH";
 
 const NEW_SERVER: ServerForm = {
   host: "",
@@ -376,8 +375,8 @@ export function ProvidersPanel() {
     }
     setBusy(false);
     if (result.error) {
-      const message = result.error.graphQLErrors[0]?.message ?? result.error.message;
-      if (values.tls && !values.certificateDerBase64 && message.includes(CERTIFICATE_NAME_MISMATCH)) {
+      const code = result.error.graphQLErrors[0]?.extensions?.code;
+      if (values.tls && !values.certificateDerBase64 && code === TLS_NAME_MISMATCH) {
         // Show the certificate the way a test does, so it can be trusted here.
         await runTest();
         return;
