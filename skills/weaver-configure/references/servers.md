@@ -13,7 +13,7 @@ last column says so.
 | `host` | String! | – | required | Name or address. Trimmed; an `http://`, `https://`, `nntp://` or `nntps://` prefix and a trailing `/` are dropped. Empty is refused. |
 | `port` | Int! | – | required | 0 to 65535. |
 | `tls` | Boolean! | – | required | Connect with TLS. |
-| `username` | String | null | **cleared** | Login name. Trimmed; blank = none. Secret: only via `add-secret.sh`. |
+| `username` | String | null | kept | Login name. Trimmed; on update, blank clears it. Secret: only via `add-secret.sh`. |
 | `password` | String | null | kept | Trimmed; blank = keep. Stored encrypted. There is no way to clear it through the API. Secret: only via `add-secret.sh`. |
 | `connections` | Int! | – | required | 0 to 65535 connections Weaver may open at once. No other bound: never more than the provider's plan allows. |
 | `active` | Boolean! | `true` | → `true` | Off = Weaver does not use the server. |
@@ -45,10 +45,8 @@ jq '{id: .data.server.id, input: (.data.server | {
 jq '.input.connections = 30' base.json > vars.json
 ```
 
-3. If the server has a login, the operator supplies the username again (a
-   variable or file), and `add-secret.sh vars.json username ...` adds it.
-   Without it the update clears the username. Leave `password` out to keep
-   it.
+3. Leave `username` and `password` out to keep them. To change one,
+   `add-secret.sh vars.json username ...` (or `password`) adds it.
 
 ## Connection tests
 
@@ -80,9 +78,9 @@ Reading a test (`TestServerConnection`):
 - A save that tests also records `supportsPipelining` and the TLS cipher
   suite. Changing `host` or `port` drops the learned pipelining depth.
 
-After a save, Weaver restarts its news connections. If that fails the error
-says the setting was saved but the old connections still run: re-read; the
-operator retries or restarts Weaver.
+After a save, Weaver restarts its news connections. If that fails
+(`INTERNAL`), the setting was saved but the old connections still run:
+re-read; the operator retries or restarts Weaver.
 
 ## ServerDownloadQuotaInput
 

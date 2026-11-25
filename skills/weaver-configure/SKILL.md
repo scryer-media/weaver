@@ -56,8 +56,8 @@ Each file's leading comment gives its purpose and a variables example.
 - Never remove a server or category. Give the operator the web UI path
   (references, "Removing").
 - Every response to a file; read with jq.
-- On a refusal, find it in `references/refusal-codes.md`. Most carry no
-  code: match the message start, show it, never retry the same input.
+- On a refusal, find its code in `references/refusal-codes.md`. Show the
+  message; never retry the same input.
 
 ## Procedure
 
@@ -75,15 +75,14 @@ Each file's leading comment gives its purpose and a variables example.
 
 3. **Agree on the change** in plain terms. Ask only for values not given. For
    a login, the operator writes it to a file (or exports a variable) and
-   gives you the path or name. Updating a server that has a login always
-   needs its username again: the update clears a username left out.
+   gives you the path or name.
 
 4. **Build the variables file.**
    - Server update: `ServerSettings` with `{"id": N}` → `server.json`; jq
      into `{id, input}` (`references/servers.md`); change the agreed fields.
    - Server add: write `{"input": {...}}` with jq.
    - Login: `sh "$S"/scripts/add-secret.sh vars.json username vars.json --env NNTP_USER`
-     (same for `password`). Leave `password` out of an update to keep it.
+     (same for `password`). Leave both out of an update to keep them.
    - Category: `{id, input: {name, destDir, aliases}}` from the list entry.
 
 5. **Show the change**:
@@ -92,7 +91,7 @@ Each file's leading comment gives its purpose and a variables example.
    for an add. Present its lines as before/after. Add a plain note when:
    - the server is active: saving tests it against `<host>` first;
    - a field shows as cleared or reset (`tlsCaCert`, the adopted
-     certificate, `username`, `destDir`, `aliases`);
+     certificate, `destDir`, `aliases`);
    - `active` turns off (Weaver stops using the server) or `connections`
      rises (must stay within the provider's plan).
    Wait for a yes.

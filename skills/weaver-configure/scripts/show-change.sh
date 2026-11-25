@@ -11,10 +11,9 @@
 # Output lines: "path: before -> after" ("path: value" for an add). Fields
 # the input leaves out are shown at what Weaver will store: the default or
 # cleared value, or nothing when Weaver keeps the stored value (password,
-# maxDownloadSpeed, downloadQuota, the route). The username and password are
-# never printed: a value being sent shows as <new secret>, and an update that
-# sends no username shows "username: <cleared if one is stored>". The adopted
-# certificate shows as its length only.
+# maxDownloadSpeed, downloadQuota, username, the route). The username and
+# password are never printed: a value being sent shows as <new secret>. The
+# adopted certificate shows as its length only.
 set -eu
 
 before=${1:?usage: show-change.sh <before.json> <after.json>}
@@ -62,9 +61,7 @@ jq -n -r --slurpfile b "$before" --slurpfile a "$after" '
          | ($B | getpath($path)) as $old
          | select($old != $new)
          | "\($p): \(show($k; $old)) -> \(show($k; $new))" ]
-       + [ ["username", "password"][] as $f | select($A | has($f)) | "\($f): <new secret>" ]
-       + (if $kind == "server" and ($A | has("username") | not)
-          then ["username: <cleared if one is stored>"] else [] end)) as $lines
+       + [ ["username", "password"][] as $f | select($A | has($f)) | "\($f): <new secret>" ]) as $lines
       | if ($lines | length) == 0 then "no changes" else $lines[] end
     end
 '

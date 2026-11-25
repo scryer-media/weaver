@@ -1,6 +1,6 @@
 # Write. Replaces a news server's settings: build input from ServerSettings
 # and change only what was agreed. Left out: password, maxDownloadSpeed,
-# downloadQuota and the route keep their value; username, tlsCaCert and the
+# downloadQuota, username and the route keep their value; tlsCaCert and the
 # adopted certificate are cleared; active, priority, backfill and
 # retentionDays take their defaults. An active server is tested against the
 # provider first. Needs the operator's yes naming the host. Scope: ADMIN.
