@@ -49,6 +49,10 @@ impl HistorySubscription {
         // the config on every 500 ms heartbeat is not worth that.
         let server_hosts =
             crate::schema::history_query::server_hosts_by_id(ctx.data::<SharedConfig>()?).await;
+        // The subscription's selection is fixed for its life: every snapshot
+        // reads only the event rows the selected fields show.
+        let event_read =
+            crate::schema::history_query::JobDetailEventRead::for_selection(ctx.look_ahead());
         let event_rx = handle.subscribe_events();
 
         // Only events for THIS job should force a database reload; an unrelated
@@ -129,6 +133,7 @@ impl HistorySubscription {
                     db.clone(),
                     job_id,
                     server_hosts.clone(),
+                    event_read,
                 ).await {
                     Ok(snapshot) => {
                         // A job with no live queue entry has settled to the slow

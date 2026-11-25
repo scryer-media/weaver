@@ -217,7 +217,8 @@ impl HistoryQuery {
         let handle = ctx.data::<SchedulerHandle>()?.clone();
         let db = ctx.data::<weaver_server_core::Database>()?.clone();
         let server_hosts = server_hosts_by_id(ctx.data::<SharedConfig>()?).await;
-        load_job_detail_snapshot(handle, db, job_id, server_hosts).await
+        let event_read = JobDetailEventRead::for_selection(ctx.look_ahead());
+        load_job_detail_snapshot(handle, db, job_id, server_hosts, event_read).await
     }
     /// Active or recent background history delete operations.
     #[graphql(guard = "ReadGuard")]
@@ -326,11 +327,73 @@ pub(crate) async fn server_hosts_by_id(config: &SharedConfig) -> HashMap<u32, St
     .await
 }
 
+// How much of a job's event log a detail snapshot reads: nothing when the
+// query selects neither `jobTimeline` nor `jobEvents`, only the page's newest
+// window when it selects `jobEvents` alone, and the timeline's wider tail
+// when it selects `jobTimeline`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum JobDetailEventRead {
+    Nothing,
+    Window,
+    Timeline,
+}
+
+impl JobDetailEventRead {
+    pub(crate) fn for_selection(selection: async_graphql::Lookahead<'_>) -> Self {
+        if selection.field("jobTimeline").exists() {
+            Self::Timeline
+        } else if selection.field("jobEvents").exists() {
+            Self::Window
+        } else {
+            Self::Nothing
+        }
+    }
+
+    // The newest rows to read, or `None` for no read.
+    fn rows(self) -> Option<u32> {
+        match self {
+            Self::Nothing => None,
+            Self::Window => Some(JOB_DETAIL_EVENT_WINDOW as u32),
+            Self::Timeline => Some(JOB_DETAIL_EVENT_CAP),
+        }
+    }
+}
+
+type JobEventRecords = Vec<weaver_server_core::history::timeline::JobEventRecord>;
+
 pub(crate) async fn load_job_detail_snapshot(
     handle: SchedulerHandle,
     db: weaver_server_core::Database,
     job_id: u64,
     server_hosts: HashMap<u32, String>,
+    event_read: JobDetailEventRead,
+) -> Result<JobDetailSnapshot> {
+    load_job_detail_snapshot_with(
+        handle,
+        db,
+        job_id,
+        server_hosts,
+        event_read,
+        |db, job_id, rows| db.get_job_event_records_window(job_id, rows, 0, None),
+    )
+    .await
+}
+
+// `load_job_detail_snapshot` with the event read passed in, so a test can
+// see which read a selection makes.
+async fn load_job_detail_snapshot_with(
+    handle: SchedulerHandle,
+    db: weaver_server_core::Database,
+    job_id: u64,
+    server_hosts: HashMap<u32, String>,
+    event_read: JobDetailEventRead,
+    read_events: impl FnOnce(
+        &weaver_server_core::Database,
+        u64,
+        u32,
+    ) -> Result<JobEventRecords, weaver_server_core::StateError>
+    + Send
+    + 'static,
 ) -> Result<JobDetailSnapshot> {
     let snapshot_started = Instant::now();
     let live_job = match handle.get_job(JobId(job_id)) {
@@ -344,8 +407,11 @@ pub(crate) async fn load_job_detail_snapshot(
         // The detail view is a read-only, high-frequency poll (heartbeat + event
         // triggers, up to a few Hz per open tab). Large RAR jobs write thousands
         // of event rows, so read only the newest slice instead of scanning the
-        // whole log.
-        let events = db.get_job_event_records_window(job_id, JOB_DETAIL_EVENT_CAP, 0, None)?;
+        // whole log, and only as much of it as the selection shows.
+        let events = match event_read.rows() {
+            Some(rows) => read_events(&db, job_id, rows)?,
+            None => Vec::new(),
+        };
         let history = if live_only {
             None
         } else {
@@ -396,10 +462,15 @@ pub(crate) async fn load_job_detail_snapshot(
                 .map(history_delete_row_state_from_core),
         )
     });
-    let job_timeline = live_job
-        .as_ref()
-        .cloned()
-        .or_else(|| history.as_ref().map(job_info_from_history_row))
+    // Built only when selected: it is the one part that reads the wide tail.
+    let job_timeline = (event_read == JobDetailEventRead::Timeline)
+        .then(|| {
+            live_job
+                .as_ref()
+                .cloned()
+                .or_else(|| history.as_ref().map(job_info_from_history_row))
+        })
+        .flatten()
         .map(|job| {
             let events = events
                 .iter()
@@ -2259,5 +2330,136 @@ mod tests {
         };
         assert_eq!(page(0), vec![7, 5, 3]);
         assert_eq!(page(3), vec![2, 1]);
+    }
+
+    // An archived job with more events than the page's window, and more
+    // than one kind, so the timeline has stages to build.
+    fn seed_job_with_events(db: &Database, job_id: u64) {
+        use weaver_server_core::history::timeline::HistoryTimelineQueries;
+        db.insert_job_history(&history_row(job_id, "complete", 5_000))
+            .unwrap();
+        let events = (0..(JOB_DETAIL_EVENT_WINDOW as i64 + 50))
+            .map(|index| weaver_server_core::JobEvent {
+                job_id,
+                timestamp: 4_000 + index,
+                kind: match index {
+                    0 => "JobCreated",
+                    149 => "JobCompleted",
+                    _ => "ExtractionMemberFinished",
+                }
+                .to_string(),
+                message: format!("fixture event {index}"),
+                file_id: None,
+            })
+            .collect::<Vec<_>>();
+        db.insert_job_events(&events).unwrap();
+    }
+
+    // The snapshot for `event_read`, with the limits of every event read it
+    // made.
+    async fn snapshot_reading(
+        db: &Database,
+        job_id: u64,
+        event_read: JobDetailEventRead,
+    ) -> (serde_json::Value, Vec<u32>) {
+        let reads = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorded = std::sync::Arc::clone(&reads);
+        let snapshot = load_job_detail_snapshot_with(
+            scheduler_with_jobs(Vec::new()),
+            db.clone(),
+            job_id,
+            HashMap::new(),
+            event_read,
+            move |db, job_id, rows| {
+                recorded.lock().unwrap().push(rows);
+                db.get_job_event_records_window(job_id, rows, 0, None)
+            },
+        )
+        .await
+        .unwrap();
+        let reads = reads.lock().unwrap().clone();
+        (serde_json::to_value(snapshot).unwrap(), reads)
+    }
+
+    // Each selection gives the fields it selects as the full path does, and
+    // reads no more of the event log than they show.
+    #[tokio::test]
+    async fn a_job_detail_snapshot_reads_only_the_events_its_selection_shows() {
+        let db = Database::open_in_memory().unwrap();
+        seed_job_with_events(&db, 7);
+
+        let (full, reads) = snapshot_reading(&db, 7, JobDetailEventRead::Timeline).await;
+        assert_eq!(reads, vec![JOB_DETAIL_EVENT_CAP]);
+        assert!(full["job_timeline"].is_object(), "{full}");
+        assert_eq!(
+            full["job_events"].as_array().unwrap().len(),
+            JOB_DETAIL_EVENT_WINDOW
+        );
+
+        let (window, reads) = snapshot_reading(&db, 7, JobDetailEventRead::Window).await;
+        assert_eq!(reads, vec![JOB_DETAIL_EVENT_WINDOW as u32]);
+        assert_eq!(window["job_events"], full["job_events"]);
+
+        let (nothing, reads) = snapshot_reading(&db, 7, JobDetailEventRead::Nothing).await;
+        assert!(reads.is_empty(), "{reads:?}");
+        for field in ["queue_item", "history_item", "server_attribution"] {
+            assert_eq!(nothing[field], full[field], "{field}");
+            assert_eq!(window[field], full[field], "{field}");
+        }
+        assert!(full["history_item"].is_object(), "{full}");
+    }
+
+    // The read follows the fields the query names, through fragments too.
+    #[tokio::test]
+    async fn the_event_read_follows_the_selected_fields() {
+        type Seen = std::sync::Arc<std::sync::Mutex<Vec<JobDetailEventRead>>>;
+        struct Probe;
+        #[async_graphql::Object]
+        impl Probe {
+            async fn snapshot(&self, ctx: &Context<'_>) -> JobDetailSnapshot {
+                ctx.data_unchecked::<Seen>()
+                    .lock()
+                    .unwrap()
+                    .push(JobDetailEventRead::for_selection(ctx.look_ahead()));
+                JobDetailSnapshot {
+                    queue_item: None,
+                    history_item: None,
+                    job_timeline: None,
+                    job_events: Vec::new(),
+                    server_attribution: Vec::new(),
+                    job_id: 0,
+                }
+            }
+        }
+        let seen = Seen::default();
+        let schema = async_graphql::Schema::build(
+            Probe,
+            async_graphql::EmptyMutation,
+            async_graphql::EmptySubscription,
+        )
+        .data(seen.clone())
+        .finish();
+        for (query, want) in [
+            (
+                "{ snapshot { serverAttribution { serverId } } }",
+                JobDetailEventRead::Nothing,
+            ),
+            (
+                "{ snapshot { jobEvents { message } } }",
+                JobDetailEventRead::Window,
+            ),
+            (
+                "{ snapshot { jobEvents { message } jobTimeline { startedAt } } }",
+                JobDetailEventRead::Timeline,
+            ),
+            (
+                "{ snapshot { ...F } } fragment F on JobDetailSnapshot { jobTimeline { startedAt } }",
+                JobDetailEventRead::Timeline,
+            ),
+        ] {
+            let response = schema.execute(query).await;
+            assert!(response.errors.is_empty(), "{query}: {:?}", response.errors);
+            assert_eq!(seen.lock().unwrap().pop(), Some(want), "{query}");
+        }
     }
 }
