@@ -36,6 +36,15 @@ const OWN_MEMBER: MemberId = MemberId(0);
 const FIRST: MemberId = MemberId(1);
 const LATE: MemberId = MemberId(2);
 
+// What the store says of its own member when a volume arrives: it takes
+// the member back and says nothing more of it yet, or takes it back and
+// says it again in the same breath as one its run makes.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Retold {
+    Dropped,
+    Handed,
+}
+
 // What the test has the run say, one step at a time.
 enum Step {
     Say(Emit),
@@ -56,6 +65,8 @@ struct Building {
     // The volume whose arrival has the store take the late member back to
     // place it itself.
     taken_at: Option<u32>,
+    // The volume whose arrival has the store retell its own member.
+    retold: Option<(u32, Retold)>,
     shared: Shared,
 }
 
@@ -66,6 +77,8 @@ impl Builder for Building {
                 volumes: self.volumes,
                 late_at: self.late_at,
                 taken_at: self.taken_at,
+                retold: self.retold,
+                handed: false,
                 announced: false,
                 late: false,
                 places_late: false,
@@ -90,6 +103,9 @@ struct Store {
     volumes: u32,
     late_at: Option<u32>,
     taken_at: Option<u32>,
+    retold: Option<(u32, Retold)>,
+    // Whether the store handed its own member to its run.
+    handed: bool,
     announced: bool,
     late: bool,
     // Whether the store places the late member itself.
@@ -125,6 +141,16 @@ impl Object for Store {
         if Some(volume) == self.taken_at && !std::mem::replace(&mut self.places_late, true) {
             out.push(Emit::Retract(LATE));
             out.push(member(LATE, "late.bin", MADE));
+        }
+        if let Some((at, retold)) = self.retold
+            && at == volume
+        {
+            self.retold = None;
+            out.push(Emit::Retract(OWN_MEMBER));
+            if retold == Retold::Handed {
+                self.handed = true;
+                out.push(member(OWN_MEMBER, "own.bin", MADE));
+            }
         }
         if volume != 0 {
             return;
@@ -219,10 +245,10 @@ impl Engine for Store {
         })
     }
 
-    // The run makes every member but the store's own, and the late one
-    // once the store places it itself.
+    // The run makes every member but the store's own, until the store
+    // hands it over, and the late one until the store places it itself.
     fn makes(&self, member: MemberId) -> bool {
-        member != OWN_MEMBER && !(member == LATE && self.places_late)
+        (member != OWN_MEMBER || self.handed) && !(member == LATE && self.places_late)
     }
 }
 
@@ -257,6 +283,15 @@ struct Rig {
 }
 
 fn rig(count: u32, late_at: Option<u32>, taken_at: Option<u32>) -> Rig {
+    rig_retelling(count, late_at, taken_at, None)
+}
+
+fn rig_retelling(
+    count: u32,
+    late_at: Option<u32>,
+    taken_at: Option<u32>,
+    retold: Option<(u32, Retold)>,
+) -> Rig {
     let volumes: Vec<Vec<u8>> = (0..count)
         .map(|index| {
             let mut volume = if index == 0 {
@@ -288,6 +323,7 @@ fn rig(count: u32, late_at: Option<u32>, taken_at: Option<u32>) -> Rig {
         volumes: count,
         late_at,
         taken_at,
+        retold,
         shared,
     };
     let dir = tempfile::tempdir().unwrap();
@@ -562,4 +598,119 @@ async fn a_member_named_while_the_store_is_on_loan_joins_the_record_once_it_is_b
         "the late member joined"
     );
     assert_eq!(rig.starts(), 1, "nothing started again");
+}
+
+// The run started on the first two volumes and ended, having made the
+// first member; the third has the store retell its own.
+async fn ended_then_retold(retold: Retold) -> Rig {
+    let mut rig = rig_retelling(3, None, None, Some((2, retold)));
+    rig.fetch(0);
+    rig.fetch(1);
+    assert_eq!(rig.made(), Some(vec![FIRST]), "the run makes the first");
+    rig.make(FIRST, 0xD1);
+    rig.end();
+    rig.until_ended().await;
+    rig.fetch(2);
+    rig
+}
+
+fn own(rig: &Rig) -> bool {
+    rig.job
+        .tree()
+        .namespace(rig.store())
+        .and_then(|namespace| namespace.get(OWN_MEMBER))
+        .expect("named")
+        .own
+}
+
+// The store's own member, taken back and not said again while its run is
+// on record: the record keeps it the store's until the store says it
+// again, so the run is not started again and is not given it.
+#[tokio::test]
+async fn the_stores_own_member_taken_back_and_not_said_again_restarts_no_run() {
+    let rig = ended_then_retold(Retold::Dropped).await;
+    assert_eq!(rig.starts(), 1, "no run started again");
+    assert!(own(&rig), "the record keeps it the store's");
+    assert_eq!(
+        rig.made(),
+        Some(vec![FIRST]),
+        "the run makes the first alone"
+    );
+}
+
+// The store's own member taken back and said again in one breath as one its
+// run makes: the run is started again, and the new run makes it.
+#[tokio::test]
+async fn the_stores_own_member_handed_to_its_run_restarts_the_run_which_makes_it() {
+    let mut rig = ended_then_retold(Retold::Handed).await;
+    assert_eq!(rig.starts(), 2, "the run started again");
+    assert!(!own(&rig), "the record gives it to the run");
+    rig.make(FIRST, 0xE1);
+    rig.make(OWN_MEMBER, 0xE2);
+    rig.end();
+    rig.until_ended().await;
+    assert!(!own(&rig), "the run made it");
+    assert!(
+        rig.job
+            .tree()
+            .namespace(rig.store())
+            .and_then(|namespace| namespace.get(OWN_MEMBER))
+            .is_some_and(|record| record.closed),
+        "closed"
+    );
+    assert_eq!(
+        rig.read(OWN_MEMBER),
+        Some(vec![0xE2; MADE as usize]),
+        "the new run made it"
+    );
+}
+
+// The run started on the first two volumes; the third has the store take
+// its own member back and say nothing more of it while the run stands.
+fn dropped_mid_run() -> Rig {
+    let mut rig = rig_retelling(3, None, None, Some((2, Retold::Dropped)));
+    rig.fetch(0);
+    rig.fetch(1);
+    rig.fetch(2);
+    assert_eq!(rig.starts(), 1, "no run started again");
+    assert!(own(&rig), "the record keeps it the store's");
+    assert_eq!(
+        rig.made(),
+        Some(vec![FIRST]),
+        "the run makes the first alone"
+    );
+    rig
+}
+
+// A run's refusal while the store's own member waits to be said again
+// fails the members the run makes; the waiting one is not among them.
+#[tokio::test]
+async fn a_refusal_while_the_stores_own_member_waits_to_be_said_again_spares_it() {
+    let mut rig = dropped_mid_run();
+    rig.say(Emit::Refuse(Why::Unsupported));
+    rig.end();
+    rig.until_ended().await;
+    assert_eq!(rig.refused(FIRST), Some(Why::Unsupported));
+    assert_eq!(rig.refused(OWN_MEMBER), None, "the waiting member stands");
+}
+
+// A run widened while the store's own member waits to be said again starts
+// over on the members it makes: the waiting one is not retracted with them,
+// and stays the store's.
+#[tokio::test]
+async fn a_widened_run_while_the_stores_own_member_waits_to_be_said_again_leaves_it() {
+    let mut rig = dropped_mid_run();
+    rig.say(Emit::Refuse(Why::TooLarge {
+        needed: Some(1 << 20),
+        allowed: None,
+    }));
+    rig.end();
+    rig.until_started(2).await;
+    assert!(own(&rig), "the record keeps it the store's");
+    assert_eq!(
+        rig.made(),
+        Some(vec![FIRST]),
+        "the new run makes the first alone"
+    );
+    assert_eq!(rig.refused(OWN_MEMBER), None, "the waiting member stands");
 }

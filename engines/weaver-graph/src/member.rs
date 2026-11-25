@@ -58,8 +58,9 @@ pub struct Member {
     // the object said when it was in its node and announced it
     // (`Tree::own_word`). False for every member of an engine that makes
     // every member, and for one a run named while its object was out. Not
-    // kept: a restore asks the rebuilt object again. Only a retraction
-    // takes it back.
+    // kept: a restore asks the rebuilt object again. A retraction keeps it:
+    // the record says whose member it was until its producer announces it
+    // again, when the tree sets it from the object's word then.
     pub own: bool,
     // How far its own articles reached, when their producer said so: past
     // what arrived where it lost bytes, short of its length where they
@@ -1082,7 +1083,9 @@ impl Namespace {
 
     // The member starts over: its bytes are forgotten and it is unbound. Its
     // output name is kept, so what comes back lands where it was, until its
-    // producer announces it again under another name.
+    // producer announces it again under another name. Whose member it was,
+    // the object's or its run's (`own`), is kept too until that announce
+    // says so again.
     pub fn retract(&mut self, member: MemberId) {
         if let Some(found) = self.members.get_mut(&member) {
             found.coverage.clear();
@@ -1092,7 +1095,6 @@ impl Namespace {
             found.crc32 = None;
             found.fronted = false;
             found.refuted = None;
-            found.own = false;
             found.reached = None;
             self.closing(member, was, false);
         }

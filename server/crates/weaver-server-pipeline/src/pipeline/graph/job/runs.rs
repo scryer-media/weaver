@@ -736,7 +736,10 @@ impl GraphJob {
     // a repair, and the run is retracted and asked again once its node is
     // brought up. The member is the run's when the tree's record said so as
     // it went, which reaches one a replaced map dropped, or says so now: one
-    // the object said again under a map that has its run make it.
+    // the object said again under a map that has its run make it. A
+    // retracted record keeps whose member it was until it is announced
+    // again, so one that was the object's and is not said again is not the
+    // run's now.
     fn invalidate_runs(&mut self) {
         for (node, member, made) in self.writer.take_retracted() {
             if !self.runs.has(node) {
