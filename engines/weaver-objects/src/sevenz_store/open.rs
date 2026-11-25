@@ -191,6 +191,19 @@ impl SevenZipStore {
         );
     }
 
+    // Whether a proof file is still to rule on a candidate: none opened the
+    // folders, a file of the map can prove one, and a candidate it has not
+    // ruled wrong is there to try. A store with nothing that proves a
+    // password, or no candidate left to try, is never proving.
+    pub(super) fn proving(&self) -> bool {
+        self.opened.is_none()
+            && self.proof.is_some()
+            && self
+                .candidates
+                .iter()
+                .any(|candidate| !candidate.folder_wrong)
+    }
+
     // Whether the folders are open under a candidate nothing proved.
     pub(super) fn on_trial(&self) -> bool {
         self.opened.is_some() && !self.proven

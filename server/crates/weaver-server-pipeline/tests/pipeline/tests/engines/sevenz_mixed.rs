@@ -2262,8 +2262,8 @@ mod damaged_as_posted {
     // moves, so the run reads the wrong byte first: under the proven
     // password the run's failure is damage, the repair rebuilds the pack,
     // the run decodes it again, and the wrong candidate queued after the
-    // right one is never offered (`strict`).
-    async fn repaired(mut posts: Vec<Post>, recovery: Vec<Post>, files: &Files, strict: bool) {
+    // right one is never offered.
+    async fn repaired(mut posts: Vec<Post>, recovery: Vec<Post>, files: &Files) {
         let label = format!("{} posts", posts.len());
         let held = (posts.len() + 1) as u32;
         posts.extend(recovery);
@@ -2286,9 +2286,6 @@ mod damaged_as_posted {
             );
         }
         assert_runs_made_only_coded(&spoken);
-        if !strict {
-            return;
-        }
         assert_eq!(
             graph.offered.values().copied().collect::<Vec<_>>(),
             vec![1],
@@ -2308,7 +2305,7 @@ mod damaged_as_posted {
             partial(post(), Sealed::Both, &files, true).await;
         }
         let recovery = par2_set("lantern", &[("lantern.7z", archive.as_slice())], 4);
-        repaired(post(), recovery, &files, strict).await;
+        repaired(post(), recovery, &files).await;
     }
 
     #[tokio::test]
@@ -2330,28 +2327,18 @@ mod damaged_as_posted {
         }
         let written = super::split::parts(&archive, &cuts);
         let recovery = super::split::recovery(&written, 4);
-        repaired(
-            super::split::parts(&posted, &cuts),
-            recovery,
-            &files,
-            strict,
-        )
-        .await;
+        repaired(super::split::parts(&posted, &cuts), recovery, &files).await;
     }
 
-    // The run starts on the coded pack while the store's proof still waits
-    // on its key: it fails under the right candidate before anything proved
-    // it, the job takes that for the key and offers the wrong one, and the
-    // run starts again. The outcome is right; the second offer and run are
-    // not what the ruling asks.
+    // The coded pack is in hand before the store's proof has its key: the
+    // run waits for the proof to rule, so it decodes once, under the
+    // candidate the proof proved, and the wrong one is never offered.
     #[tokio::test]
-    #[ignore = "a run that fails before the store's proof rules is taken for the password"]
     async fn a_coded_pack_wrong_as_posted_under_a_proven_password_never_offers_another() {
         whole(true).await;
     }
 
     #[tokio::test]
-    #[ignore = "a run that fails before the store's proof rules is taken for the password"]
     async fn a_coded_pack_wrong_as_posted_in_parts_under_a_proven_password_never_offers_another() {
         in_parts(true).await;
     }

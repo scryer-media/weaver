@@ -1107,7 +1107,15 @@ impl Engine for SevenZipStore {
         coded::run(self.map.as_deref(), self.password(), proven)
     }
 
+    // A proof still to rule on a candidate holds the run: it declares no
+    // window until the proof has proved the candidate or ruled it wrong, so
+    // the run decodes under a candidate the store has ruled on. The ruling
+    // lands as the store is touched (bytes delivered, or a key the pool
+    // derived taken back), which asks the run again.
     fn reserve(&self) -> Option<u64> {
+        if self.proving() {
+            return None;
+        }
         crate::engine::reserve::<SevenZip>(self.window)
     }
 
