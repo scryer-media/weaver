@@ -15,7 +15,6 @@ mod settle;
 mod stray;
 
 use std::io::Cursor;
-use std::num::NonZeroUsize;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -29,6 +28,7 @@ use super::{RarStore, walk};
 use crate::keys::{CAPACITY, Keys};
 use crate::testing::payload;
 use owner::Owner;
+use writer::unrar;
 use writer::{Item, Options, Version, write};
 
 const PASSWORD: &str = "a-test-passphrase";
@@ -2240,61 +2240,6 @@ fn a_real_rar5_with_encrypted_headers() {
 
 // The writer's archives are what unrar-rs reads: the cross-check that the
 // store and its writer do not share one misreading of the format.
-struct Memory(Vec<Vec<u8>>);
-
-impl unrar_rs::VolumeProvider for Memory {
-    fn get_volume(
-        &self,
-        index: usize,
-    ) -> Result<Box<dyn unrar_rs::ReadSeek>, unrar_rs::VolumeProviderError> {
-        self.0
-            .get(index)
-            .map(|bytes| Box::new(Cursor::new(bytes.clone())) as Box<dyn unrar_rs::ReadSeek>)
-            .ok_or(unrar_rs::VolumeProviderError::Unavailable {
-                volume: index,
-                reason: "no such volume".into(),
-            })
-    }
-}
-
-fn unrar(volumes: &[Vec<u8>], password: Option<&str>) -> Vec<(String, Vec<u8>)> {
-    let mut archive = unrar_rs::RarArchive::open_prefix(
-        Cursor::new(volumes[0].clone()),
-        password,
-        NonZeroUsize::MIN,
-    )
-    .unwrap();
-    archive.set_verify(true);
-    for (volume, bytes) in volumes.iter().enumerate() {
-        let mut headers = NonZeroUsize::MIN;
-        loop {
-            let found = archive
-                .extend_volume_prefix(volume, Box::new(Cursor::new(bytes.clone())), headers)
-                .unwrap();
-            if found < headers.get() {
-                break;
-            }
-            headers = headers.checked_add(1).unwrap();
-        }
-    }
-    let provider = Memory(volumes.to_vec());
-    let mut out = Vec::new();
-    for index in 0..archive.len() {
-        let info = archive.member_info(index).unwrap();
-        if info.is_directory {
-            continue;
-        }
-        let mut bytes = Vec::new();
-        archive
-            .by_index_via(index, &provider)
-            .unwrap()
-            .copy_to(&mut bytes)
-            .unwrap();
-        out.push((info.raw_name, bytes));
-    }
-    out
-}
-
 #[test]
 fn unrar_reads_what_the_writer_writes() {
     let expected: Vec<_> = files()

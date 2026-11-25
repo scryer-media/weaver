@@ -188,20 +188,8 @@ fn members(volumes: &[Vec<u8>], password: Option<&str>) -> Vec<(String, bool)> {
 // packed bytes and how they are coded.
 pub(super) fn lifted(name: &str) -> (Vec<u8>, Vec<u8>, Codec) {
     let bytes = fixture(name);
-    let plain = unrar(std::slice::from_ref(&bytes), None);
-    assert_eq!(plain.len(), 1);
-    let facts = facts(&bytes);
-    let member = &facts.members[0];
-    assert_ne!(member.compression_method, 0);
-    assert!(!facts.is_solid && !member.compression_solid);
-    let at = member.data_offset as usize;
-    let packed = bytes[at..at + member.data_size as usize].to_vec();
-    let codec = Codec {
-        method: member.compression_method,
-        version: member.compression_version,
-        dict: member.dict_size,
-    };
-    (plain[0].1.clone(), packed, codec)
+    let first = facts(&bytes).members[0].name.clone();
+    super::writer::lifted(&bytes, &first)
 }
 
 pub(super) fn packed(version: Version, name: &'static str) -> (Item, Vec<u8>) {

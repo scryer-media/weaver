@@ -11,6 +11,9 @@
 use aws_lc_rs::cipher::{AES_128, AES_256, EncryptingKey, EncryptionContext, UnboundCipherKey};
 use aws_lc_rs::iv::FixedLength;
 
+use std::io::Cursor;
+use std::num::NonZeroUsize;
+
 use crate::grid::crc32;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -379,8 +382,7 @@ impl Rar4<'_> {
         if part.dir {
             flags |= 0xe0;
         }
-        let encrypted =
-            self.options.password.is_some() && kind == 0x74 && !part.dir && !part.clear;
+        let encrypted = self.options.password.is_some() && kind == 0x74 && !part.dir && !part.clear;
         if encrypted {
             flags |= 0x4 | 0x400;
         }
@@ -643,6 +645,96 @@ pub fn write(items: &[Item], options: &Options) -> Vec<Vec<u8>> {
     }
     volumes.finish(false);
     volumes.done
+}
+
+// A set's volumes as unrar reads them: what it opens a member from.
+struct Memory(Vec<Vec<u8>>);
+
+impl unrar_rs::VolumeProvider for Memory {
+    fn get_volume(
+        &self,
+        index: usize,
+    ) -> Result<Box<dyn unrar_rs::ReadSeek>, unrar_rs::VolumeProviderError> {
+        self.0
+            .get(index)
+            .map(|bytes| Box::new(Cursor::new(bytes.clone())) as Box<dyn unrar_rs::ReadSeek>)
+            .ok_or(unrar_rs::VolumeProviderError::Unavailable {
+                volume: index,
+                reason: "no such volume".into(),
+            })
+    }
+}
+
+pub fn unrar(volumes: &[Vec<u8>], password: Option<&str>) -> Vec<(String, Vec<u8>)> {
+    let mut archive = unrar_rs::RarArchive::open_prefix(
+        Cursor::new(volumes[0].clone()),
+        password,
+        NonZeroUsize::MIN,
+    )
+    .unwrap();
+    archive.set_verify(true);
+    for (volume, bytes) in volumes.iter().enumerate() {
+        let mut headers = NonZeroUsize::MIN;
+        loop {
+            let found = archive
+                .extend_volume_prefix(volume, Box::new(Cursor::new(bytes.clone())), headers)
+                .unwrap();
+            if found < headers.get() {
+                break;
+            }
+            headers = headers.checked_add(1).unwrap();
+        }
+    }
+    let provider = Memory(volumes.to_vec());
+    let mut out = Vec::new();
+    for index in 0..archive.len() {
+        let info = archive.member_info(index).unwrap();
+        if info.is_directory {
+            continue;
+        }
+        let mut bytes = Vec::new();
+        archive
+            .by_index_via(index, &provider)
+            .unwrap()
+            .copy_to(&mut bytes)
+            .unwrap();
+        out.push((info.raw_name, bytes));
+    }
+    out
+}
+
+// The compressed member `member` RAR itself wrote in a single-volume
+// fixture: its plain bytes, packed bytes and how they are coded, to write
+// again as an `Item::Packed`.
+pub fn lifted(bytes: &[u8], member: &str) -> (Vec<u8>, Vec<u8>, Codec) {
+    let extracted = unrar(&[bytes.to_vec()], None);
+    let plain = extracted
+        .into_iter()
+        .find(|(name, _)| name == member)
+        .unwrap_or_else(|| panic!("no member {member}"))
+        .1;
+    let facts = unrar_rs::RarArchive::parse_volume_facts_walk_with_shared_kdf_cache(
+        Cursor::new(bytes.to_vec()),
+        None,
+        std::sync::Arc::new(unrar_rs::KdfCache::new()),
+    )
+    .expect("a RAR volume")
+    .facts;
+    assert!(!facts.is_solid);
+    let found = facts
+        .members
+        .iter()
+        .find(|part| part.name == member)
+        .unwrap_or_else(|| panic!("no header {member}"));
+    assert!(found.compression_method != 0 && !found.compression_solid);
+    let at = found.data_offset as usize;
+    let packed = bytes[at..at + found.data_size as usize].to_vec();
+    let codec = Codec {
+        method: found.compression_method,
+        version: found.compression_version,
+        dict: found.dict_size,
+    };
+    (plain, packed, codec)
 }
 
 // MSB-first bits, as both formats' decoders read them.
