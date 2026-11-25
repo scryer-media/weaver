@@ -19,11 +19,13 @@ use weaver_server_core::Database;
 use weaver_server_core::auth::api_keys::AuthApiKeysQueries;
 use weaver_server_core::auth::repository::AuthRepositoryQueries;
 use weaver_server_core::auth::{ApiKeyCache, LoginAuthCache, hash_api_key};
+use weaver_server_core::runtime::log_buffer::LogRingBuffer;
 use weaver_server_core::security::RuntimeSecurityConfig;
 
 use super::catalog::{Catalog, SkillOperationFile};
 use super::server::{self, ResultCap};
 use super::{MCP_MAX_REQUEST_BODY_BYTES, McpState, mcp_handler};
+use crate::http::diagnostics::{DiagnosticsSources, MetricsRender};
 use crate::http::graphql::refusal;
 use crate::http::{RequestAuthContext, SessionToken};
 
@@ -38,6 +40,8 @@ const TOOL_NAMES: &[&str] = &[
     "describe_operation",
     "run_query",
     "run_mutation",
+    "read_diagnostics_section",
+    "search_service_logs",
 ];
 
 const FIXTURE_FILES: &[SkillOperationFile] = &[
@@ -102,11 +106,31 @@ fn db_with_keys() -> Database {
 }
 
 fn router_with(db: Database, security: Arc<RuntimeSecurityConfig>) -> Router {
+    router_with_log(db, security, LogRingBuffer::new(16))
+}
+
+// The diagnostics tools read a data directory that is never created, the
+// given service log, and a fixed exposition.
+fn router_with_log(
+    db: Database,
+    security: Arc<RuntimeSecurityConfig>,
+    log: LogRingBuffer,
+) -> Router {
+    let diagnostics = DiagnosticsSources::fixture(
+        bare_schema(),
+        db.clone(),
+        "/srv/mcp-fixture-data",
+        log,
+        MetricsRender::fixed(
+            "# TYPE weaver_fixture_total counter\nweaver_fixture_total 1\nweaver_other_total 2\n",
+        ),
+    );
     Router::new()
         .route("/mcp", post(mcp_handler))
         .layer(Extension(McpState::with_catalog(
             bare_schema(),
             fixture_catalog(),
+            diagnostics,
         )))
         .layer(Extension(RequestAuthContext {
             db,
@@ -960,4 +984,252 @@ fn a_partial_graphql_result_keeps_its_data_and_error_paths() {
         .push(async_graphql::ServerError::new("fixture failure", None));
     let (content, _) = server::graphql_value(response);
     assert!(content.get("data").is_none(), "{content}");
+}
+
+// A service log of `count` INFO records whose message names the fixture
+// data directory, with one WARN record at `warn_at`.
+fn seeded_log(count: usize, warn_at: usize) -> LogRingBuffer {
+    use std::io::Write as _;
+    let mut log = LogRingBuffer::new(count);
+    for index in 0..count {
+        let level = if index == warn_at { "WARN" } else { "INFO" };
+        writeln!(
+            log,
+            "{{\"timestamp\":\"t\",\"level\":\"{level}\",\"target\":\"weaver\",\"fields\":{{\"message\":\"fixture line {index} at /srv/mcp-fixture-data/incoming\"}}}}"
+        )
+        .expect("write log");
+    }
+    log
+}
+
+#[tokio::test]
+async fn the_diagnostics_tools_refuse_a_key_below_admin() {
+    let router = router();
+    for key in [READ_KEY, CONTROL_KEY] {
+        for (tool, arguments) in [
+            ("read_diagnostics_section", json!({"section": "host"})),
+            ("search_service_logs", json!({})),
+        ] {
+            let body = call(&router, key, tool, arguments).await;
+            let error = tool_error(tool, &body);
+            assert_eq!(error["code"], "FORBIDDEN", "{body}");
+            assert_eq!(error["reason"], refusal::MCP_ADMIN_REQUIRED, "{body}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn read_diagnostics_section_serves_one_sanitized_section() {
+    let router = router();
+    let body = call(
+        &router,
+        ADMIN_KEY,
+        "read_diagnostics_section",
+        json!({"section": "host"}),
+    )
+    .await;
+    let host = success("read_diagnostics_section", &body);
+    assert_eq!(host["section"], "host", "{body}");
+    assert_eq!(host["files"][0]["name"], "host.json", "{body}");
+    assert!(host["files"][0]["value"].is_object(), "{body}");
+    assert!(
+        !body.to_string().contains("/srv/mcp-fixture-data"),
+        "{body}"
+    );
+
+    let body = call(
+        &router,
+        ADMIN_KEY,
+        "read_diagnostics_section",
+        json!({"section": "metrics", "metric_families": ["weaver_fixture"]}),
+    )
+    .await;
+    let metrics = success("read_diagnostics_section", &body);
+    assert_eq!(metrics["returned"], 2, "{body}");
+    assert!(!body.to_string().contains("weaver_other_total"), "{body}");
+}
+
+#[tokio::test]
+async fn read_diagnostics_section_checks_its_arguments() {
+    let router = router();
+    for arguments in [
+        json!({"section": "metrics"}),
+        json!({"section": "host", "metric_families": ["weaver_fixture"]}),
+        json!({"section": "nzb_reports"}),
+        json!({"section": "metrics", "metric_families": []}),
+    ] {
+        let body = call(&router, ADMIN_KEY, "read_diagnostics_section", arguments).await;
+        assert_eq!(
+            protocol_error_reason(&body),
+            refusal::MCP_ARGUMENTS_INVALID,
+            "{body}"
+        );
+        assert!(!body.to_string().contains("nzb_reports"), "{body}");
+    }
+}
+
+// A file past the result budget is withheld with its size, and the result
+// still fits the cap.
+#[tokio::test]
+async fn a_diagnostics_file_past_the_budget_is_withheld_with_its_size() {
+    let router = router();
+    let mut request = rpc_request(
+        Some(ADMIN_KEY),
+        None,
+        call_tool("read_diagnostics_section", json!({"section": "host"})),
+    );
+    request.extensions_mut().insert(ResultCap(400));
+    let (status, _, body) = send(&router, request).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let host = success("read_diagnostics_section", &body);
+    let file = &host["files"][0];
+    assert!(file.get("value").is_none(), "{body}");
+    assert!(
+        file["withheld_for_size_bytes"].as_u64().unwrap() > 300,
+        "{body}"
+    );
+}
+
+#[tokio::test]
+async fn search_service_logs_pages_newest_first_with_sanitized_lines() {
+    let router = router_with_log(
+        db_with_keys(),
+        Arc::new(RuntimeSecurityConfig::default()),
+        seeded_log(5, 1),
+    );
+    let body = call(
+        &router,
+        ADMIN_KEY,
+        "search_service_logs",
+        json!({"max_lines": 3}),
+    )
+    .await;
+    let page = success("search_service_logs", &body);
+    let lines = page["lines"].as_array().expect("lines");
+    assert_eq!(lines.len(), 3, "{body}");
+    assert!(
+        lines[0]["line"]
+            .as_str()
+            .unwrap()
+            .contains("fixture line 4"),
+        "{body}"
+    );
+    assert!(
+        lines[2]["line"]
+            .as_str()
+            .unwrap()
+            .contains("fixture line 2"),
+        "{body}"
+    );
+    assert!(
+        lines[0]["line"]
+            .as_str()
+            .unwrap()
+            .contains("<data>/incoming"),
+        "{body}"
+    );
+    assert!(
+        !body.to_string().contains("/srv/mcp-fixture-data"),
+        "{body}"
+    );
+    assert_eq!(page["stand_in_table_complete"], true, "{body}");
+    let cursor = page["next_cursor"]
+        .as_str()
+        .expect("a next page")
+        .to_string();
+
+    let body = call(
+        &router,
+        ADMIN_KEY,
+        "search_service_logs",
+        json!({"max_lines": 3, "before": cursor}),
+    )
+    .await;
+    let page = success("search_service_logs", &body);
+    let lines = page["lines"].as_array().expect("lines");
+    assert_eq!(lines.len(), 2, "{body}");
+    assert!(
+        lines[1]["line"]
+            .as_str()
+            .unwrap()
+            .contains("fixture line 0"),
+        "{body}"
+    );
+    assert!(page["next_cursor"].is_null(), "{body}");
+
+    let body = call(
+        &router,
+        ADMIN_KEY,
+        "search_service_logs",
+        json!({"level": "WARN"}),
+    )
+    .await;
+    let page = success("search_service_logs", &body);
+    assert_eq!(page["returned"], 1, "{body}");
+    assert!(
+        page["lines"][0]["line"]
+            .as_str()
+            .unwrap()
+            .contains("fixture line 1"),
+        "{body}"
+    );
+
+    let body = call(
+        &router,
+        ADMIN_KEY,
+        "search_service_logs",
+        json!({"pattern": "LINE 3"}),
+    )
+    .await;
+    let page = success("search_service_logs", &body);
+    assert_eq!(page["returned"], 1, "{body}");
+}
+
+#[tokio::test]
+async fn search_service_logs_refuses_a_bad_pattern_as_a_tool_error() {
+    let router = router();
+    let body = call(
+        &router,
+        ADMIN_KEY,
+        "search_service_logs",
+        json!({"pattern": "fixture(unclosed"}),
+    )
+    .await;
+    let error = tool_error("search_service_logs", &body);
+    assert_eq!(error["code"], "BAD_USER_INPUT", "{body}");
+    assert_eq!(error["reason"], refusal::MCP_LOG_PATTERN_INVALID, "{body}");
+    assert!(!body.to_string().contains("unclosed"), "{body}");
+
+    let body = call(
+        &router,
+        ADMIN_KEY,
+        "search_service_logs",
+        json!({"pattern": "a".repeat(257)}),
+    )
+    .await;
+    assert_eq!(
+        protocol_error_reason(&body),
+        refusal::MCP_ARGUMENTS_INVALID,
+        "{body}"
+    );
+}
+
+#[tokio::test]
+async fn a_service_log_page_past_the_cap_is_refused_with_its_sizes() {
+    let router = router_with_log(
+        db_with_keys(),
+        Arc::new(RuntimeSecurityConfig::default()),
+        seeded_log(5, 1),
+    );
+    let mut request = rpc_request(
+        Some(ADMIN_KEY),
+        None,
+        call_tool("search_service_logs", json!({})),
+    );
+    request.extensions_mut().insert(ResultCap(64));
+    let (status, _, body) = send(&router, request).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let error = tool_error("search_service_logs", &body);
+    assert_eq!(error["reason"], refusal::MCP_RESULT_TOO_LARGE, "{body}");
+    assert_eq!(error["max_bytes"], 64, "{body}");
 }

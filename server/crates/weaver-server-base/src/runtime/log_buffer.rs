@@ -82,6 +82,9 @@ pub struct LogRingBuffer {
 struct RingBufferInner {
     lines: VecDeque<String>,
     capacity: usize,
+    // Lines ever stored, so a line keeps one number while newer ones arrive
+    // and older ones roll off: the oldest held line is `stored - lines.len()`.
+    stored: u64,
     // Accumulates partial writes (no trailing newline yet).
     partial: String,
 }
@@ -93,6 +96,7 @@ impl LogRingBuffer {
             inner: Arc::new(Mutex::new(RingBufferInner {
                 lines: VecDeque::with_capacity(capacity),
                 capacity,
+                stored: 0,
                 partial: String::new(),
             })),
             tx,
@@ -115,6 +119,15 @@ impl LogRingBuffer {
             .collect()
     }
 
+    // Every held line, oldest first, and the number of the first one. A
+    // line's number stays the same for as long as it is held, so a reader can
+    // page back from one without the newer lines moving it.
+    pub fn numbered_snapshot(&self) -> (u64, Vec<String>) {
+        let inner = self.inner.lock().unwrap();
+        let first = inner.stored - inner.lines.len() as u64;
+        (first, inner.lines.iter().cloned().collect())
+    }
+
     // Subscribe to live log line broadcasts.
     pub fn subscribe(&self) -> broadcast::Receiver<String> {
         self.tx.subscribe()
@@ -135,6 +148,7 @@ impl Write for LogRingBuffer {
                         inner.lines.pop_front();
                     }
                     inner.lines.push_back(line.clone());
+                    inner.stored += 1;
                     new_lines.push(line);
                 }
             } else {
@@ -337,5 +351,21 @@ mod text_line_tests {
         buffer.write_all(b"{\"a\":1}\n{\"b\":").unwrap();
         buffer.write_all(b"2}\n{\"c\":3}\n").unwrap();
         assert_eq!(buffer.snapshot(10), ["{\"b\":2}", "{\"c\":3}"]);
+    }
+
+    #[test]
+    fn a_held_line_keeps_its_number_as_newer_ones_arrive() {
+        let mut buffer = LogRingBuffer::new(2);
+        assert_eq!(buffer.numbered_snapshot(), (0, Vec::new()));
+        buffer.write_all(b"one\ntwo\n").unwrap();
+        assert_eq!(
+            buffer.numbered_snapshot(),
+            (0, vec!["one".into(), "two".into()])
+        );
+        buffer.write_all(b"three\n").unwrap();
+        assert_eq!(
+            buffer.numbered_snapshot(),
+            (1, vec!["two".into(), "three".into()])
+        );
     }
 }

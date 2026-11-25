@@ -88,6 +88,9 @@ pub struct ServerRuntime {
     // Per-route HTTP request counters and latency, written by the
     // `request_metrics` middleware and read by the exporter.
     pub(crate) http_metrics: HttpMetricsHandle,
+    // The in-memory service log the schema serves, which the MCP log search
+    // reads with each line's number.
+    pub log_buffer: weaver_server_core::runtime::log_buffer::LogRingBuffer,
 }
 
 impl ServerRuntime {

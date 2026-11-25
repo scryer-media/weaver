@@ -378,6 +378,11 @@ pub(super) mod refusal {
     pub(in crate::http) const MCP_SKILL_UNKNOWN: &str = "MCP_SKILL_UNKNOWN";
     // The served schema could not be read.
     pub(in crate::http) const MCP_SCHEMA_UNREADABLE: &str = "MCP_SCHEMA_UNREADABLE";
+    // A diagnostics tool called with a scope below ADMIN.
+    pub(in crate::http) const MCP_ADMIN_REQUIRED: &str = "MCP_ADMIN_REQUIRED";
+    // A log search pattern that is too long, not a regular expression, or
+    // too large once compiled.
+    pub(in crate::http) const MCP_LOG_PATTERN_INVALID: &str = "MCP_LOG_PATTERN_INVALID";
 
     #[cfg(test)]
     pub(in crate::http) const ALL: &[&str] = &[
@@ -402,6 +407,8 @@ pub(super) mod refusal {
         MCP_OPERATION_AMBIGUOUS,
         MCP_SKILL_UNKNOWN,
         MCP_SCHEMA_UNREADABLE,
+        MCP_ADMIN_REQUIRED,
+        MCP_LOG_PATTERN_INVALID,
     ];
 }
 

@@ -10,12 +10,15 @@
 // refused without being echoed.
 
 mod describe_operation;
+mod diagnostics_section;
 mod list_operations;
 mod run_operation;
+mod service_logs;
 mod whoami;
 
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, LazyLock};
 
 use axum::http::HeaderMap;
@@ -30,6 +33,7 @@ use super::McpCaller;
 use super::catalog::Catalog;
 use super::confirm::Confirmations;
 use super::server::json_error;
+use crate::http::diagnostics::DiagnosticsSources;
 use crate::http::graphql::refusal;
 
 // Serialized bytes a `run_query` or `run_mutation` result may hold.
@@ -48,6 +52,10 @@ pub(crate) struct ToolContext {
     pub result_max_bytes: usize,
     // Pending mutation confirmations, shared by every request.
     pub confirmations: Arc<Confirmations>,
+    // What the diagnostics package reads.
+    pub diagnostics: Arc<DiagnosticsSources>,
+    // Raised when the client goes away; blocking work checks it.
+    pub cancelled: Arc<AtomicBool>,
 }
 
 pub(super) type ToolFuture =
@@ -68,6 +76,8 @@ pub(crate) static TOOLS: LazyLock<Vec<ToolEntry>> = LazyLock::new(|| {
         describe_operation::entry(),
         run_operation::query_entry(),
         run_operation::mutation_entry(),
+        diagnostics_section::entry(),
+        service_logs::entry(),
     ]
 });
 
@@ -141,6 +151,49 @@ impl Arguments {
         }
     }
 
+    pub(super) fn int(
+        &self,
+        name: &'static str,
+        min: i64,
+        max: i64,
+    ) -> Result<Option<i64>, ErrorData> {
+        match self.0.get(name) {
+            None => Ok(None),
+            Some(value) => match value.as_i64() {
+                Some(number) if (min..=max).contains(&number) => Ok(Some(number)),
+                Some(_) => Err(invalid_argument(name, "is out of range")),
+                None => Err(invalid_argument(name, "must be an integer")),
+            },
+        }
+    }
+
+    // A list of at most `max_items` strings, each at most `max_chars`.
+    pub(super) fn str_list(
+        &self,
+        name: &'static str,
+        max_items: usize,
+        max_chars: usize,
+    ) -> Result<Option<Vec<String>>, ErrorData> {
+        let Some(value) = self.0.get(name) else {
+            return Ok(None);
+        };
+        let Some(items) = value.as_array() else {
+            return Err(invalid_argument(name, "must be a list of strings"));
+        };
+        if items.is_empty() || items.len() > max_items {
+            return Err(invalid_argument(name, "has too few or too many items"));
+        }
+        items
+            .iter()
+            .map(|item| match item.as_str() {
+                Some(text) if text.chars().count() <= max_chars => Ok(text.to_string()),
+                Some(_) => Err(invalid_argument(name, "has an item that is too long")),
+                None => Err(invalid_argument(name, "must be a list of strings")),
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .map(Some)
+    }
+
     // The named argument, taken out unchanged.
     pub(super) fn take(&mut self, name: &str) -> Option<Value> {
         self.0.remove(name)
@@ -170,6 +223,36 @@ pub(super) async fn execute(
             headers: context.headers.clone(),
         });
     context.schema.execute(request).await
+}
+
+// `value` as a result when its serialized text fits `max_bytes`; otherwise
+// the coded error the run tools give, with both sizes, never a cut result.
+pub(super) fn capped_result(value: &Value, max_bytes: usize) -> CallToolResult {
+    let text = value.to_string();
+    if text.len() <= max_bytes {
+        return super::server::text_result(text, false);
+    }
+    let mut facts = Map::new();
+    facts.insert("result_bytes".into(), json!(text.len()));
+    facts.insert("max_bytes".into(), json!(max_bytes));
+    coded_error_with(
+        "PAYLOAD_TOO_LARGE",
+        refusal::MCP_RESULT_TOO_LARGE,
+        "The result is too large; narrow it.",
+        facts,
+    )
+}
+
+// The diagnostics tools' scope rule, as the package's: Admin only. A lower
+// scope gets the refusal as a tool error.
+pub(super) fn admit_diagnostics(context: &ToolContext) -> Option<CallToolResult> {
+    (!context.caller.scope.is_admin()).then(|| {
+        coded_error(
+            "FORBIDDEN",
+            refusal::MCP_ADMIN_REQUIRED,
+            "Diagnostics need an API key with the ADMIN scope.",
+        )
+    })
 }
 
 // A tool error built here: a code, a reason, a short message and any facts

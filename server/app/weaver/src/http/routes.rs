@@ -126,6 +126,7 @@ pub(super) fn build_router(runtime: super::ServerRuntime) -> Router {
         restart,
         torrents,
         torrent_availability,
+        log_buffer,
     } = runtime;
     let base_url_ext = super::assets::BaseUrl(Arc::new(base_url.clone()));
     let session_token = super::SessionToken(Arc::new(generate_api_key()));
@@ -200,6 +201,25 @@ pub(super) fn build_router(runtime: super::ServerRuntime) -> Router {
         (!base_url.is_empty()).then(|| build_script_callback_routes(nzbget_context.clone()));
     let nzbget_rpc_routes = build_nzbget_rpc_routes(nzbget_context);
 
+    // The MCP endpoint's diagnostics tools read what the diagnostics package
+    // reads, through the same collectors and sanitizer.
+    let mcp_state = super::mcp::McpState::new(
+        schema.clone(),
+        super::diagnostics::DiagnosticsSources {
+            schema: schema.clone(),
+            handle: handle.clone(),
+            config: config.clone(),
+            db: db.clone(),
+            disk_space: Some(Arc::clone(&disk_space)),
+            log_buffer,
+            metrics: super::diagnostics::MetricsRender::exporter(
+                metrics_exporter.clone(),
+                Arc::clone(&disk_space),
+                http_metrics.clone(),
+            ),
+        },
+    );
+
     let inner = Router::new()
         .route("/metrics", get(super::metrics::metrics_handler))
         // Probes live on the same router as everything else, so they inherit
@@ -250,7 +270,7 @@ pub(super) fn build_router(runtime: super::ServerRuntime) -> Router {
         .layer(middleware::from_fn(super::auth::enforce_browser_csrf))
         .layer(Extension(handle))
         .layer(Extension(pipeline_state))
-        .layer(Extension(super::mcp::McpState::new(schema.clone())))
+        .layer(Extension(mcp_state))
         .layer(Extension(schema))
         .layer(Extension(backup))
         .layer(Extension(db))

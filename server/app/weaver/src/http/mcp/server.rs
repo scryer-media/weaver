@@ -5,6 +5,7 @@
 // admission and the mapping of GraphQL responses to tool results.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use async_graphql::Response as GraphQLResponse;
 use rmcp::model::{
@@ -21,6 +22,7 @@ use super::McpCaller;
 use super::catalog::Catalog;
 use super::confirm::Confirmations;
 use super::tools::{self, ToolContext};
+use crate::http::diagnostics::DiagnosticsSources;
 use crate::http::graphql::refusal;
 
 const INSTRUCTIONS: &str = "Calls act with the API key's scope (READ, CONTROL or ADMIN). \
@@ -34,6 +36,7 @@ pub(crate) struct WeaverMcpServer {
     schema: WeaverSchema,
     catalog: &'static Catalog,
     confirmations: Arc<Confirmations>,
+    diagnostics: Arc<DiagnosticsSources>,
 }
 
 impl WeaverMcpServer {
@@ -41,11 +44,13 @@ impl WeaverMcpServer {
         schema: WeaverSchema,
         catalog: &'static Catalog,
         confirmations: Arc<Confirmations>,
+        diagnostics: Arc<DiagnosticsSources>,
     ) -> Self {
         Self {
             schema,
             catalog,
             confirmations,
+            diagnostics,
         }
     }
 }
@@ -114,17 +119,21 @@ impl ServerHandler for WeaverMcpServer {
             catalog: self.catalog,
             result_max_bytes,
             confirmations: self.confirmations.clone(),
+            diagnostics: self.diagnostics.clone(),
+            cancelled: Arc::new(AtomicBool::new(false)),
         };
+        let cancelled = tool_context.cancelled.clone();
         // A client that goes away cancels the request. The tool's future is
-        // dropped at its next await, which ends its GraphQL execution. The
-        // one-time schema index build, handed to `spawn_blocking`, runs to
-        // completion and is kept for the next call.
+        // dropped at its next await, which ends its GraphQL execution, and the
+        // flag stops blocking work that checks it, such as the log search.
+        // The one-time schema index build, handed to `spawn_blocking`, runs
+        // to completion and is kept for the next call.
         tokio::select! {
             result = (entry.run)(tool_context, arguments) => result.map(Into::into),
-            () = context.ct.cancelled() => Err(ErrorData::internal_error(
-                "the request was cancelled",
-                None,
-            )),
+            () = context.ct.cancelled() => {
+                cancelled.store(true, Ordering::Release);
+                Err(ErrorData::internal_error("the request was cancelled", None))
+            }
         }
     }
 }

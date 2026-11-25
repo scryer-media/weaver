@@ -415,6 +415,36 @@ pub(super) fn shell_of(component: &Component) -> Component {
     }
 }
 
+// The package's pass for one log line at a time: the table a package with no
+// field-carrying members builds, applied to a line as the pass applies it to
+// each line of `service-log.txt`, guard included.
+pub(super) struct LineSanitizer(StandIns);
+
+impl LineSanitizer {
+    // Fails only when the table cannot be built. Blocking: run it off the
+    // async runtime.
+    pub(super) fn build(
+        local: &LocalNames,
+        stored: &StoredNames,
+        schema_keys: HashSet<String>,
+        guard: Option<Guard>,
+    ) -> Result<Self, String> {
+        let mut table = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            StandIns::build(&[], local, stored)
+        }))
+        .unwrap_or_else(|_| Err("the stand-in table could not be built".to_string()))?;
+        table.schema_keys = schema_keys;
+        table.guard = guard;
+        Ok(Self(table))
+    }
+
+    // One line, without its line ending, as the package would write it.
+    pub(super) fn line(&self, line: &str) -> String {
+        let line = line.trim_end_matches(['\r', '\n']);
+        String::from_utf8_lossy(&self.0.sanitize_text(line.as_bytes())).into_owned()
+    }
+}
+
 // Drops everything before the first whole line of a text that was cut at an
 // arbitrary byte, so no name survives as a fragment the table cannot match.
 pub(super) fn from_first_line(text: &mut Vec<u8>) {

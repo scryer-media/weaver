@@ -44,6 +44,7 @@ use weaver_server_api::WeaverSchema;
 use weaver_server_api::auth::CallerIdentity;
 use weaver_server_core::auth::CallerScope;
 
+use super::diagnostics::DiagnosticsSources;
 use super::graphql::refusal;
 use catalog::Catalog;
 use server::WeaverMcpServer;
@@ -66,13 +67,18 @@ pub(crate) struct McpState {
 }
 
 impl McpState {
-    pub(crate) fn new(schema: WeaverSchema) -> Self {
+    pub(crate) fn new(schema: WeaverSchema, diagnostics: DiagnosticsSources) -> Self {
         // The catalog is parsed once, here at start-up, not on a request.
-        Self::with_catalog(schema, &catalog::CATALOG)
+        Self::with_catalog(schema, &catalog::CATALOG, diagnostics)
     }
 
-    pub(crate) fn with_catalog(schema: WeaverSchema, catalog: &'static Catalog) -> Self {
+    pub(crate) fn with_catalog(
+        schema: WeaverSchema,
+        catalog: &'static Catalog,
+        diagnostics: DiagnosticsSources,
+    ) -> Self {
         let confirmations = Arc::new(confirm::Confirmations::default());
+        let diagnostics = Arc::new(diagnostics);
         // Stateless mode answers every request, `initialize` included, on its
         // own; nothing is kept between requests. Host checks are off; see the
         // module notes for why that is safe only while every caller is an
@@ -89,6 +95,7 @@ impl McpState {
                     schema.clone(),
                     catalog,
                     confirmations.clone(),
+                    diagnostics.clone(),
                 ))
             },
             Arc::new(NeverSessionManager::default()),
