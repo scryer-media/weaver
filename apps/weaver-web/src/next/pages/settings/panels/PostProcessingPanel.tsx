@@ -1,9 +1,21 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
-import { useLayoutEffect, useMemo, useRef, useState, type KeyboardEvent, type MouseEvent } from "react";
+import {
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+  type KeyboardEvent,
+  type MouseEvent,
+} from "react";
 import { useMutation, useQuery, type CombinedError } from "urql";
-import { eventScriptDefaults, eventScriptOptions, eventScriptSection, type EventScriptOptions } from "@/next/components/EventScriptSettings";
+import {
+  eventScriptDefaults,
+  eventScriptOptions,
+  eventScriptSection,
+  type EventScriptOptions,
+} from "@/next/components/EventScriptSettings";
 import {
   DELETE_SCRIPT_INSTANCE_MUTATION,
   DISCOVERED_SCRIPTS_QUERY,
@@ -47,7 +59,10 @@ import {
   type SettingsBlock,
   type SettingsTableRowModel,
 } from "../framework";
-import { ScriptInstanceEditor, type InstanceEditorTarget } from "./ScriptInstanceEditor";
+import {
+  ScriptInstanceEditor,
+  type InstanceEditorTarget,
+} from "./ScriptInstanceEditor";
 import { ScriptTestDialog } from "./ScriptTestDialog";
 import { jobIds } from "@/next/testids";
 
@@ -113,11 +128,15 @@ function errorText(error: CombinedError): string {
 /** What applies to every script: whether and how they run, and where they are read from. */
 export function ScriptConfigurationPanel() {
   const t = useTranslate();
-  const [{ data, fetching }, reexecute] = useQuery<{ postProcessingSettings: PostProcessingSettings }>({
+  const [{ data, fetching }, reexecute] = useQuery<{
+    postProcessingSettings: PostProcessingSettings;
+  }>({
     query: POST_PROCESSING_SETTINGS_QUERY,
     requestPolicy: "cache-and-network",
   });
-  const [saveState, saveSettings] = useMutation(SET_POST_PROCESSING_SETTINGS_MUTATION);
+  const [saveState, saveSettings] = useMutation(
+    SET_POST_PROCESSING_SETTINGS_MUTATION,
+  );
   const [directoryState, saveDirectory] = useMutation(
     SET_POST_PROCESSING_SCRIPT_DIRECTORY_MUTATION,
   );
@@ -170,8 +189,14 @@ export function ScriptConfigurationPanel() {
           ...eventScriptOptions(values),
           executionEnabled: values.executionEnabled,
           globalScriptsRun: values.globalScriptsRun,
-          concurrency: Math.min(CONCURRENCY_MAX, Math.max(1, Math.round(values.concurrency || 1))),
-          terminationGraceSeconds: Math.max(0, Math.round(values.terminationGraceSeconds || 0)),
+          concurrency: Math.min(
+            CONCURRENCY_MAX,
+            Math.max(1, Math.round(values.concurrency || 1)),
+          ),
+          terminationGraceSeconds: Math.max(
+            0,
+            Math.round(values.terminationGraceSeconds || 0),
+          ),
           pythonInterpreter: values.pythonInterpreter.trim() || null,
           powershellInterpreter: values.powershellInterpreter.trim() || null,
           batchInterpreter: values.batchInterpreter.trim() || null,
@@ -210,7 +235,9 @@ export function ScriptConfigurationPanel() {
       kind: "section",
       id: "execution",
       title: t("next.postProcessing.execution"),
-      note: settings?.strictSecurityRefusesExecution ? t("next.postProcessing.strictOn") : undefined,
+      note: settings?.strictSecurityRefusesExecution
+        ? t("next.postProcessing.strictOn")
+        : undefined,
       fields: [
         {
           id: "executionEnabled",
@@ -237,7 +264,8 @@ export function ScriptConfigurationPanel() {
                 label: t("next.postProcessing.globalOnlyWithout"),
               },
             ],
-            onChange: (next) => patch({ globalScriptsRun: next as GlobalScriptsRun }),
+            onChange: (next) =>
+              patch({ globalScriptsRun: next as GlobalScriptsRun }),
           },
         },
         {
@@ -333,7 +361,10 @@ export function ScriptConfigurationPanel() {
           control: {
             kind: "custom",
             control: (
-              <div data-testid={jobIds.scriptDirectory} className="flex min-w-0 flex-wrap items-center gap-3">
+              <div
+                data-testid={jobIds.scriptDirectory}
+                className="flex min-w-0 flex-wrap items-center gap-3"
+              >
                 <PathField
                   label={t("next.postProcessing.directory")}
                   value={scriptDirectory}
@@ -343,8 +374,8 @@ export function ScriptConfigurationPanel() {
                 <SecondaryButton
                   icon="changeFolder"
                   disabled={
-                    directoryState.fetching
-                    || scriptDirectory.trim() === (settings?.scriptDirectory ?? "")
+                    directoryState.fetching ||
+                    scriptDirectory.trim() === (settings?.scriptDirectory ?? "")
                   }
                   onClick={() => setConfirmDirectory(true)}
                 >
@@ -379,7 +410,10 @@ export function ScriptConfigurationPanel() {
 /* ------------------------------------------------------------------ scripts */
 
 interface InstancesData {
-  postProcessingSettings: { scriptDirectory: string; globalScriptsRun: GlobalScriptsRun };
+  postProcessingSettings: {
+    scriptDirectory: string;
+    globalScriptsRun: GlobalScriptsRun;
+  };
   scriptInstances: ScriptInstance[];
   categories: { id: number; name: string }[];
 }
@@ -415,7 +449,13 @@ function RowAction({
   testId?: string;
 }) {
   return (
-    <SecondaryButton className="h-7 px-2" title={title} disabled={disabled} onClick={onClick} testId={testId}>
+    <SecondaryButton
+      className="h-7 px-2"
+      title={title}
+      disabled={disabled}
+      onClick={onClick}
+      testId={testId}
+    >
       <Icon name={icon} size={13} />
     </SecondaryButton>
   );
@@ -427,28 +467,33 @@ function RowAction({
  */
 export function ScriptListPanel() {
   const t = useTranslate();
-  const [{ data, fetching, error: instancesError }, reloadInstances] = useQuery<InstancesData>({
-    query: SCRIPT_INSTANCES_QUERY,
-    requestPolicy: "cache-and-network",
-  });
-  const [{ data: discovered, error: scriptsError }, reloadScripts] = useQuery<DiscoveredData>({
-    query: DISCOVERED_SCRIPTS_QUERY,
-    requestPolicy: "cache-and-network",
-  });
+  const [{ data, fetching, error: instancesError }, reloadInstances] =
+    useQuery<InstancesData>({
+      query: SCRIPT_INSTANCES_QUERY,
+      requestPolicy: "cache-and-network",
+    });
+  const [{ data: discovered, error: scriptsError }, reloadScripts] =
+    useQuery<DiscoveredData>({
+      query: DISCOVERED_SCRIPTS_QUERY,
+      requestPolicy: "cache-and-network",
+    });
   const [, updateInstance] = useMutation(UPDATE_SCRIPT_INSTANCE_MUTATION);
   const [, deleteInstance] = useMutation(DELETE_SCRIPT_INSTANCE_MUTATION);
-  const [, reorderInstances] = useMutation<{ reorderScriptInstances: ScriptInstance[] }>(
-    REORDER_SCRIPT_INSTANCES_MUTATION,
-  );
-  const [, setUpFromHeader] = useMutation<{ setUpScriptFromHeader: ScriptInstance[] }>(
-    SET_UP_SCRIPT_FROM_HEADER_MUTATION,
-  );
+  const [, reorderInstances] = useMutation<{
+    reorderScriptInstances: ScriptInstance[];
+  }>(REORDER_SCRIPT_INSTANCES_MUTATION);
+  const [, setUpFromHeader] = useMutation<{
+    setUpScriptFromHeader: ScriptInstance[];
+  }>(SET_UP_SCRIPT_FROM_HEADER_MUTATION);
   const [, reapplyHeader] = useMutation(REAPPLY_SCRIPT_HEADER_MUTATION);
 
   const [status, setStatus] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [working, setWorking] = useState(false);
-  const [editor, setEditor] = useState<{ key: number; target: InstanceEditorTarget } | null>(null);
+  const [editor, setEditor] = useState<{
+    key: number;
+    target: InstanceEditorTarget;
+  } | null>(null);
   const [confirm, setConfirm] = useState<PendingConfirm | null>(null);
   const [confirmError, setConfirmError] = useState<string | null>(null);
   const [confirmBusy, setConfirmBusy] = useState(false);
@@ -456,9 +501,10 @@ export function ScriptListPanel() {
   // The order the daemon answered a reorder with stands in until the list is
   // read again, so a second move builds on the first rather than on the order
   // last fetched.
-  const [reordered, setReordered] = useState<{ base: ScriptInstance[] | undefined; value: ScriptInstance[] } | null>(
-    null,
-  );
+  const [reordered, setReordered] = useState<{
+    base: ScriptInstance[] | undefined;
+    value: ScriptInstance[];
+  } | null>(null);
 
   const fetched = data?.scriptInstances;
   // The list as last read, for an answer that lands after a newer read than the one it was asked under.
@@ -466,11 +512,17 @@ export function ScriptListPanel() {
   useLayoutEffect(() => {
     fetchedRef.current = fetched;
   }, [fetched]);
-  const instances = reordered && reordered.base === fetched ? reordered.value : (fetched ?? NO_INSTANCES);
+  const instances =
+    reordered && reordered.base === fetched
+      ? reordered.value
+      : (fetched ?? NO_INSTANCES);
   const scripts = discovered?.discoveredScripts.scripts ?? NO_SCRIPTS;
   const problems = discovered?.discoveredScripts.problems ?? [];
   const categories = useMemo(
-    () => (data?.categories ?? []).map((category) => category.name).sort((left, right) => left.localeCompare(right)),
+    () =>
+      (data?.categories ?? [])
+        .map((category) => category.name)
+        .sort((left, right) => left.localeCompare(right)),
     [data?.categories],
   );
   const groups = useMemo(() => groupInstances(instances), [instances]);
@@ -479,7 +531,8 @@ export function ScriptListPanel() {
   const shownError = error ?? (queryError ? errorText(queryError) : null);
   usePanelStatus(shownError ?? status, shownError !== null);
 
-  const refetchInstances = () => void reloadInstances({ requestPolicy: "network-only" });
+  const refetchInstances = () =>
+    void reloadInstances({ requestPolicy: "network-only" });
 
   const openEditor = (target: InstanceEditorTarget) => {
     setError(null);
@@ -489,7 +542,10 @@ export function ScriptListPanel() {
 
   const toggle = async (instance: ScriptInstance, enabled: boolean) => {
     setStatus(null);
-    const result = await updateInstance({ id: instance.id, input: inputFromInstance(instance, { enabled }) });
+    const result = await updateInstance({
+      id: instance.id,
+      input: inputFromInstance(instance, { enabled }),
+    });
     setError(result.error ? errorText(result.error) : null);
     refetchInstances();
   };
@@ -508,7 +564,10 @@ export function ScriptListPanel() {
     } else {
       setError(null);
       if (result.data) {
-        setReordered({ base: fetchedRef.current, value: result.data.reorderScriptInstances });
+        setReordered({
+          base: fetchedRef.current,
+          value: result.data.reorderScriptInstances,
+        });
       }
     }
     refetchInstances();
@@ -525,9 +584,14 @@ export function ScriptListPanel() {
       return errorText(result.error);
     }
     setStatus(
-      countLabel(t, "next.postProcessing.setUpDone", result.data?.setUpScriptFromHeader.length ?? 0, {
-        name: script.displayName,
-      }),
+      countLabel(
+        t,
+        "next.postProcessing.setUpDone",
+        result.data?.setUpScriptFromHeader.length ?? 0,
+        {
+          name: script.displayName,
+        },
+      ),
     );
     refetchInstances();
     return null;
@@ -554,9 +618,14 @@ export function ScriptListPanel() {
     }
     setError(null);
     setStatus(
-      t(confirm.kind === "delete" ? "next.postProcessing.instanceDeleted" : "next.postProcessing.reapplied", {
-        name: confirm.instance.name,
-      }),
+      t(
+        confirm.kind === "delete"
+          ? "next.postProcessing.instanceDeleted"
+          : "next.postProcessing.reapplied",
+        {
+          name: confirm.instance.name,
+        },
+      ),
     );
     setConfirm(null);
     setEditor(null);
@@ -569,7 +638,11 @@ export function ScriptListPanel() {
     onKeyDown: (event: KeyboardEvent) => event.stopPropagation(),
   };
 
-  const instanceRow = (group: InstanceGroup, instance: ScriptInstance, index: number): SettingsTableRowModel => {
+  const instanceRow = (
+    group: InstanceGroup,
+    instance: ScriptInstance,
+    index: number,
+  ): SettingsTableRowModel => {
     const scoped = categoryScoped(instance.trigger);
     const everyCategory = t("next.postProcessing.everyCategory");
     const categoryText = instance.categories.join(", ");
@@ -579,13 +652,26 @@ export function ScriptListPanel() {
       cells: [
         <div key="name" className="flex min-w-0 flex-col gap-1">
           <span className="flex min-w-0 items-center gap-[10px]">
-            <Square color={instance.scriptProblem ? WV.error : instance.enabled ? WV.accent : WV.inert} />
-            <span className="min-w-0 truncate text-[13px]" title={instance.name}>
+            <Square
+              color={
+                instance.scriptProblem
+                  ? WV.error
+                  : instance.enabled
+                    ? WV.accent
+                    : WV.inert
+              }
+            />
+            <span
+              className="min-w-0 truncate text-[13px]"
+              title={instance.name}
+            >
               {instance.name}
             </span>
           </span>
           {instance.scriptProblem ? (
-            <span className="pl-[17px] text-[11.5px] leading-[1.4] text-wv-error-text">{instance.scriptProblem}</span>
+            <span className="pl-[17px] text-[11.5px] leading-[1.4] text-wv-error-text">
+              {instance.scriptProblem}
+            </span>
           ) : null}
           {instance.headerDrift ? (
             <span className="pl-[17px] text-[11.5px] leading-[1.4] text-wv-warn">
@@ -593,13 +679,22 @@ export function ScriptListPanel() {
             </span>
           ) : null}
         </div>,
-        <Cell key="script" mono className="text-wv-secondary" title={instance.script}>
+        <Cell
+          key="script"
+          mono
+          className="text-wv-secondary"
+          title={instance.script}
+        >
           {instance.script}
         </Cell>,
         scoped ? (
           <Cell
             key="categories"
-            className={instance.categories.length > 0 ? "text-[12.5px] text-wv-secondary" : "text-[12.5px] text-wv-muted"}
+            className={
+              instance.categories.length > 0
+                ? "text-[12.5px] text-wv-secondary"
+                : "text-[12.5px] text-wv-muted"
+            }
             title={categoryText || everyCategory}
           >
             {categoryText || everyCategory}
@@ -610,7 +705,11 @@ export function ScriptListPanel() {
           </Cell>
         ),
         <Cell key="runMode" className="text-[12.5px] text-wv-secondary">
-          {t(instance.blocking ? "next.postProcessing.blocking" : "next.postProcessing.fireAndForget")}
+          {t(
+            instance.blocking
+              ? "next.postProcessing.blocking"
+              : "next.postProcessing.fireAndForget",
+          )}
         </Cell>,
         <Cell key="timeout" mono className="text-wv-muted">
           {instance.timeoutSeconds === null
@@ -626,7 +725,11 @@ export function ScriptListPanel() {
             onChange={(next) => void toggle(instance, next)}
           />
         </span>,
-        <span key="actions" className="ml-auto flex items-center gap-1" {...own}>
+        <span
+          key="actions"
+          className="ml-auto flex items-center gap-1"
+          {...own}
+        >
           {instance.headerDrift ? (
             <RowAction
               icon="reset"
@@ -671,7 +774,9 @@ export function ScriptListPanel() {
   };
 
   const groupNote = (group: InstanceGroup): string | undefined =>
-    group.trigger === "FEED" ? t("next.postProcessing.feedGroupNote") : undefined;
+    group.trigger === "FEED"
+      ? t("next.postProcessing.feedGroupNote")
+      : undefined;
 
   const blocks: SettingsBlock[] = [
     {
@@ -680,11 +785,13 @@ export function ScriptListPanel() {
       title: t("next.postProcessing.instances"),
       // Which of the two holds is a setting, so the note says the one in force.
       note: t(
-        data?.postProcessingSettings.globalScriptsRun === "ONLY_WITHOUT_CATEGORY_SCRIPTS"
+        data?.postProcessingSettings.globalScriptsRun ===
+          "ONLY_WITHOUT_CATEGORY_SCRIPTS"
           ? "next.postProcessing.instancesNoteOnlyWithout"
           : "next.postProcessing.instancesNote",
       ),
-      columns: "minmax(150px, 1.3fr) minmax(100px, 1fr) minmax(84px, 0.9fr) 136px 76px 72px 172px",
+      columns:
+        "minmax(150px, 1.3fr) minmax(100px, 1fr) minmax(84px, 0.9fr) 136px 76px 72px 172px",
       headers: [
         t("next.postProcessing.instanceName"),
         t("next.postProcessing.script"),
@@ -695,7 +802,10 @@ export function ScriptListPanel() {
         "",
       ],
       empty: t("next.postProcessing.noInstances"),
-      add: { label: t("next.postProcessing.createInstance"), onClick: () => openEditor({ mode: "new" }) },
+      add: {
+        label: t("next.postProcessing.createInstance"),
+        onClick: () => openEditor({ mode: "new" }),
+      },
       onRowClick: (id) => {
         const instance = instances.find((entry) => `i:${entry.id}` === id);
         if (instance) {
@@ -707,7 +817,9 @@ export function ScriptListPanel() {
         id: group.id,
         title: triggerTitle(t, group.trigger, group.queueEvent),
         note: groupNote(group),
-        rows: group.instances.map((instance, index) => instanceRow(group, instance, index)),
+        rows: group.instances.map((instance, index) =>
+          instanceRow(group, instance, index),
+        ),
       })),
     },
   ];
@@ -716,7 +828,10 @@ export function ScriptListPanel() {
     <>
       {text}
       {confirmError ? (
-        <span role="alert" className="mt-3 block text-[12.5px] text-wv-error-text">
+        <span
+          role="alert"
+          className="mt-3 block text-[12.5px] text-wv-error-text"
+        >
           {confirmError}
         </span>
       ) : null}
@@ -791,7 +906,11 @@ export function ScriptListPanel() {
       />
 
       {testing ? (
-        <ScriptTestDialog key={testing.id} instance={testing} onClose={() => setTesting(null)} />
+        <ScriptTestDialog
+          key={testing.id}
+          instance={testing}
+          onClose={() => setTesting(null)}
+        />
       ) : null}
     </>
   );

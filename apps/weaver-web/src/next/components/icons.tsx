@@ -204,7 +204,22 @@ export type IconName = keyof typeof ICONS;
 /** One stroke weight everywhere; the size is the only thing a context picks. */
 export const ICON_STROKE = 1.75;
 
-export function Icon({ name, size = 14, className }: { name: IconName; size?: number; className?: string }) {
+export function Icon({
+  name,
+  size = 14,
+  className,
+}: {
+  name: IconName;
+  size?: number;
+  className?: string;
+}) {
   const Glyph = ICONS[name];
-  return <Glyph aria-hidden="true" size={size} strokeWidth={ICON_STROKE} className={className} />;
+  return (
+    <Glyph
+      aria-hidden="true"
+      size={size}
+      strokeWidth={ICON_STROKE}
+      className={className}
+    />
+  );
 }

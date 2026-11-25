@@ -17,7 +17,12 @@ import {
 } from "@/graphql/queries";
 import { useGraphqlConnectionState } from "@/graphql/client";
 import { useReconnectPolling } from "@/lib/hooks/use-reconnect-polling";
-import { normalizeJobData, type GraphqlJobData, type JobData, type JobProtocol } from "@/lib/job-types";
+import {
+  normalizeJobData,
+  type GraphqlJobData,
+  type JobData,
+  type JobProtocol,
+} from "@/lib/job-types";
 import type { QueuePageInput, QueueStateCount } from "./queue-page";
 
 /**
@@ -87,7 +92,10 @@ function useLiveRead<Data, Variables extends AnyVariables>(
   const connection = useGraphqlConnectionState();
   const disconnected = connection.status === "disconnected";
   const key = useMemo(() => stringifyVariables(variables), [variables]);
-  const tag = useCallback((_previous: unknown, data: Data) => ({ data, key }), [key]);
+  const tag = useCallback(
+    (_previous: unknown, data: Data) => ({ data, key }),
+    [key],
+  );
   const [{ data: tagged, error: pushError }] = useSubscription<
     Data,
     { data: Data; key: string },
@@ -102,10 +110,16 @@ function useLiveRead<Data, Variables extends AnyVariables>(
     onData: (data) => setPolled({ data, key }),
   });
   // An answer read on request stands until the next push replaces it.
-  const [asked, setAsked] = useState<{ data: Data; after: Data | undefined; key: string }>();
+  const [asked, setAsked] = useState<{
+    data: Data;
+    after: Data | undefined;
+    key: string;
+  }>();
   const refresh = useCallback(() => {
     void client
-      .query<Data, Variables>(query, variables, { requestPolicy: "network-only" })
+      .query<Data, Variables>(query, variables, {
+        requestPolicy: "network-only",
+      })
       .toPromise()
       .then((result) => {
         if (result.data) {
@@ -206,19 +220,29 @@ export function useQueuePage(input: QueuePageInput): LiveQueuePage {
   const page = data?.queuePageUpdates ?? data?.queuePage;
 
   // Keep each row's object while its content is the same.
-  const [previous, setPrevious] = useState<{ page: QueuePageData; jobs: JobData[] }>();
+  const [previous, setPrevious] = useState<{
+    page: QueuePageData;
+    jobs: JobData[];
+  }>();
   let jobs = EMPTY_JOBS;
   if (page) {
     if (previous?.page === page) {
       jobs = previous.jobs;
     } else {
-      const byId = new Map((previous?.jobs ?? EMPTY_JOBS).map((job) => [job.id, job]));
+      const byId = new Map(
+        (previous?.jobs ?? EMPTY_JOBS).map((job) => [job.id, job]),
+      );
       const keyed = new Map(
-        (previous?.page.items ?? []).map((item) => [item.id, JSON.stringify(item)]),
+        (previous?.page.items ?? []).map((item) => [
+          item.id,
+          JSON.stringify(item),
+        ]),
       );
       jobs = page.items.map((item) => {
         const kept = byId.get(item.id);
-        return kept && keyed.get(item.id) === JSON.stringify(item) ? kept : normalizeOnce(item);
+        return kept && keyed.get(item.id) === JSON.stringify(item)
+          ? kept
+          : normalizeOnce(item);
       });
       setPrevious({ page, jobs });
     }

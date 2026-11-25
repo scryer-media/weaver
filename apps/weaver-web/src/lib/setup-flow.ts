@@ -78,7 +78,7 @@ export const BIND_CHOICES = {
 } as const;
 
 export const NO_LOGIN_NETWORK_WARNING =
-  "No login limits browsers to this machine even when Weaver answers network-wide: other devices' browsers are turned away, only API clients with keys get in. If other machines should browse Weaver, choose \"Require login, except my local network\" instead.";
+  'No login limits browsers to this machine even when Weaver answers network-wide: other devices\' browsers are turned away, only API clients with keys get in. If other machines should browse Weaver, choose "Require login, except my local network" instead.';
 
 function setupUrl(): string {
   return new URL("api/auth/setup", document.baseURI).href;
@@ -104,7 +104,9 @@ export const RESTART_UNREACHABLE_NOTE =
 
 /// Restart Weaver from the browser and reload once it answers again.
 export function useRestartAction() {
-  const [phase, setPhase] = useState<"idle" | "restarting" | "unreachable">("idle");
+  const [phase, setPhase] = useState<"idle" | "restarting" | "unreachable">(
+    "idle",
+  );
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
@@ -182,7 +184,9 @@ async function requestRestart(): Promise<string | null> {
       headers: authHeaders(),
     });
     if (!response.ok) {
-      const payload = (await response.json().catch(() => ({}))) as { error?: string };
+      const payload = (await response.json().catch(() => ({}))) as {
+        error?: string;
+      };
       return payload.error ?? `restart failed (${response.status})`;
     }
   } catch (cause) {
@@ -210,7 +214,10 @@ async function requestSetup(
     });
     const payload = (await response.json().catch(() => ({}))) as SetupResponse;
     if (!response.ok) {
-      return { kind: "failed", error: payload.error ?? `setup failed (${response.status})` };
+      return {
+        kind: "failed",
+        error: payload.error ?? `setup failed (${response.status})`,
+      };
     }
     if (authenticatedAccess) {
       await refreshSessionCookie();
@@ -225,7 +232,10 @@ async function requestSetup(
     window.location.reload();
     return { kind: "reloading" };
   } catch (cause) {
-    return { kind: "failed", error: cause instanceof Error ? cause.message : String(cause) };
+    return {
+      kind: "failed",
+      error: cause instanceof Error ? cause.message : String(cause),
+    };
   }
 }
 
@@ -253,12 +263,16 @@ export function useSetupForm(environment?: SetupEnvironment | null) {
   const bindPinned = environment ? !environment.bindEditable : false;
   const bindQuestionApplies = !containerized && !bindPinned;
   const authenticatedAccess = environment?.authenticatedAccess === true;
-  const codeRequired = authenticatedAccess && environment?.codeRequired === true;
+  const codeRequired =
+    authenticatedAccess && environment?.codeRequired === true;
   const selectedMode = authenticatedAccess ? "login_required" : mode;
 
   const needsCredentials =
-    authenticatedAccess || mode === "login_required" || mode === "login_except_local";
-  const passwordsDiffer = password.length > 0 && confirm.length > 0 && password !== confirm;
+    authenticatedAccess ||
+    mode === "login_required" ||
+    mode === "login_except_local";
+  const passwordsDiffer =
+    password.length > 0 && confirm.length > 0 && password !== confirm;
   const credentialsValid =
     !needsCredentials ||
     (username.trim().length > 0 && password.length > 0 && password === confirm);
@@ -292,7 +306,10 @@ export function useSetupForm(environment?: SetupEnvironment | null) {
       return;
     }
     if (outcome.kind === "restart") {
-      setRestart({ supported: outcome.supported, unsupportedReason: outcome.unsupportedReason });
+      setRestart({
+        supported: outcome.supported,
+        unsupportedReason: outcome.unsupportedReason,
+      });
     }
   };
 

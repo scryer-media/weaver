@@ -1,7 +1,14 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
-import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import {
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import { useQuery } from "urql";
 import { getGraphqlWsClient, useGraphqlClient } from "@/graphql/client";
 import { SERVICE_LOGS_QUERY } from "@/graphql/queries";
@@ -45,7 +52,10 @@ export interface ServiceLogs {
   loading: boolean;
 }
 
-export function useServiceLogs(level: LogLevelFilter, query: string): ServiceLogs {
+export function useServiceLogs(
+  level: LogLevelFilter,
+  query: string,
+): ServiceLogs {
   const [paused, setPaused] = useState(false);
   const [buffer, setBuffer] = useState<LogLine[]>([]);
   const [connected, setConnected] = useState(false);
@@ -84,11 +94,14 @@ export function useServiceLogs(level: LogLevelFilter, query: string): ServiceLog
       next.push(readLogLine(nextIdRef.current, source));
       nextIdRef.current += 1;
     }
-    bufferRef.current = next.length > BUFFER_MAX ? next.slice(next.length - BUFFER_MAX) : next;
+    bufferRef.current =
+      next.length > BUFFER_MAX ? next.slice(next.length - BUFFER_MAX) : next;
     scheduleRender();
   }, [scheduleRender]);
 
-  const [{ data, fetching }] = useQuery<{ serviceLogs: { records: string[]; count: number } }>({
+  const [{ data, fetching }] = useQuery<{
+    serviceLogs: { records: string[]; count: number };
+  }>({
     query: SERVICE_LOGS_QUERY,
     variables: { limit: BUFFER_MAX },
   });
@@ -101,7 +114,12 @@ export function useServiceLogs(level: LogLevelFilter, query: string): ServiceLog
     // A re-seed — the app replaces its GraphQL client whenever the window
     // comes back to the foreground — mostly repeats what is on screen, and
     // must not rebuild it. See `mergeSnapshot`.
-    const merged = mergeSnapshot(bufferRef.current, seed, nextIdRef.current, BUFFER_MAX);
+    const merged = mergeSnapshot(
+      bufferRef.current,
+      seed,
+      nextIdRef.current,
+      BUFFER_MAX,
+    );
     nextIdRef.current = merged.nextId;
     if (!merged.changed) {
       return;
@@ -154,8 +172,10 @@ export function useServiceLogs(level: LogLevelFilter, query: string): ServiceLog
 
   useEffect(
     () => () => {
-      if (ingestTimerRef.current !== null) window.clearTimeout(ingestTimerRef.current);
-      if (renderTimerRef.current !== null) window.clearTimeout(renderTimerRef.current);
+      if (ingestTimerRef.current !== null)
+        window.clearTimeout(ingestTimerRef.current);
+      if (renderTimerRef.current !== null)
+        window.clearTimeout(renderTimerRef.current);
     },
     [],
   );
@@ -163,7 +183,9 @@ export function useServiceLogs(level: LogLevelFilter, query: string): ServiceLog
   return useMemo(() => {
     const needle = query.trim().toLowerCase();
     const searched =
-      needle === "" ? buffer : buffer.filter((line) => line.raw.toLowerCase().includes(needle));
+      needle === ""
+        ? buffer
+        : buffer.filter((line) => line.raw.toLowerCase().includes(needle));
 
     const counts: Record<LogLevelFilter, number> = {
       all: searched.length,
@@ -177,7 +199,10 @@ export function useServiceLogs(level: LogLevelFilter, query: string): ServiceLog
       counts[line.level] += 1;
     }
 
-    const matching = level === "all" ? searched : searched.filter((line) => line.level === level);
+    const matching =
+      level === "all"
+        ? searched
+        : searched.filter((line) => line.level === level);
 
     return {
       lines: matching,

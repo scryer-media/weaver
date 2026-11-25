@@ -30,7 +30,9 @@ const BALANCED: HardwareProfileOption = {
   maxConcurrentDownloads: null,
 };
 
-function settings(overrides: Partial<HardwareProfileSettings> = {}): HardwareProfileSettings {
+function settings(
+  overrides: Partial<HardwareProfileSettings> = {},
+): HardwareProfileSettings {
   return {
     selected: null,
     active: "BALANCED",
@@ -61,11 +63,17 @@ test("a setting that has not arrived yet asks nothing either", () => {
 
 test("the picker opens on the choice, and on the recommendation when there is none", () => {
   assert.equal(initialProfile(settings()), "BALANCED");
-  assert.equal(initialProfile(settings({ selected: "EFFICIENT" })), "EFFICIENT");
+  assert.equal(
+    initialProfile(settings({ selected: "EFFICIENT" })),
+    "EFFICIENT",
+  );
 });
 
 test("a saved choice this machine no longer offers opens on the recommendation", () => {
-  assert.equal(initialProfile(settings({ selected: "PERFORMANCE" })), "BALANCED");
+  assert.equal(
+    initialProfile(settings({ selected: "PERFORMANCE" })),
+    "BALANCED",
+  );
 });
 
 test("a card's lines come from the daemon's numbers", () => {
@@ -94,7 +102,11 @@ test("a schedule holding a profile says so, and nothing is said without one", ()
   assert.equal(
     scheduledProfileNotice(
       englishTranslate,
-      settings({ selected: "BALANCED", active: "EFFICIENT", scheduled: "EFFICIENT" }),
+      settings({
+        selected: "BALANCED",
+        active: "EFFICIENT",
+        scheduled: "EFFICIENT",
+      }),
     ),
     "A schedule has the Efficient profile in force now; your choice applies whenever no schedule rule does.",
   );

@@ -12,7 +12,12 @@ import { useTranslate } from "@/lib/context/translate-context";
 import { testIds } from "@/next/testids";
 import { ConfirmDialog } from "../../../components/ConfirmDialog";
 import { RecordEditor } from "../../../components/RecordEditor";
-import { NEW_SECRET, secretChange, type Secret, type SecretForm } from "../../../data/secrets";
+import {
+  NEW_SECRET,
+  secretChange,
+  type Secret,
+  type SecretForm,
+} from "../../../data/secrets";
 import {
   needsPasswordCheck,
   usePasswordCheck,
@@ -29,7 +34,8 @@ import {
  * that reason the password is asked for and the same change runs again.
  */
 
-export type SecretEditorTarget = { mode: "new" } | { mode: "edit"; secret: Secret };
+export type SecretEditorTarget =
+  { mode: "new" } | { mode: "edit"; secret: Secret };
 
 export function SecretEditor({
   target,
@@ -49,7 +55,9 @@ export function SecretEditor({
   const [, updateSecret] = useMutation(UPDATE_SECRET_MUTATION);
   const [, deleteSecret] = useMutation(DELETE_SECRET_MUTATION);
   const editing = target.mode === "edit" ? target.secret : null;
-  const [form, setForm] = useState<SecretForm>(() => (editing ? { name: editing.name, value: "" } : NEW_SECRET));
+  const [form, setForm] = useState<SecretForm>(() =>
+    editing ? { name: editing.name, value: "" } : NEW_SECRET,
+  );
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [confirmDelete, setConfirmDelete] = useState(false);
@@ -85,7 +93,11 @@ export function SecretEditor({
     setBusy(true);
     setError(null);
     const result = editing
-      ? await updateSecret({ id: editing.id, name: change.name, value: change.value })
+      ? await updateSecret({
+          id: editing.id,
+          name: change.name,
+          value: change.value,
+        })
       : await createSecret({ name: change.name, value: change.value });
     setBusy(false);
     if (askForPassword(result.error)) {
@@ -95,7 +107,9 @@ export function SecretEditor({
       setError(result.error.graphQLErrors[0]?.message ?? result.error.message);
       return "done";
     }
-    const saved = (editing ? result.data?.updateSecret : result.data?.createSecret) as Secret | undefined;
+    const saved = (
+      editing ? result.data?.updateSecret : result.data?.createSecret
+    ) as Secret | undefined;
     if (saved) {
       onSaved(saved);
     }
@@ -115,7 +129,9 @@ export function SecretEditor({
     }
     if (result.error) {
       // Refused while an instance links it; the message names them.
-      setDeleteError(result.error.graphQLErrors[0]?.message ?? result.error.message);
+      setDeleteError(
+        result.error.graphQLErrors[0]?.message ?? result.error.message,
+      );
       return "done";
     }
     setConfirmDelete(false);
@@ -165,13 +181,19 @@ export function SecretEditor({
               {
                 id: "value",
                 label: t("next.secrets.value"),
-                help: t(editing ? "next.secrets.valueKeepHelp" : "next.secrets.valueHelp"),
+                help: t(
+                  editing
+                    ? "next.secrets.valueKeepHelp"
+                    : "next.secrets.valueHelp",
+                ),
                 control: {
                   kind: "text",
                   type: "password",
                   secret: true,
                   value: form.value,
-                  placeholder: editing ? t("next.secrets.valueSaved") : undefined,
+                  placeholder: editing
+                    ? t("next.secrets.valueSaved")
+                    : undefined,
                   onChange: (next) => patch({ value: next }),
                 },
               },
@@ -190,7 +212,10 @@ export function SecretEditor({
           <>
             {t("next.secrets.deleteBody", { name: editing?.name ?? "" })}
             {deleteError ? (
-              <span role="alert" className="mt-3 block text-[12.5px] text-wv-error-text">
+              <span
+                role="alert"
+                className="mt-3 block text-[12.5px] text-wv-error-text"
+              >
                 {deleteError}
               </span>
             ) : null}

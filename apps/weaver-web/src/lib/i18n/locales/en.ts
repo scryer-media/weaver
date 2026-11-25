@@ -20,22 +20,27 @@ const en: LocaleDictionary = {
   "applicationUpgrade.upToDate": "Weaver v{{version}} is up to date.",
   "applicationUpgrade.available": "Weaver v{{version}} is available.",
   "applicationUpgrade.install": "Install v{{version}}",
-  "applicationUpgrade.notEligible": "Weaver cannot update this installation in-app ({{reason}}).",
+  "applicationUpgrade.notEligible":
+    "Weaver cannot update this installation in-app ({{reason}}).",
   "applicationUpgrade.failed": "The update to v{{version}} failed: {{error}}",
-  "applicationUpgrade.githubUnavailable": "GitHub is temporarily unavailable. Please try upgrading again later.",
+  "applicationUpgrade.githubUnavailable":
+    "GitHub is temporarily unavailable. Please try upgrading again later.",
   "applicationUpgrade.completed": "Updated to v{{version}}.",
   "applicationUpgrade.phase.checking": "Checking the release…",
   "applicationUpgrade.phase.downloading": "Downloading v{{version}}…",
   "applicationUpgrade.phase.verifying": "Verifying the download…",
   "applicationUpgrade.phase.staging": "Unpacking the update…",
   "applicationUpgrade.phase.applying": "Installing v{{version}}…",
-  "applicationUpgrade.phase.awaiting_elevation": "Waiting for permission to install…",
+  "applicationUpgrade.phase.awaiting_elevation":
+    "Waiting for permission to install…",
   "applicationUpgrade.phase.restarting": "Restarting Weaver…",
-  "applicationUpgrade.phase.reboot_required": "Restart this computer to finish updating.",
+  "applicationUpgrade.phase.reboot_required":
+    "Restart this computer to finish updating.",
   "update.newVersionAria": "Open Weaver v{{version}} on GitHub in a new tab",
 
   // System information
-  "systemInfo.diagnosticsFailed": "The diagnostics package could not be created.",
+  "systemInfo.diagnosticsFailed":
+    "The diagnostics package could not be created.",
 
   // Status labels
   "status.queued": "Queued",
@@ -45,7 +50,8 @@ const en: LocaleDictionary = {
   "status.seeding": "Seeding",
   "status.stalled": "Stalled",
   "status.propagating": "Propagating",
-  "status.propagationUntil": "Waiting for propagation. Download starts at {{time}}.",
+  "status.propagationUntil":
+    "Waiting for propagation. Download starts at {{time}}.",
   "status.fetchingRepairData": "Fetching repair data",
   "status.verifying": "Verifying",
   "status.repairing": "Repairing",
@@ -83,7 +89,8 @@ const en: LocaleDictionary = {
   "action.next": "Next",
 
   // Confirmation dialogs
-  "confirm.cancelSelectedMessage": "These downloads will be stopped and cannot be resumed.",
+  "confirm.cancelSelectedMessage":
+    "These downloads will be stopped and cannot be resumed.",
   "bulk.selected": "{{count}} selected",
   "bulk.editSelected": "Edit Selected",
   "bulk.pauseSelected": "Pause Selected",
@@ -173,28 +180,37 @@ const en: LocaleDictionary = {
   "metrics.range7d": "7d",
   "metrics.range30d": "30d",
   "metrics.downloadThroughputChart": "Download Throughput",
-  "metrics.downloadThroughputDesc": "Per-second byte flow derived from stored download, decode, and commit counters.",
+  "metrics.downloadThroughputDesc":
+    "Per-second byte flow derived from stored download, decode, and commit counters.",
   "metrics.segmentsChart": "Segments",
-  "metrics.segmentsDesc": "How quickly the pipeline is downloading, decoding, committing, retrying, and failing segments.",
+  "metrics.segmentsDesc":
+    "How quickly the pipeline is downloading, decoding, committing, retrying, and failing segments.",
   "metrics.errorsChart": "Errors",
-  "metrics.errorsDesc": "Counter-derived failure rates that reveal article gaps, decode failures, and CRC trouble.",
+  "metrics.errorsDesc":
+    "Counter-derived failure rates that reveal article gaps, decode failures, and CRC trouble.",
   "metrics.downloadSpeedChart": "Download Speed",
-  "metrics.downloadSpeedDesc": "Raw sampled download speed as reported by the live pipeline metrics exporter.",
+  "metrics.downloadSpeedDesc":
+    "Raw sampled download speed as reported by the live pipeline metrics exporter.",
   "metrics.queueDepthsChart": "Queue Depths",
-  "metrics.queueDepthsDesc": "Backlog growth across download, decode, commit, and recovery stages.",
+  "metrics.queueDepthsDesc":
+    "Backlog growth across download, decode, commit, and recovery stages.",
   "metrics.activeWorkersChart": "Active Workers",
-  "metrics.activeWorkersDesc": "Live worker pressure across verify, repair, and extraction stages.",
+  "metrics.activeWorkersDesc":
+    "Live worker pressure across verify, repair, and extraction stages.",
   "metrics.writeBufferChart": "Write Buffer",
-  "metrics.writeBufferDesc": "Buffered bytes and buffered segment counts waiting to hit disk.",
+  "metrics.writeBufferDesc":
+    "Buffered bytes and buffered segment counts waiting to hit disk.",
   "metrics.throughputRatesChart": "Throughput Rates",
-  "metrics.throughputRatesDesc": "Current articles per second beside decode throughput for quick pacing checks.",
+  "metrics.throughputRatesDesc":
+    "Current articles per second beside decode throughput for quick pacing checks.",
 
   // API Keys
   "action.edit": "Edit",
   "action.save": "Save",
 
   // Duplicate handling
-  "upload.forceDesc": "Accept this submission despite semantic and article-fingerprint duplicate policy. Idempotency conflicts still apply.",
+  "upload.forceDesc":
+    "Accept this submission despite semantic and article-fingerprint duplicate policy. Idempotency conflicts still apply.",
   ...duplicateLocaleEntries.eng,
   ...nextEn,
 };

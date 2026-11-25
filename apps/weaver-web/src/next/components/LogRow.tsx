@@ -3,7 +3,11 @@
 
 import { memo, type KeyboardEvent } from "react";
 import { LOG_LEVEL_COLORS } from "../data/palette";
-import { recordJson, type LogKeyValue, type LogLine } from "../data/service-log-buffer";
+import {
+  recordJson,
+  type LogKeyValue,
+  type LogLine,
+} from "../data/service-log-buffer";
 
 /** Split the message so its `key=value` tail can be tinted separately. */
 function messageFragments(line: LogLine) {
@@ -11,9 +15,15 @@ function messageFragments(line: LogLine) {
   let cursor = 0;
   for (const pair of line.kvPairs) {
     if (pair.start > cursor) {
-      fragments.push({ text: line.message.slice(cursor, pair.start), kv: null });
+      fragments.push({
+        text: line.message.slice(cursor, pair.start),
+        kv: null,
+      });
     }
-    fragments.push({ text: line.message.slice(pair.start, pair.end), kv: pair });
+    fragments.push({
+      text: line.message.slice(pair.start, pair.end),
+      kv: pair,
+    });
     cursor = pair.end;
   }
   if (cursor < line.message.length) {
@@ -65,7 +75,9 @@ export const LogRow = memo(function LogRow({
           }
         : {})}
     >
-      <span className="w-[34px] flex-none text-right text-wv-dim">{line.id + 1}</span>
+      <span className="w-[34px] flex-none text-right text-wv-dim">
+        {line.id + 1}
+      </span>
       {bare ? null : (
         <>
           <span className="flex-none text-wv-faint">{line.time}</span>
@@ -75,7 +87,9 @@ export const LogRow = memo(function LogRow({
           >
             {line.level}
           </span>
-          <span className="min-w-0 flex-1 truncate text-wv-slate sm:flex-none">{line.target}</span>
+          <span className="min-w-0 flex-1 truncate text-wv-slate sm:flex-none">
+            {line.target}
+          </span>
         </>
       )}
       <span
@@ -86,7 +100,10 @@ export const LogRow = memo(function LogRow({
         }
       >
         {messageFragments(line).map((fragment, index) => (
-          <span key={index} className={fragment.kv ? "text-wv-info" : undefined}>
+          <span
+            key={index}
+            className={fragment.kv ? "text-wv-info" : undefined}
+          >
             {fragment.text}
           </span>
         ))}

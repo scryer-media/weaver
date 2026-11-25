@@ -54,18 +54,33 @@ import { EmptyState } from "../../components/chrome";
 import { ConfirmDialog } from "../../components/ConfirmDialog";
 import { Dialog } from "../../components/Dialog";
 import { RecordEditor } from "../../components/RecordEditor";
-import { PrimaryButton, SecondaryButton, Select } from "../../components/controls";
+import {
+  PrimaryButton,
+  SecondaryButton,
+  Select,
+} from "../../components/controls";
 import { Cell } from "../../components/rows";
 import { countLabel } from "../../i18n/labels";
-import { DnsCapabilityResults, dnsServerFields } from "../../pages/settings/dns-fields";
-import { SettingsBlocks, usePanelStatus, useSearchReport, type SettingsBlock } from "../../pages/settings/framework";
+import {
+  DnsCapabilityResults,
+  dnsServerFields,
+} from "../../pages/settings/dns-fields";
+import {
+  SettingsBlocks,
+  usePanelStatus,
+  useSearchReport,
+  type SettingsBlock,
+} from "../../pages/settings/framework";
 import { Hint } from "./presentation";
 import { useNamedRefusal } from "./refusal-names";
 import { DraftRouteEditor, useDraftRoute } from "./TestViaDialog";
 import { useNextData } from "../../data/next-data";
 
 /** The words each kind of profile is shown with. */
-const KIND_WORDS: Record<DnsProfileKind, { title: string; add: string; used: string; deleteBody: string }> = {
+const KIND_WORDS: Record<
+  DnsProfileKind,
+  { title: string; add: string; used: string; deleteBody: string }
+> = {
   ROUTE: {
     title: "next.dns.profiles.title",
     add: "next.dns.profiles.add",
@@ -81,10 +96,18 @@ const KIND_WORDS: Record<DnsProfileKind, { title: string; add: string; used: str
 };
 
 /** The lists, and the profiles of each kind: System first, then that kind by id. */
-type DnsData = { dnsServerLists: DnsServerList[]; nameProfiles: DnsNameProfileRow[]; routeProfiles: DnsRouteProfileRow[] };
+type DnsData = {
+  dnsServerLists: DnsServerList[];
+  nameProfiles: DnsNameProfileRow[];
+  routeProfiles: DnsRouteProfileRow[];
+};
 
 /** Runs one change; resolves to its refusal's sentence, or null once it landed and the page was read again. */
-type DnsAction = (document: DocumentNode, variables: Record<string, unknown>, onData?: (data: unknown) => void) => Promise<string | null>;
+type DnsAction = (
+  document: DocumentNode,
+  variables: Record<string, unknown>,
+  onData?: (data: unknown) => void,
+) => Promise<string | null>;
 
 /**
  * Networking -> DNS: saved server lists, and the profiles routes pick from.
@@ -94,13 +117,20 @@ type DnsAction = (document: DocumentNode, variables: Record<string, unknown>, on
 export function DnsPage() {
   const t = useTranslate();
   const client = useClient();
-  const [{ data, error, fetching }, refresh] = useQuery<DnsData>({ query: DNS_QUERY, requestPolicy: "cache-and-network" });
+  const [{ data, error, fetching }, refresh] = useQuery<DnsData>({
+    query: DNS_QUERY,
+    requestPolicy: "cache-and-network",
+  });
   const [busy, setBusy] = useState(false);
   const [message, setMessage] = useState<string | null>(null);
   const [failed, setFailed] = useState(false);
-  const [editingList, setEditingList] = useState<DnsServerList | "new" | null>(null);
+  const [editingList, setEditingList] = useState<DnsServerList | "new" | null>(
+    null,
+  );
   // A saved profile, or the kind of a new one.
-  const [editingProfile, setEditingProfile] = useState<DnsProfileEdited | { kind: DnsProfileKind } | null>(null);
+  const [editingProfile, setEditingProfile] = useState<
+    DnsProfileEdited | { kind: DnsProfileKind } | null
+  >(null);
   usePanelStatus(message, failed);
   useSearchReport(0, !data && fetching);
 
@@ -121,7 +151,10 @@ export function DnsPage() {
         }
         return failure;
       } catch (caught) {
-        const failure = caught instanceof Error ? caught.message : t("next.networking.requestFailed");
+        const failure =
+          caught instanceof Error
+            ? caught.message
+            : t("next.networking.requestFailed");
         setFailed(true);
         setMessage(failure);
         return failure;
@@ -138,7 +171,10 @@ export function DnsPage() {
         title={t("next.networking.loadFailed")}
         body={error.message}
         action={
-          <SecondaryButton icon="refresh" onClick={() => refresh({ requestPolicy: "network-only" })}>
+          <SecondaryButton
+            icon="refresh"
+            onClick={() => refresh({ requestPolicy: "network-only" })}
+          >
             {t("next.networking.retry")}
           </SecondaryButton>
         }
@@ -146,7 +182,13 @@ export function DnsPage() {
     );
   }
   if (!data) {
-    return <EmptyState loading title={t("next.common.loading")} body={t("next.networking.loading")} />;
+    return (
+      <EmptyState
+        loading
+        title={t("next.common.loading")}
+        body={t("next.networking.loading")}
+      />
+    );
   }
 
   const lists = data.dnsServerLists;
@@ -155,8 +197,16 @@ export function DnsPage() {
     // Each with its kind, and counted by what uses that kind.
     const shown: (DnsProfileEdited & { builtIn: boolean; used: number })[] =
       kind === "PROXY_NAME"
-        ? data.nameProfiles.map((profile) => ({ ...profile, kind, used: profile.usedByProxies }))
-        : data.routeProfiles.map((profile) => ({ ...profile, kind, used: profile.usedByRoutes }));
+        ? data.nameProfiles.map((profile) => ({
+            ...profile,
+            kind,
+            used: profile.usedByProxies,
+          }))
+        : data.routeProfiles.map((profile) => ({
+            ...profile,
+            kind,
+            used: profile.usedByRoutes,
+          }));
     const words = KIND_WORDS[kind];
     return {
       kind: "table",
@@ -191,11 +241,18 @@ export function DnsPage() {
             <Cell key="name" title={name}>
               {name}
               {profile.builtIn ? (
-                <span className="ml-2 font-wv-mono text-[11px] text-wv-muted">{t("next.dns.profiles.builtIn")}</span>
+                <span className="ml-2 font-wv-mono text-[11px] text-wv-muted">
+                  {t("next.dns.profiles.builtIn")}
+                </span>
               ) : null}
             </Cell>,
             <Cell key="who">{t(dnsWhoKey(profile.who, kind))}</Cell>,
-            <Cell key="summary" mono className="text-wv-secondary" title={summary}>
+            <Cell
+              key="summary"
+              mono
+              className="text-wv-secondary"
+              title={summary}
+            >
               {summary}
             </Cell>,
             <Cell key="used" mono>
@@ -213,9 +270,16 @@ export function DnsPage() {
       title: t("next.dns.lists.title"),
       note: countLabel(t, "next.dns.lists.count", lists.length),
       columns: "minmax(0, 1fr) 96px minmax(0, 1.4fr)",
-      headers: [t("next.dns.lists.name"), t("next.dns.lists.servers"), t("next.dns.lists.usedBy")],
+      headers: [
+        t("next.dns.lists.name"),
+        t("next.dns.lists.servers"),
+        t("next.dns.lists.usedBy"),
+      ],
       empty: t("next.dns.lists.empty"),
-      add: { label: t("next.dns.lists.add"), onClick: () => setEditingList("new") },
+      add: {
+        label: t("next.dns.lists.add"),
+        onClick: () => setEditingList("new"),
+      },
       onRowClick: (id) => {
         const list = lists.find((candidate) => String(candidate.id) === id);
         if (list) setEditingList(list);
@@ -232,7 +296,12 @@ export function DnsPage() {
             <Cell key="servers" mono>
               {countLabel(t, "next.dns.lists.serverCount", list.servers.length)}
             </Cell>,
-            <Cell key="usedBy" mono className="text-wv-secondary" title={usedBy}>
+            <Cell
+              key="usedBy"
+              mono
+              className="text-wv-secondary"
+              title={usedBy}
+            >
               {usedBy || "—"}
             </Cell>,
           ],
@@ -249,7 +318,11 @@ export function DnsPage() {
       <SettingsBlocks blocks={blocks} />
       {editingProfile ? (
         <DnsProfileEditor
-          key={"id" in editingProfile ? editingProfile.id : `new-${editingProfile.kind}`}
+          key={
+            "id" in editingProfile
+              ? editingProfile.id
+              : `new-${editingProfile.kind}`
+          }
           profile={"id" in editingProfile ? editingProfile : null}
           kind={editingProfile.kind}
           lists={lists}
@@ -288,7 +361,10 @@ export function DnsFlowEditor({
 }) {
   const t = useTranslate();
   const client = useClient();
-  const [{ data }] = useQuery<DnsData>({ query: DNS_QUERY, requestPolicy: "cache-and-network" });
+  const [{ data }] = useQuery<DnsData>({
+    query: DNS_QUERY,
+    requestPolicy: "cache-and-network",
+  });
   const [busy, setBusy] = useState(false);
   const refusal = useNamedRefusal();
   const action = useCallback<DnsAction>(
@@ -303,7 +379,9 @@ export function DnsFlowEditor({
         }
         return failure;
       } catch (caught) {
-        return caught instanceof Error ? caught.message : t("next.networking.requestFailed");
+        return caught instanceof Error
+          ? caught.message
+          : t("next.networking.requestFailed");
       } finally {
         setBusy(false);
       }
@@ -312,10 +390,21 @@ export function DnsFlowEditor({
   );
   if (!data) return null;
   if (target.kind === "dnsList") {
-    const list = data.dnsServerLists.find((candidate) => candidate.id === target.id);
-    return list ? <DnsListEditor list={list} action={action} busy={busy} onClose={onClose} /> : null;
+    const list = data.dnsServerLists.find(
+      (candidate) => candidate.id === target.id,
+    );
+    return list ? (
+      <DnsListEditor
+        list={list}
+        action={action}
+        busy={busy}
+        onClose={onClose}
+      />
+    ) : null;
   }
-  const profile = data.routeProfiles.find((candidate) => candidate.id === target.id && !candidate.builtIn);
+  const profile = data.routeProfiles.find(
+    (candidate) => candidate.id === target.id && !candidate.builtIn,
+  );
   return profile ? (
     <DnsProfileEditor
       profile={{ ...profile, kind: "ROUTE" }}
@@ -351,13 +440,18 @@ function DnsListEditor({
   const [picking, setPicking] = useState(false);
   const [run, setRun] = useState<DnsTestRun | null>(null);
   // A refused test: the sentence, and the form row it names when it names one.
-  const [testRefusal, setTestRefusal] = useState<{ sentence: string; row: number | null } | null>(null);
+  const [testRefusal, setTestRefusal] = useState<{
+    sentence: string;
+    row: number | null;
+  } | null>(null);
   // The latest run's number: an answer to any earlier run is dropped.
   const latestRun = useRef(0);
   // The rows as they stand now, read when an answer lands.
   const rowsNow = useRef(form.servers);
   rowsNow.current = form.servers;
-  const [, testServers] = useMutation<{ testDnsServers: DnsServerCapability[] }>(TEST_DNS_SERVERS);
+  const [, testServers] = useMutation<{
+    testDnsServers: DnsServerCapability[];
+  }>(TEST_DNS_SERVERS);
   const refusal = useNamedRefusal();
   const setServers = (change: (current: DnsServerRow[]) => DnsServerRow[]) => {
     setTestRefusal(null);
@@ -376,20 +470,34 @@ function DnsListEditor({
     const request = probeRequest(form.servers);
     const token = ++latestRun.current;
     setRun({ key, rows: request.rows, route: caption, results: null });
-    const result = await testServers({ route: routeInput(route), servers: request.servers });
+    const result = await testServers({
+      route: routeInput(route),
+      servers: request.servers,
+    });
     if (token !== latestRun.current) return;
     if (result.error) {
       setRun(null);
       // A refusal of one server names it by its place among the servers sent.
-      const at = (result.error.graphQLErrors[0]?.extensions?.params as { index?: unknown } | undefined)?.index;
+      const at = (
+        result.error.graphQLErrors[0]?.extensions?.params as
+          { index?: unknown } | undefined
+      )?.index;
       const sentence = await refusal(result.error);
-      const landing = testRefusalRow({ key, rows: request.rows }, at, rowsNow.current);
+      const landing = testRefusalRow(
+        { key, rows: request.rows },
+        at,
+        rowsNow.current,
+      );
       if (token !== latestRun.current || landing === null) return;
       setTestRefusal({ sentence, row: landing.row });
       return;
     }
     // A run whose rows were edited meanwhile no longer matches, and stays hidden.
-    setRun((current) => (current?.key === key ? { ...current, results: result.data?.testDnsServers ?? [] } : current));
+    setRun((current) =>
+      current?.key === key
+        ? { ...current, results: result.data?.testDnsServers ?? [] }
+        : current,
+    );
   };
 
   const save = async () => {
@@ -400,9 +508,15 @@ function DnsListEditor({
       return;
     }
     let saved = form.id;
-    const failure = await action(SAVE_DNS_SERVER_LIST, { input: listInput(form) }, (data) => {
-      saved = (data as { saveDnsServerList?: { id: number } } | undefined)?.saveDnsServerList?.id ?? saved;
-    });
+    const failure = await action(
+      SAVE_DNS_SERVER_LIST,
+      { input: listInput(form) },
+      (data) => {
+        saved =
+          (data as { saveDnsServerList?: { id: number } } | undefined)
+            ?.saveDnsServerList?.id ?? saved;
+      },
+    );
     if (failure) {
       setError(failure);
       return;
@@ -454,15 +568,31 @@ function DnsListEditor({
               {
                 id: "dnsListName",
                 label: t("next.dns.lists.name"),
-                control: { kind: "text", mono: false, value: form.name, onChange: (name) => setForm((current) => ({ ...current, name })) },
+                control: {
+                  kind: "text",
+                  mono: false,
+                  value: form.name,
+                  onChange: (name) =>
+                    setForm((current) => ({ ...current, name })),
+                },
               },
-              ...dnsServerFields(t, form.servers, setServers, testRefusal?.row == null ? undefined : { row: testRefusal.row, sentence: testRefusal.sentence }),
+              ...dnsServerFields(
+                t,
+                form.servers,
+                setServers,
+                testRefusal?.row == null
+                  ? undefined
+                  : { row: testRefusal.row, sentence: testRefusal.sentence },
+              ),
             ],
             body: (
               <>
                 {table ? <DnsCapabilityResults t={t} table={table} /> : null}
                 {testRefusal === null || testRefusal.row !== null ? null : (
-                  <p role="alert" className="flex-none px-4 py-3 text-[12.5px] leading-[1.5] text-wv-error-text sm:px-6">
+                  <p
+                    role="alert"
+                    className="flex-none px-4 py-3 text-[12.5px] leading-[1.5] text-wv-error-text sm:px-6"
+                  >
                     {testRefusal.sentence}
                   </p>
                 )}
@@ -483,7 +613,10 @@ function DnsListEditor({
         onDismiss={() => setDeleting(false)}
       />
       {picking ? (
-        <DnsCapabilityDialog onRun={(route, caption) => void test(route, caption)} onClose={() => setPicking(false)} />
+        <DnsCapabilityDialog
+          onRun={(route, caption) => void test(route, caption)}
+          onClose={() => setPicking(false)}
+        />
       ) : null}
     </>
   );
@@ -507,7 +640,11 @@ function DnsCapabilityDialog({
     if (!draft.route || !draft.data) return;
     const caption = routeCaption(
       draft.route,
-      { egresses: draft.data.egressInterfaces, proxies: draft.data.proxyProfiles, pools: draft.data.proxyPools },
+      {
+        egresses: draft.data.egressInterfaces,
+        proxies: draft.data.proxyProfiles,
+        pools: draft.data.proxyPools,
+      },
       t("next.networking.route.direct"),
     );
     onRun(draft.route, caption);
@@ -522,7 +659,9 @@ function DnsCapabilityDialog({
       onDismiss={onClose}
       footer={
         <>
-          <SecondaryButton onClick={onClose}>{t("next.networking.close")}</SecondaryButton>
+          <SecondaryButton onClick={onClose}>
+            {t("next.networking.close")}
+          </SecondaryButton>
           <PrimaryButton
             icon="test"
             disabled={!draft.route || draft.problem !== null}
@@ -560,12 +699,15 @@ function DnsProfileEditor({
 }) {
   const t = useTranslate();
   const { refreshDnsProfiles } = useNextData("refreshDnsProfiles");
-  const [form, setForm] = useState<DnsProfileForm>(() => profileForm(profile, lists, kind));
+  const [form, setForm] = useState<DnsProfileForm>(() =>
+    profileForm(profile, lists, kind),
+  );
   const [error, setError] = useState<string | null>(null);
   const [errorCode, setErrorCode] = useState<string | null>(null);
   const [deleting, setDeleting] = useState(false);
   const [addingList, setAddingList] = useState(false);
-  const patch = (next: Partial<DnsProfileForm>) => setForm((current) => ({ ...current, ...next }));
+  const patch = (next: Partial<DnsProfileForm>) =>
+    setForm((current) => ({ ...current, ...next }));
 
   const save = async () => {
     const problem = profileProblem(form);
@@ -574,7 +716,9 @@ function DnsProfileEditor({
       setError(t(problem.key, problem.values));
       return;
     }
-    const failure = await action(SAVE_DNS_PROFILE, { input: profileInput(form) });
+    const failure = await action(SAVE_DNS_PROFILE, {
+      input: profileInput(form),
+    });
     refreshDnsProfiles();
     if (failure) {
       setError(failure);
@@ -611,7 +755,11 @@ function DnsProfileEditor({
         saveLabel={t("next.dns.profiles.save")}
         onSave={() => void save()}
         onDismiss={onClose}
-        onDelete={profile && profile.id !== SYSTEM_DNS_PROFILE_ID ? () => setDeleting(true) : undefined}
+        onDelete={
+          profile && profile.id !== SYSTEM_DNS_PROFILE_ID
+            ? () => setDeleting(true)
+            : undefined
+        }
         deleteLabel={t("next.dns.profiles.delete")}
         sections={[
           {
@@ -621,17 +769,30 @@ function DnsProfileEditor({
               {
                 id: "dnsProfileName",
                 label: t("next.dns.profiles.name"),
-                control: { kind: "text", mono: false, value: form.name, onChange: (name) => patch({ name }) },
+                control: {
+                  kind: "text",
+                  mono: false,
+                  value: form.name,
+                  onChange: (name) => patch({ name }),
+                },
               },
               {
                 id: "dnsWho",
                 label: t("next.dns.who"),
-                help: t(proxyName ? `next.dns.nameWhoHelp.${form.who}` : `next.dns.whoHelp.${form.who}`),
+                help: t(
+                  proxyName
+                    ? `next.dns.nameWhoHelp.${form.who}`
+                    : `next.dns.whoHelp.${form.who}`,
+                ),
                 control: {
                   kind: "segmented",
                   value: form.who,
-                  options: whoChoices(form.kind).map((who) => ({ value: who, label: t(dnsWhoKey(who, form.kind)) })),
-                  onChange: (who) => setForm((current) => withWho(current, who as DnsWho)),
+                  options: whoChoices(form.kind).map((who) => ({
+                    value: who,
+                    label: t(dnsWhoKey(who, form.kind)),
+                  })),
+                  onChange: (who) =>
+                    setForm((current) => withWho(current, who as DnsWho)),
                 },
               },
               ...(form.who === "WEAVER"
@@ -645,14 +806,27 @@ function DnsProfileEditor({
                           <div className="flex w-[268px] max-w-full flex-wrap items-center gap-2">
                             <Select<string>
                               label={t("next.dns.list")}
-                              value={form.serverListId === null ? "" : String(form.serverListId)}
+                              value={
+                                form.serverListId === null
+                                  ? ""
+                                  : String(form.serverListId)
+                              }
                               placeholder={t("next.dns.listChoose")}
-                              options={lists.map((list) => ({ value: String(list.id), label: list.name }))}
+                              options={lists.map((list) => ({
+                                value: String(list.id),
+                                label: list.name,
+                              }))}
                               className="min-w-0 flex-1"
                               testId={testIds.field("dnsList")}
-                              onChange={(id) => patch({ serverListId: Number(id) })}
+                              onChange={(id) =>
+                                patch({ serverListId: Number(id) })
+                              }
                             />
-                            <SecondaryButton icon="add" testId={testIds.field("dnsListNew")} onClick={() => setAddingList(true)}>
+                            <SecondaryButton
+                              icon="add"
+                              testId={testIds.field("dnsListNew")}
+                              onClick={() => setAddingList(true)}
+                            >
                               {t("next.dns.listNew")}
                             </SecondaryButton>
                           </div>
@@ -662,17 +836,21 @@ function DnsProfileEditor({
                     ...(proxyName
                       ? []
                       : [
-                    {
-                      id: "dnsTransit",
-                      label: t("next.dns.transit"),
-                      help: t("next.dns.transitHelp"),
-                      control: {
-                        kind: "segmented" as const,
-                        value: form.transit,
-                        options: DNS_TRANSITS.map((transit) => ({ value: transit, label: t(dnsTransitKey(transit)) })),
-                        onChange: (transit: string) => patch({ transit: transit as DnsTransit }),
-                      },
-                    },
+                          {
+                            id: "dnsTransit",
+                            label: t("next.dns.transit"),
+                            help: t("next.dns.transitHelp"),
+                            control: {
+                              kind: "segmented" as const,
+                              value: form.transit,
+                              options: DNS_TRANSITS.map((transit) => ({
+                                value: transit,
+                                label: t(dnsTransitKey(transit)),
+                              })),
+                              onChange: (transit: string) =>
+                                patch({ transit: transit as DnsTransit }),
+                            },
+                          },
                         ]),
                   ]
                 : []),
@@ -685,7 +863,8 @@ function DnsProfileEditor({
                       control: {
                         kind: "toggle" as const,
                         value: form.systemFallback,
-                        onChange: (systemFallback: boolean) => patch({ systemFallback }),
+                        onChange: (systemFallback: boolean) =>
+                          patch({ systemFallback }),
                       },
                     },
                   ]
@@ -698,7 +877,8 @@ function DnsProfileEditor({
                       control: {
                         kind: "toggle" as const,
                         value: form.trust === "VALIDATE",
-                        onChange: (validate: boolean) => patch({ trust: validate ? "VALIDATE" : "AS_SENT" }),
+                        onChange: (validate: boolean) =>
+                          patch({ trust: validate ? "VALIDATE" : "AS_SENT" }),
                       },
                     },
                   ]

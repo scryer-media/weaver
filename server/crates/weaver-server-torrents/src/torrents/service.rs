@@ -920,6 +920,9 @@ pub struct Inner {
     crash_marks: Mutex<weaver_server_base::runtime::panic_trap::CrashMarks>,
     pub signal: Arc<Signal>,
     ticks: watch::Sender<u64>,
+    // The clock as the last tick read it: a tick that reads an earlier one
+    // has found it stepped back.
+    tick_at_ms: AtomicI64,
     // Counts the waits for a route's session to open, begun off an add or
     // an action, that have ended.
     attaches: watch::Sender<u64>,
@@ -1072,6 +1075,7 @@ impl TorrentService {
                 crash_marks: Mutex::default(),
                 signal: Arc::new(Signal::default()),
                 ticks: watch::channel(0).0,
+                tick_at_ms: AtomicI64::new(i64::MIN),
                 attaches: watch::channel(0).0,
                 retired: watch::channel(0).0,
                 written: watch::channel(Written::default()).0,

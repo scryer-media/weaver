@@ -16,4 +16,7 @@ export const SETTINGS_REDIRECTS: RouteObject[] = [
   ["networking/bandwidth", "networking/egress"],
   ["post-processing", "scripts/configuration"],
   ["scripts", "scripts/configuration"],
-].map(([path, to]) => ({ path, element: <Navigate to={`/settings/${to}`} replace /> }));
+].map(([path, to]) => ({
+  path,
+  element: <Navigate to={`/settings/${to}`} replace />,
+}));

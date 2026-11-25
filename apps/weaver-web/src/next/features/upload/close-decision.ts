@@ -17,5 +17,7 @@
  * dialog open so the user can act on it.
  */
 export function shouldCloseAfterSubmit(statuses: readonly string[]): boolean {
-  return statuses.length > 0 && statuses.every((status) => status === "submitted");
+  return (
+    statuses.length > 0 && statuses.every((status) => status === "submitted")
+  );
 }

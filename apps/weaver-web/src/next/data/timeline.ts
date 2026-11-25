@@ -121,8 +121,12 @@ export interface TimelineView {
  * so pauses and the wait before the first article are left out. Null when no
  * run has closed, which leaves nothing honest to average over.
  */
-export function downloadingMs(timeline: JobTimelineData | null | undefined): number | null {
-  const lane = timeline?.lanes.find((candidate) => candidate.stage === "DOWNLOADING");
+export function downloadingMs(
+  timeline: JobTimelineData | null | undefined,
+): number | null {
+  const lane = timeline?.lanes.find(
+    (candidate) => candidate.stage === "DOWNLOADING",
+  );
   let total = 0;
   for (const span of lane?.spans ?? []) {
     if (span.endedAt !== null && span.endedAt > span.startedAt) {
@@ -171,7 +175,9 @@ export function buildTimelineView(
       color,
       dashed,
       title: `${title} · ${formatClockSeconds(entry.startedAt)} → ${
-        entry.endedAt === null ? t("next.timeline.now") : formatClockSeconds(entry.endedAt)
+        entry.endedAt === null
+          ? t("next.timeline.now")
+          : formatClockSeconds(entry.endedAt)
       } · ${formatSpan(ended - entry.startedAt)}`,
     };
   };
@@ -191,7 +197,9 @@ export function buildTimelineView(
       start: pending ? 0 : percentOf(extent.started),
       end: pending ? 0 : percentOf(extent.ended),
       color: failed ? WV.error : color,
-      duration: pending ? t("next.timeline.pending") : formatSpan(runTime(lane.spans, to)),
+      duration: pending
+        ? t("next.timeline.pending")
+        : formatSpan(runTime(lane.spans, to)),
       pending,
       segments: lane.spans.map((entry) =>
         segmentOf(
@@ -210,7 +218,11 @@ export function buildTimelineView(
       group.members.map((member) => {
         const name = member.member.split("/").pop() || member.member;
         const extent = extentOf(member.spans, to);
-        const state = engineLabel(t, `next.timeline.member.${member.state}`, member.state);
+        const state = engineLabel(
+          t,
+          `next.timeline.member.${member.state}`,
+          member.state,
+        );
         const stage: WaterfallStage = {
           id: `${group.setName}:${member.member}`,
           label: name,
@@ -222,14 +234,25 @@ export function buildTimelineView(
               ? formatSpan(runTime(member.spans, to))
               : `${formatSpan(runTime(member.spans, to))} · ${state}`,
           pending: member.spans.length === 0,
-          title: [member.member, t("next.timeline.set", { name: group.setName }), state, member.error]
+          title: [
+            member.member,
+            t("next.timeline.set", { name: group.setName }),
+            state,
+            member.error,
+          ]
             .filter(Boolean)
             .join(" · "),
           segments: member.spans.map((entry) => {
-            const kind = engineLabel(t, `next.timeline.span.${entry.kind}`, entry.kind);
+            const kind = engineLabel(
+              t,
+              `next.timeline.span.${entry.kind}`,
+              entry.kind,
+            );
             return segmentOf(
               entry,
-              entry.state === "FAILED" ? WV.error : MEMBER_SPAN_COLOR[entry.kind],
+              entry.state === "FAILED"
+                ? WV.error
+                : MEMBER_SPAN_COLOR[entry.kind],
               entry.label ? `${kind} · ${entry.label}` : kind,
             );
           }),
@@ -239,7 +262,8 @@ export function buildTimelineView(
     )
     .sort(
       (left, right) =>
-        left.startedAt - right.startedAt || left.stage.label.localeCompare(right.stage.label),
+        left.startedAt - right.startedAt ||
+        left.stage.label.localeCompare(right.stage.label),
     )
     .map((entry) => entry.stage);
 
@@ -253,16 +277,28 @@ export function buildTimelineView(
     window: running
       ? t("next.timeline.windowRunning", { time: formatClockSeconds(from) })
       : `${formatClockSeconds(from)} → ${formatClockSeconds(to)}`,
-    total: running ? t("next.timeline.soFar", { span: formatSpan(span) }) : formatSpan(span),
+    total: running
+      ? t("next.timeline.soFar", { span: formatSpan(span) })
+      : formatSpan(span),
     note: running
-      ? t("next.timeline.noteRunning", { stage: active, stages: stages.length, span: formatSpan(span) })
-      : t(`next.timeline.noteDone.${active === 1 ? "one" : "other"}`, { count: active, span: formatSpan(span) }),
+      ? t("next.timeline.noteRunning", {
+          stage: active,
+          stages: stages.length,
+          span: formatSpan(span),
+        })
+      : t(`next.timeline.noteDone.${active === 1 ? "one" : "other"}`, {
+          count: active,
+          span: formatSpan(span),
+        }),
     running,
   };
 }
 
 /** The first start and the last end of a set of runs; a run still going ends now. */
-function extentOf(spans: readonly { startedAt: number; endedAt: number | null }[], now: number) {
+function extentOf(
+  spans: readonly { startedAt: number; endedAt: number | null }[],
+  now: number,
+) {
   let started = Number.POSITIVE_INFINITY;
   let ended = Number.NEGATIVE_INFINITY;
   for (const entry of spans) {
@@ -273,8 +309,15 @@ function extentOf(spans: readonly { startedAt: number; endedAt: number | null }[
 }
 
 /** Time actually spent in the runs, leaving out the gaps between them. */
-function runTime(spans: readonly { startedAt: number; endedAt: number | null }[], now: number) {
-  return spans.reduce((total, entry) => total + Math.max(0, (entry.endedAt ?? now) - entry.startedAt), 0);
+function runTime(
+  spans: readonly { startedAt: number; endedAt: number | null }[],
+  now: number,
+) {
+  return spans.reduce(
+    (total, entry) =>
+      total + Math.max(0, (entry.endedAt ?? now) - entry.startedAt),
+    0,
+  );
 }
 
 function orderOf(stage: string): number {

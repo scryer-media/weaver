@@ -8,7 +8,10 @@ import { withoutTorrentOnly } from "../../../data/torrents-shown";
 import { BackupPanel } from "./BackupPanel";
 import { CategoriesPanel } from "./CategoriesPanel";
 import { GeneralPanel } from "./GeneralPanel";
-import { ScriptConfigurationPanel, ScriptListPanel } from "./PostProcessingPanel";
+import {
+  ScriptConfigurationPanel,
+  ScriptListPanel,
+} from "./PostProcessingPanel";
 import { ProvidersPanel } from "./ProvidersPanel";
 import { NetworkingPanel } from "./NetworkingPanel";
 import { RssPanel } from "./RssPanel";
@@ -29,7 +32,10 @@ import { WatchFolderPanel } from "./WatchFolderPanel";
 export type PanelGroup = "networking" | "scripts";
 
 /** The rail row each group of panels nests under: its name and its one icon. */
-export const PANEL_GROUPS: Record<PanelGroup, { label: string; icon: IconName }> = {
+export const PANEL_GROUPS: Record<
+  PanelGroup,
+  { label: string; icon: IconName }
+> = {
   networking: { label: "settings.networking", icon: "networking" },
   scripts: { label: "next.settings.panel.scripts", icon: "postProcessing" },
 };
@@ -193,12 +199,18 @@ export const SETTINGS_PANELS: readonly PanelDefinition[] = [
  * each of them, a panel that does not exist.
  */
 export function settingsPanels(torrentsAvailable: boolean): PanelDefinition[] {
-  return withoutTorrentOnly(SETTINGS_PANELS, torrentsAvailable, (panel) => panel.torrentOnly === true);
+  return withoutTorrentOnly(
+    SETTINGS_PANELS,
+    torrentsAvailable,
+    (panel) => panel.torrentOnly === true,
+  );
 }
 
 /** Whether `slug` is a panel there only while the server has torrents. */
 export function isTorrentOnlyPanel(slug: string | undefined): boolean {
-  return SETTINGS_PANELS.some((panel) => panel.slug === slug && panel.torrentOnly === true);
+  return SETTINGS_PANELS.some(
+    (panel) => panel.slug === slug && panel.torrentOnly === true,
+  );
 }
 
 export function findPanel(
@@ -218,7 +230,10 @@ export function panelSearchTitle(
 ): string {
   const panel = t(entry.label);
   return entry.group
-    ? t("next.settings.searchPanelPath", { group: t(PANEL_GROUPS[entry.group].label), panel })
+    ? t("next.settings.searchPanelPath", {
+        group: t(PANEL_GROUPS[entry.group].label),
+        panel,
+      })
     : panel;
 }
 
@@ -258,12 +273,20 @@ export function settingsRail(
     const children = [row];
     nested.set(entry.group, children);
     const group = PANEL_GROUPS[entry.group];
-    items.push({ to: row.to, label: t(group.label), icon: group.icon, children });
+    items.push({
+      to: row.to,
+      label: t(group.label),
+      icon: group.icon,
+      children,
+    });
   }
   // A tag every panel of a group carries is said once, on the group's row.
   return items.map((item) => {
     const shared = item.children?.[0]?.tag;
-    if (shared === undefined || !item.children?.every((child) => child.tag === shared)) {
+    if (
+      shared === undefined ||
+      !item.children?.every((child) => child.tag === shared)
+    ) {
       return item;
     }
     return {

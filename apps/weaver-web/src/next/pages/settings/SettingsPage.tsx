@@ -1,18 +1,36 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
-import { memo, useCallback, useMemo, useRef, useState, useSyncExternalStore } from "react";
+import {
+  memo,
+  useCallback,
+  useMemo,
+  useRef,
+  useState,
+  useSyncExternalStore,
+} from "react";
 import { useNavigate, useParams } from "react-router";
 import { useTranslate } from "@/lib/context/translate-context";
 import { PasswordManagersKeptOut } from "@/lib/password-manager";
 import { NextShell } from "../../shell/NextShell";
 import { PanelListBlock } from "../../shell/rail-blocks";
 import { useNextDataSelector } from "../../data/next-data";
-import { torrentsAvailable, torrentsAvailableView } from "../../data/torrents-shown";
+import {
+  torrentsAvailable,
+  torrentsAvailableView,
+} from "../../data/torrents-shown";
 import { useTorrentsState } from "../../data/use-torrents-shown";
 import { BetaTag, EmptyState } from "../../components/chrome";
-import { PrimaryButton, SecondaryButton, TextField } from "../../components/controls";
-import { SettingsPanelScope, SettingsShellProvider, type PanelFlags } from "./framework";
+import {
+  PrimaryButton,
+  SecondaryButton,
+  TextField,
+} from "../../components/controls";
+import {
+  SettingsPanelScope,
+  SettingsShellProvider,
+  type PanelFlags,
+} from "./framework";
 import {
   findPanel,
   isTorrentOnlyPanel,
@@ -43,10 +61,21 @@ function SearchOutcomeState({
     () => searchOutcome(slugs, (slug) => registry.panel(slug)).state,
   );
   if (state === "loading") {
-    return <EmptyState loading title={t("next.common.loading")} body={t("next.settings.searchLoadingBody")} />;
+    return (
+      <EmptyState
+        loading
+        title={t("next.common.loading")}
+        body={t("next.settings.searchLoadingBody")}
+      />
+    );
   }
   if (state === "empty") {
-    return <EmptyState title={t("next.settings.noMatch", { search })} body={t("next.settings.noMatchBody")} />;
+    return (
+      <EmptyState
+        title={t("next.settings.noMatch", { search })}
+        body={t("next.settings.noMatchBody")}
+      />
+    );
   }
   return null;
 }
@@ -65,14 +94,23 @@ function SearchOutcomeState({
  * it returns to the open panel as it was left.
  */
 
-const CLEAN: PanelFlags = { dirty: false, busy: false, status: null, failed: false };
+const CLEAN: PanelFlags = {
+  dirty: false,
+  busy: false,
+  status: null,
+  failed: false,
+};
 
 /**
  * One panel's page, apart from the shell's own state: a keystroke in the
  * search box or a panel reporting itself dirty draws the shell again, not the
  * page. What a panel reads from the shell reaches it through context.
  */
-const PanelPage = memo(function PanelPage({ entry }: { entry: PanelDefinition }) {
+const PanelPage = memo(function PanelPage({
+  entry,
+}: {
+  entry: PanelDefinition;
+}) {
   // The grouped screens, Networking and Scripts, hold credentials for other
   // things and never the Weaver login.
   return (
@@ -115,38 +153,50 @@ export function SettingsPage() {
   // The panels there are: without the torrents' own on a server that has no
   // torrents, where its address is one no panel answers.
   const torrents = useTorrentsState();
-  const panels = useMemo(() => settingsPanels(torrentsAvailable(torrents)), [torrents]);
+  const panels = useMemo(
+    () => settingsPanels(torrentsAvailable(torrents)),
+    [torrents],
+  );
   const slugs = useMemo(() => panels.map((entry) => entry.slug), [panels]);
   const panel = findPanel(slug, panels);
   // A direct visit to the torrents' own panel waits, drawing nothing, for the
   // server's answer instead of saying there is no such panel and then
   // drawing it.
-  const awaited = !panel && isTorrentOnlyPanel(slug) && torrentsAvailableView(torrents, false, false, true);
+  const awaited =
+    !panel &&
+    isTorrentOnlyPanel(slug) &&
+    torrentsAvailableView(torrents, false, false, true);
   const serverCount = useNextDataSelector((data) => data.providers.length);
 
   const [search, setSearch] = useState("");
   const [registry] = useState(() => new SearchRegistry());
   const [flags, setFlagsState] = useState<PanelFlags>(CLEAN);
   const [controlsHost, setControlsHost] = useState<HTMLElement | null>(null);
-  const actionsRef = useRef<{ save: () => void; revert: () => void } | null>(null);
+  const actionsRef = useRef<{ save: () => void; revert: () => void } | null>(
+    null,
+  );
 
   // Panels publish flags from an effect, so this must be stable or every panel
   // would re-register on each of the shell's own renders.
   const setFlags = useCallback((next: PanelFlags) => {
     setFlagsState((current) =>
-      current.dirty === next.dirty
-      && current.busy === next.busy
-      && current.status === next.status
-      && current.failed === next.failed
+      current.dirty === next.dirty &&
+      current.busy === next.busy &&
+      current.status === next.status &&
+      current.failed === next.failed
         ? current
         : next,
     );
   }, []);
 
-  const railItems = useMemo(() => settingsRail(t, serverCount, panels), [panels, serverCount, t]);
+  const railItems = useMemo(
+    () => settingsRail(t, serverCount, panels),
+    [panels, serverCount, t],
+  );
 
   const statusRight =
-    flags.status ?? (flags.dirty ? t("next.settings.unsaved") : t("next.settings.allSaved"));
+    flags.status ??
+    (flags.dirty ? t("next.settings.unsaved") : t("next.settings.allSaved"));
   const statusTone = flags.failed
     ? "text-wv-error-text"
     : flags.dirty
@@ -163,7 +213,13 @@ export function SettingsPage() {
       title={panel ? t(panel.label) : t("nav.settings")}
       titleTag={panel?.tag === "beta" ? <BetaTag /> : undefined}
       note={panel?.note ? t(panel.note) : undefined}
-      railMiddle={<PanelListBlock eyebrow={t("nav.settings")} items={railItems} testId={settingsIds.nav} />}
+      railMiddle={
+        <PanelListBlock
+          eyebrow={t("nav.settings")}
+          items={railItems}
+          testId={settingsIds.nav}
+        />
+      }
       statusRight={<span className={statusTone}>{statusRight}</span>}
       controls={
         <>
@@ -188,7 +244,10 @@ export function SettingsPage() {
             pair. `empty:hidden` keeps a panel that publishes none — most of
             them — from spending a gap on an empty slot.
           */}
-          <div ref={setControlsHost} className="flex items-center gap-[10px] empty:hidden" />
+          <div
+            ref={setControlsHost}
+            className="flex items-center gap-[10px] empty:hidden"
+          />
           <SecondaryButton
             icon="revert"
             testId={settingsIds.revert}
@@ -199,7 +258,13 @@ export function SettingsPage() {
           </SecondaryButton>
           <PrimaryButton
             icon="save"
-            testId={flags.busy ? settingsIds.saving : flags.dirty ? settingsIds.save : settingsIds.saved}
+            testId={
+              flags.busy
+                ? settingsIds.saving
+                : flags.dirty
+                  ? settingsIds.save
+                  : settingsIds.saved
+            }
             disabled={!flags.dirty || flags.busy}
             onClick={() => actionsRef.current?.save()}
           >
@@ -232,7 +297,13 @@ export function SettingsPage() {
               title={panelSearchTitle(t, entry)}
             />
           ))}
-          {searching ? <SearchOutcomeState search={search.trim()} registry={registry} slugs={slugs} /> : null}
+          {searching ? (
+            <SearchOutcomeState
+              search={search.trim()}
+              registry={registry}
+              slugs={slugs}
+            />
+          ) : null}
           {!searching && !panel && !awaited ? (
             <EmptyState
               title={t("next.settings.noPanel")}

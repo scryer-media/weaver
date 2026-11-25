@@ -42,7 +42,10 @@ export function Pagination({
   const t = useTranslate();
   const from = total === 0 ? 0 : pageIndex * pageSize + 1;
   const to = Math.min(total, (pageIndex + 1) * pageSize);
-  const windowStart = Math.max(0, Math.min(pageIndex - 2, pageCount - PAGE_WINDOW));
+  const windowStart = Math.max(
+    0,
+    Math.min(pageIndex - 2, pageCount - PAGE_WINDOW),
+  );
   const pages = Array.from(
     { length: Math.min(PAGE_WINDOW, pageCount) },
     (_, index) => windowStart + index,
@@ -58,10 +61,16 @@ export function Pagination({
         testId={testIds.paginationPageSize}
         label={t("table.rowsPerPage")}
         value={String(pageSize)}
-        options={pageSizes.map((size) => ({ value: String(size), label: String(size) }))}
+        options={pageSizes.map((size) => ({
+          value: String(size),
+          label: String(size),
+        }))}
         onChange={(next) => onPageSize(Number(next))}
       />
-      <span data-testid={testIds.paginationRange} className="font-wv-mono text-[11.5px] whitespace-nowrap text-wv-muted">
+      <span
+        data-testid={testIds.paginationRange}
+        className="font-wv-mono text-[11.5px] whitespace-nowrap text-wv-muted"
+      >
         {total === 0
           ? t("next.pagination.empty")
           : t("next.pagination.range", {
@@ -137,9 +146,17 @@ function Step({
           : "cursor-pointer border-wv-control text-wv-fg hover:border-wv-control-hover",
       )}
     >
-      {before === undefined ? null : <Icon name={before} size={13} className="-ml-[3px] mr-[4px] flex-none" />}
+      {before === undefined ? null : (
+        <Icon
+          name={before}
+          size={13}
+          className="-ml-[3px] mr-[4px] flex-none"
+        />
+      )}
       {label}
-      {after === undefined ? null : <Icon name={after} size={13} className="-mr-[3px] ml-[4px] flex-none" />}
+      {after === undefined ? null : (
+        <Icon name={after} size={13} className="-mr-[3px] ml-[4px] flex-none" />
+      )}
     </button>
   );
 }

@@ -6948,7 +6948,8 @@ type TorrentPortMapping {
 	"""
 	externalPort: Int
 	"""
-	The gateway's external address, when it told it.
+	The gateway's external address, when it told a public one. A gateway
+	inside a tunnel may tell the tunnel's own private address: not shown.
 	"""
 	gatewayAddress: String
 	error: String

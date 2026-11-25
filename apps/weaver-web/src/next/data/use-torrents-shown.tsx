@@ -45,7 +45,9 @@ export function useTorrentsState(): TorrentsState {
  * The one way an add surface asks.
  */
 export function useTorrentAddsOffered(): boolean {
-  return useNextDataSelector((data) => torrentAddsOffered(data.torrentPresence));
+  return useNextDataSelector((data) =>
+    torrentAddsOffered(data.torrentPresence),
+  );
 }
 
 /**
@@ -54,7 +56,9 @@ export function useTorrentAddsOffered(): boolean {
  * run asks this, such as the rail's torrent rates.
  */
 export function useTorrentsEnabled(): boolean {
-  return useNextDataSelector((data) => torrentAddsOffered(data.torrentPresence));
+  return useNextDataSelector((data) =>
+    torrentAddsOffered(data.torrentPresence),
+  );
 }
 
 /**
@@ -72,5 +76,10 @@ export function TorrentsOnly({
   fallback?: ReactNode;
   pending?: ReactNode;
 }) {
-  return torrentsView(useNextDataSelector((data) => data.torrents), children, fallback, pending);
+  return torrentsView(
+    useNextDataSelector((data) => data.torrents),
+    children,
+    fallback,
+    pending,
+  );
 }

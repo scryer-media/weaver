@@ -6,7 +6,10 @@ import type { DownloadBlockState } from "@/lib/context/live-data-context";
 function formatBytes(bytes: number): string {
   if (bytes === 0) return "0 B";
   const units = ["B", "KB", "MB", "GB", "TB"];
-  const i = Math.min(Math.floor(Math.log(bytes) / Math.log(1024)), units.length - 1);
+  const i = Math.min(
+    Math.floor(Math.log(bytes) / Math.log(1024)),
+    units.length - 1,
+  );
   const value = bytes / Math.pow(1024, i);
   return `${value.toFixed(i === 0 ? 0 : 1)} ${units[i]}`;
 }
@@ -73,11 +76,15 @@ export const METRICS_RANGE_OPTIONS = [
   { range: "THIRTY_DAYS", minutes: 43_200, labelKey: "metrics.range30d" },
 ] as const;
 
-export type MetricsHistoryRange = (typeof METRICS_RANGE_OPTIONS)[number]["range"];
+export type MetricsHistoryRange =
+  (typeof METRICS_RANGE_OPTIONS)[number]["range"];
 export type MetricsHistorySeriesVariant = "ACTUAL" | "AVG" | "PEAK";
 
 export function metricsRangeWindowMinutes(range: MetricsHistoryRange): number {
-  return METRICS_RANGE_OPTIONS.find((option) => option.range === range)?.minutes ?? 60;
+  return (
+    METRICS_RANGE_OPTIONS.find((option) => option.range === range)?.minutes ??
+    60
+  );
 }
 
 export function isRollupMetricsRange(range: MetricsHistoryRange): boolean {
@@ -146,7 +153,9 @@ const LIVE_JOB_STATUS_TO_METRIC_LABEL: Record<string, JobStatusMetricLabel> = {
   COMPLETE: "complete",
 };
 
-export function jobStatusMetricLabelFromLiveStatus(status: string): JobStatusMetricLabel | null {
+export function jobStatusMetricLabelFromLiveStatus(
+  status: string,
+): JobStatusMetricLabel | null {
   return LIVE_JOB_STATUS_TO_METRIC_LABEL[status] ?? null;
 }
 
@@ -211,10 +220,14 @@ export const HISTORY_METRIC_NAMES = [
   JOB_STATUS_HISTORY_METRIC,
 ] as const satisfies readonly string[];
 
-export type CounterHistoryMetricName = (typeof COUNTER_HISTORY_METRIC_NAMES)[number];
-export type GaugeHistoryMetricName = (typeof GAUGE_HISTORY_METRIC_NAMES)[number];
-export type SnapshotHistoryMetricName = (typeof SNAPSHOT_HISTORY_METRIC_NAMES)[number];
-export type HistoryMetricName = SnapshotHistoryMetricName | typeof JOB_STATUS_HISTORY_METRIC;
+export type CounterHistoryMetricName =
+  (typeof COUNTER_HISTORY_METRIC_NAMES)[number];
+export type GaugeHistoryMetricName =
+  (typeof GAUGE_HISTORY_METRIC_NAMES)[number];
+export type SnapshotHistoryMetricName =
+  (typeof SNAPSHOT_HISTORY_METRIC_NAMES)[number];
+export type HistoryMetricName =
+  SnapshotHistoryMetricName | typeof JOB_STATUS_HISTORY_METRIC;
 
 type NumericMetricsSnapshotKey = {
   [K in keyof MetricsSnapshot]: MetricsSnapshot[K] extends number ? K : never;
@@ -236,14 +249,17 @@ export const PROM_METRIC_TO_SNAPSHOT_FIELD: Record<
     "downloadFailuresArticleNotFound",
   weaver_pipeline_download_failures_capacity_unavailable_total:
     "downloadFailuresCapacityUnavailable",
-  weaver_pipeline_download_failures_transient_total: "downloadFailuresTransient",
+  weaver_pipeline_download_failures_transient_total:
+    "downloadFailuresTransient",
   weaver_pipeline_download_failures_auth_total: "downloadFailuresAuth",
-  weaver_pipeline_download_failures_permanent_total: "downloadFailuresPermanent",
+  weaver_pipeline_download_failures_permanent_total:
+    "downloadFailuresPermanent",
   weaver_pipeline_articles_not_found_total: "articlesNotFound",
   weaver_pipeline_decode_errors_total: "decodeErrors",
   weaver_pipeline_crc_errors_total: "crcErrors",
   weaver_pipeline_download_pressure_stalls_total: "downloadPressureStallsTotal",
-  weaver_pipeline_current_download_speed_bytes_per_second: "currentDownloadSpeed",
+  weaver_pipeline_current_download_speed_bytes_per_second:
+    "currentDownloadSpeed",
   weaver_pipeline_download_queue_depth: "downloadQueueDepth",
   weaver_pipeline_articles_in_flight: "articlesInFlight",
   weaver_pipeline_active_decodes: "activeDecodes",
@@ -257,10 +273,14 @@ export const PROM_METRIC_TO_SNAPSHOT_FIELD: Record<
   weaver_pipeline_extract_active: "extractActive",
   weaver_pipeline_write_buffered_bytes: "writeBufferedBytes",
   weaver_pipeline_write_buffered_segments: "writeBufferedSegments",
-  weaver_pipeline_decode_pressure_soft_limit_bytes: "decodePressureSoftLimitBytes",
-  weaver_pipeline_decode_pressure_hard_limit_bytes: "decodePressureHardLimitBytes",
-  weaver_pipeline_write_pressure_soft_limit_bytes: "writePressureSoftLimitBytes",
-  weaver_pipeline_write_pressure_hard_limit_bytes: "writePressureHardLimitBytes",
+  weaver_pipeline_decode_pressure_soft_limit_bytes:
+    "decodePressureSoftLimitBytes",
+  weaver_pipeline_decode_pressure_hard_limit_bytes:
+    "decodePressureHardLimitBytes",
+  weaver_pipeline_write_pressure_soft_limit_bytes:
+    "writePressureSoftLimitBytes",
+  weaver_pipeline_write_pressure_hard_limit_bytes:
+    "writePressureHardLimitBytes",
   weaver_pipeline_articles_per_second: "articlesPerSec",
   weaver_pipeline_decode_rate_mebibytes_per_second: "decodeRateMbps",
 };
@@ -556,7 +576,10 @@ function clampMetricValue(value: number): number {
   return Number.isFinite(value) ? value : 0;
 }
 
-function formatRoundedNumber(value: number, kind: "whole" | "one" | "two"): string {
+function formatRoundedNumber(
+  value: number,
+  kind: "whole" | "one" | "two",
+): string {
   const safeValue = clampMetricValue(value);
   if (kind === "whole") {
     return WHOLE_NUMBER_FORMAT.format(safeValue);
@@ -575,7 +598,10 @@ export function formatLatency(microseconds: number): string {
   return `${formatRoundedNumber(safeValue, safeValue >= 100 ? "whole" : "one")} us`;
 }
 
-export function formatMetricValue(format: MetricValueFormat, value: number): string {
+export function formatMetricValue(
+  format: MetricValueFormat,
+  value: number,
+): string {
   const safeValue = clampMetricValue(value);
   switch (format) {
     case "bytes":
@@ -585,7 +611,8 @@ export function formatMetricValue(format: MetricValueFormat, value: number): str
     case "count":
       return formatRoundedNumber(safeValue, safeValue >= 100 ? "whole" : "one");
     case "countPerSecond": {
-      const precision = safeValue >= 100 ? "whole" : safeValue >= 10 ? "one" : "two";
+      const precision =
+        safeValue >= 100 ? "whole" : safeValue >= 10 ? "one" : "two";
       return `${formatRoundedNumber(safeValue, precision)}/s`;
     }
     case "latencyUs":

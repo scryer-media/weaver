@@ -1307,6 +1307,10 @@ fn a_reading_carries_the_part_of_a_second_to_the_next() {
         let mut now = EPOCH_MS;
         for step in steps {
             now += step;
+            // A step back is the tick's to find.
+            if *step < 0 {
+                timed = timed.stepped_back(now);
+            }
             timed = timed.advanced(now, true, false, &mut counters);
         }
         (counters.active_duration_s, counters.finished_duration_s)
@@ -1318,6 +1322,27 @@ fn a_reading_carries_the_part_of_a_second_to_the_next() {
     // Stepped back 60 s: nothing for that reading, then 7 s from there.
     assert_eq!(run(&[1_000, -60_000]), (1, 0));
     assert_eq!(run(&[1_000, -60_000, 7_000]), (8, 0));
+}
+
+// A reading earlier than the last, with no step back found, credits
+// nothing and leaves the instant where it was: the time up to the later
+// reading is counted once.
+#[test]
+fn a_reading_that_comes_late_counts_no_time_twice() {
+    let mut counters = TorrentCounters::default();
+    let timed = Timed::at(EPOCH_MS)
+        .advanced(EPOCH_MS + 1_800_000, true, true, &mut counters)
+        .advanced(EPOCH_MS, true, true, &mut counters)
+        .advanced(EPOCH_MS + 1_800_000, true, true, &mut counters);
+    assert_eq!(
+        (
+            counters.active_duration_s,
+            counters.finished_duration_s,
+            counters.consecutive_seeding_s
+        ),
+        (1_800, 1_800, 0)
+    );
+    let _ = timed;
 }
 
 // All the seeding there has been keeps running across a break; the current
@@ -1358,6 +1383,10 @@ fn a_gap_between_seeding_readings_restarts_the_run_and_keeps_the_whole() {
         let mut now = EPOCH_MS;
         for step in steps {
             now += step;
+            // A step back is the tick's to find.
+            if *step < 0 {
+                timed = timed.stepped_back(now);
+            }
             timed = timed.advanced(now, true, true, &mut counters);
         }
         (

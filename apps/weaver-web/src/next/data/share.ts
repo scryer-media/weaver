@@ -56,7 +56,10 @@ export function shareStructure<T>(previous: unknown, next: T): T {
 export function useSharedStructure<T>(value: T): T {
   const held = useRef({ input: value, output: value });
   if (held.current.input !== value) {
-    held.current = { input: value, output: shareStructure(held.current.output, value) };
+    held.current = {
+      input: value,
+      output: shareStructure(held.current.output, value),
+    };
   }
   return held.current.output;
 }

@@ -44,7 +44,10 @@ export type SecretChange =
  * its name when it was renamed, and a value only when one was typed, since a
  * blank value field keeps the saved one.
  */
-export function secretChange(form: SecretForm, editing: Secret | null): SecretChange {
+export function secretChange(
+  form: SecretForm,
+  editing: Secret | null,
+): SecretChange {
   const name = form.name.trim();
   if (name === "" || new TextEncoder().encode(name).length > MAX_NAME_BYTES) {
     return { ok: false, problem: "next.secrets.nameInvalid" };
@@ -68,7 +71,9 @@ export function usedByText(secret: Secret): string {
 
 /** Secrets in the order every list and picker draws them: by name, ignoring case. */
 export function sortedSecrets(secrets: readonly Secret[]): Secret[] {
-  return [...secrets].sort((left, right) =>
-    left.name.localeCompare(right.name, undefined, { sensitivity: "base" }) || left.id.localeCompare(right.id),
+  return [...secrets].sort(
+    (left, right) =>
+      left.name.localeCompare(right.name, undefined, { sensitivity: "base" }) ||
+      left.id.localeCompare(right.id),
   );
 }

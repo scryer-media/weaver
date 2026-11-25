@@ -1,7 +1,15 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
-import { memo, useEffect, useMemo, useRef, useState, useSyncExternalStore, type ReactNode } from "react";
+import {
+  memo,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  useSyncExternalStore,
+  type ReactNode,
+} from "react";
 import { useTranslate } from "@/lib/context/translate-context";
 import {
   closedPath,
@@ -34,13 +42,28 @@ import { EmptyState } from "../../components/chrome";
 import { SecondaryButton, Select } from "../../components/controls";
 import { Icon } from "../../components/icons";
 import { countLabel } from "../../i18n/labels";
-import { metered, quotaHeldState, quotaStateLabel, quotaSummary } from "./egress-quota";
+import {
+  metered,
+  quotaHeldState,
+  quotaStateLabel,
+  quotaSummary,
+} from "./egress-quota";
 import { formatRate, stateColor, stateLabel, stateTone } from "./presentation";
 
-type FlowConsumer = { key: string; name: string; cap?: number; route?: NetworkRoute | null };
+type FlowConsumer = {
+  key: string;
+  name: string;
+  cap?: number;
+  route?: NetworkRoute | null;
+};
 
 /** The far end a speed test measures against: what it is, where it is, and what it is doing. */
-export type FlowEndpoint = { title: string; detail: string; state: string; label: string };
+export type FlowEndpoint = {
+  title: string;
+  detail: string;
+  state: string;
+  label: string;
+};
 
 /** What a box in the flow stands for, and so what picking it edits. */
 export type FlowTarget =
@@ -70,7 +93,8 @@ const INK = {
   dns: "#5aa2ec",
   dnsFill: "#1b2633",
 } as const;
-const FONT = '"Fira Code Variable", ui-monospace, "SFMono-Regular", Menlo, monospace';
+const FONT =
+  '"Fira Code Variable", ui-monospace, "SFMono-Regular", Menlo, monospace';
 const TITLE_FONT = '"Sora Variable", ui-sans-serif, system-ui, sans-serif';
 
 type Lane = { x: number; width: number; end: number };
@@ -85,7 +109,8 @@ const ENDPOINTS_WIDE = lane(1138, 214);
 const WIDTH_WIDE = 1368;
 const HOP_GAP = 26;
 /** How wide each hop of a chain of `hops` is, side by side across the proxy lane. */
-const hopWidth = (proxy: Lane, hops: number) => (proxy.width - (hops - 1) * HOP_GAP) / hops;
+const hopWidth = (proxy: Lane, hops: number) =>
+  (proxy.width - (hops - 1) * HOP_GAP) / hops;
 /** Where each gap between a chain's hops starts and ends across the proxy lane. */
 const chainGaps = (proxy: Lane, hops: number): [number, number][] =>
   Array.from({ length: hops - 1 }, (_, gap) => {
@@ -128,7 +153,8 @@ const DNS_TURN = 28;
 const EGRESS_PAGE = "/settings/networking/egress";
 const PROXIES_PAGE = "/settings/networking/proxies";
 const DNS_PAGE = "/settings/networking/dns";
-const routePage = (consumer: string) => `/settings/networking/routes?consumer=${encodeURIComponent(consumer)}`;
+const routePage = (consumer: string) =>
+  `/settings/networking/routes?consumer=${encodeURIComponent(consumer)}`;
 
 type Point = [number, number];
 type Member = {
@@ -194,14 +220,18 @@ const legKey = (leg: LegFlow) => `${leg.consumer}:${leg.position}`;
 
 /** The limits an egress is held to, each a row at the bottom of its card: its speed limit, then its quota. */
 const heldTo = (egress: Egress) => [
-  ...(egress.downloadBps !== null || egress.uploadBps !== null ? (["speed"] as const) : []),
+  ...(egress.downloadBps !== null || egress.uploadBps !== null
+    ? (["speed"] as const)
+    : []),
   ...(metered(egress) ? (["quota"] as const) : []),
 ];
 
 /** An egress's own speed limits, each direction that has one. */
 const speedSummary = (egress: Egress) =>
   [
-    ...(egress.downloadBps !== null ? [`↓ ${formatRate(egress.downloadBps)}`] : []),
+    ...(egress.downloadBps !== null
+      ? [`↓ ${formatRate(egress.downloadBps)}`]
+      : []),
     ...(egress.uploadBps !== null ? [`↑ ${formatRate(egress.uploadBps)}`] : []),
   ].join(" · ");
 
@@ -218,7 +248,10 @@ function wrap(text: string, width: number, size: number, limit: number) {
   for (const word of text.split(/\s+/).filter(Boolean)) {
     const last = lines.length - 1;
     // Whatever is past the last line joins it and is cut there.
-    if (last >= 0 && (lines.length === limit || `${lines[last]} ${word}`.length <= room)) {
+    if (
+      last >= 0 &&
+      (lines.length === limit || `${lines[last]} ${word}`.length <= room)
+    ) {
       lines[last] = `${lines[last]} ${word}`;
     } else {
       lines.push(word);
@@ -272,21 +305,32 @@ const ENDPOINT_GAP = 20;
 const FEED_HEIGHT = 56;
 const OUTBOUND_HEIGHT = 38;
 
-type EndpointCard = { cap: number; cells: number; rows: number; y: number; height: number; anchor: number };
+type EndpointCard = {
+  cap: number;
+  cells: number;
+  rows: number;
+  y: number;
+  height: number;
+  anchor: number;
+};
 
 /**
  * Whether a consumer's legs hold connections open to download over, as a
  * server's do. A feed or Default outbound opens one only for a moment, so its
  * legs show no count, speed or plan of connections.
  */
-const sustained = (consumer: string) => consumer !== OUTBOUND_CONSUMER && !consumer.startsWith("rss:");
+const sustained = (consumer: string) =>
+  consumer !== OUTBOUND_CONSUMER && !consumer.startsWith("rss:");
 
 /**
  * Where each route card sits, and where its legs meet it: halfway down, or on
  * a server's card halfway down its first row of connection boxes. A server's
  * card is as tall as those rows need.
  */
-function endpointCards(consumers: FlowConsumer[], legs: LegFlow[]): Map<string, EndpointCard> {
+function endpointCards(
+  consumers: FlowConsumer[],
+  legs: LegFlow[],
+): Map<string, EndpointCard> {
   const cards = new Map<string, EndpointCard>();
   let y = 58;
   for (const consumer of consumers) {
@@ -300,7 +344,14 @@ function endpointCards(consumers: FlowConsumer[], legs: LegFlow[]): Map<string, 
         : consumer.key.startsWith("rss:")
           ? FEED_HEIGHT
           : ENDPOINT_HEIGHT + (rows - 1) * CELL_ROW_PITCH;
-    cards.set(consumer.key, { cap, cells, rows, y, height, anchor: y + Math.min(height, ENDPOINT_HEIGHT) / 2 });
+    cards.set(consumer.key, {
+      cap,
+      cells,
+      rows,
+      y,
+      height,
+      anchor: y + Math.min(height, ENDPOINT_HEIGHT) / 2,
+    });
     y += height + ENDPOINT_GAP;
   }
   return cards;
@@ -316,9 +367,13 @@ function routeOrder(
   legs: LegFlow[],
   egresses: Egress[],
 ): { legs: LegFlow[]; egresses: Egress[] } {
-  const rank = new Map(consumers.map((consumer, index) => [consumer.key, index]));
+  const rank = new Map(
+    consumers.map((consumer, index) => [consumer.key, index]),
+  );
   const rows = [...legs].sort(
-    (a, b) => (rank.get(a.consumer) ?? 0) - (rank.get(b.consumer) ?? 0) || a.position - b.position,
+    (a, b) =>
+      (rank.get(a.consumer) ?? 0) - (rank.get(b.consumer) ?? 0) ||
+      a.position - b.position,
   );
   const reached = new Map<number, { sum: number; count: number }>();
   for (const [index, leg] of rows.entries()) {
@@ -329,17 +384,24 @@ function routeOrder(
     const at = reached.get(egress.id);
     return at ? at.sum / at.count : rows.length;
   };
-  return { legs: rows, egresses: [...egresses].sort((a, b) => middle(a) - middle(b)) };
+  return {
+    legs: rows,
+    egresses: [...egresses].sort((a, b) => middle(a) - middle(b)),
+  };
 }
 
 /** A linear map from [0, domain] onto [0, range], clamped at both ends. */
 function scale(domain: number, range: number) {
-  return (value: number) => Math.max(0, Math.min(range, (value / Math.max(1, domain)) * range));
+  return (value: number) =>
+    Math.max(0, Math.min(range, (value / Math.max(1, domain)) * range));
 }
 
 /** What a rung is doing for its leg. `direct` is the rung with no tunnel. */
 function rungStatus(leg: LegFlow, rungIndex: number, direct: boolean): string {
-  if (leg.open > 0 && (direct ? leg.selectedRung == null : leg.selectedRung === rungIndex)) {
+  if (
+    leg.open > 0 &&
+    (direct ? leg.selectedRung == null : leg.selectedRung === rungIndex)
+  ) {
     return "ACTIVE";
   }
   if (leg.state === "PROBING") {
@@ -360,7 +422,11 @@ function rungStatus(leg: LegFlow, rungIndex: number, direct: boolean): string {
  * member holding connections is active; one held in reserve is on standby,
  * as an idle rung is, whether or not the pool has measured it yet.
  */
-function memberState(member: PoolMemberFlow | undefined, pinned: boolean, enabled: boolean): string {
+function memberState(
+  member: PoolMemberFlow | undefined,
+  pinned: boolean,
+  enabled: boolean,
+): string {
   if (!enabled || member?.state === "DISABLED") {
     return "DISABLED";
   }
@@ -376,7 +442,11 @@ function memberState(member: PoolMemberFlow | undefined, pinned: boolean, enable
   if ((member?.opening ?? 0) > 0) {
     return "PROBING";
   }
-  if (member?.state === "SUSPECT" || member?.state === "CHALLENGER" || member?.state === "PROBING") {
+  if (
+    member?.state === "SUSPECT" ||
+    member?.state === "CHALLENGER" ||
+    member?.state === "PROBING"
+  ) {
     return member.state;
   }
   if (member?.failures) {
@@ -390,7 +460,12 @@ function memberState(member: PoolMemberFlow | undefined, pinned: boolean, enable
  * before it carried the attempt that far, and the hops after it were never
  * reached.
  */
-function hopState(position: number, failingAt: number, status: string, enabled: boolean): string {
+function hopState(
+  position: number,
+  failingAt: number,
+  status: string,
+  enabled: boolean,
+): string {
   if (!enabled) {
     return "DISABLED";
   }
@@ -418,8 +493,12 @@ function useMeasurements(legs: LegFlow[]) {
     }));
     // Every frame would set the counts already held, key for key.
     if (
-      Object.keys(current.current).length === new Set(values.map((value) => value.key)).size &&
-      values.every((value) => Object.hasOwn(current.current, value.key) && value.from === value.to)
+      Object.keys(current.current).length ===
+        new Set(values.map((value) => value.key)).size &&
+      values.every(
+        (value) =>
+          Object.hasOwn(current.current, value.key) && value.from === value.to,
+      )
     ) {
       return;
     }
@@ -430,7 +509,12 @@ function useMeasurements(legs: LegFlow[]) {
         start = now;
       }
       const progress = Math.min(1, (now - start) / 300);
-      const next = Object.fromEntries(values.map((value) => [value.key, value.from + (value.to - value.from) * progress]));
+      const next = Object.fromEntries(
+        values.map((value) => [
+          value.key,
+          value.from + (value.to - value.from) * progress,
+        ]),
+      );
       current.current = next;
       setCounts(next);
       if (progress < 1) {
@@ -471,8 +555,20 @@ const StateText = memo(function StateText({
 });
 
 /** The bar down a box's left edge, in the colour of the state the box is in. */
-const StateBar = memo(function StateBar({ x, y, height, state }: { x: number; y: number; height: number; state: string }) {
-  return <rect x={x} y={y} width="3" height={height} fill={stateColor(state)} />;
+const StateBar = memo(function StateBar({
+  x,
+  y,
+  height,
+  state,
+}: {
+  x: number;
+  y: number;
+  height: number;
+  state: string;
+}) {
+  return (
+    <rect x={x} y={y} width="3" height={height} fill={stateColor(state)} />
+  );
 });
 
 /** Lines written under a box's state: what went wrong with what the box stands for. */
@@ -481,7 +577,13 @@ const Note = memo(
     return (
       <>
         {lines.map((line, index) => (
-          <text key={index} x={x} y={y + index * NOTE_LINE} fill={INK.muted} fontSize="9.5">
+          <text
+            key={index}
+            x={x}
+            y={y + index * NOTE_LINE}
+            fill={INK.muted}
+            fontSize="9.5"
+          >
             {line}
           </text>
         ))}
@@ -544,14 +646,31 @@ function HopBox({
       />
       <StateBar x={x} y={y} height={height} state={state} />
       <text x={x + 14} y={y + 18} fill={INK.fg} fontSize="11">
-        {fit(title, width - 26 - switchRoom - (aside ? aside.length * 6 + 10 : 0), 11)}
+        {fit(
+          title,
+          width - 26 - switchRoom - (aside ? aside.length * 6 + 10 : 0),
+          11,
+        )}
       </text>
       {aside ? (
-        <text x={x + width - 12 - switchRoom} y={y + 18} fill={INK.fg} fontSize="10" textAnchor="end">
+        <text
+          x={x + width - 12 - switchRoom}
+          y={y + 18}
+          fill={INK.fg}
+          fontSize="10"
+          textAnchor="end"
+        >
           {aside}
         </text>
       ) : null}
-      <StateText x={x + 14} y={y + 35} size={9.5} state={state} label={fit(label, width - 39, 9.5)} testId={stateTestId} />
+      <StateText
+        x={x + 14}
+        y={y + 35}
+        size={9.5}
+        state={state}
+        label={fit(label, width - 39, 9.5)}
+        testId={stateTestId}
+      />
       <Note x={x + 14} y={y + BOX_HEIGHT + 5} lines={note} />
       {toggle ? toggle(x + width - 10 - toggleWidth, y + 6) : null}
     </g>
@@ -559,7 +678,11 @@ function HopBox({
 }
 
 /** How wide each half of an Up/Down switch is: room for the longer of its two words. */
-const switchHalf = (words: readonly string[]) => Math.max(24, Math.ceil(Math.max(...words.map((word) => word.length)) * 9 * 0.6) + 8);
+const switchHalf = (words: readonly string[]) =>
+  Math.max(
+    24,
+    Math.ceil(Math.max(...words.map((word) => word.length)) * 9 * 0.6) + 8,
+  );
 
 /**
  * An Up/Down switch drawn inside a box, Up until it is turned: Down leaves the
@@ -596,14 +719,21 @@ function UpDownSwitch({
       aria-label={label}
       data-testid={testId}
       onKeyDown={(event) => {
-        const wantDown = ["ArrowRight", "ArrowDown"].includes(event.key) ? true : ["ArrowLeft", "ArrowUp"].includes(event.key) ? false : null;
+        const wantDown = ["ArrowRight", "ArrowDown"].includes(event.key)
+          ? true
+          : ["ArrowLeft", "ArrowUp"].includes(event.key)
+            ? false
+            : null;
         if (wantDown === null) {
           return;
         }
         event.preventDefault();
         event.stopPropagation();
         pick(wantDown);
-        (event.currentTarget.children[wantDown ? 1 : 0] as SVGGElement | undefined)?.focus();
+        (
+          event.currentTarget.children[wantDown ? 1 : 0] as
+            SVGGElement | undefined
+        )?.focus();
       }}
     >
       {words.map((word, index) => {
@@ -633,7 +763,14 @@ function UpDownSwitch({
               }
             }}
           >
-            <rect x={left} y={y} width={half} height="16" fill={checked ? color : INK.row} stroke={checked ? color : INK.control} />
+            <rect
+              x={left}
+              y={y}
+              width={half}
+              height="16"
+              fill={checked ? color : INK.row}
+              stroke={checked ? color : INK.control}
+            />
             <rect
               x={left + 1.5}
               y={y + 1.5}
@@ -643,7 +780,13 @@ function UpDownSwitch({
               stroke={INK.fg}
               className="opacity-0 group-focus-visible:opacity-100"
             />
-            <text x={left + half / 2} y={y + 11.5} textAnchor="middle" fontSize="9" fill={checked ? INK.ground : INK.muted}>
+            <text
+              x={left + half / 2}
+              y={y + 11.5}
+              textAnchor="middle"
+              fontSize="9"
+              fill={checked ? INK.ground : INK.muted}
+            >
               {word}
             </text>
           </g>
@@ -654,14 +797,29 @@ function UpDownSwitch({
 }
 
 /** How wide a DNS pill is for its words, with room for a lock before them. */
-const pillWidth = (label: string, locked: boolean) => Math.ceil(label.length * DNS_SIZE * 0.6) + 20 + (locked ? 12 : 0);
+const pillWidth = (label: string, locked: boolean) =>
+  Math.ceil(label.length * DNS_SIZE * 0.6) + 20 + (locked ? 12 : 0);
 
 /** A padlock, centred on `x`, `y`: DNSSEC on the one asking, DoT or DoH on the line. */
 function Lock({ x, y, color }: { x: number; y: number; color: string }) {
   return (
     <g aria-hidden="true">
-      <rect x={x - 4} y={y - 1.5} width="8" height="6" rx="1" fill="none" stroke={color} strokeWidth="1.1" />
-      <path d={`M ${x - 2.5} ${y - 1.5} V ${y - 3.5} A 2.5 2.5 0 0 1 ${x + 2.5} ${y - 3.5} V ${y - 1.5}`} fill="none" stroke={color} strokeWidth="1.1" />
+      <rect
+        x={x - 4}
+        y={y - 1.5}
+        width="8"
+        height="6"
+        rx="1"
+        fill="none"
+        stroke={color}
+        strokeWidth="1.1"
+      />
+      <path
+        d={`M ${x - 2.5} ${y - 1.5} V ${y - 3.5} A 2.5 2.5 0 0 1 ${x + 2.5} ${y - 3.5} V ${y - 1.5}`}
+        fill="none"
+        stroke={color}
+        strokeWidth="1.1"
+      />
     </g>
   );
 }
@@ -689,10 +847,20 @@ function DnsPill({
   const shown = width ?? pillWidth(label, locked);
   const textX = x + 10 + (locked ? 12 : 0);
   const wireX = x + shown - 10;
-  const wireStart = wire ? wireX - Math.ceil(wire.length * DNS_SIZE * 0.6) - 12 : x + shown - 8;
+  const wireStart = wire
+    ? wireX - Math.ceil(wire.length * DNS_SIZE * 0.6) - 12
+    : x + shown - 8;
   return (
     <g>
-      <rect x={x} y={mid - DNS_PILL / 2} width={shown} height={DNS_PILL} rx={DNS_PILL / 2} fill={INK.dnsFill} stroke={color} />
+      <rect
+        x={x}
+        y={mid - DNS_PILL / 2}
+        width={shown}
+        height={DNS_PILL}
+        rx={DNS_PILL / 2}
+        fill={INK.dnsFill}
+        stroke={color}
+      />
       {locked ? <Lock x={x + 15} y={mid} color={color} /> : null}
       <text x={textX} y={mid + 3.5} fill={INK.secondary} fontSize={DNS_SIZE}>
         {fit(label, wireStart - textX - (wire ? 6 : 0), DNS_SIZE)}
@@ -700,7 +868,13 @@ function DnsPill({
       {wire ? (
         <>
           <Lock x={wireStart + 4} y={mid} color={color} />
-          <text x={wireX} y={mid + 3.5} fill={color} fontSize={DNS_SIZE} textAnchor="end">
+          <text
+            x={wireX}
+            y={mid + 3.5}
+            fill={color}
+            fontSize={DNS_SIZE}
+            textAnchor="end"
+          >
             {wire}
           </text>
         </>
@@ -718,13 +892,37 @@ const onMotionChange = (changed: () => void) => {
 };
 
 /** Whether the reader asks for less motion, followed while the flow is shown; traffic then stands still. */
-const useLessMotion = () => useSyncExternalStore(onMotionChange, lessMotion, () => false);
+const useLessMotion = () =>
+  useSyncExternalStore(onMotionChange, lessMotion, () => false);
 
 /** Traffic on a line: dashes that crawl from the egress out toward the endpoint. */
-function Traffic({ points, width, still }: { points: Point[]; width: number; still: boolean }) {
+function Traffic({
+  points,
+  width,
+  still,
+}: {
+  points: Point[];
+  width: number;
+  still: boolean;
+}) {
   return (
-    <path d={thread(points)} fill="none" stroke={stateColor("ACTIVE")} strokeWidth={width} strokeLinecap="round" strokeDasharray="18 30">
-      {still ? null : <animate attributeName="stroke-dashoffset" from="48" to="0" dur="0.8s" repeatCount="indefinite" />}
+    <path
+      d={thread(points)}
+      fill="none"
+      stroke={stateColor("ACTIVE")}
+      strokeWidth={width}
+      strokeLinecap="round"
+      strokeDasharray="18 30"
+    >
+      {still ? null : (
+        <animate
+          attributeName="stroke-dashoffset"
+          from="48"
+          to="0"
+          dur="0.8s"
+          repeatCount="indefinite"
+        />
+      )}
     </path>
   );
 }
@@ -790,7 +988,10 @@ export const NetworkFlow = memo(function NetworkFlow({
    * egress, leg, rung, chain hop and pool member to change it. Downed proxies
    * are drawn down here; the caller draws downed legs and rungs into `flow`.
    */
-  toggles?: { overrides: PathOverride; onToggle?: (target: DownTarget) => void };
+  toggles?: {
+    overrides: PathOverride;
+    onToggle?: (target: DownTarget) => void;
+  };
   /**
    * Drawn scaled to the width it is given, with no route picker: routes
    * chosen by the caller, as a job's panel and its enlarged view show them.
@@ -814,17 +1015,24 @@ export const NetworkFlow = memo(function NetworkFlow({
   const single = endpoint !== undefined;
   const onToggle = toggles?.onToggle;
   const overrides = toggles?.overrides;
-  const switchWords = [t("next.networking.speed.upSwitch"), t("next.networking.speed.downSwitch")] as const;
+  const switchWords = [
+    t("next.networking.speed.upSwitch"),
+    t("next.networking.speed.downSwitch"),
+  ] as const;
   const half = switchHalf(switchWords);
   const toggleWidth = onToggle ? 2 * half : 0;
   // With one route picked, the flow is that route alone: its legs, the
   // egresses they leave through and its own card.
   const shownLegs = useMemo(
-    () => (filter ? flow.legs.filter((leg) => leg.consumer === filter) : flow.legs),
+    () =>
+      filter ? flow.legs.filter((leg) => leg.consumer === filter) : flow.legs,
     [flow.legs, filter],
   );
   const shown = useMemo(
-    () => (filter ? consumers.filter((consumer) => consumer.key === filter) : consumers),
+    () =>
+      filter
+        ? consumers.filter((consumer) => consumer.key === filter)
+        : consumers,
     [consumers, filter],
   );
   // An egress no route leaves through is not part of the flow, so it has no card.
@@ -834,25 +1042,44 @@ export const NetworkFlow = memo(function NetworkFlow({
   }, [egresses, shownLegs]);
   const grouped = !single && (used.length > 6 || shownLegs.length > 40);
   const order = useMemo(
-    () => routeOrder(shown, shownLegs.filter((leg) => !grouped || group === leg.egressId), used),
+    () =>
+      routeOrder(
+        shown,
+        shownLegs.filter((leg) => !grouped || group === leg.egressId),
+        used,
+      ),
     [shown, shownLegs, grouped, group, used],
   );
-  const byKey = useMemo(() => new Map(consumers.map((consumer) => [consumer.key, consumer])), [consumers]);
+  const byKey = useMemo(
+    () => new Map(consumers.map((consumer) => [consumer.key, consumer])),
+    [consumers],
+  );
   // How many legs each route splits across: only a split is numbered and shared out.
   const legCounts = useMemo(() => {
     const counted = new Map<string, number>();
-    for (const leg of flow.legs) counted.set(leg.consumer, (counted.get(leg.consumer) ?? 0) + 1);
+    for (const leg of flow.legs)
+      counted.set(leg.consumer, (counted.get(leg.consumer) ?? 0) + 1);
     return counted;
   }, [flow.legs]);
   // Each leg's lookup, as its route's profile has it. A leg behind a kill switch dials nothing, so it looks nothing up.
   const lookups = useMemo(() => {
-    const found = new Map<string, { lookup: LegLookup; profile: FlowDnsProfile }>();
+    const found = new Map<
+      string,
+      { lookup: LegLookup; profile: FlowDnsProfile }
+    >();
     if (!dns) return found;
-    const profileById = new Map(dns.profiles.map((candidate) => [candidate.id, candidate]));
+    const profileById = new Map(
+      dns.profiles.map((candidate) => [candidate.id, candidate]),
+    );
     for (const leg of shownLegs) {
-      const chosen = profileById.get(byKey.get(leg.consumer)?.route?.dnsProfileId ?? SYSTEM_DNS_PROFILE_ID);
+      const chosen = profileById.get(
+        byKey.get(leg.consumer)?.route?.dnsProfileId ?? SYSTEM_DNS_PROFILE_ID,
+      );
       if (chosen && !closedPath(leg.path)) {
-        found.set(legKey(leg), { lookup: legLookup(leg, chosen, profiles), profile: chosen });
+        found.set(legKey(leg), {
+          lookup: legLookup(leg, chosen, profiles),
+          profile: chosen,
+        });
       }
     }
     return found;
@@ -863,7 +1090,13 @@ export const NetworkFlow = memo(function NetworkFlow({
   // line is never lost inside the card.
   const egressSlots = useMemo(() => {
     type Slot =
-      | { kind: "ask"; at: string; profile: FlowDnsProfile; lookup: LegLookup; legs: LegFlow[] }
+      | {
+          kind: "ask";
+          at: string;
+          profile: FlowDnsProfile;
+          lookup: LegLookup;
+          legs: LegFlow[];
+        }
       | { kind: "pass"; key: string };
     const slots = new Map<number, Slot[]>();
     for (const leg of order.legs) {
@@ -875,10 +1108,19 @@ export const NetworkFlow = memo(function NetworkFlow({
         here.push({ kind: "pass", key: legKey(leg) });
       } else {
         const same = here.find(
-          (slot) => slot.kind === "ask" && slot.at === found.lookup.at && slot.profile.id === found.profile.id,
+          (slot) =>
+            slot.kind === "ask" &&
+            slot.at === found.lookup.at &&
+            slot.profile.id === found.profile.id,
         );
         if (same?.kind === "ask") same.legs.push(leg);
-        else here.push({ kind: "ask", at: found.lookup.at, ...found, legs: [leg] });
+        else
+          here.push({
+            kind: "ask",
+            at: found.lookup.at,
+            ...found,
+            legs: [leg],
+          });
       }
       slots.set(leg.egressId, here);
     }
@@ -886,30 +1128,62 @@ export const NetworkFlow = memo(function NetworkFlow({
   }, [order.legs, lookups]);
   // Each egress card in the lane, from the top; one with a speed limit is a row taller, and so is one for each DNS pill.
   const egressCards = useMemo(() => {
-    const placed: { egress: Egress; y: number; shift: number; base: number; height: number }[] = [];
+    const placed: {
+      egress: Egress;
+      y: number;
+      shift: number;
+      base: number;
+      height: number;
+    }[] = [];
     let top = 58;
     for (const egress of order.egresses) {
       // Everything below the addresses moves down by the ones stacked after the first.
-      const shift = Math.max(0, (egress.addresses?.length ?? 0) - 1) * ADDRESS_LINE;
-      const base = EGRESS_HEIGHT + shift + heldTo(egress).length * EGRESS_LIMIT_ROW;
+      const shift =
+        Math.max(0, (egress.addresses?.length ?? 0) - 1) * ADDRESS_LINE;
+      const base =
+        EGRESS_HEIGHT + shift + heldTo(egress).length * EGRESS_LIMIT_ROW;
       const pills = egressSlots.get(egress.id)?.length ?? 0;
-      const card = { egress, y: top, shift, base, height: base + pills * DNS_ROW };
+      const card = {
+        egress,
+        y: top,
+        shift,
+        base,
+        height: base + pills * DNS_ROW,
+      };
       placed.push(card);
       top += card.height + EGRESS_GAP;
     }
     return placed;
   }, [order.egresses, egressSlots]);
-  const egressCardById = new Map(egressCards.map((placed) => [placed.egress.id, placed]));
-  const egressBottom = egressCards.reduce((bottom, card) => Math.max(bottom, card.y + card.height), 38);
-  const cards = useMemo(() => endpointCards(shown, flow.legs), [shown, flow.legs]);
-  const cardsBottom = [...cards.values()].reduce((bottom, card) => Math.max(bottom, card.y + card.height), 0);
+  const egressCardById = new Map(
+    egressCards.map((placed) => [placed.egress.id, placed]),
+  );
+  const egressBottom = egressCards.reduce(
+    (bottom, card) => Math.max(bottom, card.y + card.height),
+    38,
+  );
+  const cards = useMemo(
+    () => endpointCards(shown, flow.legs),
+    [shown, flow.legs],
+  );
+  const cardsBottom = [...cards.values()].reduce(
+    (bottom, card) => Math.max(bottom, card.y + card.height),
+    0,
+  );
 
   // A chain draws its hops side by side and needs the wide lane; every other proxy box keeps a card's width.
   const chained = order.legs.some(
-    (leg) => leg.path.kind !== "DIRECT" && leg.path.rungs.some((rung) => rung.kind === "CHAIN" && rung.chainIds.length > 1),
+    (leg) =>
+      leg.path.kind !== "DIRECT" &&
+      leg.path.rungs.some(
+        (rung) => rung.kind === "CHAIN" && rung.chainIds.length > 1,
+      ),
   );
   const PROXY = chained ? PROXY_WIDE : PROXY_REGULAR;
-  const ENDPOINTS = lane(ENDPOINTS_WIDE.x + PROXY.width - PROXY_WIDE.width, ENDPOINTS_WIDE.width);
+  const ENDPOINTS = lane(
+    ENDPOINTS_WIDE.x + PROXY.width - PROXY_WIDE.width,
+    ENDPOINTS_WIDE.width,
+  );
   const WIDTH = WIDTH_WIDE + PROXY.width - PROXY_WIDE.width;
   const layout = useMemo(() => {
     let offset = 58;
@@ -921,18 +1195,40 @@ export const NetworkFlow = memo(function NetworkFlow({
       for (const [rungIndex, rung] of rungs.entries()) {
         const live =
           rung.kind === "POOL"
-            ? flow.pools.find((candidate) => candidate.poolId === rung.poolId && candidate.egressId === leg.egressId)
+            ? flow.pools.find(
+                (candidate) =>
+                  candidate.poolId === rung.poolId &&
+                  candidate.egressId === leg.egressId,
+              )
             : undefined;
-        const configured = rung.kind === "POOL" ? pools.find((candidate) => candidate.id === rung.poolId) : undefined;
-        const hop = leg.failingHops?.find((candidate) => candidate.rung === rungIndex);
+        const configured =
+          rung.kind === "POOL"
+            ? pools.find((candidate) => candidate.id === rung.poolId)
+            : undefined;
+        const hop = leg.failingHops?.find(
+          (candidate) => candidate.rung === rungIndex,
+        );
         // The hop's failure in our sentence for its code.
-        const failing = hop && { ...hop, reason: proxyFaultSentence(t, { ...hop, message: hop.reason }) };
-        const members: Member[] = (configured?.memberIds ?? live?.members.map((member) => member.id) ?? []).map((id) => {
+        const failing = hop && {
+          ...hop,
+          reason: proxyFaultSentence(t, { ...hop, message: hop.reason }),
+        };
+        const members: Member[] = (
+          configured?.memberIds ??
+          live?.members.map((member) => member.id) ??
+          []
+        ).map((id) => {
           const member = live?.members.find((candidate) => candidate.id === id);
-          const measured = member != null && (member.connectMs != null || member.bytesPerSecond != null);
+          const measured =
+            member != null &&
+            (member.connectMs != null || member.bytesPerSecond != null);
           const carrying = (member?.open ?? 0) > 0;
-          const said = member?.blocked ?? (failing?.proxyId === id ? failing.reason : null);
-          const note = said ? wrap(said, PROXY.width - 45 - toggleWidth, 9.5, 2) : [];
+          const said =
+            member?.blocked ??
+            (failing?.proxyId === id ? failing.reason : null);
+          const note = said
+            ? wrap(said, PROXY.width - 45 - toggleWidth, 9.5, 2)
+            : [];
           return {
             id,
             live: member,
@@ -942,7 +1238,8 @@ export const NetworkFlow = memo(function NetworkFlow({
                 : memberState(
                     member,
                     live?.pinnedMember === id,
-                    profiles.find((profile) => profile.id === id)?.enabled !== false,
+                    profiles.find((profile) => profile.id === id)?.enabled !==
+                      false,
                   ),
             measured,
             carrying,
@@ -957,12 +1254,21 @@ export const NetworkFlow = memo(function NetworkFlow({
             : PROXY.width;
         const note =
           failing && !members.some((member) => member.id === failing.proxyId)
-            ? wrap(failing.reason, boxWidth - 26, 9.5, rung.kind === "CHAIN" ? 4 : 2)
+            ? wrap(
+                failing.reason,
+                boxWidth - 26,
+                9.5,
+                rung.kind === "CHAIN" ? 4 : 2,
+              )
             : [];
         // What carries the pool's traffic first, then the quickest to connect; the unmeasured last.
-        const latency = (member: Member) => member.live?.connectMs ?? Number.POSITIVE_INFINITY;
+        const latency = (member: Member) =>
+          member.live?.connectMs ?? Number.POSITIVE_INFINITY;
         members.sort(
-          (a, b) => Number(b.state === "ACTIVE") - Number(a.state === "ACTIVE") || latency(a) - latency(b) || 0,
+          (a, b) =>
+            Number(b.state === "ACTIVE") - Number(a.state === "ACTIVE") ||
+            latency(a) - latency(b) ||
+            0,
         );
         // An active head and a carrying member share a tint, so the rows start a gap below the head.
         const memberTops: number[] = [];
@@ -972,7 +1278,14 @@ export const NetworkFlow = memo(function NetworkFlow({
           memberTop += member.height;
         }
         const carriers = members.flatMap((member, index) =>
-          member.carrying ? [{ at: memberTops[index]! + (member.height - 2) / 2, open: member.live?.open ?? 0 }] : [],
+          member.carrying
+            ? [
+                {
+                  at: memberTops[index]! + (member.height - 2) / 2,
+                  open: member.live?.open ?? 0,
+                },
+              ]
+            : [],
         );
         const height =
           BOX_HEIGHT +
@@ -980,7 +1293,9 @@ export const NetworkFlow = memo(function NetworkFlow({
           members.reduce((sum, member) => sum + member.height, 0) +
           (members.length ? 2 * MEMBER_GAP : 0);
         // A lookup at the proxy carrying the leg stands at the bottom of that rung's box.
-        const asked = lookups.get(legKey(leg))?.lookup.at === "proxy" && rungIndex === (leg.selectedRung ?? 0);
+        const asked =
+          lookups.get(legKey(leg))?.lookup.at === "proxy" &&
+          rungIndex === (leg.selectedRung ?? 0);
         const dnsTop = asked ? height : null;
         const top = bottom;
         bottom = top + height + (asked ? DNS_ROW : 0) + 8;
@@ -998,7 +1313,12 @@ export const NetworkFlow = memo(function NetworkFlow({
         });
       }
       // Direct has no box: its line crosses level with the leg, or beneath the ladder it backs up.
-      const bypass = leg.path.kind === "DIRECT" ? LEG_HEIGHT / 2 : leg.path.directFallback ? bottom + 14 : null;
+      const bypass =
+        leg.path.kind === "DIRECT"
+          ? LEG_HEIGHT / 2
+          : leg.path.directFallback
+            ? bottom + 14
+            : null;
       // A kill switch stands where the ladder's first rung would.
       const closed = closedPath(leg.path);
       const note = leg.reason ? wrap(leg.reason, LEGS.width - 28, 9.5, 2) : [];
@@ -1006,33 +1326,76 @@ export const NetworkFlow = memo(function NetworkFlow({
       // The host's lookup, or one refused for want of a proxy, stands at the bottom of the leg's own card.
       const cardHeight = LEG_HEIGHT + noteHeight(note.length) + 0;
       const y = offset;
-      const height = Math.max(cardHeight, closed ? BOX_HEIGHT : bypass == null ? bottom - 8 : bypass + 16);
+      const height = Math.max(
+        cardHeight,
+        closed ? BOX_HEIGHT : bypass == null ? bottom - 8 : bypass + 16,
+      );
       offset += height + 18;
-      rows.push({ leg, y, height, cardHeight, note, blocks, bypass, closed, lookup });
+      rows.push({
+        leg,
+        y,
+        height,
+        cardHeight,
+        note,
+        blocks,
+        bypass,
+        closed,
+        lookup,
+      });
     }
     // The one endpoint stands level with the middle of everything that leads to it.
     const middle = (58 + Math.max(offset - 18, egressBottom)) / 2;
-    const endpointY = Math.max(58, Math.round(middle - ENDPOINT_BOX_HEIGHT / 2));
+    const endpointY = Math.max(
+      58,
+      Math.round(middle - ENDPOINT_BOX_HEIGHT / 2),
+    );
     const bottom = Math.max(
       offset - 16,
       egressBottom,
       single ? endpointY + ENDPOINT_BOX_HEIGHT : cardsBottom,
     );
-    return { rows, endpointY, height: single ? bottom + 12 : Math.max(bottom + 52, 260) };
-  }, [order.legs, flow.pools, pools, profiles, egressBottom, cardsBottom, single, toggleWidth, overrides, t, lookups, PROXY]);
+    return {
+      rows,
+      endpointY,
+      height: single ? bottom + 12 : Math.max(bottom + 52, 260),
+    };
+  }, [
+    order.legs,
+    flow.pools,
+    pools,
+    profiles,
+    egressBottom,
+    cardsBottom,
+    single,
+    toggleWidth,
+    overrides,
+    t,
+    lookups,
+    PROXY,
+  ]);
 
   // A flow no leg tunnels through has no proxy lane: the endpoints stand where it would start, and
   // a leg's line runs straight to its endpoint with nothing written on it.
-  const tunnelled = layout.rows.some(({ blocks, closed }) => blocks.length > 0 || closed);
+  const tunnelled = layout.rows.some(
+    ({ blocks, closed }) => blocks.length > 0 || closed,
+  );
   const endpoints = tunnelled ? ENDPOINTS : lane(PROXY.x, ENDPOINTS.width);
   const span = tunnelled ? WIDTH : endpoints.end + 16;
-  const width = scale(Math.max(RIBBON_FULL, ...consumers.map((consumer) => consumer.cap ?? 1)), 28);
-  const profile = (id: number | null) => profiles.find((candidate) => candidate.id === id);
-  const name = (id: number) => profile(id)?.name ?? t("next.networking.proxyNumber", { id });
+  const width = scale(
+    Math.max(RIBBON_FULL, ...consumers.map((consumer) => consumer.cap ?? 1)),
+    28,
+  );
+  const profile = (id: number | null) =>
+    profiles.find((candidate) => candidate.id === id);
+  const name = (id: number) =>
+    profile(id)?.name ?? t("next.networking.proxyNumber", { id });
   const poolName = (id: number | null) =>
-    pools.find((pool) => pool.id === id)?.name ?? t("next.networking.flow.pool");
-  const consumerName = (leg: LegFlow) => byKey.get(leg.consumer)?.name ?? leg.consumer;
-  const holds = (leg: LegFlow) => byKey.get(leg.consumer)?.route?.failover === "HOLD";
+    pools.find((pool) => pool.id === id)?.name ??
+    t("next.networking.flow.pool");
+  const consumerName = (leg: LegFlow) =>
+    byKey.get(leg.consumer)?.name ?? leg.consumer;
+  const holds = (leg: LegFlow) =>
+    byKey.get(leg.consumer)?.route?.failover === "HOLD";
 
   // The box under the pointer picks the routes to light. Everything else fades, and with nothing
   // pointed at the whole flow is lit.
@@ -1045,12 +1408,19 @@ export const NetworkFlow = memo(function NetworkFlow({
         ? leg.consumer === focus.key
         : legKey(leg) === focus.key);
   /** A leg's ways are its rungs in order, then the one with no tunnel. */
-  const onWay = (leg: LegFlow, index: number) => onRoute(leg) && (focus?.kind !== "way" || focus.index === index);
+  const onWay = (leg: LegFlow, index: number) =>
+    onRoute(leg) && (focus?.kind !== "way" || focus.index === index);
   const lit = layout.rows.filter(({ leg }) => onRoute(leg));
   const egressLit = (id: number) =>
-    !focus || (focus.kind === "egress" ? focus.id === id : lit.some(({ leg }) => leg.egressId === id));
+    !focus ||
+    (focus.kind === "egress"
+      ? focus.id === id
+      : lit.some(({ leg }) => leg.egressId === id));
   const endpointLit = (key: string) =>
-    !focus || (focus.kind === "endpoint" ? focus.key === key : lit.some(({ leg }) => leg.consumer === key));
+    !focus ||
+    (focus.kind === "endpoint"
+      ? focus.key === key
+      : lit.some(({ leg }) => leg.consumer === key));
   const point = (target: Focus) => ({
     onPointerEnter: () => setHover(target),
     onPointerLeave: () => setHover(null),
@@ -1059,7 +1429,13 @@ export const NetworkFlow = memo(function NetworkFlow({
    * A box that opens the editor for what it stands for. It is a real link to that thing's page; on
    * screen the editor opens over the flow instead. Where the flow is only shown, it is just the box.
    */
-  function card(target: FlowTarget | null, href: string, children: ReactNode, label?: string, key?: number) {
+  function card(
+    target: FlowTarget | null,
+    href: string,
+    children: ReactNode,
+    label?: string,
+    key?: number,
+  ) {
     if (!onEdit || !target) {
       return <g key={key}>{children}</g>;
     }
@@ -1079,7 +1455,8 @@ export const NetworkFlow = memo(function NetworkFlow({
       </a>
     );
   }
-  const proxyTarget = (id: number | null): FlowTarget | null => (id == null ? null : { kind: "proxy", id });
+  const proxyTarget = (id: number | null): FlowTarget | null =>
+    id == null ? null : { kind: "proxy", id };
   /** The test ID of the switch that takes `target` down. */
   const switchId = (target: DownTarget) =>
     target.kind === "leg"
@@ -1105,14 +1482,17 @@ export const NetworkFlow = memo(function NetworkFlow({
           />
         )
       : undefined;
-  const proxyDown = (id: number) => !!toggles && isDown(toggles.overrides, { kind: "proxy", id });
+  const proxyDown = (id: number) =>
+    !!toggles && isDown(toggles.overrides, { kind: "proxy", id });
   /** What a leg's line says where it goes direct, past the rungs of its ladder. */
   const directLabel = (leg: LegFlow, rungs: number) =>
     `${t("next.networking.route.direct")} · ${stateLabel(t, rungStatus(leg, rungs, true))}`;
 
   // DNS: a pill for each lookup in the box it leaves from, a card below the endpoints for each
   // thing that answers, and a line from one to the other.
-  const exitName = (exit: { proxyId: number | null; poolId: number | null } | null) =>
+  const exitName = (
+    exit: { proxyId: number | null; poolId: number | null } | null,
+  ) =>
     exit?.proxyId != null ? name(exit.proxyId) : poolName(exit?.poolId ?? null);
   const answerKey = (destination: LookupDestination) =>
     destination.kind === "host"
@@ -1126,7 +1506,12 @@ export const NetworkFlow = memo(function NetworkFlow({
   const rowByKey = new Map(layout.rows.map((row) => [legKey(row.leg), row]));
   /** The box a lookup leaves from, where its pill stands in it, and the gap below the row its line runs along. */
   type Origin = { x: number; mid: number; boxEnd: number; gapY: number | null };
-  const origins: { origin: Origin; lookup: LegLookup; profile: FlowDnsProfile; legs: LegFlow[] }[] = [];
+  const origins: {
+    origin: Origin;
+    lookup: LegLookup;
+    profile: FlowDnsProfile;
+    legs: LegFlow[];
+  }[] = [];
   for (const row of layout.rows) {
     const { leg, y, blocks, lookup } = row;
     const found = lookups.get(legKey(leg));
@@ -1137,7 +1522,12 @@ export const NetworkFlow = memo(function NetworkFlow({
       const hops = block.rung.kind === "CHAIN" ? block.rung.chainIds.length : 1;
       const x = PROXY.x + (hops - 1) * (hopWidth(PROXY, hops) + HOP_GAP) + 14;
       const mid = y + block.top + block.dnsTop! + 4 + DNS_PILL / 2;
-      origins.push({ origin: { x, mid, boxEnd: PROXY.end, gapY: null }, lookup, profile: found.profile, legs: [leg] });
+      origins.push({
+        origin: { x, mid, boxEnd: PROXY.end, gapY: null },
+        lookup,
+        profile: found.profile,
+        legs: [leg],
+      });
     }
   }
   // A line out of an egress runs along the first gap between rows at or below its pill, so it never jogs up;
@@ -1150,7 +1540,12 @@ export const NetworkFlow = memo(function NetworkFlow({
       if (ask.kind !== "ask") continue;
       const mid = y + base + index * DNS_ROW + 4 + DNS_PILL / 2;
       egressOrigins.push({
-        origin: { x: EGRESS.x + 14, mid, boxEnd: EGRESS.end, gapY: rowGaps.find((gap) => gap >= mid - 2) ?? null },
+        origin: {
+          x: EGRESS.x + 14,
+          mid,
+          boxEnd: EGRESS.end,
+          gapY: rowGaps.find((gap) => gap >= mid - 2) ?? null,
+        },
         lookup: ask.lookup,
         profile: ask.profile,
         legs: ask.legs,
@@ -1159,18 +1554,25 @@ export const NetworkFlow = memo(function NetworkFlow({
   }
   const sharing = new Map<number, typeof egressOrigins>();
   for (const found of egressOrigins) {
-    if (found.origin.gapY !== null) sharing.set(found.origin.gapY, [...(sharing.get(found.origin.gapY) ?? []), found]);
+    if (found.origin.gapY !== null)
+      sharing.set(found.origin.gapY, [
+        ...(sharing.get(found.origin.gapY) ?? []),
+        found,
+      ]);
   }
   for (const [gap, sharers] of sharing) {
     sharers.sort((a, b) => a.origin.mid - b.origin.mid);
     for (const [index, { origin }] of sharers.entries()) {
-      origin.gapY = gap + Math.max(-7, Math.min(7, (index - (sharers.length - 1) / 2) * 5));
+      origin.gapY =
+        gap + Math.max(-7, Math.min(7, (index - (sharers.length - 1) / 2) * 5));
     }
   }
   origins.push(...egressOrigins);
   // Lines run to their answers in the order they leave, top first, and the answers stack in that order, so
   // no line crosses another on its way down.
-  origins.sort((a, b) => (a.origin.gapY ?? a.origin.mid) - (b.origin.gapY ?? b.origin.mid));
+  origins.sort(
+    (a, b) => (a.origin.gapY ?? a.origin.mid) - (b.origin.gapY ?? b.origin.mid),
+  );
   // What answers, in the order the lookups reach it, stacked below the endpoints.
   const answers: {
     key: string;
@@ -1185,7 +1587,10 @@ export const NetworkFlow = memo(function NetworkFlow({
   }[] = [];
   const answerByKey = new Map<string, (typeof answers)[number]>();
   const wireWords = { TLS: "dnsWireTls", HTTPS: "dnsWireHttps" } as const;
-  let answerTop = (single ? layout.endpointY + ENDPOINT_BOX_HEIGHT : cardsBottom) + ENDPOINT_GAP + 18;
+  let answerTop =
+    (single ? layout.endpointY + ENDPOINT_BOX_HEIGHT : cardsBottom) +
+    ENDPOINT_GAP +
+    18;
   for (const { lookup, legs } of origins) {
     const destination = lookup.destination;
     if (!destination) continue;
@@ -1196,17 +1601,27 @@ export const NetworkFlow = memo(function NetworkFlow({
       seen.lit ||= lit;
       continue;
     }
-    const list = destination.kind === "list" && destination.id !== null ? listById.get(destination.id) : undefined;
-    const tunnel = destination.kind === "tunnel" ? profile(destination.proxyId) : undefined;
+    const list =
+      destination.kind === "list" && destination.id !== null
+        ? listById.get(destination.id)
+        : undefined;
+    const tunnel =
+      destination.kind === "tunnel" ? profile(destination.proxyId) : undefined;
     // A plain server says nothing of its transport; DoT and DoH are named on it. A tunnel's servers are asked plainly inside it.
     const servers =
       destination.kind === "list"
         ? (list?.servers.map((server) => ({
             label: serverPill(server),
-            wire: server.wire === "PLAIN" ? undefined : t(`next.networking.flow.${wireWords[server.wire]}`),
+            wire:
+              server.wire === "PLAIN"
+                ? undefined
+                : t(`next.networking.flow.${wireWords[server.wire]}`),
           })) ?? [])
         : destination.kind === "tunnel"
-          ? (tunnel?.dnsServers ?? []).map((label) => ({ label, wire: undefined }))
+          ? (tunnel?.dnsServers ?? []).map((label) => ({
+              label,
+              wire: undefined,
+            }))
           : [];
     const title =
       destination.kind === "host"
@@ -1214,8 +1629,12 @@ export const NetworkFlow = memo(function NetworkFlow({
         : destination.kind === "list"
           ? (list?.name ?? t("next.networking.flow.dnsListMissing"))
           : destination.kind === "tunnel"
-            ? t("next.networking.flow.dnsTunnelCard", { proxy: name(destination.proxyId) })
-            : t("next.networking.flow.dnsProxyCard", { proxy: exitName(destination) });
+            ? t("next.networking.flow.dnsTunnelCard", {
+                proxy: name(destination.proxyId),
+              })
+            : t("next.networking.flow.dnsProxyCard", {
+                proxy: exitName(destination),
+              });
     const note =
       destination.kind === "host"
         ? t("next.networking.flow.dnsHostNote")
@@ -1238,105 +1657,174 @@ export const NetworkFlow = memo(function NetworkFlow({
                 ? { kind: "pool", id: destination.poolId }
                 : null
             : null;
-    const height = DNS_CARD_HEAD + (note ? DNS_CARD_NOTE : 0) + servers.length * DNS_SERVER_ROW + 6;
-    const answer = { key, destination, y: answerTop, height, title, note, servers, target, lit };
+    const height =
+      DNS_CARD_HEAD +
+      (note ? DNS_CARD_NOTE : 0) +
+      servers.length * DNS_SERVER_ROW +
+      6;
+    const answer = {
+      key,
+      destination,
+      y: answerTop,
+      height,
+      title,
+      note,
+      servers,
+      target,
+      lit,
+    };
     answers.push(answer);
     answerByKey.set(key, answer);
     answerTop += height + ENDPOINT_GAP;
   }
-  const egressNames = new Map(egresses.map((egress) => [egress.id, egress.name]));
+  const egressNames = new Map(
+    egresses.map((egress) => [egress.id, egress.name]),
+  );
   // Where a lookup's line turns from the gap below its row toward its answer: the higher the gap, the
   // further right it turns, so a line turning down passes in front of the gaps below it, not across them.
-  const gaps = [...new Set(origins.flatMap(({ origin }) => (origin.gapY === null ? [] : [origin.gapY])))].sort((a, b) => a - b);
-  const approachAt = (gapY: number) => endpoints.x - 28 - gaps.indexOf(gapY) * 10;
-  const asks = origins.map(({ origin, lookup, profile: chosen, legs }, index) => {
-    const leg = legs[0]!;
-    // The pill says only that names are looked up here; who asks, and how, is in its tooltip.
-    const label = t(lookup.asker === null ? "next.networking.flow.dnsRefused" : "next.networking.flow.dnsAsk");
-    const list = lookup.destination?.kind === "list" && lookup.destination.id !== null ? listById.get(lookup.destination.id) : undefined;
-    const egressName = egressNames.get(leg.egressId) ?? "";
-    const values = { profile: chosen.name, proxy: exitName(lookup.exit), list: list?.name ?? chosen.name, from: egressName };
-    const says = [
-      lookup.refused === "NO_PROXY"
-        ? t("next.networking.flow.dnsRefusedNoProxy", values)
-        : lookup.refused === "NO_TUNNEL_DNS"
-          ? t("next.networking.flow.dnsRefusedNoTunnelDns", values)
-          : lookup.refused === "ONLY_WIREGUARD_VALIDATES"
-            ? t("next.networking.flow.dnsRefusedValidate", values)
-            : lookup.asker === "HOST"
-              ? t(lookup.fallback ? "next.networking.flow.dnsSaysFallback" : "next.networking.flow.dnsSaysHost", values)
-              : lookup.asker === "PROXY"
-                ? t("next.networking.flow.dnsSaysProxy", values)
-                : lookup.destination?.kind === "tunnel"
-                  ? t("next.networking.flow.dnsSaysTunnel", values)
-                  : t(lookup.at === "proxy" ? "next.networking.flow.dnsSaysListThrough" : "next.networking.flow.dnsSaysList", values),
-      ...(lookup.validates && !lookup.refused ? [t("next.networking.flow.dnsSaysValidates")] : []),
-    ].join(" ");
-    const answer = lookup.destination ? answerByKey.get(answerKey(lookup.destination)) : undefined;
-    const destY = answer ? answer.y + 17 : undefined;
-    // Where a leg's line meets its own pill in the egress it leaves on, below that egress's own pills.
-    const passOf = (fed: LegFlow) => {
-      const through = egressCardById.get(fed.egressId);
-      const passIndex = egressSlots.get(fed.egressId)?.findIndex((slot) => slot.kind === "pass" && slot.key === legKey(fed)) ?? -1;
-      return through && passIndex >= 0 ? through.y + through.base + passIndex * DNS_ROW + 4 + DNS_PILL / 2 : null;
-    };
-    // Out of its box, along the gap below its row where it has one, then to its answer.
-    const line: Point[] | null =
-      destY === undefined
-        ? null
-        : origin.gapY !== null && approachAt(origin.gapY) - origin.boxEnd > 2 * DNS_TURN
-          ? [
-              [origin.boxEnd, origin.mid],
-              [origin.boxEnd + DNS_TURN, origin.gapY],
-              [approachAt(origin.gapY), origin.gapY],
-              [endpoints.x, destY],
-            ]
-          : [
-              [origin.boxEnd, origin.mid],
-              [endpoints.x, destY],
-            ];
-    // A line from each leg's card to the box that asks for it says which route the lookup is for: into the
-    // egress it leaves through, or on through that egress to the proxy carrying it.
-    const entry = origin.x - 14;
-    const feeds = legs.flatMap((fed) => {
-            const row = rowByKey.get(legKey(fed));
-            if (!row) return [];
-            const start: Point = [LEGS.end, row.y + row.cardHeight - 14];
-            const pass = lookup.at === "proxy" ? passOf(fed) : null;
-            const paths: Point[][] =
-              lookup.at !== "proxy"
-                ? [[start, [EGRESS.x, origin.mid]]]
-                : pass !== null
-                  ? [
-                      [start, [EGRESS.x, pass]],
-                      [[EGRESS.end, pass], [entry, origin.mid]],
-                    ]
-                  : [[start, [entry, origin.mid]]];
-            return [{ key: legKey(fed), y: start[1], paths, pass, lit: onRoute(fed) }];
-          });
-    return {
-      key: `${index}:${legKey(leg)}:${chosen.id}`,
-      ...origin,
-      legs,
-      profile: chosen,
-      label,
-      says,
-      locked: lookup.validates && !lookup.refused,
-      refused: lookup.refused !== null,
-      width: Math.min(pillWidth(label, lookup.validates), origin.boxEnd - origin.x - 14),
-      line,
-      feeds,
-      entry,
-      // A pill reached from a leg's card has its line come in at the box's edge.
-      enters: feeds.length > 0,
-      target:
-        chosen.id === SYSTEM_DNS_PROFILE_ID
-          ? ({ kind: "route", consumer: leg.consumer } as const)
-          : ({ kind: "dnsProfile", id: chosen.id } as const),
-      lit: legs.some(onRoute),
-    };
-  });
-  const drawnHeight = answers.length ? Math.max(layout.height, answerTop + 32) : layout.height;
+  const gaps = [
+    ...new Set(
+      origins.flatMap(({ origin }) =>
+        origin.gapY === null ? [] : [origin.gapY],
+      ),
+    ),
+  ].sort((a, b) => a - b);
+  const approachAt = (gapY: number) =>
+    endpoints.x - 28 - gaps.indexOf(gapY) * 10;
+  const asks = origins.map(
+    ({ origin, lookup, profile: chosen, legs }, index) => {
+      const leg = legs[0]!;
+      // The pill says only that names are looked up here; who asks, and how, is in its tooltip.
+      const label = t(
+        lookup.asker === null
+          ? "next.networking.flow.dnsRefused"
+          : "next.networking.flow.dnsAsk",
+      );
+      const list =
+        lookup.destination?.kind === "list" && lookup.destination.id !== null
+          ? listById.get(lookup.destination.id)
+          : undefined;
+      const egressName = egressNames.get(leg.egressId) ?? "";
+      const values = {
+        profile: chosen.name,
+        proxy: exitName(lookup.exit),
+        list: list?.name ?? chosen.name,
+        from: egressName,
+      };
+      const says = [
+        lookup.refused === "NO_PROXY"
+          ? t("next.networking.flow.dnsRefusedNoProxy", values)
+          : lookup.refused === "NO_TUNNEL_DNS"
+            ? t("next.networking.flow.dnsRefusedNoTunnelDns", values)
+            : lookup.refused === "ONLY_WIREGUARD_VALIDATES"
+              ? t("next.networking.flow.dnsRefusedValidate", values)
+              : lookup.asker === "HOST"
+                ? t(
+                    lookup.fallback
+                      ? "next.networking.flow.dnsSaysFallback"
+                      : "next.networking.flow.dnsSaysHost",
+                    values,
+                  )
+                : lookup.asker === "PROXY"
+                  ? t("next.networking.flow.dnsSaysProxy", values)
+                  : lookup.destination?.kind === "tunnel"
+                    ? t("next.networking.flow.dnsSaysTunnel", values)
+                    : t(
+                        lookup.at === "proxy"
+                          ? "next.networking.flow.dnsSaysListThrough"
+                          : "next.networking.flow.dnsSaysList",
+                        values,
+                      ),
+        ...(lookup.validates && !lookup.refused
+          ? [t("next.networking.flow.dnsSaysValidates")]
+          : []),
+      ].join(" ");
+      const answer = lookup.destination
+        ? answerByKey.get(answerKey(lookup.destination))
+        : undefined;
+      const destY = answer ? answer.y + 17 : undefined;
+      // Where a leg's line meets its own pill in the egress it leaves on, below that egress's own pills.
+      const passOf = (fed: LegFlow) => {
+        const through = egressCardById.get(fed.egressId);
+        const passIndex =
+          egressSlots
+            .get(fed.egressId)
+            ?.findIndex(
+              (slot) => slot.kind === "pass" && slot.key === legKey(fed),
+            ) ?? -1;
+        return through && passIndex >= 0
+          ? through.y + through.base + passIndex * DNS_ROW + 4 + DNS_PILL / 2
+          : null;
+      };
+      // Out of its box, along the gap below its row where it has one, then to its answer.
+      const line: Point[] | null =
+        destY === undefined
+          ? null
+          : origin.gapY !== null &&
+              approachAt(origin.gapY) - origin.boxEnd > 2 * DNS_TURN
+            ? [
+                [origin.boxEnd, origin.mid],
+                [origin.boxEnd + DNS_TURN, origin.gapY],
+                [approachAt(origin.gapY), origin.gapY],
+                [endpoints.x, destY],
+              ]
+            : [
+                [origin.boxEnd, origin.mid],
+                [endpoints.x, destY],
+              ];
+      // A line from each leg's card to the box that asks for it says which route the lookup is for: into the
+      // egress it leaves through, or on through that egress to the proxy carrying it.
+      const entry = origin.x - 14;
+      const feeds = legs.flatMap((fed) => {
+        const row = rowByKey.get(legKey(fed));
+        if (!row) return [];
+        const start: Point = [LEGS.end, row.y + row.cardHeight - 14];
+        const pass = lookup.at === "proxy" ? passOf(fed) : null;
+        const paths: Point[][] =
+          lookup.at !== "proxy"
+            ? [[start, [EGRESS.x, origin.mid]]]
+            : pass !== null
+              ? [
+                  [start, [EGRESS.x, pass]],
+                  [
+                    [EGRESS.end, pass],
+                    [entry, origin.mid],
+                  ],
+                ]
+              : [[start, [entry, origin.mid]]];
+        return [
+          { key: legKey(fed), y: start[1], paths, pass, lit: onRoute(fed) },
+        ];
+      });
+      return {
+        key: `${index}:${legKey(leg)}:${chosen.id}`,
+        ...origin,
+        legs,
+        profile: chosen,
+        label,
+        says,
+        locked: lookup.validates && !lookup.refused,
+        refused: lookup.refused !== null,
+        width: Math.min(
+          pillWidth(label, lookup.validates),
+          origin.boxEnd - origin.x - 14,
+        ),
+        line,
+        feeds,
+        entry,
+        // A pill reached from a leg's card has its line come in at the box's edge.
+        enters: feeds.length > 0,
+        target:
+          chosen.id === SYSTEM_DNS_PROFILE_ID
+            ? ({ kind: "route", consumer: leg.consumer } as const)
+            : ({ kind: "dnsProfile", id: chosen.id } as const),
+        lit: legs.some(onRoute),
+      };
+    },
+  );
+  const drawnHeight = answers.length
+    ? Math.max(layout.height, answerTop + 32)
+    : layout.height;
 
   /** One rung of a leg's ladder, drawn in the proxy lane. */
   function rungBlock(leg: LegFlow, rowY: number, block: Block) {
@@ -1349,20 +1837,47 @@ export const NetworkFlow = memo(function NetworkFlow({
       ...point({ kind: "way", key: legKey(leg), index: rungIndex }),
     };
     // The whole block answers the pointer, the gaps between its boxes included.
-    const ground = <rect x={PROXY.x} y={y} width={PROXY.width} height={block.height} fill="transparent" />;
+    const ground = (
+      <rect
+        x={PROXY.x}
+        y={y}
+        width={PROXY.width}
+        height={block.height}
+        fill="transparent"
+      />
+    );
 
     if (rung.kind === "CHAIN") {
       const boxWidth = hopWidth(PROXY, rung.chainIds.length);
       const failingAt = failing ? rung.chainIds.indexOf(failing.proxyId) : -1;
       return (
-        <g key={rungIndex} role="group" aria-label={rung.chainIds.map(name).join(" > ")} {...way}>
+        <g
+          key={rungIndex}
+          role="group"
+          aria-label={rung.chainIds.map(name).join(" > ")}
+          {...way}
+        >
           {ground}
           {rung.chainIds.map((id, position) => {
             const x = PROXY.x + position * (boxWidth + HOP_GAP);
-            const state = proxyDown(id) ? "DOWN" : hopState(position, failingAt, status, profile(id)?.enabled !== false);
+            const state = proxyDown(id)
+              ? "DOWN"
+              : hopState(
+                  position,
+                  failingAt,
+                  status,
+                  profile(id)?.enabled !== false,
+                );
             return (
               <g key={id}>
-                <title>{[name(id), ...(failing && position === failingAt ? [failing.reason] : [])].join(" · ")}</title>
+                <title>
+                  {[
+                    name(id),
+                    ...(failing && position === failingAt
+                      ? [failing.reason]
+                      : []),
+                  ].join(" · ")}
+                </title>
                 {card(
                   proxyTarget(id),
                   PROXIES_PAGE,
@@ -1378,7 +1893,11 @@ export const NetworkFlow = memo(function NetworkFlow({
                     active={isActive}
                     toggle={toggle({ kind: "proxy", id }, name(id))}
                     toggleWidth={toggleWidth}
-                    stateTestId={networkIds.flowRung(leg.position, rungIndex, state)}
+                    stateTestId={networkIds.flowRung(
+                      leg.position,
+                      rungIndex,
+                      state,
+                    )}
                   />,
                 )}
               </g>
@@ -1391,7 +1910,10 @@ export const NetworkFlow = memo(function NetworkFlow({
     if (rung.kind === "POOL") {
       const configured = pools.find((pool) => pool.id === rung.poolId);
       const state = configured?.enabled === false ? "DISABLED" : status;
-      const held = members.reduce((sum, member) => sum + (member.live?.open ?? 0), 0);
+      const held = members.reduce(
+        (sum, member) => sum + (member.live?.open ?? 0),
+        0,
+      );
       const head = BOX_HEIGHT + noteHeight(block.note.length);
       return (
         <g key={rungIndex} {...way}>
@@ -1406,8 +1928,14 @@ export const NetworkFlow = memo(function NetworkFlow({
               y={y}
               width={PROXY.width}
               height={head}
-              title={t("next.networking.flow.poolRung", { name: poolName(rung.poolId) })}
-              aside={held > 0 ? countLabel(t, "next.networking.flow.holding", held) : undefined}
+              title={t("next.networking.flow.poolRung", {
+                name: poolName(rung.poolId),
+              })}
+              aside={
+                held > 0
+                  ? countLabel(t, "next.networking.flow.holding", held)
+                  : undefined
+              }
               state={state}
               label={stateLabel(t, state)}
               note={block.note}
@@ -1415,25 +1943,43 @@ export const NetworkFlow = memo(function NetworkFlow({
               toggleWidth={toggleWidth}
               toggle={toggle(
                 { kind: "rung", leg: leg.position, rung: rungIndex },
-                t("next.networking.route.rungTarget", { leg: leg.position + 1, rung: rungIndex + 1 }),
+                t("next.networking.route.rungTarget", {
+                  leg: leg.position + 1,
+                  rung: rungIndex + 1,
+                }),
               )}
               stateTestId={networkIds.flowRung(leg.position, rungIndex, state)}
             />,
           )}
           <StateBar x={PROXY.x} y={y} height={block.height} state={state} />
-          <g role="group" aria-label={t("next.networking.flow.poolMembers", { name: poolName(rung.poolId) })}>
+          <g
+            role="group"
+            aria-label={t("next.networking.flow.poolMembers", {
+              name: poolName(rung.poolId),
+            })}
+          >
             {members.map((member, index) => {
               const top = y + block.memberTops[index]!;
               // Only what the pool has measured: a figure it has not taken is left out, not dashed.
               const ms = member.measured ? member.live?.connectMs : null;
               const speed =
                 member.measured && member.live?.bytesPerSecond != null
-                  ? t("next.networking.flow.memberSpeed", { rate: formatRate(member.live.bytesPerSecond) })
+                  ? t("next.networking.flow.memberSpeed", {
+                      rate: formatRate(member.live.bytesPerSecond),
+                    })
                   : null;
               const timings = (latency: string | null) =>
-                member.measured ? [latency, speed].filter((part) => part !== null).join(" · ") : null;
+                member.measured
+                  ? [latency, speed].filter((part) => part !== null).join(" · ")
+                  : null;
               // The hover has no room for the signal mark, so it says what the figure is.
-              const timing = timings(ms == null ? null : t("next.networking.flow.memberConnect", { ms: ms.toFixed(0) }));
+              const timing = timings(
+                ms == null
+                  ? null
+                  : t("next.networking.flow.memberConnect", {
+                      ms: ms.toFixed(0),
+                    }),
+              );
               // A member carrying traffic shows what it carries now; its timings move to the hover.
               const signal = !member.carrying && ms != null;
               const detail = member.carrying
@@ -1441,7 +1987,13 @@ export const NetworkFlow = memo(function NetworkFlow({
                     open: member.live?.open ?? 0,
                     rate: formatRate(member.live?.liveBytesPerSecond ?? 0),
                   })
-                : timings(ms == null ? null : t("next.networking.flow.memberLatency", { ms: ms.toFixed(0) }));
+                : timings(
+                    ms == null
+                      ? null
+                      : t("next.networking.flow.memberLatency", {
+                          ms: ms.toFixed(0),
+                        }),
+                  );
               const detailX = PROXY.x + 29 + (signal ? 14 : 0);
               return card(
                 proxyTarget(member.id),
@@ -1455,21 +2007,44 @@ export const NetworkFlow = memo(function NetworkFlow({
                     height={member.height - 2}
                     fill={member.carrying ? INK.rowActive : INK.row}
                   />
-                  <rect x={PROXY.x + 16} y={top + 6} width="7" height="7" fill={stateColor(member.state)} />
-                  <text x={PROXY.x + 29} y={top + 13} fill={INK.secondary} fontSize="10">
+                  <rect
+                    x={PROXY.x + 16}
+                    y={top + 6}
+                    width="7"
+                    height="7"
+                    fill={stateColor(member.state)}
+                  />
+                  <text
+                    x={PROXY.x + 29}
+                    y={top + 13}
+                    fill={INK.secondary}
+                    fontSize="10"
+                  >
                     {`${fit(name(member.id), PROXY.width / 2 - 20, 10)} · ${stateLabel(t, member.state)}`}
                   </text>
                   {signal ? (
-                    <g transform={`translate(${PROXY.x + 29} ${top + 17})`} color={INK.muted}>
+                    <g
+                      transform={`translate(${PROXY.x + 29} ${top + 17})`}
+                      color={INK.muted}
+                    >
                       <Icon name="signal" size={10} />
                     </g>
                   ) : null}
                   {detail ? (
-                    <text x={detailX} y={top + 25} fill={INK.muted} fontSize="9.5">
+                    <text
+                      x={detailX}
+                      y={top + 25}
+                      fill={INK.muted}
+                      fontSize="9.5"
+                    >
                       {fit(detail, PROXY.end - 16 - detailX, 9.5)}
                     </text>
                   ) : null}
-                  <Note x={PROXY.x + 29} y={top + (detail ? 37 : 25)} lines={member.note} />
+                  <Note
+                    x={PROXY.x + 29}
+                    y={top + (detail ? 37 : 25)}
+                    lines={member.note}
+                  />
                   {toggle({ kind: "proxy", id: member.id }, name(member.id))?.(
                     PROXY.end - 16 - toggleWidth,
                     top + 2,
@@ -1513,7 +2088,10 @@ export const NetworkFlow = memo(function NetworkFlow({
             toggleWidth={toggleWidth}
             toggle={toggle(
               { kind: "rung", leg: leg.position, rung: rungIndex },
-              t("next.networking.route.rungTarget", { leg: leg.position + 1, rung: rungIndex + 1 }),
+              t("next.networking.route.rungTarget", {
+                leg: leg.position + 1,
+                rung: rungIndex + 1,
+              }),
             )}
             stateTestId={networkIds.flowRung(leg.position, rungIndex, state)}
           />,
@@ -1523,7 +2101,12 @@ export const NetworkFlow = memo(function NetworkFlow({
   }
 
   if (consumers.length === 0 && egresses.length === 0) {
-    return <EmptyState title={t("next.networking.flow.emptyTitle")} body={t("next.networking.flow.emptyBody")} />;
+    return (
+      <EmptyState
+        title={t("next.networking.flow.emptyTitle")}
+        body={t("next.networking.flow.emptyBody")}
+      />
+    );
   }
 
   return (
@@ -1537,7 +2120,10 @@ export const NetworkFlow = memo(function NetworkFlow({
             className="min-w-[180px]"
             options={[
               { value: "", label: t("next.networking.flow.allConsumers") },
-              ...consumers.map((consumer) => ({ value: consumer.key, label: consumer.name })),
+              ...consumers.map((consumer) => ({
+                value: consumer.key,
+                label: consumer.name,
+              })),
             ]}
           />
         </div>
@@ -1555,7 +2141,12 @@ export const NetworkFlow = memo(function NetworkFlow({
               onClick={() => setGroup(group === egress.id ? null : egress.id)}
               className={group === egress.id ? "!border-wv-accent" : undefined}
             >
-              {egress.name} · {countLabel(t, "next.networking.legCount", shownLegs.filter((leg) => leg.egressId === egress.id).length)}
+              {egress.name} ·{" "}
+              {countLabel(
+                t,
+                "next.networking.legCount",
+                shownLegs.filter((leg) => leg.egressId === egress.id).length,
+              )}
             </SecondaryButton>
           ))}
         </div>
@@ -1571,16 +2162,39 @@ export const NetworkFlow = memo(function NetworkFlow({
           style={
             fitWidth
               ? { background: INK.ground, fontFamily: FONT, width: "100%" }
-              : { background: INK.ground, fontFamily: FONT, width: `${(100 * span) / WIDTH}%`, minWidth: (1160 * span) / WIDTH }
+              : {
+                  background: INK.ground,
+                  fontFamily: FONT,
+                  width: `${(100 * span) / WIDTH}%`,
+                  minWidth: (1160 * span) / WIDTH,
+                }
           }
         >
           {[
             [EGRESS.x, t("next.networking.flow.egressColumn")],
             [LEGS.x, t("next.networking.flow.legsColumn")],
-            ...(tunnelled ? [[PROXY.x, t("next.networking.flow.proxyColumn")]] : []),
-            [endpoints.x, t(single ? "next.networking.flow.endpointColumn" : "next.networking.flow.consumersColumn")],
+            ...(tunnelled
+              ? [[PROXY.x, t("next.networking.flow.proxyColumn")]]
+              : []),
+            [
+              endpoints.x,
+              t(
+                single
+                  ? "next.networking.flow.endpointColumn"
+                  : "next.networking.flow.consumersColumn",
+              ),
+            ],
           ].map(([x, label]) => (
-            <text key={String(x)} x={Number(x) + 4} y="30" fill={INK.faint} fontSize="10.5" fontWeight="600" letterSpacing="1.5" fontFamily={TITLE_FONT}>
+            <text
+              key={String(x)}
+              x={Number(x) + 4}
+              y="30"
+              fill={INK.faint}
+              fontSize="10.5"
+              fontWeight="600"
+              letterSpacing="1.5"
+              fontFamily={TITLE_FONT}
+            >
               {String(label).toUpperCase()}
             </text>
           ))}
@@ -1603,17 +2217,22 @@ export const NetworkFlow = memo(function NetworkFlow({
           )}
 
           {layout.rows.map(({ leg, y, blocks, bypass, closed }) => {
-            const egressCard = egressCardById.get(leg.egressId) ?? egressCards[0];
+            const egressCard =
+              egressCardById.get(leg.egressId) ?? egressCards[0];
             const egressY = egressCard ? egressCard.y + EGRESS_HEIGHT / 2 : 112;
             const consumerY = endpoint
               ? layout.endpointY + ENDPOINT_BOX_HEIGHT / 2
               : (cards.get(leg.consumer)?.anchor ?? 58 + ENDPOINT_HEIGHT / 2);
             const legY = y + LEG_HEIGHT / 2;
             const count = counts[legKey(leg)] ?? leg.open;
-            const flowing = traffic && leg.open > 0 && (leg.bytesPerSecond ?? 0) > 0;
+            const flowing =
+              traffic && leg.open > 0 && (leg.bytesPerSecond ?? 0) > 0;
             const color = stateColor(leg.state);
             const tip = [
-              t("next.networking.flow.connections", { open: leg.open, target: leg.target }),
+              t("next.networking.flow.connections", {
+                open: leg.open,
+                target: leg.target,
+              }),
               formatRate(leg.bytesPerSecond),
               leg.sourceAddress ?? t("next.networking.flow.noSource"),
               ...(leg.reason ? [leg.reason] : []),
@@ -1626,18 +2245,25 @@ export const NetworkFlow = memo(function NetworkFlow({
                 // The rung carrying the leg is met where its traffic goes: a pool's inside its box, split
                 // between the members carrying it as they share its connections.
                 const carriers = status === "ACTIVE" ? block.carriers : [];
-                const held = carriers.reduce((sum, carrier) => sum + carrier.open, 0);
+                const held = carriers.reduce(
+                  (sum, carrier) => sum + carrier.open,
+                  0,
+                );
                 return {
                   branches: carriers.length
                     ? carriers.map((carrier) => ({
                         at: y + block.top + carrier.at,
-                        share: held > 0 ? carrier.open / held : 1 / carriers.length,
+                        share:
+                          held > 0 ? carrier.open / held : 1 / carriers.length,
                       }))
                     : [{ at: y + block.top + BOX_HEIGHT / 2, share: 1 }],
                   stop: PROXY.x + (carriers.length ? MEMBER_INSET : 0),
                   resume: PROXY.end - (carriers.length ? MEMBER_INSET : 0),
                   // A chain's line runs on through the gap between each hop and the next.
-                  gaps: block.rung.kind === "CHAIN" ? chainGaps(PROXY, block.rung.chainIds.length) : [],
+                  gaps:
+                    block.rung.kind === "CHAIN"
+                      ? chainGaps(PROXY, block.rung.chainIds.length)
+                      : [],
                   status,
                 };
               }),
@@ -1649,7 +2275,13 @@ export const NetworkFlow = memo(function NetworkFlow({
                       stop: PROXY.x + DIRECT_X - DIRECT_GAP,
                       // The words are monospaced, after their state's square.
                       resume:
-                        PROXY.x + DIRECT_X + 13 + directLabel(leg, blocks.length).length * DIRECT_SIZE * 0.6 + DIRECT_GAP,
+                        PROXY.x +
+                        DIRECT_X +
+                        13 +
+                        directLabel(leg, blocks.length).length *
+                          DIRECT_SIZE *
+                          0.6 +
+                        DIRECT_GAP,
                       gaps: [],
                       status: rungStatus(leg, blocks.length, true),
                     },
@@ -1666,7 +2298,10 @@ export const NetworkFlow = memo(function NetworkFlow({
                   ]
                 : []),
             ];
-            const taken = ways.find((way) => way.status === "ACTIVE") ?? ways[leg.selectedRung ?? 0] ?? ways[0];
+            const taken =
+              ways.find((way) => way.status === "ACTIVE") ??
+              ways[leg.selectedRung ?? 0] ??
+              ways[0];
             const passable = stateTone(leg.state) !== "bad";
             // `moves`: what a pointed-at route sets moving, the way the leg takes or the one pointed at.
             // A line split between pool members fans out of the end its branches share: `fan`.
@@ -1699,14 +2334,19 @@ export const NetworkFlow = memo(function NetworkFlow({
                   carries: way === taken,
                   color: way === taken ? color : stateColor(way.status),
                   lit: onWay(leg, index),
-                  moves: passable && stateTone(way.status) !== "bad" && (way === taken || focus?.kind === "way"),
+                  moves:
+                    passable &&
+                    stateTone(way.status) !== "bad" &&
+                    (way === taken || focus?.kind === "way"),
                 };
                 const enter = way.branches.map(({ at, share }) => ({
                   points: tunnelled
                     ? ([
                         [EGRESS.end, egressY],
                         [PROXY.x, at],
-                        ...(way.stop > PROXY.x ? [[way.stop, at] satisfies Point] : []),
+                        ...(way.stop > PROXY.x
+                          ? [[way.stop, at] satisfies Point]
+                          : []),
                       ] satisfies Point[])
                     : ([
                         [EGRESS.end, egressY],
@@ -1716,7 +2356,9 @@ export const NetworkFlow = memo(function NetworkFlow({
                 }));
                 const leave = way.branches.map(({ at, share }) => ({
                   points: [
-                    ...(way.resume < PROXY.end ? [[way.resume, at] satisfies Point] : []),
+                    ...(way.resume < PROXY.end
+                      ? [[way.resume, at] satisfies Point]
+                      : []),
                     [PROXY.end, at],
                     [endpoints.x, consumerY],
                   ] satisfies Point[],
@@ -1736,7 +2378,9 @@ export const NetworkFlow = memo(function NetworkFlow({
                 return [
                   { ...line, branches: enter, fan: "start" as const },
                   ...across,
-                  ...(tunnelled ? [{ ...line, branches: leave, fan: "end" as const }] : []),
+                  ...(tunnelled
+                    ? [{ ...line, branches: leave, fan: "end" as const }]
+                    : []),
                 ];
               }),
             ];
@@ -1744,12 +2388,17 @@ export const NetworkFlow = memo(function NetworkFlow({
               <g key={`ribbon:${legKey(leg)}`}>
                 <title>{tip}</title>
                 {lines.map((line, index) => {
-                  const traced = trace && focus !== null && line.lit && line.moves;
+                  const traced =
+                    trace && focus !== null && line.lit && line.moves;
                   // What a pointed-at box fades stands still, so only what it lights moves.
                   const moving = traced || (flowing && line.lit);
                   const open = line.carries && count > 0;
                   // A traced line with nothing open is drawn as the live ribbon its leg's connections would fill.
-                  const carried = open ? count : traced ? Math.max(1, leg.target) : 0;
+                  const carried = open
+                    ? count
+                    : traced
+                      ? Math.max(1, leg.target)
+                      : 0;
                   if (carried === 0) {
                     return line.branches.map(({ points }, branch) => (
                       <path
@@ -1765,23 +2414,38 @@ export const NetworkFlow = memo(function NetworkFlow({
                   }
                   // Each branch is as thick as its share and no thinner than a line, and they leave their
                   // shared end side by side, as the one ribbon they make there.
-                  const thicknesses = line.branches.map(({ share }) => Math.max(2, width(carried) * share));
-                  let edge = -thicknesses.reduce((sum, thickness) => sum + thickness, 0) / 2;
+                  const thicknesses = line.branches.map(({ share }) =>
+                    Math.max(2, width(carried) * share),
+                  );
+                  let edge =
+                    -thicknesses.reduce(
+                      (sum, thickness) => sum + thickness,
+                      0,
+                    ) / 2;
                   return line.branches.map(({ points }, branch) => {
                     const thickness = thicknesses[branch]!;
                     const shift = edge + thickness / 2;
                     edge += thickness;
                     const shared = line.fan === "start" ? 0 : points.length - 1;
-                    const spread = points.map(([x, height], at): Point => [x, at === shared ? height + shift : height]);
+                    const spread = points.map(([x, height], at): Point => [
+                      x,
+                      at === shared ? height + shift : height,
+                    ]);
                     return (
                       <g key={`${index}:${branch}`}>
                         <path
                           d={band(spread, thickness)}
                           fill={open ? line.color : stateColor("ACTIVE")}
-                          opacity={line.lit ? (focus ? 0.5 : 0.28) : 0.28 * FADE}
+                          opacity={
+                            line.lit ? (focus ? 0.5 : 0.28) : 0.28 * FADE
+                          }
                         />
                         {moving ? (
-                          <Traffic points={spread} width={Math.min(4, Math.max(2, thickness / 2))} still={still} />
+                          <Traffic
+                            points={spread}
+                            width={Math.min(4, Math.max(2, thickness / 2))}
+                            still={still}
+                          />
                         ) : null}
                       </g>
                     );
@@ -1794,10 +2458,19 @@ export const NetworkFlow = memo(function NetworkFlow({
           {/* From each leg to the box that looks its names up, under the cards it passes. */}
           {asks.flatMap((ask) =>
             ask.feeds.map((feed) => (
-              <g key={`dns-feed:${ask.key}:${feed.key}`} opacity={feed.lit ? undefined : FADE}>
+              <g
+                key={`dns-feed:${ask.key}:${feed.key}`}
+                opacity={feed.lit ? undefined : FADE}
+              >
                 <circle cx={LEGS.end} cy={feed.y} r="2.5" fill={INK.dns} />
                 {feed.paths.map((points, part) => (
-                  <path key={part} d={thread(points)} fill="none" stroke={INK.dns} strokeWidth="1.25" />
+                  <path
+                    key={part}
+                    d={thread(points)}
+                    fill="none"
+                    stroke={INK.dns}
+                    strokeWidth="1.25"
+                  />
                 ))}
               </g>
             )),
@@ -1806,9 +2479,22 @@ export const NetworkFlow = memo(function NetworkFlow({
           {/* Each lookup's line, laid under the boxes it passes, out to what answers it. */}
           {asks.map((ask) =>
             ask.line ? (
-              <g key={`dns-line:${ask.key}`} opacity={ask.lit ? undefined : FADE}>
-                <path d={thread(ask.line)} fill="none" stroke={INK.dns} strokeWidth="1.5" />
-                <circle cx={endpoints.x} cy={ask.line.at(-1)![1]} r="2.5" fill={INK.dns} />
+              <g
+                key={`dns-line:${ask.key}`}
+                opacity={ask.lit ? undefined : FADE}
+              >
+                <path
+                  d={thread(ask.line)}
+                  fill="none"
+                  stroke={INK.dns}
+                  strokeWidth="1.5"
+                />
+                <circle
+                  cx={endpoints.x}
+                  cy={ask.line.at(-1)![1]}
+                  r="2.5"
+                  fill={INK.dns}
+                />
               </g>
             ) : null,
           )}
@@ -1816,22 +2502,58 @@ export const NetworkFlow = memo(function NetworkFlow({
           {egressCards.map(({ egress, y, shift, height }) => {
             const legs = flow.legs.filter((leg) => leg.egressId === egress.id);
             const down = egress.health === "DOWN";
-            const open = Math.round(legs.reduce((sum, leg) => sum + (counts[legKey(leg)] ?? leg.open), 0));
+            const open = Math.round(
+              legs.reduce(
+                (sum, leg) => sum + (counts[legKey(leg)] ?? leg.open),
+                0,
+              ),
+            );
             const x = EGRESS.x + 14;
             const room = EGRESS.width - 28;
             return (
-              <g key={egress.id} opacity={egressLit(egress.id) ? undefined : FADE} {...point({ kind: "egress", id: egress.id })}>
+              <g
+                key={egress.id}
+                opacity={egressLit(egress.id) ? undefined : FADE}
+                {...point({ kind: "egress", id: egress.id })}
+              >
                 <title>{egress.reason ?? egress.name}</title>
                 {card(
                   { kind: "egress", id: egress.id },
                   EGRESS_PAGE,
                   <>
-                    <rect x={EGRESS.x} y={y} width={EGRESS.width} height={height} fill={INK.card} stroke={down ? stateColor("DOWN") : INK.line} strokeDasharray={down ? "4 4" : undefined} />
-                    <StateBar x={EGRESS.x} y={y} height={height} state={egress.health} />
-                    <text x={x} y={y + 24} fill={INK.fg} fontSize="13" fontFamily={TITLE_FONT} fontWeight="600">
-                      {fit(egress.name, room - (toggleWidth ? toggleWidth + 6 : 0), 13)}
+                    <rect
+                      x={EGRESS.x}
+                      y={y}
+                      width={EGRESS.width}
+                      height={height}
+                      fill={INK.card}
+                      stroke={down ? stateColor("DOWN") : INK.line}
+                      strokeDasharray={down ? "4 4" : undefined}
+                    />
+                    <StateBar
+                      x={EGRESS.x}
+                      y={y}
+                      height={height}
+                      state={egress.health}
+                    />
+                    <text
+                      x={x}
+                      y={y + 24}
+                      fill={INK.fg}
+                      fontSize="13"
+                      fontFamily={TITLE_FONT}
+                      fontWeight="600"
+                    >
+                      {fit(
+                        egress.name,
+                        room - (toggleWidth ? toggleWidth + 6 : 0),
+                        13,
+                      )}
                     </text>
-                    {toggle({ kind: "egress", id: egress.id }, egress.name)?.(EGRESS.end - 12 - toggleWidth, y + 10)}
+                    {toggle({ kind: "egress", id: egress.id }, egress.name)?.(
+                      EGRESS.end - 12 - toggleWidth,
+                      y + 10,
+                    )}
                     <StateText
                       x={x}
                       y={y + 46}
@@ -1841,37 +2563,75 @@ export const NetworkFlow = memo(function NetworkFlow({
                     />
                     {(egress.addresses?.length
                       ? egress.addresses
-                      : [egress.sourceAddress || egress.interfaceName || t("next.networking.binding.system")]
+                      : [
+                          egress.sourceAddress ||
+                            egress.interfaceName ||
+                            t("next.networking.binding.system"),
+                        ]
                     ).map((address, line) => (
-                      <text key={line} x={x} y={y + 66 + line * ADDRESS_LINE} fill={INK.muted} fontSize="10">
+                      <text
+                        key={line}
+                        x={x}
+                        y={y + 66 + line * ADDRESS_LINE}
+                        fill={INK.muted}
+                        fontSize="10"
+                      >
                         {fit(address, room, 10)}
                       </text>
                     ))}
                     {down && egress.reason ? (
-                      <Note x={x} y={y + shift + 85} lines={wrap(egress.reason, room, 9.5, 2)} />
+                      <Note
+                        x={x}
+                        y={y + shift + 85}
+                        lines={wrap(egress.reason, room, 9.5, 2)}
+                      />
                     ) : (
-                      <text x={x} y={y + shift + 86} fill={INK.muted} fontSize="10">
+                      <text
+                        x={x}
+                        y={y + shift + 86}
+                        fill={INK.muted}
+                        fontSize="10"
+                      >
                         {down
                           ? t("next.networking.state.down")
                           : t("next.networking.flow.egressLoad", {
                               open,
-                              rate: formatRate(legs.reduce((sum, leg) => sum + (leg.bytesPerSecond ?? 0), 0)),
+                              rate: formatRate(
+                                legs.reduce(
+                                  (sum, leg) => sum + (leg.bytesPerSecond ?? 0),
+                                  0,
+                                ),
+                              ),
                             })}
                       </text>
                     )}
                     {heldTo(egress).map((limit, row) => {
-                      const baseline = y + EGRESS_HEIGHT + shift + 7 + row * EGRESS_LIMIT_ROW;
-                      const held = limit === "quota" ? quotaHeldState(egress) : null;
+                      const baseline =
+                        y + EGRESS_HEIGHT + shift + 7 + row * EGRESS_LIMIT_ROW;
+                      const held =
+                        limit === "quota" ? quotaHeldState(egress) : null;
                       const tone = held ? stateColor("HOLD") : INK.muted;
                       return (
                         <g key={limit} color={tone}>
                           <title>
-                            {t(limit === "speed" ? "next.networking.egress.limit" : "next.networking.egress.quota")}
+                            {t(
+                              limit === "speed"
+                                ? "next.networking.egress.limit"
+                                : "next.networking.egress.quota",
+                            )}
                           </title>
                           <g transform={`translate(${x} ${baseline - 10})`}>
-                            <Icon name={limit === "speed" ? "bandwidth" : "quota"} size={12} />
+                            <Icon
+                              name={limit === "speed" ? "bandwidth" : "quota"}
+                              size={12}
+                            />
                           </g>
-                          <text x={x + 18} y={baseline} fill={tone} fontSize="10">
+                          <text
+                            x={x + 18}
+                            y={baseline}
+                            fill={tone}
+                            fontSize="10"
+                          >
                             {limit === "speed"
                               ? speedSummary(egress)
                               : held
@@ -1892,12 +2652,19 @@ export const NetworkFlow = memo(function NetworkFlow({
             const open = Math.round(counts[key] ?? leg.open);
             const x = LEGS.x + 14;
             const room = LEGS.width - 28;
-            const split = sustained(leg.consumer) && (legCounts.get(leg.consumer) ?? 1) > 1;
-            const weight = t("next.networking.flow.legWeight", { weight: leg.weight });
+            const split =
+              sustained(leg.consumer) && (legCounts.get(leg.consumer) ?? 1) > 1;
+            const weight = t("next.networking.flow.legWeight", {
+              weight: leg.weight,
+            });
             const toggleRoom = toggleWidth ? toggleWidth + 8 : 0;
             const weightRoom = split ? weight.length * 12 * 0.6 + 8 : 0;
             return (
-              <g key={key} opacity={onRoute(leg) ? undefined : FADE} {...point({ kind: "leg", key })}>
+              <g
+                key={key}
+                opacity={onRoute(leg) ? undefined : FADE}
+                {...point({ kind: "leg", key })}
+              >
                 <title>
                   {[
                     ...(sustained(leg.consumer)
@@ -1911,7 +2678,11 @@ export const NetworkFlow = memo(function NetworkFlow({
                         ]
                       : []),
                     leg.sourceAddress ?? t("next.networking.flow.noSocket"),
-                    ...(leg.pinnedAddress ? [`${t("next.networking.flow.detailPin")} ${leg.pinnedAddress}`] : []),
+                    ...(leg.pinnedAddress
+                      ? [
+                          `${t("next.networking.flow.detailPin")} ${leg.pinnedAddress}`,
+                        ]
+                      : []),
                     ...(leg.reason ? [leg.reason] : []),
                   ].join(" · ")}
                 </title>
@@ -1919,22 +2690,55 @@ export const NetworkFlow = memo(function NetworkFlow({
                   { kind: "route", consumer: leg.consumer },
                   routePage(leg.consumer),
                   <>
-                    <rect x={LEGS.x} y={y} width={LEGS.width} height={height} fill={INK.card} stroke={INK.line} />
-                    <StateBar x={LEGS.x} y={y} height={height} state={leg.state} />
+                    <rect
+                      x={LEGS.x}
+                      y={y}
+                      width={LEGS.width}
+                      height={height}
+                      fill={INK.card}
+                      stroke={INK.line}
+                    />
+                    <StateBar
+                      x={LEGS.x}
+                      y={y}
+                      height={height}
+                      state={leg.state}
+                    />
                     <text x={x} y={y + 21} fill={INK.fg} fontSize="12">
                       {/* A feed, Default outbound or any route on one leg has no split to number it by. */}
                       {!split
-                        ? fit(single && sustained(leg.consumer) ? t("next.networking.flow.legShort", { position: 1 }) : consumerName(leg), room - toggleRoom, 12)
+                        ? fit(
+                            single && sustained(leg.consumer)
+                              ? t("next.networking.flow.legShort", {
+                                  position: 1,
+                                })
+                              : consumerName(leg),
+                            room - toggleRoom,
+                            12,
+                          )
                         : single
-                          ? t("next.networking.flow.legShort", { position: leg.position + 1 })
+                          ? t("next.networking.flow.legShort", {
+                              position: leg.position + 1,
+                            })
                           : t("next.networking.flow.legTitle", {
-                              name: fit(consumerName(leg), room - toggleRoom - weightRoom - 64, 12),
+                              name: fit(
+                                consumerName(leg),
+                                room - toggleRoom - weightRoom - 64,
+                                12,
+                              ),
                               position: leg.position + 1,
                             })}
                     </text>
                     {/* Each leg of a split route shows its share of the route. */}
                     {split ? (
-                      <text x={LEGS.end - 12 - toggleRoom} y={y + 21} fill={INK.fg} fontSize="12" fontWeight="600" textAnchor="end">
+                      <text
+                        x={LEGS.end - 12 - toggleRoom}
+                        y={y + 21}
+                        fill={INK.fg}
+                        fontSize="12"
+                        fontWeight="600"
+                        textAnchor="end"
+                      >
                         {weight}
                       </text>
                     ) : null}
@@ -1953,24 +2757,41 @@ export const NetworkFlow = memo(function NetworkFlow({
                     />
                     {leg.open ? (
                       <text x={x} y={y + 54} fill={INK.muted} fontSize="9.5">
-                        {fit(leg.sourceAddress ?? t("next.networking.flow.noSource"), room, 9.5)}
+                        {fit(
+                          leg.sourceAddress ??
+                            t("next.networking.flow.noSource"),
+                          room,
+                          9.5,
+                        )}
                       </text>
                     ) : leg.state === "DOWN" || sustained(leg.consumer) ? (
-                      <text x={x} y={y + 54} fill={holds(leg) ? INK.warn : INK.muted} fontSize="9.5">
+                      <text
+                        x={x}
+                        y={y + 54}
+                        fill={holds(leg) ? INK.warn : INK.muted}
+                        fontSize="9.5"
+                      >
                         {holds(leg) && leg.state === "DOWN"
                           ? t("next.networking.flow.parkedHold")
                           : leg.state === "DOWN"
                             ? t("next.networking.flow.shareMoved")
-                            : t("next.networking.flow.planned", { count: leg.target })}
+                            : t("next.networking.flow.planned", {
+                                count: leg.target,
+                              })}
                       </text>
                     ) : null}
                     <Note x={x} y={y + LEG_HEIGHT + 4} lines={note} />
                     {toggle(
                       { kind: "leg", position: leg.position },
-                      t("next.networking.route.leg", { position: leg.position + 1 }),
+                      t("next.networking.route.leg", {
+                        position: leg.position + 1,
+                      }),
                     )?.(LEGS.end - 12 - toggleWidth, y + 8)}
                   </>,
-                  t("next.networking.flow.editLeg", { name: consumerName(leg), position: leg.position + 1 }),
+                  t("next.networking.flow.editLeg", {
+                    name: consumerName(leg),
+                    position: leg.position + 1,
+                  }),
                 )}
               </g>
             );
@@ -1998,7 +2819,9 @@ export const NetworkFlow = memo(function NetworkFlow({
                         label={`${stateLabel(t, "BLOCKED")} · ${t("next.networking.flow.killSwitchNote")}`}
                         active={false}
                       />,
-                      t("next.networking.flow.openKillSwitch", { name: consumerName(leg) }),
+                      t("next.networking.flow.openKillSwitch", {
+                        name: consumerName(leg),
+                      }),
                     )}
                   </g>
                 ) : null}
@@ -2021,23 +2844,49 @@ export const NetworkFlow = memo(function NetworkFlow({
 
           {/* Who asks, in the box the lookup leaves from, with its line out to that box's edge. */}
           {asks.map((ask) => (
-            <g key={ask.key} opacity={ask.lit ? undefined : FADE} {...point({ kind: "leg", key: legKey(ask.legs[0]!) })}>
+            <g
+              key={ask.key}
+              opacity={ask.lit ? undefined : FADE}
+              {...point({ kind: "leg", key: legKey(ask.legs[0]!) })}
+            >
               <title>{ask.says}</title>
               {ask.refused ? null : (
-                <path d={`M ${ask.x + ask.width} ${ask.mid} L ${ask.boxEnd} ${ask.mid}`} stroke={INK.dns} strokeWidth="1.5" />
+                <path
+                  d={`M ${ask.x + ask.width} ${ask.mid} L ${ask.boxEnd} ${ask.mid}`}
+                  stroke={INK.dns}
+                  strokeWidth="1.5"
+                />
               )}
               {ask.enters ? (
-                <path d={`M ${ask.entry} ${ask.mid} L ${ask.x} ${ask.mid}`} stroke={INK.dns} strokeWidth="1.25" />
+                <path
+                  d={`M ${ask.entry} ${ask.mid} L ${ask.x} ${ask.mid}`}
+                  stroke={INK.dns}
+                  strokeWidth="1.25"
+                />
               ) : null}
               {card(
                 ask.target,
-                ask.target?.kind === "route" ? routePage(ask.legs[0]!.consumer) : DNS_PAGE,
-                <DnsPill x={ask.x} mid={ask.mid} label={ask.label} locked={ask.locked} refused={ask.refused} width={ask.width} />,
-                t(ask.target?.kind === "route" ? "next.networking.flow.editLeg" : "next.networking.flow.dnsEditProfile", {
-                  name: consumerName(ask.legs[0]!),
-                  position: ask.legs[0]!.position + 1,
-                  profile: ask.profile.name,
-                }),
+                ask.target?.kind === "route"
+                  ? routePage(ask.legs[0]!.consumer)
+                  : DNS_PAGE,
+                <DnsPill
+                  x={ask.x}
+                  mid={ask.mid}
+                  label={ask.label}
+                  locked={ask.locked}
+                  refused={ask.refused}
+                  width={ask.width}
+                />,
+                t(
+                  ask.target?.kind === "route"
+                    ? "next.networking.flow.editLeg"
+                    : "next.networking.flow.dnsEditProfile",
+                  {
+                    name: consumerName(ask.legs[0]!),
+                    position: ask.legs[0]!.position + 1,
+                    profile: ask.profile.name,
+                  },
+                ),
               )}
               {ask.feeds.map((feed) =>
                 feed.pass === null ? null : (
@@ -2047,7 +2896,14 @@ export const NetworkFlow = memo(function NetworkFlow({
                       stroke={INK.dns}
                       strokeWidth="1.25"
                     />
-                    <DnsPill x={EGRESS.x + 14} mid={feed.pass} label={ask.label} locked={ask.locked} refused={ask.refused} width={ask.width} />
+                    <DnsPill
+                      x={EGRESS.x + 14}
+                      mid={feed.pass}
+                      label={ask.label}
+                      locked={ask.locked}
+                      refused={ask.refused}
+                      width={ask.width}
+                    />
                   </g>
                 ),
               )}
@@ -2056,16 +2912,46 @@ export const NetworkFlow = memo(function NetworkFlow({
 
           {endpoint ? (
             <g
-              opacity={consumers[0] && !endpointLit(consumers[0].key) ? FADE : undefined}
-              {...(consumers[0] ? point({ kind: "endpoint", key: consumers[0].key }) : {})}
+              opacity={
+                consumers[0] && !endpointLit(consumers[0].key)
+                  ? FADE
+                  : undefined
+              }
+              {...(consumers[0]
+                ? point({ kind: "endpoint", key: consumers[0].key })
+                : {})}
             >
               <title>{`${endpoint.title} · ${endpoint.detail}`}</title>
-              <rect x={endpoints.x} y={layout.endpointY} width={endpoints.width} height={ENDPOINT_BOX_HEIGHT} fill={INK.card} stroke={INK.line} />
-              <StateBar x={endpoints.x} y={layout.endpointY} height={ENDPOINT_BOX_HEIGHT} state={endpoint.state} />
-              <text x={endpoints.x + 14} y={layout.endpointY + 23} fill={INK.fg} fontSize="12.5" fontFamily={TITLE_FONT} fontWeight="600">
+              <rect
+                x={endpoints.x}
+                y={layout.endpointY}
+                width={endpoints.width}
+                height={ENDPOINT_BOX_HEIGHT}
+                fill={INK.card}
+                stroke={INK.line}
+              />
+              <StateBar
+                x={endpoints.x}
+                y={layout.endpointY}
+                height={ENDPOINT_BOX_HEIGHT}
+                state={endpoint.state}
+              />
+              <text
+                x={endpoints.x + 14}
+                y={layout.endpointY + 23}
+                fill={INK.fg}
+                fontSize="12.5"
+                fontFamily={TITLE_FONT}
+                fontWeight="600"
+              >
                 {fit(endpoint.title, endpoints.width - 28, 12.5)}
               </text>
-              <text x={endpoints.x + 14} y={layout.endpointY + 41} fill={INK.muted} fontSize="9.5">
+              <text
+                x={endpoints.x + 14}
+                y={layout.endpointY + 41}
+                fill={INK.muted}
+                fontSize="9.5"
+              >
                 {fit(endpoint.detail, endpoints.width - 28, 9.5)}
               </text>
               <StateText
@@ -2077,81 +2963,144 @@ export const NetworkFlow = memo(function NetworkFlow({
             </g>
           ) : (
             shown.map((consumer) => {
-                const legs = flow.legs.filter((leg) => leg.consumer === consumer.key);
-                const { cap, cells, y, height } = cards.get(consumer.key)!;
-                const open = legs.reduce((sum, leg) => sum + (counts[legKey(leg)] ?? leg.open), 0);
-                const parked =
-                  consumer.route?.failover === "HOLD" ? Math.max(0, cap - legs.reduce((sum, leg) => sum + leg.target, 0)) : 0;
-                const down = legs.length > 0 && legs.every((leg) => leg.state === "DOWN" || leg.state === "BLOCKED");
-                // One row stretches across the card; past a full row the boxes keep their size and wrap.
-                const cellX = scale(Math.max(1, Math.min(cells, CELLS_PER_ROW)), 188);
-                const rss = consumer.key.startsWith("rss:");
-                // Default outbound's name already says what it is.
-                const outbound = consumer.key === OUTBOUND_CONSUMER;
-                // Only a server's card counts its connections.
-                const server = !rss && !outbound;
-                const x = endpoints.x + 14;
-                return (
-                  <g
-                    key={consumer.key}
-                    opacity={(down ? 0.65 : 1) * (endpointLit(consumer.key) ? 1 : FADE)}
-                    {...point({ kind: "endpoint", key: consumer.key })}
-                  >
-                    {card(
-                      { kind: "route", consumer: consumer.key },
-                      routePage(consumer.key),
-                      <>
-                        <rect x={endpoints.x} y={y} width={endpoints.width} height={height} fill={INK.card} stroke={down ? stateColor("DOWN") : INK.line} />
-                        <StateBar x={endpoints.x} y={y} height={height} state={down ? "DOWN" : open > 0 ? "UP" : "IDLE"} />
-                        <text x={x} y={y + 23} fill={INK.fg} fontSize="12.5" fontFamily={TITLE_FONT} fontWeight="600">
-                          {rss ? fit(consumer.name, endpoints.width - 50, 12.5) : consumer.name.slice(0, 24)}
-                        </text>
-                        {rss ? (
-                          <g transform={`translate(${endpoints.end - 26} ${y + 12})`} color={INK.muted}>
-                            <Icon name="rss" size={12} />
-                          </g>
-                        ) : null}
-                        {rss ? (
-                          <text x={x} y={y + 41} fill={INK.muted} fontSize="9.5">
-                            {t("next.networking.routes.rssFeed")}
-                          </text>
-                        ) : null}
-                        {server ? (
-                          <>
-                            <text x={x} y={y + 49} fill={INK.fg} fontSize="20">
-                              {`${Math.round(open)} / ${cap}`}
-                            </text>
-                            <text x={x} y={y + 67} fill={INK.muted} fontSize="10">
-                              {formatRate(legs.reduce((sum, leg) => sum + (leg.bytesPerSecond ?? 0), 0))}
-                              {parked ? ` · ${t("next.networking.flow.parked", { count: parked })}` : ""}
-                            </text>
-                            {Array.from({ length: cells }, (_, cell) => {
-                              const boundary = (cell * cap) / cells;
-                              const reserved = boundary >= cap - parked;
-                              return (
-                                <rect
-                                  key={cell}
-                                  x={x + cellX(cell % CELLS_PER_ROW)}
-                                  y={y + 80 + Math.floor(cell / CELLS_PER_ROW) * CELL_ROW_PITCH}
-                                  width={Math.max(1, cellX(1) - 2)}
-                                  height={CELL_HEIGHT}
-                                  fill={boundary < open ? INK.accent : "none"}
-                                  stroke={reserved ? INK.warn : INK.track}
-                                  strokeDasharray={reserved ? "2 2" : undefined}
-                                />
-                              );
-                            })}
-                          </>
-                        ) : null}
-                      </>,
-                    )}
-                  </g>
+              const legs = flow.legs.filter(
+                (leg) => leg.consumer === consumer.key,
+              );
+              const { cap, cells, y, height } = cards.get(consumer.key)!;
+              const open = legs.reduce(
+                (sum, leg) => sum + (counts[legKey(leg)] ?? leg.open),
+                0,
+              );
+              const parked =
+                consumer.route?.failover === "HOLD"
+                  ? Math.max(
+                      0,
+                      cap - legs.reduce((sum, leg) => sum + leg.target, 0),
+                    )
+                  : 0;
+              const down =
+                legs.length > 0 &&
+                legs.every(
+                  (leg) => leg.state === "DOWN" || leg.state === "BLOCKED",
                 );
-              })
+              // One row stretches across the card; past a full row the boxes keep their size and wrap.
+              const cellX = scale(
+                Math.max(1, Math.min(cells, CELLS_PER_ROW)),
+                188,
+              );
+              const rss = consumer.key.startsWith("rss:");
+              // Default outbound's name already says what it is.
+              const outbound = consumer.key === OUTBOUND_CONSUMER;
+              // Only a server's card counts its connections.
+              const server = !rss && !outbound;
+              const x = endpoints.x + 14;
+              return (
+                <g
+                  key={consumer.key}
+                  opacity={
+                    (down ? 0.65 : 1) * (endpointLit(consumer.key) ? 1 : FADE)
+                  }
+                  {...point({ kind: "endpoint", key: consumer.key })}
+                >
+                  {card(
+                    { kind: "route", consumer: consumer.key },
+                    routePage(consumer.key),
+                    <>
+                      <rect
+                        x={endpoints.x}
+                        y={y}
+                        width={endpoints.width}
+                        height={height}
+                        fill={INK.card}
+                        stroke={down ? stateColor("DOWN") : INK.line}
+                      />
+                      <StateBar
+                        x={endpoints.x}
+                        y={y}
+                        height={height}
+                        state={down ? "DOWN" : open > 0 ? "UP" : "IDLE"}
+                      />
+                      <text
+                        x={x}
+                        y={y + 23}
+                        fill={INK.fg}
+                        fontSize="12.5"
+                        fontFamily={TITLE_FONT}
+                        fontWeight="600"
+                      >
+                        {rss
+                          ? fit(consumer.name, endpoints.width - 50, 12.5)
+                          : consumer.name.slice(0, 24)}
+                      </text>
+                      {rss ? (
+                        <g
+                          transform={`translate(${endpoints.end - 26} ${y + 12})`}
+                          color={INK.muted}
+                        >
+                          <Icon name="rss" size={12} />
+                        </g>
+                      ) : null}
+                      {rss ? (
+                        <text x={x} y={y + 41} fill={INK.muted} fontSize="9.5">
+                          {t("next.networking.routes.rssFeed")}
+                        </text>
+                      ) : null}
+                      {server ? (
+                        <>
+                          <text x={x} y={y + 49} fill={INK.fg} fontSize="20">
+                            {`${Math.round(open)} / ${cap}`}
+                          </text>
+                          <text x={x} y={y + 67} fill={INK.muted} fontSize="10">
+                            {formatRate(
+                              legs.reduce(
+                                (sum, leg) => sum + (leg.bytesPerSecond ?? 0),
+                                0,
+                              ),
+                            )}
+                            {parked
+                              ? ` · ${t("next.networking.flow.parked", { count: parked })}`
+                              : ""}
+                          </text>
+                          {Array.from({ length: cells }, (_, cell) => {
+                            const boundary = (cell * cap) / cells;
+                            const reserved = boundary >= cap - parked;
+                            return (
+                              <rect
+                                key={cell}
+                                x={x + cellX(cell % CELLS_PER_ROW)}
+                                y={
+                                  y +
+                                  80 +
+                                  Math.floor(cell / CELLS_PER_ROW) *
+                                    CELL_ROW_PITCH
+                                }
+                                width={Math.max(1, cellX(1) - 2)}
+                                height={CELL_HEIGHT}
+                                fill={boundary < open ? INK.accent : "none"}
+                                stroke={reserved ? INK.warn : INK.track}
+                                strokeDasharray={reserved ? "2 2" : undefined}
+                              />
+                            );
+                          })}
+                        </>
+                      ) : null}
+                    </>,
+                  )}
+                </g>
+              );
+            })
           )}
 
           {answers.length ? (
-            <text x={endpoints.x + 4} y={answers[0]!.y - 12} fill={INK.faint} fontSize="10.5" fontWeight="600" letterSpacing="1.5" fontFamily={TITLE_FONT}>
+            <text
+              x={endpoints.x + 4}
+              y={answers[0]!.y - 12}
+              fill={INK.faint}
+              fontSize="10.5"
+              fontWeight="600"
+              letterSpacing="1.5"
+              fontFamily={TITLE_FONT}
+            >
               {t("next.networking.flow.dnsColumn").toUpperCase()}
             </text>
           ) : null}
@@ -2161,23 +3110,53 @@ export const NetworkFlow = memo(function NetworkFlow({
                 answer.target,
                 answer.target?.kind === "dnsList" ? DNS_PAGE : PROXIES_PAGE,
                 <>
-                  <rect x={endpoints.x} y={answer.y} width={endpoints.width} height={answer.height} fill={INK.card} stroke={INK.dns} strokeOpacity="0.55" />
-                  <text x={endpoints.x + 14} y={answer.y + 20} fill={INK.fg} fontSize="11.5" fontFamily={TITLE_FONT} fontWeight="600">
+                  <rect
+                    x={endpoints.x}
+                    y={answer.y}
+                    width={endpoints.width}
+                    height={answer.height}
+                    fill={INK.card}
+                    stroke={INK.dns}
+                    strokeOpacity="0.55"
+                  />
+                  <text
+                    x={endpoints.x + 14}
+                    y={answer.y + 20}
+                    fill={INK.fg}
+                    fontSize="11.5"
+                    fontFamily={TITLE_FONT}
+                    fontWeight="600"
+                  >
                     {fit(answer.title, endpoints.width - 28, 11.5)}
                   </text>
                   {answer.note ? (
-                    <text x={endpoints.x + 14} y={answer.y + DNS_CARD_HEAD + 6} fill={INK.muted} fontSize="9.5">
+                    <text
+                      x={endpoints.x + 14}
+                      y={answer.y + DNS_CARD_HEAD + 6}
+                      fill={INK.muted}
+                      fontSize="9.5"
+                    >
                       {fit(answer.note, endpoints.width - 28, 9.5)}
                     </text>
                   ) : null}
                 </>,
-                answer.target?.kind === "dnsList" ? t("next.networking.flow.dnsEditList", { list: answer.title }) : answer.title,
+                answer.target?.kind === "dnsList"
+                  ? t("next.networking.flow.dnsEditList", {
+                      list: answer.title,
+                    })
+                  : answer.title,
               )}
               {answer.servers.map((server, index) => (
                 <DnsPill
                   key={index}
                   x={endpoints.x + 10}
-                  mid={answer.y + DNS_CARD_HEAD + (answer.note ? DNS_CARD_NOTE : 0) + index * DNS_SERVER_ROW + DNS_PILL / 2}
+                  mid={
+                    answer.y +
+                    DNS_CARD_HEAD +
+                    (answer.note ? DNS_CARD_NOTE : 0) +
+                    index * DNS_SERVER_ROW +
+                    DNS_PILL / 2
+                  }
                   label={server.label}
                   wire={server.wire}
                   width={endpoints.width - 20}
@@ -2188,7 +3167,9 @@ export const NetworkFlow = memo(function NetworkFlow({
 
           {layout.rows.length ? null : (
             <text x={LEGS.x} y="85" fill={INK.muted} fontSize="12">
-              {grouped ? t("next.networking.flow.expandGroup") : t("next.networking.flow.noLegs")}
+              {grouped
+                ? t("next.networking.flow.expandGroup")
+                : t("next.networking.flow.noLegs")}
             </text>
           )}
           {single ? null : (

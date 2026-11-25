@@ -47,10 +47,12 @@ export const nextKo: LocaleDictionary = {
   "next.rail.cause.overLimit": "연결이 너무 많음",
   "next.rail.cause.overLimitRetry": "연결이 너무 많음, {{time}} 후 재시도",
   "next.rail.cause.coolingDown": "반복된 오류로 일시 중지됨",
-  "next.rail.cause.coolingDownResume": "반복된 오류로 일시 중지됨. {{time}} 후 재개합니다",
+  "next.rail.cause.coolingDownResume":
+    "반복된 오류로 일시 중지됨. {{time}} 후 재개합니다",
   "next.rail.cause.degraded": "최근 요청에서 오류가 발생했습니다",
   "next.rail.cause.disabled": "로그인 실패 또는 반복된 오류로 일시 중지됨",
-  "next.rail.cause.disabledRetry": "로그인 실패 또는 반복된 오류로 일시 중지됨, {{time}} 후 재시도",
+  "next.rail.cause.disabledRetry":
+    "로그인 실패 또는 반복된 오류로 일시 중지됨, {{time}} 후 재시도",
   "next.rail.cause.preparing": "복구 데이터 가져오는 중",
   "next.rail.addProvider": "공급자 추가",
   "next.rail.sinceRestart": "마지막 재시작 이후",
@@ -79,13 +81,16 @@ export const nextKo: LocaleDictionary = {
   // Error page
   "next.errorPage.notFound": "페이지를 찾을 수 없습니다",
   "next.errorPage.requestFailed": "요청 실패 ({{status}})",
-  "next.errorPage.routingBody": "페이지 로드가 끝나기 전에 라우팅 오류가 발생했습니다.",
+  "next.errorPage.routingBody":
+    "페이지 로드가 끝나기 전에 라우팅 오류가 발생했습니다.",
   "next.errorPage.title": "문제가 발생했습니다",
-  "next.errorPage.renderBody": "이 화면을 표시하는 중 예기치 않은 오류가 발생했습니다.",
+  "next.errorPage.renderBody":
+    "이 화면을 표시하는 중 예기치 않은 오류가 발생했습니다.",
   "next.errorPage.goBack": "뒤로",
   "next.errorPage.retry": "다시 시도",
   "next.errorPage.checking": "확인 중…",
-  "next.errorPage.unreachable": "Weaver가 응답하지 않습니다. 응답하는 즉시 이 페이지가 Weaver를 엽니다.",
+  "next.errorPage.unreachable":
+    "Weaver가 응답하지 않습니다. 응답하는 즉시 이 페이지가 Weaver를 엽니다.",
   "next.errorPage.details": "기술 세부 정보",
 
   // Shared components
@@ -97,7 +102,8 @@ export const nextKo: LocaleDictionary = {
   "next.pagination.rows": "행",
   "next.pagination.range": "{{total}}개 중 {{from}}–{{to}}",
   "next.pagination.empty": "0개 중 0",
-  "next.routing.profilesUnreadable": "프록시 프로필을 읽을 수 없습니다. 기존 할당은 그대로 유지됩니다.",
+  "next.routing.profilesUnreadable":
+    "프록시 프로필을 읽을 수 없습니다. 기존 할당은 그대로 유지됩니다.",
   "next.routing.noRoutes": "프록시 경로 없음",
   "next.routing.proxyId": "프록시 #{{id}}",
   "next.routing.disabled": "비활성화됨",
@@ -110,7 +116,8 @@ export const nextKo: LocaleDictionary = {
   "next.routing.finalDirect": "최종 경로: 직접 연결",
   "next.routing.finalBlocked": "최종 경로: 차단",
   "next.routing.allowDirect": "최후 수단으로 직접 연결 허용",
-  "next.routing.cannotConnect": "프록시도 직접 연결 대체 경로도 없으면 전혀 연결할 수 없습니다.",
+  "next.routing.cannotConnect":
+    "프록시도 직접 연결 대체 경로도 없으면 전혀 연결할 수 없습니다.",
   "next.routing.state.idle": "경로 유휴",
   "next.routing.state.proxy": "프록시 경로",
   "next.routing.state.direct": "직접 경로",
@@ -160,8 +167,10 @@ export const nextKo: LocaleDictionary = {
   "next.downloads.shown": "다운로드 {{total}}개 중 {{shown}}개 표시",
   "next.downloads.loadingBody": "대기열을 불러오는 중입니다.",
   "next.downloads.emptyTitle": "활성 다운로드 없음",
-  "next.downloads.emptyBody": "NZB 또는 토렌트를 추가하거나 이 목록 아무 곳에나 끌어다 놓으세요.",
-  "next.downloads.emptyBodyNzb": "NZB를 추가하거나 이 목록 아무 곳에나 끌어다 놓으세요.",
+  "next.downloads.emptyBody":
+    "NZB 또는 토렌트를 추가하거나 이 목록 아무 곳에나 끌어다 놓으세요.",
+  "next.downloads.emptyBodyNzb":
+    "NZB를 추가하거나 이 목록 아무 곳에나 끌어다 놓으세요.",
   "next.downloads.noMatchTitle": "이 보기와 일치하는 항목 없음",
   "next.downloads.noMatchBody": "검색을 지우거나 다른 필터를 선택하세요.",
   "next.downloads.selectGroup": "'{{group}}'의 다운로드 모두 선택",
@@ -174,20 +183,28 @@ export const nextKo: LocaleDictionary = {
   "next.downloads.keepDownloading": "계속 다운로드",
   "next.downloads.bulk.paused.one": "다운로드 1개 일시정지함",
   "next.downloads.bulk.paused.other": "다운로드 {{count}}개 일시정지함",
-  "next.downloads.bulk.pausedPartial": "{{total}}개 중 {{done}}개 일시정지함 — {{refused}}개 거부됨",
+  "next.downloads.bulk.pausedPartial":
+    "{{total}}개 중 {{done}}개 일시정지함 — {{refused}}개 거부됨",
   "next.downloads.bulk.resumed.one": "다운로드 1개 재개함",
   "next.downloads.bulk.resumed.other": "다운로드 {{count}}개 재개함",
-  "next.downloads.bulk.resumedPartial": "{{total}}개 중 {{done}}개 재개함 — {{refused}}개 거부됨",
+  "next.downloads.bulk.resumedPartial":
+    "{{total}}개 중 {{done}}개 재개함 — {{refused}}개 거부됨",
   "next.downloads.bulk.priority.one": "다운로드 1개의 우선순위 설정함",
-  "next.downloads.bulk.priority.other": "다운로드 {{count}}개의 우선순위 설정함",
-  "next.downloads.bulk.priorityPartial": "{{total}}개 중 {{done}}개의 우선순위 설정함 — {{refused}}개 거부됨",
+  "next.downloads.bulk.priority.other":
+    "다운로드 {{count}}개의 우선순위 설정함",
+  "next.downloads.bulk.priorityPartial":
+    "{{total}}개 중 {{done}}개의 우선순위 설정함 — {{refused}}개 거부됨",
   "next.downloads.bulk.category.one": "다운로드 1개의 카테고리 설정함",
-  "next.downloads.bulk.category.other": "다운로드 {{count}}개의 카테고리 설정함",
-  "next.downloads.bulk.categoryPartial": "{{total}}개 중 {{done}}개의 카테고리 설정함 — {{refused}}개 거부됨",
+  "next.downloads.bulk.category.other":
+    "다운로드 {{count}}개의 카테고리 설정함",
+  "next.downloads.bulk.categoryPartial":
+    "{{total}}개 중 {{done}}개의 카테고리 설정함 — {{refused}}개 거부됨",
   "next.downloads.bulk.cancelled.one": "다운로드 1개 취소함",
   "next.downloads.bulk.cancelled.other": "다운로드 {{count}}개 취소함",
-  "next.downloads.bulk.cancelledPartial": "{{total}}개 중 {{done}}개 취소함 — {{refused}}개 거부됨",
-  "next.downloads.bulk.failed": "선택한 다운로드가 변경되지 않았습니다 — {{message}}",
+  "next.downloads.bulk.cancelledPartial":
+    "{{total}}개 중 {{done}}개 취소함 — {{refused}}개 거부됨",
+  "next.downloads.bulk.failed":
+    "선택한 다운로드가 변경되지 않았습니다 — {{message}}",
   "next.inspector.selected": "선택한 다운로드",
   "next.inspector.openDetail": "작업 상세 열기",
   "next.inspector.filesShown": "{{count}}개 중 {{shown}}개",
@@ -195,7 +212,8 @@ export const nextKo: LocaleDictionary = {
   "next.inspector.rate": "속도",
   "next.inspector.seedingTime": "시딩 시간",
   "next.inspector.destination": "저장 위치",
-  "next.inspector.noFiles": "아직 기록된 파일이 없습니다 — 다운로드가 저장 위치에 도달하면 파일이 표시됩니다.",
+  "next.inspector.noFiles":
+    "아직 기록된 파일이 없습니다 — 다운로드가 저장 위치에 도달하면 파일이 표시됩니다.",
   "next.inspector.topOfQueue": "대기열 맨 앞으로",
   "next.inspector.stopScripts": "스크립트 중지",
   "next.inspector.removeDownload": "다운로드 제거",
@@ -208,7 +226,8 @@ export const nextKo: LocaleDictionary = {
   "next.speedLimit.ceilingAria": "초당 메가바이트 단위 속도 제한",
   "next.speedLimit.upload": "업로드 속도",
   "next.speedLimit.uploadAria": "초당 메가바이트 단위 업로드 제한",
-  "next.speedLimit.scheduleHolding": "지금 일정에 따라 다운로드가 {{rate}}(으)로 제한되고 있습니다.",
+  "next.speedLimit.scheduleHolding":
+    "지금 일정에 따라 다운로드가 {{rate}}(으)로 제한되고 있습니다.",
   "next.addNzb.title": "추가",
   "next.addNzb.submitOne": "다운로드 추가",
   "next.addNzb.submitMany": "다운로드 {{count}}개 추가",
@@ -224,7 +243,8 @@ export const nextKo: LocaleDictionary = {
   "next.addNzb.forceTitle": "중복 항목을 그래도 추가할까요?",
   "next.addNzb.forceNote": "{{count}}개 차단됨",
   "next.addNzb.forceBody.one": "이 NZB는 중복 정책에 의해 거부되었습니다:",
-  "next.addNzb.forceBody.other": "이 NZB {{count}}개는 중복 정책에 의해 거부되었습니다:",
+  "next.addNzb.forceBody.other":
+    "이 NZB {{count}}개는 중복 정책에 의해 거부되었습니다:",
   "next.addNzb.andMore": "외 {{count}}개",
   "next.addNzb.forceConfirm.one": "그래도 추가",
   "next.addNzb.forceConfirm.other": "{{count}}개 그래도 추가",
@@ -261,7 +281,8 @@ export const nextKo: LocaleDictionary = {
   "next.rail.uptime": "가동 시간",
   "next.downloads.tabDownloading": "다운로드 중",
   "next.downloads.tabSeeding": "시딩 중",
-  "next.status.propagationUntil": "전파를 기다리는 중입니다. 다운로드는 {{time}}에 시작됩니다.",
+  "next.status.propagationUntil":
+    "전파를 기다리는 중입니다. 다운로드는 {{time}}에 시작됩니다.",
   "next.day.today": "오늘",
   "next.day.yesterday": "어제",
   "next.day.undated": "날짜 없음",
@@ -294,7 +315,8 @@ export const nextKo: LocaleDictionary = {
   "next.timeline.member.FAILED": "실패",
   "next.timeline.windowRunning": "{{time}} 시작 · 아직 실행 중",
   "next.timeline.soFar": "지금까지 {{span}}",
-  "next.timeline.noteRunning": "{{stages}}단계 중 {{stage}}단계 · {{span}} 경과",
+  "next.timeline.noteRunning":
+    "{{stages}}단계 중 {{stage}}단계 · {{span}} 경과",
   "next.timeline.noteDone.one": "{{count}}단계 · 총 {{span}}",
   "next.timeline.noteDone.other": "{{count}}단계 · 총 {{span}}",
   "next.completed.sort.newest": "최신순",
@@ -303,10 +325,13 @@ export const nextKo: LocaleDictionary = {
   "next.completed.sortMenu": "완료 항목 정렬",
   "next.completed.bulk.requeued.one": "항목 {{count}}개를 다시 대기열에 넣음",
   "next.completed.bulk.requeued.other": "항목 {{count}}개를 다시 대기열에 넣음",
-  "next.completed.bulk.requeuedPartial": "{{total}}개 중 {{done}}개를 다시 대기열에 넣음 — {{refused}}개 거부됨",
+  "next.completed.bulk.requeuedPartial":
+    "{{total}}개 중 {{done}}개를 다시 대기열에 넣음 — {{refused}}개 거부됨",
   "next.completed.bulk.rerun.one": "항목 {{count}}개의 스크립트를 다시 실행함",
-  "next.completed.bulk.rerun.other": "항목 {{count}}개의 스크립트를 다시 실행함",
-  "next.completed.bulk.rerunPartial": "{{total}}개 중 {{done}}개의 스크립트를 다시 실행함 — {{refused}}개 거부됨",
+  "next.completed.bulk.rerun.other":
+    "항목 {{count}}개의 스크립트를 다시 실행함",
+  "next.completed.bulk.rerunPartial":
+    "{{total}}개 중 {{done}}개의 스크립트를 다시 실행함 — {{refused}}개 거부됨",
   "next.completed.redownload": "다시 다운로드",
   "next.completed.rerunScripts": "스크립트 다시 실행",
   "next.completed.exported.one": "이 페이지를 내보냄 — 항목 {{count}}개",
@@ -353,7 +378,8 @@ export const nextKo: LocaleDictionary = {
   "next.download.recovery": "복구",
   "next.download.recoveryShown": "{{count}}개 중 {{shown}}개 표시",
   "next.download.setsShown": "{{count}}개 세트 중 {{shown}}개 표시",
-  "next.download.recoverySet": "블록 {{blocks}}개 · 손상 {{damaged}} · 복구 {{repaired}}",
+  "next.download.recoverySet":
+    "블록 {{blocks}}개 · 손상 {{damaged}} · 복구 {{repaired}}",
   "next.download.files": "파일",
   "next.download.articles": "기사",
   "next.download.missing": "누락",
@@ -410,10 +436,12 @@ export const nextKo: LocaleDictionary = {
   "next.completed.dayTotal": "{{size}} 완료",
   "next.completed.deleting": "삭제 중",
   "next.completed.took": "{{span}} 걸림",
-  "next.completed.deleteBody": "'삭제, 파일 유지'는 항목을 지우고 파일은 디스크에 남깁니다. '삭제'는 다운로드한 파일도 지웁니다. 둘 다 백그라운드에서 실행되며, 항목은 사라질 때까지 잠긴 채 여기에 남습니다.",
+  "next.completed.deleteBody":
+    "'삭제, 파일 유지'는 항목을 지우고 파일은 디스크에 남깁니다. '삭제'는 다운로드한 파일도 지웁니다. 둘 다 백그라운드에서 실행되며, 항목은 사라질 때까지 잠긴 채 여기에 남습니다.",
   "next.job.title": "작업",
   "next.job.missingTitle": "해당 작업 없음",
-  "next.job.missingBody": "기록에서 삭제되었거나, 링크가 weaver에 없는 id를 가리킵니다.",
+  "next.job.missingBody":
+    "기록에서 삭제되었거나, 링크가 weaver에 없는 id를 가리킵니다.",
   "next.job.backToHistory": "기록으로 돌아가기",
   "next.job.loadingBody": "이 작업의 상태를 불러오는 중입니다.",
   "next.job.outcomeFailed": "실패 — 불완전, 이동된 것 없음",
@@ -476,11 +504,13 @@ export const nextKo: LocaleDictionary = {
   "next.job.noSetPosted": "게시된 복구 세트 없음",
   "next.job.ofFetched": "{{size}} 중 받음",
   "next.job.setSkipped": "par2 세트 건너뜀",
-  "next.job.noStages": "아직 시작된 단계가 없습니다 — 작업이 처리되기 시작하면 파이프라인이 표시됩니다.",
+  "next.job.noStages":
+    "아직 시작된 단계가 없습니다 — 작업이 처리되기 시작하면 파이프라인이 표시됩니다.",
   "next.job.nothingWritten": "아직 기록된 것 없음",
   "next.job.fileCount.one": "파일 {{count}}개",
   "next.job.fileCount.other": "파일 {{count}}개",
-  "next.job.filesAppear": "작업이 저장 위치에 도달하면 여기에 파일이 표시됩니다.",
+  "next.job.filesAppear":
+    "작업이 저장 위치에 도달하면 여기에 파일이 표시됩니다.",
   "next.job.copyPathTitle": "전체 경로 복사",
   "next.job.downloadNzb": "NZB 내려받기",
   "next.job.nzbSaved": "{{name}}의 NZB를 저장했습니다",
@@ -489,16 +519,20 @@ export const nextKo: LocaleDictionary = {
   "next.support.copy": "복사",
   "next.support.copyReport": "지원 보고서 복사",
   "next.support.downloadJson": "JSON 내려받기",
-  "next.support.copied": "지원 보고서를 복사했습니다. 이름, 그룹, 메시지 ID는 포함되지 않습니다.",
-  "next.support.copyBlocked": "브라우저가 클립보드를 차단했습니다. 대신 JSON 내려받기를 사용하세요.",
+  "next.support.copied":
+    "지원 보고서를 복사했습니다. 이름, 그룹, 메시지 ID는 포함되지 않습니다.",
+  "next.support.copyBlocked":
+    "브라우저가 클립보드를 차단했습니다. 대신 JSON 내려받기를 사용하세요.",
   "next.support.saved": "지원 보고서를 저장했습니다.",
   "next.support.failed": "지원 보고서를 만들지 못했습니다.",
   "next.analyzer.note": "대기열에 추가하지 않고 NZB 또는 토렌트를 검사합니다",
   "next.analyzer.noteNzb": "대기열에 추가하지 않고 NZB를 검사합니다",
   "next.analyzer.source": "NZB, 토렌트 또는 마그넷",
   "next.analyzer.sourceNzb": "NZB",
-  "next.analyzer.dropZone": ".nzb, .nzb.gz 또는 .torrent 파일을 여기에 놓거나 클릭해 선택하세요",
-  "next.analyzer.dropZoneNzb": ".nzb 또는 .nzb.gz 파일을 여기에 놓거나 클릭해 선택하세요",
+  "next.analyzer.dropZone":
+    ".nzb, .nzb.gz 또는 .torrent 파일을 여기에 놓거나 클릭해 선택하세요",
+  "next.analyzer.dropZoneNzb":
+    ".nzb 또는 .nzb.gz 파일을 여기에 놓거나 클릭해 선택하세요",
   "next.analyzer.magnet": "마그넷 링크",
   "next.analyzer.analyze": "분석",
   "next.analyzer.analyzing": "분석 중…",
@@ -506,8 +540,10 @@ export const nextKo: LocaleDictionary = {
   "next.analyzer.magnetFailed": "마그넷 링크를 분석하지 못했습니다.",
   "next.analyzer.tooLarge": "파일이 {{size}}를 초과합니다.",
   "next.analyzer.emptyTitle": "아직 분석한 항목이 없습니다",
-  "next.analyzer.emptyBody": "보고서는 이름, 경로, 그룹, 메시지 ID, 패스키 없이 구조, 트래커, 경고 신호를 보여 주므로 공개적으로 붙여 넣어도 안전합니다.",
-  "next.analyzer.emptyBodyNzb": "보고서는 이름, 경로, 그룹, 메시지 ID 없이 구조와 경고 신호를 보여 주므로 공개적으로 붙여 넣어도 안전합니다.",
+  "next.analyzer.emptyBody":
+    "보고서는 이름, 경로, 그룹, 메시지 ID, 패스키 없이 구조, 트래커, 경고 신호를 보여 주므로 공개적으로 붙여 넣어도 안전합니다.",
+  "next.analyzer.emptyBodyNzb":
+    "보고서는 이름, 경로, 그룹, 메시지 ID 없이 구조와 경고 신호를 보여 주므로 공개적으로 붙여 넣어도 안전합니다.",
   "next.analyzer.report": "보고서",
   "next.job.download": "내려받기",
   "next.job.downloadFileTitle": "{{name}} 내려받기",
@@ -540,7 +576,8 @@ export const nextKo: LocaleDictionary = {
   "next.job.originalTitle": "원래 NZB 제목",
   "next.job.originalTorrentName": "원래 토렌트 이름",
   "next.job.providersUsed": "사용한 공급자",
-  "next.job.providersEmpty": "이 작업에는 기록되지 않았습니다 — 아직 받은 것이 없거나, weaver가 공급자별로 집계하기 전에 끝났습니다.",
+  "next.job.providersEmpty":
+    "이 작업에는 기록되지 않았습니다 — 아직 받은 것이 없거나, weaver가 공급자별로 집계하기 전에 끝났습니다.",
   "next.job.serverId": "서버 {{id}}",
   "next.job.articles.one": "기사 {{count}}개",
   "next.job.articles.other": "기사 {{count}}개",
@@ -554,8 +591,10 @@ export const nextKo: LocaleDictionary = {
   "next.job.deleteTitle": "기록에서 삭제",
   "next.job.deleteBody": "항목은 기록에서 사라지고 파일은 디스크에 남습니다.",
   "next.job.cancelTitle": "다운로드 취소",
-  "next.job.cancelBody": "다운로드가 멈추고 대기열에서 빠집니다. 부분 데이터는 평소대로 정리됩니다.",
-  "next.job.forgetBody": "weaver는 이 릴리스를 이전에 본 항목의 중복으로 더 이상 인식하지 않습니다. 같은 릴리스를 다시 받으면 새 항목으로 취급됩니다.",
+  "next.job.cancelBody":
+    "다운로드가 멈추고 대기열에서 빠집니다. 부분 데이터는 평소대로 정리됩니다.",
+  "next.job.forgetBody":
+    "weaver는 이 릴리스를 이전에 본 항목의 중복으로 더 이상 인식하지 않습니다. 같은 릴리스를 다시 받으면 새 항목으로 취급됩니다.",
   "next.common.yes": "예",
   "next.common.no": "아니요",
   "next.monitoring.note": "파이프라인 부하, 공급자, 실패",
@@ -574,7 +613,8 @@ export const nextKo: LocaleDictionary = {
   "next.monitoring.pipeline": "파이프라인",
   "next.monitoring.active": "활성",
   "next.monitoring.idle": "유휴",
-  "next.monitoring.pipelineNote": "다운로드 {{downloads}}개, 복구 {{repairs}}개",
+  "next.monitoring.pipelineNote":
+    "다운로드 {{downloads}}개, 복구 {{repairs}}개",
   "next.monitoring.peak": "이번 세션 최고 {{value}} {{unit}}",
   "next.monitoring.noTraffic": "아직 트래픽 없음",
   "next.monitoring.connections": "연결",
@@ -593,7 +633,8 @@ export const nextKo: LocaleDictionary = {
   "next.monitoring.depths": "대기열 깊이",
   "next.monitoring.depthsNote": "다운로드, 디코딩, 기록 전반의 적체",
   "next.monitoring.providersNote": "연결 부하, 왕복 시간, 실패",
-  "next.monitoring.noProviders": "설정된 공급자가 없습니다 — 설정 → 공급자에서 추가하세요.",
+  "next.monitoring.noProviders":
+    "설정된 공급자가 없습니다 — 설정 → 공급자에서 추가하세요.",
   "next.monitoring.roundTrip": "왕복 시간",
   "next.monitoring.pinnedAddress": "새 연결이 사용하는 주소",
   "next.monitoring.failuresSinceStart": "시작 이후 실패",
@@ -689,13 +730,17 @@ export const nextKo: LocaleDictionary = {
   "next.settings.panel.scriptJobs": "작업",
   "next.settings.panel.secrets": "비밀 값",
   "next.secrets.secret": "비밀 값",
-  "next.secrets.note": "값은 이름과 함께 암호화되어 저장되며 다시 표시되지 않습니다. 스크립트 입력은 이름으로 비밀 값을 연결하므로, 여기서 바꾸면 연결한 모든 작업에 적용됩니다.",
+  "next.secrets.note":
+    "값은 이름과 함께 암호화되어 저장되며 다시 표시되지 않습니다. 스크립트 입력은 이름으로 비밀 값을 연결하므로, 여기서 바꾸면 연결한 모든 작업에 적용됩니다.",
   "next.secrets.name": "이름",
-  "next.secrets.nameHelp": "스크립트 입력이 이 비밀 값을 고를 때 쓰는 이름입니다. 대소문자를 구분하지 않고 고유해야 합니다.",
+  "next.secrets.nameHelp":
+    "스크립트 입력이 이 비밀 값을 고를 때 쓰는 이름입니다. 대소문자를 구분하지 않고 고유해야 합니다.",
   "next.secrets.nameInvalid": "비밀 값의 이름은 128바이트 이하로 지정하세요.",
   "next.secrets.value": "값",
-  "next.secrets.valueHelp": "암호화되어 저장됩니다. 저장한 뒤에는 다시 표시되지 않습니다.",
-  "next.secrets.valueKeepHelp": "비워 두면 저장된 값을 유지하고, 새 값을 입력하면 바꿉니다.",
+  "next.secrets.valueHelp":
+    "암호화되어 저장됩니다. 저장한 뒤에는 다시 표시되지 않습니다.",
+  "next.secrets.valueKeepHelp":
+    "비워 두면 저장된 값을 유지하고, 새 값을 입력하면 바꿉니다.",
   "next.secrets.valueSaved": "저장됨 · 비워 두면 유지",
   "next.secrets.valueRequired": "저장할 값을 입력하세요.",
   "next.secrets.usedBy": "사용처",
@@ -706,7 +751,8 @@ export const nextKo: LocaleDictionary = {
   "next.secrets.created": "비밀 값 {{name}}을(를) 만들었습니다",
   "next.secrets.saved": "비밀 값 {{name}}을(를) 저장했습니다",
   "next.secrets.delete": "비밀 값 삭제",
-  "next.secrets.deleteBody": "{{name}}을(를) 삭제할까요? 연결한 작업이 있으면 삭제할 수 없습니다.",
+  "next.secrets.deleteBody":
+    "{{name}}을(를) 삭제할까요? 연결한 작업이 있으면 삭제할 수 없습니다.",
   "next.secrets.deleted": "비밀 값 {{name}}을(를) 삭제했습니다",
   "next.settings.panel.scriptRuns": "실행 기록",
   "next.settings.panel.watchFolder": "감시 폴더",
@@ -730,32 +776,40 @@ export const nextKo: LocaleDictionary = {
   "next.settings.noPanelBody": "탐색 메뉴의 설정 목록에서 하나를 고르세요.",
   "next.settings.loadingBody": "설정을 가져오는 중입니다.",
   "next.settings.nothingHere": "여기에는 설정할 항목이 없습니다",
-  "next.settings.noMatch": "\"{{search}}\"와 일치하는 설정이 없습니다",
+  "next.settings.noMatch": '"{{search}}"와 일치하는 설정이 없습니다',
   "next.settings.nothingHereBody": "이 패널에는 아직 설정이 없습니다.",
-  "next.settings.noMatchBody": "다른 검색어를 입력하거나 검색을 지워 이 페이지를 보세요.",
+  "next.settings.noMatchBody":
+    "다른 검색어를 입력하거나 검색을 지워 이 페이지를 보세요.",
   "next.settings.nothingConfigured": "아직 설정된 항목이 없습니다.",
   "next.general.duplicateAction.accept": "수락",
   "next.general.duplicateAction.warn": "경고",
   "next.general.duplicateAction.pause": "일시 중지",
   "next.general.duplicateAction.block": "차단",
   "next.general.duplicate.strictActive": "같은 릴리스, 이미 있음",
-  "next.general.duplicate.strictActiveHelp": "지금 다운로드 중이거나 성공적으로 완료된 동일한 NZB.",
+  "next.general.duplicate.strictActiveHelp":
+    "지금 다운로드 중이거나 성공적으로 완료된 동일한 NZB.",
   "next.general.duplicate.strictFailed": "같은 릴리스, 이전에 실패",
-  "next.general.duplicate.strictFailedHelp": "이전 시도가 실패했거나 취소된 동일한 NZB.",
+  "next.general.duplicate.strictFailedHelp":
+    "이전 시도가 실패했거나 취소된 동일한 NZB.",
   "next.general.duplicate.layoutActive": "같은 기사 구성, 이미 있음",
-  "next.general.duplicate.layoutActiveHelp": "진행 중이거나 완료된 작업과 같은 기사를 게시하는 다른 NZB.",
+  "next.general.duplicate.layoutActiveHelp":
+    "진행 중이거나 완료된 작업과 같은 기사를 게시하는 다른 NZB.",
   "next.general.duplicate.layoutFailed": "같은 기사 구성, 이전에 실패",
-  "next.general.duplicate.layoutFailedHelp": "실패한 시도와 같은 기사를 게시하는 다른 NZB.",
+  "next.general.duplicate.layoutFailedHelp":
+    "실패한 시도와 같은 기사를 게시하는 다른 NZB.",
   "next.general.duplicate.articleSet": "겹치는 기사 집합",
-  "next.general.duplicate.articleSetHelp": "weaver가 이미 본 항목과 일부가 겹침.",
+  "next.general.duplicate.articleSetHelp":
+    "weaver가 이미 본 항목과 일부가 겹침.",
   "next.general.duplicate.normalizedName": "같은 정규화 이름",
-  "next.general.duplicate.normalizedNameHelp": "대소문자, 공백, 태그를 제거하면 이름이 일치하는 릴리스.",
+  "next.general.duplicate.normalizedNameHelp":
+    "대소문자, 공백, 태그를 제거하면 이름이 일치하는 릴리스.",
   "next.general.language": "언어",
   "next.general.languageHelp": "이 브라우저에만 적용됩니다.",
   "next.general.interface": "인터페이스",
   "next.general.updates": "업데이트",
   "next.general.checkForUpdates": "업데이트 확인",
-  "next.general.checkForUpdatesHelp": "Weaver는 6시간마다 새 릴리스를 확인합니다.",
+  "next.general.checkForUpdatesHelp":
+    "Weaver는 6시간마다 새 릴리스를 확인합니다.",
   "next.general.checkNow": "지금 확인",
   "next.general.checking": "확인 중…",
   "next.general.updateFound": "v{{version}} 사용 가능",
@@ -767,31 +821,40 @@ export const nextKo: LocaleDictionary = {
   "next.general.attempts": "회",
   "next.general.propagationDelay": "전파 대기 시간",
   "next.general.maxConcurrentNzbs": "최대 동시 NZB 수",
-  "next.general.maxConcurrentNzbsHelp": "시작부터 복구, 압축 해제 및 최종 완료까지 Usenet NZB 수를 제한합니다. 모든 제공업체에 공통으로 적용됩니다.",
+  "next.general.maxConcurrentNzbsHelp":
+    "시작부터 복구, 압축 해제 및 최종 완료까지 Usenet NZB 수를 제한합니다. 모든 제공업체에 공통으로 적용됩니다.",
   "next.status.wait.nzb_slot": "NZB 슬롯 대기 중",
   "next.status.wait.disk_space": "디스크 공간 부족",
-  "next.status.wait.disk_space_need": "디스크 공간 부족: {{need}} 필요, {{free}} 남음",
+  "next.status.wait.disk_space_need":
+    "디스크 공간 부족: {{need}} 필요, {{free}} 남음",
   "next.status.wait.disk_space_unread": "디스크 측정 대기 중: {{need}} 필요",
   "next.status.wait.disk_too_small": "디스크가 너무 작음",
-  "next.status.wait.disk_too_small_need": "디스크가 너무 작음: {{need}} 필요, 최대 {{most}}",
+  "next.status.wait.disk_too_small_need":
+    "디스크가 너무 작음: {{need}} 필요, 최대 {{most}}",
   "next.status.wait.disk_full": "디스크 가득 참: 시딩만",
   "next.status.wait.goal_met": "시딩 목표 달성",
   "next.status.wait.fetch_trackers": "트래커에 피어 요청 중",
   "next.status.wait.fetch_discovery": "트래커, DHT, LSD에 피어 요청 중",
   "next.status.wait.fetch_waiting": "트래커에서 피어 없음",
-  "next.status.wait.login_refused": "대기 중: {{server}}에 의해 로그인이 거부됨",
+  "next.status.wait.login_refused":
+    "대기 중: {{server}}에 의해 로그인이 거부됨",
   "next.status.diskShort": "디스크에 쓰는 중",
-  "next.status.diskWriting": "디스크에 쓰는 중 · {{volume}}에 {{waiting}} 대기 중 · {{rate}}",
-  "next.status.diskWaiting": "디스크에 쓰는 중 · {{volume}}에 {{waiting}} 대기 중",
+  "next.status.diskWriting":
+    "디스크에 쓰는 중 · {{volume}}에 {{waiting}} 대기 중 · {{rate}}",
+  "next.status.diskWaiting":
+    "디스크에 쓰는 중 · {{volume}}에 {{waiting}} 대기 중",
   "next.status.diskLeft": "디스크에 쓰는 중: {{volume}}에 쓸 {{left}} 남음",
   "next.attention.slowDisk": "대상 디스크가 느립니다: {{rate}}로 쓰는 중",
   "next.attention.slowDiskUnmeasured": "대상 디스크가 느립니다",
-  "next.general.propagationDelayHelp": "모든 기사가 서버에 도달하도록 새 NZB의 시작을 이 시간만큼 보류합니다.",
+  "next.general.propagationDelayHelp":
+    "모든 기사가 서버에 도달하도록 새 NZB의 시작을 이 시간만큼 보류합니다.",
   "next.general.seconds": "초",
   "next.general.srrdb": "SRRDB 릴리스 조회",
-  "next.general.srrdbHelp": "난독화된 아카이브 멤버의 경우 CRC32 체크섬만 공개 SRRDB 색인에 보내 릴리스 이름을 복원합니다.",
+  "next.general.srrdbHelp":
+    "난독화된 아카이브 멤버의 경우 CRC32 체크섬만 공개 SRRDB 색인에 보내 릴리스 이름을 복원합니다.",
   "next.general.unacceptableExtensions": "허용하지 않는 확장자",
-  "next.general.unacceptableExtensionsHelp": "쉼표로 구분합니다. 이 중 하나를 포함한 완료된 다운로드의 처리는 아래 동작으로 정해집니다.",
+  "next.general.unacceptableExtensionsHelp":
+    "쉼표로 구분합니다. 이 중 하나를 포함한 완료된 다운로드의 처리는 아래 동작으로 정해집니다.",
   "next.general.unwantedExtensionAction": "허용하지 않는 확장자 처리",
   "next.general.unwantedExtensionActionHelp":
     "목록에 있는 파일은 압축 파일로 열지 않습니다. '작업 실패'는 다운로드를 거부하고, '원치 않는 파일만 삭제'는 해당 파일을 지우고 나머지를 부분 완료로 전달합니다.",
@@ -801,29 +864,41 @@ export const nextKo: LocaleDictionary = {
   "next.archivePasswords.list": "비밀번호 (한 줄에 하나)",
   "next.archivePasswords.edit": "비밀번호 편집",
   "next.archivePasswords.clearTitle": "저장된 비밀번호 지우기",
-  "next.archivePasswords.clearBody": "저장된 비밀번호 목록을 삭제할까요? 표시하거나 복원할 수 없습니다.",
+  "next.archivePasswords.clearBody":
+    "저장된 비밀번호 목록을 삭제할까요? 표시하거나 복원할 수 없습니다.",
   "next.archivePasswords.file": "비밀번호 파일",
   "next.archivePasswords.password": "압축 파일 비밀번호",
   "next.general.storage": "저장소",
-  "next.general.dataDirHelp": "서비스 시작 시 정해지며, 데이터베이스와 기본 폴더가 여기에 있습니다.",
+  "next.general.dataDirHelp":
+    "서비스 시작 시 정해지며, 데이터베이스와 기본 폴더가 여기에 있습니다.",
   "next.general.workingDir": "작업 디렉터리",
-  "next.general.workingDirHelp": "후처리 전에 다운로드를 조립하는 곳입니다. 비워 두면 데이터 디렉터리를 사용합니다.",
+  "next.general.workingDirHelp":
+    "후처리 전에 다운로드를 조립하는 곳입니다. 비워 두면 데이터 디렉터리를 사용합니다.",
   "next.general.completeDir": "완료 디렉터리",
-  "next.general.completeDirHelp": "대상을 따로 지정하지 않은 카테고리는 이 안에 폴더가 만들어집니다.",
+  "next.general.completeDirHelp":
+    "대상을 따로 지정하지 않은 카테고리는 이 안에 폴더가 만들어집니다.",
   "next.general.cleanup": "압축 해제 후 정리",
-  "next.general.cleanupHelp": "릴리스 압축 해제에 성공하면 아카이브와 복구 파일을 삭제합니다.",
-  "next.general.deleteFailedJobFiles": "유지 관리 중 실패한 작업의 불완전한 파일 삭제",
+  "next.general.cleanupHelp":
+    "릴리스 압축 해제에 성공하면 아카이브와 복구 파일을 삭제합니다.",
+  "next.general.deleteFailedJobFiles":
+    "유지 관리 중 실패한 작업의 불완전한 파일 삭제",
   "next.general.historyRetentionDays": "기록 보관 기간(일)",
-  "next.general.historyRetentionDaysHelp": "이보다 오래된 항목은 기록에서 사라지며, 파일은 디스크에 남습니다. 0이면 기록을 영구 보관합니다.",
+  "next.general.historyRetentionDaysHelp":
+    "이보다 오래된 항목은 기록에서 사라지며, 파일은 디스크에 남습니다. 0이면 기록을 영구 보관합니다.",
   "next.general.days": "일",
   "next.historyArchive.action": "기록만 남기기",
   "next.historyArchive.title": "기록만 남기기",
-  "next.historyArchive.body": "기록만 남기면 이 항목들의 다운로드한 파일이 디스크에서 삭제되고, 항목과 NZB는 기록에 남습니다. Weaver가 만든 폴더만 건드립니다. 되돌릴 수 없습니다.",
-  "next.historyArchive.jobBody": "기록만 남기면 이 항목의 다운로드한 파일이 디스크에서 삭제되고, 항목과 NZB는 기록에 남습니다. Weaver가 만든 폴더만 건드립니다. 되돌릴 수 없습니다.",
+  "next.historyArchive.body":
+    "기록만 남기면 이 항목들의 다운로드한 파일이 디스크에서 삭제되고, 항목과 NZB는 기록에 남습니다. Weaver가 만든 폴더만 건드립니다. 되돌릴 수 없습니다.",
+  "next.historyArchive.jobBody":
+    "기록만 남기면 이 항목의 다운로드한 파일이 디스크에서 삭제되고, 항목과 NZB는 기록에 남습니다. Weaver가 만든 폴더만 건드립니다. 되돌릴 수 없습니다.",
   "next.historyArchive.mark": "기록만 남김",
-  "next.historyArchive.queued.one": "{{count}}개 항목을 기록만 남기도록 대기열에 넣었습니다",
-  "next.historyArchive.queued.other": "{{count}}개 항목을 기록만 남기도록 대기열에 넣었습니다",
-  "next.historyArchive.queuedPartial": "{{total}}개 중 {{done}}개를 기록만 남기도록 대기열에 넣었습니다",
+  "next.historyArchive.queued.one":
+    "{{count}}개 항목을 기록만 남기도록 대기열에 넣었습니다",
+  "next.historyArchive.queued.other":
+    "{{count}}개 항목을 기록만 남기도록 대기열에 넣었습니다",
+  "next.historyArchive.queuedPartial":
+    "{{total}}개 중 {{done}}개를 기록만 남기도록 대기열에 넣었습니다",
   "next.historyArchive.pending": "기록만 남기는 중",
   "next.historyArchive.failed": "기록만 남기지 못함",
   "next.historyArchive.notAccepted": "기록만 남길 수 없습니다.",
@@ -831,7 +906,8 @@ export const nextKo: LocaleDictionary = {
   "next.historyArchive.alreadyArchived.other": "{{count}}개는 이미 기록만 남음",
   "next.historyArchive.more": "외 {{count}}개",
   "next.historyArchive.unanswered.one": "{{count}}개는 보내지 않아 선택된 상태",
-  "next.historyArchive.unanswered.other": "{{count}}개는 보내지 않아 선택된 상태",
+  "next.historyArchive.unanswered.other":
+    "{{count}}개는 보내지 않아 선택된 상태",
   "next.historyArchive.outcome.ARCHIVED": "기록만 남김",
   "next.historyArchive.outcome.ALREADY_GONE": "이미 없음",
   "next.historyArchive.outcome.NOT_MANAGED": "Weaver가 관리하지 않음",
@@ -840,7 +916,8 @@ export const nextKo: LocaleDictionary = {
   "next.historyArchive.outcome.FAILED": "실패",
   "next.historyArchive.outcome.NOT_FINISHED": "완료되지 않음",
   "next.general.duplicates": "중복",
-  "next.general.duplicatesNote": "새 NZB가 weaver가 이미 본 항목과 일치할 때의 동작",
+  "next.general.duplicatesNote":
+    "새 NZB가 weaver가 이미 본 항목과 일치할 때의 동작",
   "next.weekday.mon": "월요일",
   "next.weekday.tue": "화요일",
   "next.weekday.wed": "수요일",
@@ -877,7 +954,8 @@ export const nextKo: LocaleDictionary = {
   "next.schedules.days": "요일",
   "next.schedules.action": "동작",
   "next.schedules.label": "레이블",
-  "next.schedules.empty": "아직 일정이 없습니다. Weaver는 작업이 있으면 언제든 다운로드합니다.",
+  "next.schedules.empty":
+    "아직 일정이 없습니다. Weaver는 작업이 있으면 언제든 다운로드합니다.",
   "next.schedules.add": "일정 추가",
   "next.schedules.enabledAria": "{{time}} 일정 사용",
   "next.schedules.schedule": "일정",
@@ -886,10 +964,12 @@ export const nextKo: LocaleDictionary = {
   "next.schedules.daysHelp": "요일을 하나도 선택하지 않으면 매일 실행합니다.",
   "next.schedules.whatHappens": "동작 내용",
   "next.schedules.speedLimitHelp": "초당 메비바이트.",
-  "next.schedules.labelHelp": "선택 사항. 표에 표시되어 두 항목을 하나의 시간대로 읽을 수 있게 합니다.",
+  "next.schedules.labelHelp":
+    "선택 사항. 표에 표시되어 두 항목을 하나의 시간대로 읽을 수 있게 합니다.",
   "next.schedules.labelPlaceholder": "비혼잡 시간 시작",
   "next.schedules.enabled": "사용",
-  "next.schedules.removeBody": "대기열은 현재 상태를 그대로 유지하며, 다른 것은 바뀌지 않습니다.",
+  "next.schedules.removeBody":
+    "대기열은 현재 상태를 그대로 유지하며, 다른 것은 바뀌지 않습니다.",
   "next.categories.nameRequired": "카테고리에는 이름이 필요합니다.",
   "next.categories.note": "저장 위치를 비워 두면 완료 폴더",
   "next.categories.name": "이름",
@@ -899,25 +979,32 @@ export const nextKo: LocaleDictionary = {
   "next.categories.add": "카테고리 추가",
   "next.categories.category": "카테고리",
   "next.categories.remove": "카테고리 삭제",
-  "next.categories.nameHelp": "대기열, 사이드바, 인덱서에서 이 카테고리를 부르는 이름입니다.",
+  "next.categories.nameHelp":
+    "대기열, 사이드바, 인덱서에서 이 카테고리를 부르는 이름입니다.",
   "next.categories.destinationHelp": "비워 두면 {{path}}을(를) 사용합니다.",
   "next.categories.completedFolder": "완료 폴더",
   "next.categories.namePlaceholder": "<이름>",
-  "next.categories.aliasesHelp": "인덱서가 이 이름 대신 보낼 수 있는 쉼표로 구분된 이름입니다.",
-  "next.categories.removeBody": "이미 {{name}}에 분류된 다운로드는 폴더를 유지하고, 새 다운로드는 완료 폴더에 저장됩니다.",
+  "next.categories.aliasesHelp":
+    "인덱서가 이 이름 대신 보낼 수 있는 쉼표로 구분된 이름입니다.",
+  "next.categories.removeBody":
+    "이미 {{name}}에 분류된 다운로드는 폴더를 유지하고, 새 다운로드는 완료 폴더에 저장됩니다.",
   "next.watchFolder.polling": "폴링",
   "next.watchFolder.live": "실시간",
   "next.watchFolder.folderRequired": "감시를 켜기 전에 폴더를 선택하세요.",
   "next.watchFolder.saveFailed": "감시 폴더를 저장하지 못했습니다.",
   "next.watchFolder.watching": "감시",
-  "next.watchFolder.watchingHelp": "실시간은 파일 시스템 이벤트를 사용하고, 폴링은 주기적으로 폴더를 다시 읽습니다. 네트워크 공유는 보통 폴링이 필요합니다.",
+  "next.watchFolder.watchingHelp":
+    "실시간은 파일 시스템 이벤트를 사용하고, 폴링은 주기적으로 폴더를 다시 읽습니다. 네트워크 공유는 보통 폴링이 필요합니다.",
   "next.watchFolder.folder": "폴더",
-  "next.watchFolder.folderHelp": "여기에 넣은 모든 .nzb는 대기열에 추가된 뒤 다른 곳으로 옮겨집니다.",
+  "next.watchFolder.folderHelp":
+    "여기에 넣은 모든 .nzb는 대기열에 추가된 뒤 다른 곳으로 옮겨집니다.",
   "next.watchFolder.pollInterval": "폴링 간격",
   "next.watchFolder.settleTime": "안정화 대기 시간",
-  "next.watchFolder.settleTimeHelp": "쓰는 중인 NZB가 대기열에 들어가지 않도록, 파일 변경이 멈춘 뒤 읽기 전에 이만큼 기다립니다.",
+  "next.watchFolder.settleTimeHelp":
+    "쓰는 중인 NZB가 대기열에 들어가지 않도록, 파일 변경이 멈춘 뒤 읽기 전에 이만큼 기다립니다.",
   "next.watchFolder.categoryFromSubfolder": "하위 폴더로 카테고리 지정",
-  "next.watchFolder.categoryFromSubfolderHelp": "`watch/tv` 안의 파일은 `tv` 카테고리로 대기열에 추가됩니다.",
+  "next.watchFolder.categoryFromSubfolderHelp":
+    "`watch/tv` 안의 파일은 `tv` 카테고리로 대기열에 추가됩니다.",
   "next.watchFolder.pauseScanning": "스캔 일시 중지",
   "next.watchFolder.lastScan": "마지막 스캔",
   "next.watchFolder.lastScanNote": "{{found}}개 중 {{queued}}개 대기열 추가",
@@ -927,23 +1014,29 @@ export const nextKo: LocaleDictionary = {
   "next.watchFolder.scanning": "스캔 중…",
   "next.watchFolder.scanNow": "지금 스캔",
   "next.proxies.needsPrivateKey": "WireGuard에는 개인 키가 필요합니다.",
-  "next.proxies.malformedPrivateKey": "개인 키가 WireGuard 키 형식이 아닙니다. wg genkey가 출력하는 그대로의 32바이트 base64여야 합니다.",
-  "next.proxies.malformedPeerKey": "피어 공개 키가 WireGuard 키 형식이 아닙니다. wg genkey가 출력하는 그대로의 32바이트 base64여야 합니다.",
-  "next.proxies.malformedPresharedKey": "사전 공유 키가 WireGuard 키 형식이 아닙니다. wg genkey가 출력하는 그대로의 32바이트 base64여야 합니다.",
+  "next.proxies.malformedPrivateKey":
+    "개인 키가 WireGuard 키 형식이 아닙니다. wg genkey가 출력하는 그대로의 32바이트 base64여야 합니다.",
+  "next.proxies.malformedPeerKey":
+    "피어 공개 키가 WireGuard 키 형식이 아닙니다. wg genkey가 출력하는 그대로의 32바이트 base64여야 합니다.",
+  "next.proxies.malformedPresharedKey":
+    "사전 공유 키가 WireGuard 키 형식이 아닙니다. wg genkey가 출력하는 그대로의 32바이트 base64여야 합니다.",
   "next.proxies.needsPeerKey": "WireGuard에는 피어의 공개 키가 필요합니다.",
-  "next.proxies.needsAddress": "WireGuard에는 인터페이스 주소가 하나 이상 필요합니다(예: 10.6.0.2/32).",
+  "next.proxies.needsAddress":
+    "WireGuard에는 인터페이스 주소가 하나 이상 필요합니다(예: 10.6.0.2/32).",
   "next.proxies.configTooLarge": "이 설정은 64KiB보다 큽니다.",
   "next.proxies.configNotWireguard": "WireGuard 설정이 아닌 것 같습니다.",
   "next.proxies.configFilled": "설정으로 양식을 채웠습니다.",
   "next.proxies.configPeers": "피어가 {{count}}개 있지만 첫 번째만 읽었습니다.",
-  "next.proxies.configIgnored": "터널 프록시가 사용하지 않는 {{fields}} 항목을 무시했습니다.",
+  "next.proxies.configIgnored":
+    "터널 프록시가 사용하지 않는 {{fields}} 항목을 무시했습니다.",
   "next.proxies.nameRequired": "프록시에는 이름이 필요합니다.",
   "next.proxies.hostRequired": "프록시에는 호스트가 필요합니다.",
   "next.proxies.name": "이름",
   "next.proxies.type": "유형",
   "next.proxies.endpoint": "엔드포인트",
   "next.proxies.host": "호스트",
-  "next.proxies.endpointHelp": "`Endpoint = host:port` 줄을 그대로 붙여 넣어도 됩니다.",
+  "next.proxies.endpointHelp":
+    "`Endpoint = host:port` 줄을 그대로 붙여 넣어도 됩니다.",
   "next.proxies.port": "포트",
   "next.proxies.timeout": "시간 제한",
   "next.proxies.enabled": "사용",
@@ -970,20 +1063,29 @@ export const nextKo: LocaleDictionary = {
   "next.dns.trust.AS_SENT": "DNSSEC 끔",
   "next.dns.trust.VALIDATE": "DNSSEC 켬",
   "next.dns.tooMany": "DNS 서버는 최대 {{count}}개입니다.",
-  "next.dns.orderHelp": "서버는 위에서부터 이 순서대로 질의합니다. 최대 {{count}}개입니다.",
-  "next.dns.badAddress": "DNS 서버 {{number}}에는 IP 주소가 필요하며, 포트는 기본값이 아닐 때만 적습니다.",
-  "next.dns.badUrl": "DNS 서버 {{number}}에는 호스트와 경로가 있는 https:// 주소가 필요합니다. 예: https://cloudflare-dns.com/dns-query",
-  "next.dns.dohNeedsAddress": "DNS 서버 {{number}}: 이 호스트에 연결할 IP 주소를 입력하세요.",
-  "next.dns.badTlsName": "DNS 서버 {{number}}의 TLS 이름이 올바른 호스트 이름이 아닙니다.",
+  "next.dns.orderHelp":
+    "서버는 위에서부터 이 순서대로 질의합니다. 최대 {{count}}개입니다.",
+  "next.dns.badAddress":
+    "DNS 서버 {{number}}에는 IP 주소가 필요하며, 포트는 기본값이 아닐 때만 적습니다.",
+  "next.dns.badUrl":
+    "DNS 서버 {{number}}에는 호스트와 경로가 있는 https:// 주소가 필요합니다. 예: https://cloudflare-dns.com/dns-query",
+  "next.dns.dohNeedsAddress":
+    "DNS 서버 {{number}}: 이 호스트에 연결할 IP 주소를 입력하세요.",
+  "next.dns.badTlsName":
+    "DNS 서버 {{number}}의 TLS 이름이 올바른 호스트 이름이 아닙니다.",
   "next.dns.title": "DNS",
-  "next.dns.note": "저장된 DNS 서버 목록과 프로필입니다. 프록시 이름 프로필은 주소가 이름인 프록시를 찾으며, 프록시 편집기에서 고릅니다. 각 경로는 편집기에서 고른 경로 프로필 하나를 따릅니다. 변경은 다음 조회부터 적용됩니다.",
+  "next.dns.note":
+    "저장된 DNS 서버 목록과 프로필입니다. 프록시 이름 프로필은 주소가 이름인 프록시를 찾으며, 프록시 편집기에서 고릅니다. 각 경로는 편집기에서 고른 경로 프로필 하나를 따릅니다. 변경은 다음 조회부터 적용됩니다.",
   "next.dns.who.SYSTEM": "시스템",
   "next.dns.who.WEAVER": "Weaver",
   "next.dns.who.HOST": "호스트",
-  "next.dns.nameWhoHelp.SYSTEM": "호스트가 이 프록시를 조회합니다. 체인 안에서는 이 프록시를 실어 나르는 프록시가 조회합니다.",
+  "next.dns.nameWhoHelp.SYSTEM":
+    "호스트가 이 프록시를 조회합니다. 체인 안에서는 이 프록시를 실어 나르는 프록시가 조회합니다.",
   "next.dns.profiles.hostName": "호스트",
-  "next.dns.whoHelp.SYSTEM": "호스트 자체 리졸버가 다른 프로그램과 마찬가지로 응답합니다.",
-  "next.dns.whoHelp.PROXY": "SOCKS5, HTTP, SSH 프록시에는 이름을 그대로 넘깁니다. WireGuard 프록시는 자체 DNS 서버에 터널을 통해 묻습니다.",
+  "next.dns.whoHelp.SYSTEM":
+    "호스트 자체 리졸버가 다른 프로그램과 마찬가지로 응답합니다.",
+  "next.dns.whoHelp.PROXY":
+    "SOCKS5, HTTP, SSH 프록시에는 이름을 그대로 넘깁니다. WireGuard 프록시는 자체 DNS 서버에 터널을 통해 묻습니다.",
   "next.dns.whoHelp.WEAVER": "Weaver가 저장된 목록의 서버에 순서대로 묻습니다.",
   "next.dns.list": "서버 목록",
   "next.dns.listChoose": "목록 선택",
@@ -992,13 +1094,18 @@ export const nextKo: LocaleDictionary = {
   "next.dns.transit": "경로",
   "next.dns.transit.EGRESS": "출구 경유",
   "next.dns.transit.PROXY": "프록시 경유",
-  "next.dns.transitHelp": "프록시 경유는 레그의 활성 프록시 마지막 홉을 통해 묻습니다. 프록시가 없는 레그나 단계는 출구에서 묻습니다.",
+  "next.dns.transitHelp":
+    "프록시 경유는 레그의 활성 프록시 마지막 홉을 통해 묻습니다. 프록시가 없는 레그나 단계는 출구에서 묻습니다.",
   "next.dns.systemFallback": "프록시가 없는 레그에서는 시스템에 묻기",
-  "next.dns.systemFallbackHelp": "끄면 직접 레그나 직접 대체 경로가 있는 경로는 이 프로필을 쓸 수 없습니다.",
+  "next.dns.systemFallbackHelp":
+    "끄면 직접 레그나 직접 대체 경로가 있는 경로는 이 프로필을 쓸 수 없습니다.",
   "next.dns.systemFallbackOn": "프록시를 쓰지 않는 곳에서는 시스템",
-  "next.dns.routeNeedsWireGuard": "여기서는 WireGuard 프록시의 응답만 검증할 수 있으므로, 이 경로의 모든 레그는 WireGuard 프록시에서 끝나야 하며 직접 레그나 직접 대체 경로가 없어야 합니다.",
-  "next.dns.routeNeedsProxy": "이 경로에는 직접 레그나 직접 대체 경로가 있어 프록시가 DNS에 답할 수 없습니다. 프록시를 주거나, 프로필에서 ‘프록시가 없는 레그에서는 시스템에 묻기’를 켜세요.",
-  "next.dns.routeNeedsTunnelDns": "여기서는 프록시가 DNS에 응답하지만, 다음 WireGuard 프록시는 터널의 DNS 서버를 지정하지 않았습니다: {{proxies}}. 각각에 터널의 DNS 서버를 추가하세요.",
+  "next.dns.routeNeedsWireGuard":
+    "여기서는 WireGuard 프록시의 응답만 검증할 수 있으므로, 이 경로의 모든 레그는 WireGuard 프록시에서 끝나야 하며 직접 레그나 직접 대체 경로가 없어야 합니다.",
+  "next.dns.routeNeedsProxy":
+    "이 경로에는 직접 레그나 직접 대체 경로가 있어 프록시가 DNS에 답할 수 없습니다. 프록시를 주거나, 프로필에서 ‘프록시가 없는 레그에서는 시스템에 묻기’를 켜세요.",
+  "next.dns.routeNeedsTunnelDns":
+    "여기서는 프록시가 DNS에 응답하지만, 다음 WireGuard 프록시는 터널의 DNS 서버를 지정하지 않았습니다: {{proxies}}. 각각에 터널의 DNS 서버를 추가하세요.",
   "next.dns.wireShort.PLAIN": "일반",
   "next.dns.wireShort.TLS": "TLS",
   "next.dns.wireShort.HTTPS": "HTTPS",
@@ -1014,7 +1121,8 @@ export const nextKo: LocaleDictionary = {
   "next.dns.lists.section": "서버 목록",
   "next.dns.lists.save": "목록 저장",
   "next.dns.lists.delete": "목록 삭제",
-  "next.dns.lists.deleteBody": "서버 목록 {{name}}을(를) 삭제할까요? 프로필이 아직 사용하는 목록은 삭제할 수 없습니다.",
+  "next.dns.lists.deleteBody":
+    "서버 목록 {{name}}을(를) 삭제할까요? 프로필이 아직 사용하는 목록은 삭제할 수 없습니다.",
   "next.dns.lists.nameRequired": "목록 이름을 입력하세요.",
   "next.dns.lists.serverCount.one": "서버 {{count}}개",
   "next.dns.lists.serverCount.other": "서버 {{count}}개",
@@ -1031,15 +1139,20 @@ export const nextKo: LocaleDictionary = {
   "next.dns.profiles.section": "프로필",
   "next.dns.profiles.save": "프로필 저장",
   "next.dns.profiles.delete": "프로필 삭제",
-  "next.dns.profiles.deleteBody": "DNS 프로필 {{name}}을(를) 삭제할까요? 경로가 아직 따르는 프로필은 삭제할 수 없습니다.",
+  "next.dns.profiles.deleteBody":
+    "DNS 프로필 {{name}}을(를) 삭제할까요? 경로가 아직 따르는 프로필은 삭제할 수 없습니다.",
   "next.dns.profiles.nameRequired": "프로필 이름을 입력하세요.",
   "next.dns.profiles.builtIn": "기본 제공",
-  "next.dns.nameWhoHelp.WEAVER": "Weaver가 저장된 목록의 서버에 이그레스에서 순서대로 묻습니다.",
-  "next.dns.nameProfiles.deleteBody": "DNS 프로필 {{name}}을(를) 삭제할까요? 프록시가 아직 사용하는 프로필은 삭제할 수 없습니다.",
+  "next.dns.nameWhoHelp.WEAVER":
+    "Weaver가 저장된 목록의 서버에 이그레스에서 순서대로 묻습니다.",
+  "next.dns.nameProfiles.deleteBody":
+    "DNS 프로필 {{name}}을(를) 삭제할까요? 프록시가 아직 사용하는 프로필은 삭제할 수 없습니다.",
   "next.dns.nameProfiles.add": "프록시 이름 프로필 추가",
   "next.dns.nameProfiles.title": "프록시 이름 프로필",
-  "next.dns.profiles.inUseByBoth": "다음 경로가 아직 이 프로필을 따릅니다: {{routes}}. 다음 프록시가 아직 이것으로 주소를 찾습니다: {{proxies}}. 먼저 다른 프로필을 고르세요.",
-  "next.dns.profiles.inUseByProxies": "다음 프록시가 아직 이 프로필로 주소를 찾습니다: {{proxies}}. 먼저 다른 프로필을 고르세요.",
+  "next.dns.profiles.inUseByBoth":
+    "다음 경로가 아직 이 프로필을 따릅니다: {{routes}}. 다음 프록시가 아직 이것으로 주소를 찾습니다: {{proxies}}. 먼저 다른 프로필을 고르세요.",
+  "next.dns.profiles.inUseByProxies":
+    "다음 프록시가 아직 이 프로필로 주소를 찾습니다: {{proxies}}. 먼저 다른 프로필을 고르세요.",
   "next.dns.profiles.proxyCount.other": "프록시 {{count}}개",
   "next.dns.profiles.proxyCount.one": "프록시 {{count}}개",
   "next.dns.profiles.proxies": "프록시",
@@ -1054,15 +1167,18 @@ export const nextKo: LocaleDictionary = {
   "next.dns.test.ownWire": "이 행이 쓰는 프로토콜",
   "next.dns.test.signaturesValidated": "서명 검증됨",
   "next.proxies.tunnelDns": "DNS 서버",
-  "next.proxies.tunnelDnsHelp": "터널 자체 DNS 서버로, 한 줄에 IP 주소 하나씩 입력합니다. 경로의 DNS 프로필이 프록시 응답일 때 응답합니다.",
+  "next.proxies.tunnelDnsHelp":
+    "터널 자체 DNS 서버로, 한 줄에 IP 주소 하나씩 입력합니다. 경로의 DNS 프로필이 프록시 응답일 때 응답합니다.",
   "next.proxies.tunnelDnsBad": "터널 DNS 서버는 IP 주소여야 합니다.",
   "next.proxies.dnsProfileNumber": "DNS 프로필 #{{id}}",
   "next.proxies.dnsProfileDetail": "{{name}}(으)로 찾음",
-  "next.proxies.dnsProfileHelp": "이 프록시의 주소가 이름일 때 조회하는 데 씁니다.",
+  "next.proxies.dnsProfileHelp":
+    "이 프록시의 주소가 이름일 때 조회하는 데 씁니다.",
   "next.proxies.dnsProfile": "이 프록시를 찾는 방법",
   "next.proxies.mtuHelp": "비워 두면 {{value}}을(를) 사용합니다.",
   "next.proxies.keepalive": "킵얼라이브",
-  "next.proxies.keepaliveHelp": "비워 두면 {{seconds}}초를 사용하며, 0이면 끕니다.",
+  "next.proxies.keepaliveHelp":
+    "비워 두면 {{seconds}}초를 사용하며, 0이면 끕니다.",
   "next.proxies.natpmp": "NAT-PMP 포트 포워딩",
   "next.proxies.forwardedPort": "포워딩된 포트",
   "next.proxies.username": "사용자 이름",
@@ -1092,38 +1208,51 @@ export const nextKo: LocaleDictionary = {
   "next.proxies.configBadKey": "{{key}}은(는) WireGuard 키가 아닙니다.",
   "next.proxies.configBadEndpoint": "Endpoint가 host:port 형식이 아닙니다.",
   "next.proxies.configBadNumber": "{{key}}은(는) 숫자가 아닙니다.",
-  "next.proxies.removeBody": "이 프록시를 거치던 연결은 다음 경로로 넘어가며, 허용된 경우 직접 연결을 사용합니다.",
+  "next.proxies.removeBody":
+    "이 프록시를 거치던 연결은 다음 경로로 넘어가며, 허용된 경우 직접 연결을 사용합니다.",
   "next.proxies.forgetKey": "키 지우기",
-  "next.proxies.forgetBody": "다음 연결은 호스트가 제시하는 어떤 키든 신뢰합니다. 호스트를 다시 구축한 것을 알고 있을 때만 실행하세요.",
+  "next.proxies.forgetBody":
+    "다음 연결은 호스트가 제시하는 어떤 키든 신뢰합니다. 호스트를 다시 구축한 것을 알고 있을 때만 실행하세요.",
   "next.security.mode.required": "모든 브라우저에서 로그인 필요",
-  "next.security.mode.exceptTrusted": "신뢰할 수 있는 네트워크를 제외하고 로그인 필요",
+  "next.security.mode.exceptTrusted":
+    "신뢰할 수 있는 네트워크를 제외하고 로그인 필요",
   "next.security.mode.noLogin": "로그인 없음(이 컴퓨터만)",
   "next.security.scope.read": "읽기 전용",
   "next.security.scope.control": "대기열 제어",
   "next.security.scope.admin": "전체 관리",
-  "next.security.listenSaved": "수신 주소를 저장했습니다 — 적용하려면 weaver를 다시 시작하세요",
-  "next.security.listenCleared": "수신 주소를 지웠습니다 — 다음 재시작 때 weaver는 이 컴퓨터에서만 접근할 수 있게 됩니다",
+  "next.security.listenSaved":
+    "수신 주소를 저장했습니다 — 적용하려면 weaver를 다시 시작하세요",
+  "next.security.listenCleared":
+    "수신 주소를 지웠습니다 — 다음 재시작 때 weaver는 이 컴퓨터에서만 접근할 수 있게 됩니다",
   "next.security.policyApplied": "접근 정책을 적용했습니다",
   "next.security.passwordsMismatch": "두 비밀번호가 일치하지 않습니다.",
-  "next.security.credentialsRequired": "사용자 이름과 비밀번호가 모두 필요합니다.",
+  "next.security.credentialsRequired":
+    "사용자 이름과 비밀번호가 모두 필요합니다.",
   "next.security.keyNameRequired": "키를 사용할 대상의 이름을 붙이세요.",
   "next.security.keyCreateFailed": "키를 만들지 못했습니다.",
   "next.security.listenAddress": "수신 주소",
-  "next.security.listenHelp": "Weaver는 기본적으로 이 컴퓨터에서만 접근할 수 있는 127.0.0.1에서 응답합니다. 모든 인터페이스에서 받으려면 0.0.0.0을 사용하세요. 다음 재시작 때 적용됩니다.",
-  "next.security.listenPinnedHelp": "weaver 환경의 {{variable}}에 의해 고정되어 있습니다. 배포 설정에서 변경하세요.",
+  "next.security.listenHelp":
+    "Weaver는 기본적으로 이 컴퓨터에서만 접근할 수 있는 127.0.0.1에서 응답합니다. 모든 인터페이스에서 받으려면 0.0.0.0을 사용하세요. 다음 재시작 때 적용됩니다.",
+  "next.security.listenPinnedHelp":
+    "weaver 환경의 {{variable}}에 의해 고정되어 있습니다. 배포 설정에서 변경하세요.",
   "next.security.listenPlaceholder": "{{address}}(기본값)",
   "next.security.browserAccess": "브라우저 접근",
-  "next.security.accessPinnedHelp": "weaver 환경의 {{variable}}에서 관리합니다.",
-  "next.security.accessHelp": "로그인 없이 웹 인터페이스를 사용할 수 있는 대상입니다.",
+  "next.security.accessPinnedHelp":
+    "weaver 환경의 {{variable}}에서 관리합니다.",
+  "next.security.accessHelp":
+    "로그인 없이 웹 인터페이스를 사용할 수 있는 대상입니다.",
   "next.security.trustedNetworks": "신뢰할 수 있는 네트워크",
-  "next.security.trustedNetworksHelp": "한 줄에 CIDR 하나. 이 범위 안의 브라우저는 로그인을 건너뜁니다.",
+  "next.security.trustedNetworksHelp":
+    "한 줄에 CIDR 하나. 이 범위 안의 브라우저는 로그인을 건너뜁니다.",
   "next.security.mcpEnabled": "MCP 서버 허용",
-  "next.security.mcpEnabledHelp": "API 키가 있는 에이전트가 /mcp에서 운영자 스킬의 작업을 실행할 수 있게 합니다.",
+  "next.security.mcpEnabledHelp":
+    "API 키가 있는 에이전트가 /mcp에서 운영자 스킬의 작업을 실행할 수 있게 합니다.",
   "next.security.signIn": "로그인",
   "next.security.signedInAs": "{{name}}(으)로 로그인됨",
   "next.security.notConfigured": "설정되지 않음",
   "next.security.requireLogin": "로그인 요구",
-  "next.security.requireLoginOffHelp": "weaver에 접근할 수 있는 누구나 전체 관리 권한을 가집니다.",
+  "next.security.requireLoginOffHelp":
+    "weaver에 접근할 수 있는 누구나 전체 관리 권한을 가집니다.",
   "next.security.changePassword": "비밀번호 변경",
   "next.security.turnOff": "끄기",
   "next.security.setUpLogin": "로그인 설정",
@@ -1134,11 +1263,13 @@ export const nextKo: LocaleDictionary = {
   "next.security.scope": "범위",
   "next.security.created": "생성",
   "next.security.lastUsed": "마지막 사용",
-  "next.security.keysEmpty": "API 키가 없습니다. Sonarr, Radarr, NZBGet 호환 인터페이스는 각각 하나씩 필요합니다.",
+  "next.security.keysEmpty":
+    "API 키가 없습니다. Sonarr, Radarr, NZBGet 호환 인터페이스는 각각 하나씩 필요합니다.",
   "next.security.addKey": "API 키 추가",
   "next.security.never": "없음",
   "next.security.revoke": "폐기",
-  "next.security.exposedWarning": "로그인이 설정되지 않은 동안에는 다음 재시작 후 이 컴퓨터 밖에서도 Weaver에 접근할 수 있습니다.",
+  "next.security.exposedWarning":
+    "로그인이 설정되지 않은 동안에는 다음 재시작 후 이 컴퓨터 밖에서도 Weaver에 접근할 수 있습니다.",
   "next.security.appliesImmediately": "즉시 적용",
   "next.security.turnOnLogin": "로그인 켜기",
   "next.security.administrator": "관리자",
@@ -1152,86 +1283,112 @@ export const nextKo: LocaleDictionary = {
   "next.security.newKeyNote": "한 번만 볼 수 있습니다",
   "next.security.createKey": "키 만들기",
   "next.security.key": "키",
-  "next.security.scopeHelp": "읽기는 대기열 보기, 제어는 작업 추가와 삭제, 관리는 설정 변경까지 할 수 있습니다.",
+  "next.security.scopeHelp":
+    "읽기는 대기열 보기, 제어는 작업 추가와 삭제, 관리는 설정 변경까지 할 수 있습니다.",
   "next.security.keyCreated": "API 키를 만들었습니다",
   "next.security.copied": "복사됨",
   "next.security.copyFailed": "복사하지 못했습니다. Ctrl+C 또는 ⌘C를 누르세요",
   "next.security.copyKey": "키 복사",
   "next.security.done": "완료",
-  "next.security.copyNow": "지금 복사하세요. Weaver는 해시만 저장하므로 다시 표시할 수 없습니다.",
+  "next.security.copyNow":
+    "지금 복사하세요. Weaver는 해시만 저장하므로 다시 표시할 수 없습니다.",
   "next.security.apiKey": "API 키",
   "next.security.turnOffTitle": "로그인 끄기",
   "next.security.turnOffLogin": "로그인 끄기",
-  "next.security.turnOffBody": "weaver에 접근할 수 있는 누구나 로그인 없이 전체 관리 권한을 갖게 됩니다.",
+  "next.security.turnOffBody":
+    "weaver에 접근할 수 있는 누구나 로그인 없이 전체 관리 권한을 갖게 됩니다.",
   "next.security.revokeTitle": "API 키 폐기",
   "next.security.revokeKey": "키 폐기",
-  "next.security.revokeBody": "아직 {{name}}을(를) 사용하는 모든 것이 즉시 작동을 멈춥니다.",
+  "next.security.revokeBody":
+    "아직 {{name}}을(를) 사용하는 모든 것이 즉시 작동을 멈춥니다.",
   "next.security.thisKey": "이 키",
   "next.security.checkTitle": "비밀번호 확인",
   "next.security.checkNote": "15분마다 한 번 확인합니다",
   "next.security.checkCancel": "취소",
   "next.security.checkContinue": "계속",
   "next.security.checking": "확인 중…",
-  "next.security.checkBusy": "시도 횟수가 너무 많습니다. 잠시 후 다시 시도하세요.",
+  "next.security.checkBusy":
+    "시도 횟수가 너무 많습니다. 잠시 후 다시 시도하세요.",
   "next.security.checkFailed": "비밀번호가 올바르지 않습니다.",
-  "next.security.checkUnreachable": "비밀번호를 확인하기 위해 Weaver에 연결할 수 없습니다.",
+  "next.security.checkUnreachable":
+    "비밀번호를 확인하기 위해 Weaver에 연결할 수 없습니다.",
   "next.security.passwordHelp": "비밀번호를 바꾸면 모든 세션이 로그아웃됩니다.",
   "next.security.signOutEverywhere": "모든 곳에서 로그아웃",
   "next.security.signOutEverywhereTitle": "모든 브라우저 로그아웃",
-  "next.security.signOutEverywhereBody": "이 브라우저를 포함해 weaver에 로그인한 모든 브라우저가 로그아웃되며 다시 로그인해야 합니다. API 키는 계속 작동합니다.",
-  "next.security.signOutEverywhereFailed": "Weaver가 다른 세션을 로그아웃하지 못했습니다. 다시 시도하세요.",
+  "next.security.signOutEverywhereBody":
+    "이 브라우저를 포함해 weaver에 로그인한 모든 브라우저가 로그아웃되며 다시 로그인해야 합니다. API 키는 계속 작동합니다.",
+  "next.security.signOutEverywhereFailed":
+    "Weaver가 다른 세션을 로그아웃하지 못했습니다. 다시 시도하세요.",
   "next.security.listeningNow": "현재 수신 주소",
-  "next.security.listenPending": "Weaver는 아직 이 주소에서 수신 중입니다. 저장한 주소는 다음 재시작 때 적용됩니다.",
+  "next.security.listenPending":
+    "Weaver는 아직 이 주소에서 수신 중입니다. 저장한 주소는 다음 재시작 때 적용됩니다.",
   "next.security.rememberedNetworks": "로그인 유지 허용 네트워크",
-  "next.security.rememberedNetworksHelp": "이 범위의 브라우저는 로그인할 때 로그인 유지를 사용할 수 있습니다. 한 줄에 CIDR 하나, 비워 두면 모든 클라이언트를 허용합니다.",
+  "next.security.rememberedNetworksHelp":
+    "이 범위의 브라우저는 로그인할 때 로그인 유지를 사용할 수 있습니다. 한 줄에 CIDR 하나, 비워 두면 모든 클라이언트를 허용합니다.",
   "next.security.trustedProxies": "신뢰하는 프록시",
-  "next.security.trustedProxiesHelp": "전달 헤더는 이 주소 또는 CIDR에서만 신뢰합니다. 직접 운영하는 프록시만 입력하세요.",
+  "next.security.trustedProxiesHelp":
+    "전달 헤더는 이 주소 또는 CIDR에서만 신뢰합니다. 직접 운영하는 프록시만 입력하세요.",
   "next.security.thisBrowser": "이 브라우저",
-  "next.security.connectionHelp": "연결의 피어 주소와 weaver가 그로부터 확인한 클라이언트 주소입니다.",
+  "next.security.connectionHelp":
+    "연결의 피어 주소와 weaver가 그로부터 확인한 클라이언트 주소입니다.",
   "next.security.headersIgnored": "전달 헤더가 무시되었습니다.",
   "next.security.unknown": "알 수 없음",
   "next.security.draft": "초안",
-  "next.security.draftHelp": "저장하지 않은 변경 사항의 결과로, 입력하는 동안 weaver가 확인합니다.",
-  "next.security.draftResolves": "{{networks}}에서 로그인 유지, 신뢰하는 프록시: {{proxies}}.",
+  "next.security.draftHelp":
+    "저장하지 않은 변경 사항의 결과로, 입력하는 동안 weaver가 확인합니다.",
+  "next.security.draftResolves":
+    "{{networks}}에서 로그인 유지, 신뢰하는 프록시: {{proxies}}.",
   "next.security.anyClient": "모든 클라이언트",
   "next.security.draftRestart": "수신 주소는 다음 재시작 때 적용됩니다.",
-  "next.security.draftLocksOut": "이 브라우저는 더 이상 로그인 유지를 사용할 수 없게 됩니다.",
-  "next.security.policyInvalid": "저장된 로그인 유지 네트워크가 올바르지 않아 weaver가 모든 로그인 유지 세션을 거부하고 있습니다. 아래에서 수정하세요.",
-  "next.security.networkSaved": "네트워크 접근을 저장했습니다. 수신 주소 변경은 다음 재시작 때 적용됩니다.",
+  "next.security.draftLocksOut":
+    "이 브라우저는 더 이상 로그인 유지를 사용할 수 없게 됩니다.",
+  "next.security.policyInvalid":
+    "저장된 로그인 유지 네트워크가 올바르지 않아 weaver가 모든 로그인 유지 세션을 거부하고 있습니다. 아래에서 수정하세요.",
+  "next.security.networkSaved":
+    "네트워크 접근을 저장했습니다. 수신 주소 변경은 다음 재시작 때 적용됩니다.",
   "next.security.lockoutTitle": "이 브라우저의 로그인 유지가 해제됩니다",
-  "next.security.lockoutBody": "이 브라우저는 저장하려는 네트워크 범위 밖에 있습니다. 로그인 유지로 로그인했다면 다시 로그인해야 합니다.",
+  "next.security.lockoutBody":
+    "이 브라우저는 저장하려는 네트워크 범위 밖에 있습니다. 로그인 유지로 로그인했다면 다시 로그인해야 합니다.",
   "next.security.lockoutConfirm": "그래도 저장",
   "next.backup.requestFailed": "요청이 상태 {{status}}(으)로 실패했습니다",
   "next.backup.building": "아카이브를 만드는 중…",
   "next.backup.savedFile": "{{name}} 저장됨",
   "next.backup.reading": "아카이브를 읽는 중…",
-  "next.backup.readNeedsRemaps": "아카이브를 읽었습니다. 아래 카테고리에 이 컴퓨터의 저장 위치를 지정하세요.",
+  "next.backup.readNeedsRemaps":
+    "아카이브를 읽었습니다. 아래 카테고리에 이 컴퓨터의 저장 위치를 지정하세요.",
   "next.backup.readDone": "아카이브를 읽었습니다.",
   "next.backup.staging": "복원을 준비하는 중…",
-  "next.backup.staged.one": "복원 준비됨 · 기록에 다운로드 {{count}}개 · 적용하려면 weaver를 다시 시작하세요",
-  "next.backup.staged.other": "복원 준비됨 · 기록에 다운로드 {{count}}개 · 적용하려면 weaver를 다시 시작하세요",
+  "next.backup.staged.one":
+    "복원 준비됨 · 기록에 다운로드 {{count}}개 · 적용하려면 weaver를 다시 시작하세요",
+  "next.backup.staged.other":
+    "복원 준비됨 · 기록에 다운로드 {{count}}개 · 적용하려면 weaver를 다시 시작하세요",
   "next.backup.restored.one": "기록에서 다운로드 {{count}}개를 복원했습니다",
   "next.backup.restored.other": "기록에서 다운로드 {{count}}개를 복원했습니다",
   "next.backup.theDataDirectory": "데이터 디렉터리",
   "next.backup.archive": "아카이브",
-  "next.backup.archiveHelp": "이 컴퓨터나 다른 컴퓨터에서 백업이 만든 .enc 파일입니다.",
+  "next.backup.archiveHelp":
+    "이 컴퓨터나 다른 컴퓨터에서 백업이 만든 .enc 파일입니다.",
   "next.backup.noFile": "선택한 파일 없음",
   "next.backup.chooseFile": "파일 선택",
   "next.backup.password": "비밀번호",
-  "next.backup.dataDirHelp": "복원한 데이터베이스와 상태를 이 컴퓨터의 어디에 기록할지 정합니다.",
+  "next.backup.dataDirHelp":
+    "복원한 데이터베이스와 상태를 이 컴퓨터의 어디에 기록할지 정합니다.",
   "next.backup.intermediateDir": "중간 디렉터리",
   "next.backup.blankUses": "비워 두면 {{path}}을(를) 사용합니다.",
   "next.backup.readTheArchive": "아카이브 확인",
-  "next.backup.readTheArchiveHelp": "Weaver가 아카이브를 검사하고, 복원하기 전에 복원 시 무엇이 바뀌는지 알려 줍니다.",
+  "next.backup.readTheArchiveHelp":
+    "Weaver가 아카이브를 검사하고, 복원하기 전에 복원 시 무엇이 바뀌는지 알려 줍니다.",
   "next.backup.checking": "확인 중…",
   "next.backup.restoreAvailable": "복원 가능",
   "next.backup.restoreUnavailable": "복원 불가",
   "next.backup.readArchive": "아카이브 읽기",
   "next.backup.restore": "복원",
-  "next.backup.restoreHelp": "이 컴퓨터의 설정, 공급자, 카테고리, 기록을 아카이브의 내용으로 바꿉니다.",
+  "next.backup.restoreHelp":
+    "이 컴퓨터의 설정, 공급자, 카테고리, 기록을 아카이브의 내용으로 바꿉니다.",
   "next.backup.restoreFromArchive": "아카이브에서 복원",
   "next.backup.exportNote": "설정, 공급자, 카테고리, 일정, 기록",
-  "next.backup.passwordHelp": "아카이브는 이 비밀번호로 암호화됩니다. Weaver는 비밀번호를 복구해 줄 수 없습니다.",
+  "next.backup.passwordHelp":
+    "아카이브는 이 비밀번호로 암호화됩니다. Weaver는 비밀번호를 복구해 줄 수 없습니다.",
   "next.backup.confirmPassword": "비밀번호 확인",
   "next.backup.stagedRestore": "준비된 복원",
   "next.backup.waitingRestart": "재시작 대기 중",
@@ -1249,7 +1406,8 @@ export const nextKo: LocaleDictionary = {
   "next.backup.sourceDataDir": "원본 데이터 디렉터리",
   "next.backup.sourceCompleteDir": "원본 완료 디렉터리",
   "next.backup.sourceIntermediateDir": "원본 중간 디렉터리",
-  "next.backup.keyIncompatible": "이 아카이브의 암호화 키를 설정된 키 저장소로 옮길 수 없어 여기서는 복원할 수 없습니다.",
+  "next.backup.keyIncompatible":
+    "이 아카이브의 암호화 키를 설정된 키 저장소로 옮길 수 없어 여기서는 복원할 수 없습니다.",
   "next.backup.categoryDestinations": "카테고리 저장 위치",
   "next.backup.categoryDestinationsNote": "이 폴더들은 이 컴퓨터에 없습니다",
   "next.backup.was": "이전",
@@ -1257,23 +1415,29 @@ export const nextKo: LocaleDictionary = {
   "next.backup.destinationFor": "{{name}}의 저장 위치",
   "next.backup.download": "백업 다운로드",
   "next.backup.stageRestore": "복원 준비",
-  "next.backup.restoreBody": "weaver가 아는 모든 것 — 공급자, 카테고리, 일정, 기록 — 이 아카이브의 내용으로 바뀝니다. 복원은 따로 기록되었다가 서비스를 다음에 시작할 때 적용됩니다.",
-  "next.postProcessing.directorySaved": "스크립트 디렉터리를 저장했습니다 · 모든 스크립트 작업을 껐습니다",
+  "next.backup.restoreBody":
+    "weaver가 아는 모든 것 — 공급자, 카테고리, 일정, 기록 — 이 아카이브의 내용으로 바뀝니다. 복원은 따로 기록되었다가 서비스를 다음에 시작할 때 적용됩니다.",
+  "next.postProcessing.directorySaved":
+    "스크립트 디렉터리를 저장했습니다 · 모든 스크립트 작업을 껐습니다",
   "next.postProcessing.required": "필수.",
   "next.postProcessing.defaultValue": "기본값: {{value}}.",
   "next.postProcessing.execution": "실행",
   "next.postProcessing.strictOn": "엄격한 보안이 켜져 있음",
   "next.postProcessing.runScripts": "스크립트 실행",
-  "next.postProcessing.runScriptsHelp": "끄면 weaver가 스크립트를 찾기만 하고 실행하지는 않습니다.",
+  "next.postProcessing.runScriptsHelp":
+    "끄면 weaver가 스크립트를 찾기만 하고 실행하지는 않습니다.",
   "next.postProcessing.concurrency": "동시 스크립트",
-  "next.postProcessing.concurrencyHelp": "모든 다운로드와 이벤트를 통틀어 동시에 실행할 수 있는 스크립트 수. 한 다운로드의 스크립트는 지금처럼 차례대로 실행됩니다.",
+  "next.postProcessing.concurrencyHelp":
+    "모든 다운로드와 이벤트를 통틀어 동시에 실행할 수 있는 스크립트 수. 한 다운로드의 스크립트는 지금처럼 차례대로 실행됩니다.",
   "next.postProcessing.grace": "종료 유예 시간",
   "next.postProcessing.interpreters": "인터프리터",
-  "next.postProcessing.interpretersNote": "비워 두면 데몬의 PATH에 있는 것을 사용",
+  "next.postProcessing.interpretersNote":
+    "비워 두면 데몬의 PATH에 있는 것을 사용",
   "next.postProcessing.directory": "스크립트 디렉터리",
   "next.postProcessing.directoryNote": "데몬 자체 파일 시스템에서 읽음",
   "next.postProcessing.directoryLabel": "디렉터리",
-  "next.postProcessing.directoryHelp": "스크립트는 여기에서 찾습니다. Weaver는 스크립트를 업로드, 편집, 삭제하지 않습니다.",
+  "next.postProcessing.directoryHelp":
+    "스크립트는 여기에서 찾습니다. Weaver는 스크립트를 업로드, 편집, 삭제하지 않습니다.",
   "next.postProcessing.change": "변경",
   "next.postProcessing.script": "스크립트",
   "next.postProcessing.timeout": "제한 시간",
@@ -1285,30 +1449,40 @@ export const nextKo: LocaleDictionary = {
   "next.postProcessing.moveUp": "위로 이동",
   "next.postProcessing.moveDown": "아래로 이동",
   "next.postProcessing.adapter": "어댑터",
-  "next.postProcessing.discoveredEmpty": "스크립트를 찾을 수 없습니다. 스크립트 디렉터리에 넣고 새로 고치세요.",
+  "next.postProcessing.discoveredEmpty":
+    "스크립트를 찾을 수 없습니다. 스크립트 디렉터리에 넣고 새로 고치세요.",
   "next.postProcessing.problems": "읽을 수 없는 스크립트",
   "next.postProcessing.changeDirTitle": "스크립트 디렉터리 변경",
   "next.postProcessing.changeDirConfirm": "디렉터리 변경",
-  "next.postProcessing.changeDirBody": "새 디렉터리의 같은 이름이 연결해 둔 스크립트와 같다고 볼 수 없으므로 모든 스크립트 작업이 꺼집니다. 저장된 내용은 모두 유지됩니다. 디스크의 파일은 건드리지 않습니다.",
+  "next.postProcessing.changeDirBody":
+    "새 디렉터리의 같은 이름이 연결해 둔 스크립트와 같다고 볼 수 없으므로 모든 스크립트 작업이 꺼집니다. 저장된 내용은 모두 유지됩니다. 디스크의 파일은 건드리지 않습니다.",
   "next.postProcessing.events": "이벤트 스크립트와 출력 보존",
-  "next.postProcessing.eventsNote": "한 다운로드의 대기열 이벤트는 한 번에 하나씩 실행",
+  "next.postProcessing.eventsNote":
+    "한 다운로드의 대기열 이벤트는 한 번에 하나씩 실행",
   "next.postProcessing.eventTimeout": "기본 이벤트 제한 시간",
-  "next.postProcessing.eventTimeoutHelp": "대기열, 스캔, 일정, 피드 스크립트 작업에 자체 제한 시간이 없을 때 사용됩니다.",
+  "next.postProcessing.eventTimeoutHelp":
+    "대기열, 스캔, 일정, 피드 스크립트 작업에 자체 제한 시간이 없을 때 사용됩니다.",
   "next.postProcessing.fileEventInterval": "파일 이벤트 간격",
-  "next.postProcessing.fileEventIntervalHelp": "한 다운로드에서 파일 이벤트 사이의 최소 시간입니다. 0은 제한하지 않고, -1은 끕니다. 다이렉트 스토어 다운로드에는 스크립트가 살펴볼 압축 파일이 없을 수 있습니다.",
+  "next.postProcessing.fileEventIntervalHelp":
+    "한 다운로드에서 파일 이벤트 사이의 최소 시간입니다. 0은 제한하지 않고, -1은 끕니다. 다이렉트 스토어 다운로드에는 스크립트가 살펴볼 압축 파일이 없을 수 있습니다.",
   "next.postProcessing.outputRuns": "다운로드당 보존 실행 수",
-  "next.postProcessing.outputRunsHelp": "각 다운로드와 각 스캔, 일정, 피드마다 보존하는 최신 실행 수입니다.",
+  "next.postProcessing.outputRunsHelp":
+    "각 다운로드와 각 스캔, 일정, 피드마다 보존하는 최신 실행 수입니다.",
   "next.postProcessing.outputFailedRuns": "실패한 실행 보존",
-  "next.postProcessing.outputFailedRunsHelp": "다운로드마다 그 수를 넘어서도 보존되는 실패한 실행 수로, 실패를 계속 확인할 수 있습니다.",
-  "next.postProcessing.outputLoweringDeletes": "이 값을 낮추면 저장하는 즉시 모든 다운로드의 오래된 실행이 삭제됩니다.",
+  "next.postProcessing.outputFailedRunsHelp":
+    "다운로드마다 그 수를 넘어서도 보존되는 실패한 실행 수로, 실패를 계속 확인할 수 있습니다.",
+  "next.postProcessing.outputLoweringDeletes":
+    "이 값을 낮추면 저장하는 즉시 모든 다운로드의 오래된 실행이 삭제됩니다.",
   "next.postProcessing.outputTruncatedChip": "잘림",
   "next.postProcessing.kindPostProcessing": "후처리",
   "next.postProcessing.kindQueue": "대기열",
   "next.postProcessing.kindScan": "스캔",
   "next.postProcessing.kindFeed": "피드",
   "next.postProcessing.instances": "작업",
-  "next.postProcessing.instancesNote": "모든 카테고리용 작업이 카테고리 전용 작업보다 먼저 실행됩니다",
-  "next.postProcessing.instancesNoteOnlyWithout": "모든 카테고리용 작업은 카테고리 전용 작업이 없을 때만 실행됩니다",
+  "next.postProcessing.instancesNote":
+    "모든 카테고리용 작업이 카테고리 전용 작업보다 먼저 실행됩니다",
+  "next.postProcessing.instancesNoteOnlyWithout":
+    "모든 카테고리용 작업은 카테고리 전용 작업이 없을 때만 실행됩니다",
   "next.postProcessing.noInstances": "아직 작업이 없습니다.",
   "next.postProcessing.createInstance": "작업 추가",
   "next.postProcessing.chooseScript": "스크립트 선택",
@@ -1318,7 +1492,8 @@ export const nextKo: LocaleDictionary = {
   "next.postProcessing.inputs": "입력",
   "next.postProcessing.noInputs": "이 작업에는 입력이 없습니다.",
   "next.postProcessing.secret": "비밀 값",
-  "next.postProcessing.secretLinkHelp": "설정 · 스크립트 · 비밀 값에서 연결합니다. 스크립트는 실행할 때 값을 받으며, 여기에는 표시되지 않습니다.",
+  "next.postProcessing.secretLinkHelp":
+    "설정 · 스크립트 · 비밀 값에서 연결합니다. 스크립트는 실행할 때 값을 받으며, 여기에는 표시되지 않습니다.",
   "next.postProcessing.chooseSecret": "비밀 값 선택",
   "next.postProcessing.noSecret": "비밀 값 없음",
   "next.postProcessing.createSecret": "새 비밀 값 만들기…",
@@ -1330,54 +1505,73 @@ export const nextKo: LocaleDictionary = {
   "next.postProcessing.newInputIsSecret": "새 입력은 시크릿입니다",
   "next.postProcessing.ownSecretSaved": "저장됨. 입력하면 교체",
   "next.postProcessing.addInput": "입력 추가",
-  "next.postProcessing.inputNameInvalid": "영문자로 시작하고 영문자, 숫자, -, _ 를 사용하세요. 이런 부분은 점으로 이을 수 있습니다.",
-  "next.postProcessing.inputNameTaken": "이 작업에 같은 이름의 입력이 이미 있습니다.",
+  "next.postProcessing.inputNameInvalid":
+    "영문자로 시작하고 영문자, 숫자, -, _ 를 사용하세요. 이런 부분은 점으로 이을 수 있습니다.",
+  "next.postProcessing.inputNameTaken":
+    "이 작업에 같은 이름의 입력이 이미 있습니다.",
   "next.postProcessing.runPolicy": "실행 방법",
   "next.postProcessing.categories": "카테고리",
-  "next.postProcessing.categoriesHelp": "이 카테고리의 다운로드에만 실행됩니다. 아무것도 고르지 않으면 모든 카테고리에 실행됩니다.",
+  "next.postProcessing.categoriesHelp":
+    "이 카테고리의 다운로드에만 실행됩니다. 아무것도 고르지 않으면 모든 카테고리에 실행됩니다.",
   "next.postProcessing.everyCategory": "모든 카테고리",
   "next.postProcessing.noCategories": "정의된 카테고리가 없습니다",
   "next.postProcessing.runTimes": "실행 시각",
-  "next.postProcessing.runTimeNeeded": "이 작업의 실행 시각을 지정하거나 시작 시 실행을 켜십시오.",
-  "next.postProcessing.runTimeInvalid": "{{time}}은(는) 시각이 아닙니다. HH:MM 또는 매시간을 뜻하는 *:MM을 사용하십시오.",
-  "next.postProcessing.runModeHelp": "블로킹은 끝날 때까지 기다린 뒤 다음으로 넘어갑니다. 완료를 기다리지 않음은 시작만 하고 끝나기를 기다리지 않습니다.",
-  "next.postProcessing.timeoutHelp": "0이면 기본값을 씁니다. 후처리 스크립트는 하루, 나머지는 기본 이벤트 제한 시간입니다. 최대 7일입니다.",
+  "next.postProcessing.runTimeNeeded":
+    "이 작업의 실행 시각을 지정하거나 시작 시 실행을 켜십시오.",
+  "next.postProcessing.runTimeInvalid":
+    "{{time}}은(는) 시각이 아닙니다. HH:MM 또는 매시간을 뜻하는 *:MM을 사용하십시오.",
+  "next.postProcessing.runModeHelp":
+    "블로킹은 끝날 때까지 기다린 뒤 다음으로 넘어갑니다. 완료를 기다리지 않음은 시작만 하고 끝나기를 기다리지 않습니다.",
+  "next.postProcessing.timeoutHelp":
+    "0이면 기본값을 씁니다. 후처리 스크립트는 하루, 나머지는 기본 이벤트 제한 시간입니다. 최대 7일입니다.",
   "next.postProcessing.timeoutDefault": "기본값",
   "next.postProcessing.enabledFor": "{{name}} 사용",
   "next.postProcessing.headerDrift": "입력이 스크립트 헤더와 다릅니다",
-  "next.postProcessing.headerDriftBody": "이 작업의 입력이 스크립트 헤더에 선언된 내용과 더 이상 맞지 않습니다. 헤더에서 다시 적용하면 맞춰지며 저장된 값은 유지됩니다.",
+  "next.postProcessing.headerDriftBody":
+    "이 작업의 입력이 스크립트 헤더에 선언된 내용과 더 이상 맞지 않습니다. 헤더에서 다시 적용하면 맞춰지며 저장된 값은 유지됩니다.",
   "next.postProcessing.reapply": "헤더에서 다시 적용",
-  "next.postProcessing.reapplyBody": "저장된 값은 유지되고, 새 입력은 기본값으로 추가되며, 헤더에 더 이상 선언되지 않은 입력은 제거됩니다. 트리거는 바뀌지 않습니다.",
+  "next.postProcessing.reapplyBody":
+    "저장된 값은 유지되고, 새 입력은 기본값으로 추가되며, 헤더에 더 이상 선언되지 않은 입력은 제거됩니다. 트리거는 바뀌지 않습니다.",
   "next.postProcessing.reapplied": "{{name}}을(를) 헤더에서 다시 적용했습니다",
   "next.postProcessing.setUpFromHeader": "헤더로 작업 설정",
-  "next.postProcessing.setUpFromHeaderHelp": "스크립트 헤더에 선언된 트리거 가운데 아직 작업이 없는 것마다 작업을 만듭니다.",
-  "next.postProcessing.setUpDone.one": "{{name}}의 작업 {{count}}개를 만들었습니다",
-  "next.postProcessing.setUpDone.other": "{{name}}의 작업 {{count}}개를 만들었습니다",
+  "next.postProcessing.setUpFromHeaderHelp":
+    "스크립트 헤더에 선언된 트리거 가운데 아직 작업이 없는 것마다 작업을 만듭니다.",
+  "next.postProcessing.setUpDone.one":
+    "{{name}}의 작업 {{count}}개를 만들었습니다",
+  "next.postProcessing.setUpDone.other":
+    "{{name}}의 작업 {{count}}개를 만들었습니다",
   "next.postProcessing.instanceCreated": "{{name}}을(를) 만들었습니다",
   "next.postProcessing.instanceSaved": "{{name}}을(를) 저장했습니다",
   "next.postProcessing.instanceDeleted": "{{name}}을(를) 삭제했습니다",
   "next.postProcessing.deleteTitle": "작업 삭제",
-  "next.postProcessing.deleteBody": "작업이 제거되며, 피드에 지정된 자리도 함께 제거됩니다. 스크립트 파일은 건드리지 않습니다.",
+  "next.postProcessing.deleteBody":
+    "작업이 제거되며, 피드에 지정된 자리도 함께 제거됩니다. 스크립트 파일은 건드리지 않습니다.",
   "next.postProcessing.feedGroupNote": "연결된 피드에서 실행",
   "next.postProcessing.globalScriptsRun": "전역 스크립트 실행",
-  "next.postProcessing.globalScriptsRunHelp": "전역 스크립트는 자체 카테고리가 없는 작업이며, 카테고리의 스크립트보다 먼저 실행됩니다. 카테고리에 스크립트가 있는 다운로드에도 실행할지 여기서 정합니다.",
+  "next.postProcessing.globalScriptsRunHelp":
+    "전역 스크립트는 자체 카테고리가 없는 작업이며, 카테고리의 스크립트보다 먼저 실행됩니다. 카테고리에 스크립트가 있는 다운로드에도 실행할지 여기서 정합니다.",
   "next.postProcessing.globalAlways": "모든 다운로드에",
   "next.postProcessing.globalOnlyWithout": "카테고리에 스크립트가 없을 때만",
   "next.postProcessing.test": "테스트",
   "next.postProcessing.testTitle": "{{name}} 테스트",
-  "next.postProcessing.testNote": "저장된 그대로의 작업을 지어낸 입력으로 한 번 실행합니다. 스크립트가 요청한 것은 아무것도 적용되지 않습니다.",
+  "next.postProcessing.testNote":
+    "저장된 그대로의 작업을 지어낸 입력으로 한 번 실행합니다. 스크립트가 요청한 것은 아무것도 적용되지 않습니다.",
   "next.postProcessing.testStarting": "테스트를 시작하는 중…",
   "next.postProcessing.testRunning": "실행 중",
   "next.postProcessing.testGone": "데몬에 이 테스트 실행이 더 이상 없습니다.",
   "next.postProcessing.testInputs": "시뮬레이션된 입력",
-  "next.postProcessing.testInputsNote": "이번 실행을 위해 지어낸 값 · 작업 자체 입력은 제외",
+  "next.postProcessing.testInputsNote":
+    "이번 실행을 위해 지어낸 값 · 작업 자체 입력은 제외",
   "next.postProcessing.testArguments": "인수",
   "next.postProcessing.testLog": "실행 로그",
-  "next.postProcessing.testLogWaiting": "스크립트가 아직 아무것도 출력하지 않았습니다.",
-  "next.postProcessing.testLogEmpty": "스크립트가 아무것도 출력하지 않았습니다.",
+  "next.postProcessing.testLogWaiting":
+    "스크립트가 아직 아무것도 출력하지 않았습니다.",
+  "next.postProcessing.testLogEmpty":
+    "스크립트가 아무것도 출력하지 않았습니다.",
   "next.postProcessing.testCommands": "스크립트가 요청한 것",
   "next.postProcessing.testCommandsNote": "어느 것도 적용되지 않았습니다",
-  "next.postProcessing.testCommandsTruncated": "스크립트가 여기 표시된 것보다 더 많이 요청했습니다.",
+  "next.postProcessing.testCommandsTruncated":
+    "스크립트가 여기 표시된 것보다 더 많이 요청했습니다.",
   "next.postProcessing.testAgain": "다시 실행",
   "next.postProcessing.cancelTest": "테스트 취소",
   "next.scriptRuns.note": "최신순",
@@ -1414,7 +1608,8 @@ export const nextKo: LocaleDictionary = {
   "next.providers.connections": "연결 수",
   "next.providers.transport": "전송",
   "next.providers.role": "역할",
-  "next.providers.empty": "아직 공급자가 없습니다. 하나를 추가하면 다운로드를 시작할 수 있습니다.",
+  "next.providers.empty":
+    "아직 공급자가 없습니다. 하나를 추가하면 다운로드를 시작할 수 있습니다.",
   "next.providers.add": "공급자 추가",
   "next.providers.enabledAria": "{{host}} 사용",
   "next.providers.connection": "연결",
@@ -1422,12 +1617,16 @@ export const nextKo: LocaleDictionary = {
   "next.providers.username": "사용자 이름",
   "next.providers.password": "비밀번호",
   "next.providers.passwordKeep": "저장된 비밀번호를 유지하려면 비워 두세요.",
-  "next.providers.connectionsHelp": "weaver가 동시에 열 수 있는 연결 수. 요금제에서 허용하는 수를 넘기지 마세요.",
+  "next.providers.connectionsHelp":
+    "weaver가 동시에 열 수 있는 연결 수. 요금제에서 허용하는 수를 넘기지 마세요.",
   "next.providers.enabled": "사용",
-  "next.providers.killSwitchHelp": "이 공급자를 사용하지 않는 상태로, 연결 테스트 없이, 나가는 경로 없이 저장합니다. 네트워크에서 경로를 설정한 다음 여기에서 사용하도록 설정하세요.",
+  "next.providers.killSwitchHelp":
+    "이 공급자를 사용하지 않는 상태로, 연결 테스트 없이, 나가는 경로 없이 저장합니다. 네트워크에서 경로를 설정한 다음 여기에서 사용하도록 설정하세요.",
   "next.providers.priority": "우선순위",
-  "next.providers.priorityHelp": "낮은 숫자가 우선이며 같은 숫자의 공급자는 대역폭을 공유합니다. 앞선 그룹이 해당 기사를 제공할 수 없을 때만 다음 그룹을 사용합니다. 연결이 사용 중이라는 이유로 전환하지 않습니다.",
-  "next.providers.backfillServerHelp": "기본 서버에 없는 기사를 채우는 데만 사용합니다. 기본 서버가 다운되었거나 자격 증명을 거부할 때는 사용하지 않습니다.",
+  "next.providers.priorityHelp":
+    "낮은 숫자가 우선이며 같은 숫자의 공급자는 대역폭을 공유합니다. 앞선 그룹이 해당 기사를 제공할 수 없을 때만 다음 그룹을 사용합니다. 연결이 사용 중이라는 이유로 전환하지 않습니다.",
+  "next.providers.backfillServerHelp":
+    "기본 서버에 없는 기사를 채우는 데만 사용합니다. 기본 서버가 다운되었거나 자격 증명을 거부할 때는 사용하지 않습니다.",
   "next.providers.retention": "보존 기간",
   "next.providers.days": "일",
   "next.providers.unlimitedSpeed": "속도 제한 없음",
@@ -1443,9 +1642,11 @@ export const nextKo: LocaleDictionary = {
   "next.providers.test": "연결 테스트",
   "next.providers.loading": "공급자를 불러오는 중…",
   "next.providers.pipelining": "파이프라이닝",
-  "next.providers.certMismatch": "이 서버의 인증서에는 다른 호스트 이름이 적혀 있습니다. 제공업체의 서버가 확실할 때만 신뢰하세요.",
+  "next.providers.certMismatch":
+    "이 서버의 인증서에는 다른 호스트 이름이 적혀 있습니다. 제공업체의 서버가 확실할 때만 신뢰하세요.",
   "next.providers.trustCert": "이 인증서 신뢰",
-  "next.providers.removeBody": "Weaver가 {{host}} 사용을 중지합니다. 진행 중인 다운로드는 나머지 공급자로 넘어갑니다.",
+  "next.providers.removeBody":
+    "Weaver가 {{host}} 사용을 중지합니다. 진행 중인 다운로드는 나머지 공급자로 넘어갑니다.",
   "next.providers.thisProvider": "이 공급자",
   "next.providers.quotaWindow": "할당량 기간",
   "next.providers.usedSoFar": "지금까지 사용량: {{size}}.",
@@ -1487,7 +1688,8 @@ export const nextKo: LocaleDictionary = {
   "next.rss.url": "URL",
   "next.rss.interval": "간격",
   "next.rss.lastPoll": "마지막 확인",
-  "next.rss.feedsEmpty": "피드가 없습니다. 하나를 추가하면 weaver가 인덱서의 검색을 지켜봅니다.",
+  "next.rss.feedsEmpty":
+    "피드가 없습니다. 하나를 추가하면 weaver가 인덱서의 검색을 지켜봅니다.",
   "next.rss.addFeed": "피드 추가",
   "next.rss.poll": "확인",
   "next.rss.rules": "규칙",
@@ -1497,7 +1699,8 @@ export const nextKo: LocaleDictionary = {
   "next.rss.order": "순서",
   "next.rss.titleMatches": "제목 일치",
   "next.rss.filesInto": "분류 위치",
-  "next.rss.rulesEmpty": "규칙이 없습니다. 피드가 알리는 모든 항목을 수락합니다.",
+  "next.rss.rulesEmpty":
+    "규칙이 없습니다. 피드가 알리는 모든 항목을 수락합니다.",
   "next.rss.addRule": "규칙 추가",
   "next.rss.anything": "모두",
   "next.rss.recentlySeen": "최근 확인한 항목",
@@ -1507,20 +1710,26 @@ export const nextKo: LocaleDictionary = {
   "next.rss.decisionColumn": "결정",
   "next.rss.size": "크기",
   "next.rss.seen": "확인 시각",
-  "next.rss.seenEmpty": "아직 확인한 항목이 없습니다. 피드를 확인하면 여기에 항목이 표시됩니다.",
+  "next.rss.seenEmpty":
+    "아직 확인한 항목이 없습니다. 피드를 확인하면 여기에 항목이 표시됩니다.",
   "next.rss.clearHistory": "기록 지우기",
   "next.rss.urlHelp": "API 키가 포함된 인덱서의 RSS 또는 Newznab 검색.",
   "next.rss.enabled": "사용",
-  "next.rss.killSwitchHelp": "이 피드를 사용하지 않는 상태로, 나가는 경로 없이 저장합니다. 네트워크에서 경로를 설정한 다음 여기에서 사용하도록 설정하세요.",
+  "next.rss.killSwitchHelp":
+    "이 피드를 사용하지 않는 상태로, 나가는 경로 없이 저장합니다. 네트워크에서 경로를 설정한 다음 여기에서 사용하도록 설정하세요.",
   "next.rss.pollInterval": "확인 간격",
   "next.rss.defaultCategory": "기본 카테고리",
-  "next.rss.defaultCategoryHelp": "규칙이 덮어쓰지 않을 때 수락한 항목을 분류할 카테고리.",
+  "next.rss.defaultCategoryHelp":
+    "규칙이 덮어쓰지 않을 때 수락한 항목을 분류할 카테고리.",
   "next.rss.feedScripts": "피드 스크립트",
-  "next.rss.feedScriptsHelp": "이 피드가 이 순서대로 실행하는 피드 작업입니다. 없으면 이 피드에서는 스크립트가 실행되지 않습니다.",
+  "next.rss.feedScriptsHelp":
+    "이 피드가 이 순서대로 실행하는 피드 작업입니다. 없으면 이 피드에서는 스크립트가 실행되지 않습니다.",
   "next.rss.attachScript": "피드 작업 연결",
-  "next.rss.noFeedInstances": "아직 피드 작업이 없습니다. 스크립트에서 만드세요.",
+  "next.rss.noFeedInstances":
+    "아직 피드 작업이 없습니다. 스크립트에서 만드세요.",
   "next.rss.defaultMetadata": "기본 메타데이터",
-  "next.rss.defaultMetadataHelp": "한 줄에 하나의 키 = 값. 이 피드가 대기열에 넣는 모든 항목에 붙습니다.",
+  "next.rss.defaultMetadataHelp":
+    "한 줄에 하나의 키 = 값. 이 피드가 대기열에 넣는 모든 항목에 붙습니다.",
   "next.rss.credentials": "자격 증명",
   "next.rss.credentialsNote": "선택 사항 · 쓰기 전용으로 저장",
   "next.rss.username": "사용자 이름",
@@ -1530,34 +1739,44 @@ export const nextKo: LocaleDictionary = {
   "next.rss.orderHelp": "낮은 숫자를 먼저 시도합니다.",
   "next.rss.titleMatchesHelp": "정규 표현식. 비워 두면 모든 제목과 일치합니다.",
   "next.rss.feedCategories": "피드 카테고리",
-  "next.rss.feedCategoriesHelp": "인덱서가 붙이는 카테고리를 쉼표로 구분합니다. 비워 두면 모두와 일치합니다.",
+  "next.rss.feedCategoriesHelp":
+    "인덱서가 붙이는 카테고리를 쉼표로 구분합니다. 비워 두면 모두와 일치합니다.",
   "next.rss.minSize": "최소 크기",
   "next.rss.maxSize": "최대 크기",
   "next.rss.fileInto": "분류 위치",
-  "next.rss.fileIntoHelp": "이 규칙이 수락한 항목에 대해 피드의 기본 카테고리를 덮어씁니다.",
+  "next.rss.fileIntoHelp":
+    "이 규칙이 수락한 항목에 대해 피드의 기본 카테고리를 덮어씁니다.",
   "next.rss.metadata": "메타데이터",
-  "next.rss.metadataHelp": "한 줄에 하나의 키 = 값. 이 규칙이 수락한 항목에 붙습니다.",
+  "next.rss.metadataHelp":
+    "한 줄에 하나의 키 = 값. 이 규칙이 수락한 항목에 붙습니다.",
   "next.rss.pollAll": "모두 확인",
   "next.rss.newFeed": "새 피드",
   "next.rss.removeFeed": "피드 제거",
   "next.rss.editRule": "규칙 편집",
   "next.rss.rule": "규칙",
   "next.rss.removeRule": "규칙 제거",
-  "next.rss.removeFeedBody": "피드의 규칙과 기억한 항목도 함께 제거됩니다. 이미 대기열에 넣은 다운로드는 그대로입니다.",
-  "next.rss.removeRuleBody": "이 규칙이 결정하던 항목은 뒤에 오는 규칙으로 넘어갑니다.",
+  "next.rss.removeFeedBody":
+    "피드의 규칙과 기억한 항목도 함께 제거됩니다. 이미 대기열에 넣은 다운로드는 그대로입니다.",
+  "next.rss.removeRuleBody":
+    "이 규칙이 결정하던 항목은 뒤에 오는 규칙으로 넘어갑니다.",
   "next.rss.clearSeenTitle": "확인 기록 지우기",
   "next.rss.forgetItemTitle": "이 항목 잊기",
   "next.rss.items.one": "항목 {{count}}개",
   "next.rss.items.other": "항목 {{count}}개",
   "next.rss.forgetItem": "항목 잊기",
-  "next.rss.clearSeenBody": "다음 확인 때 모든 피드가 알리는 항목을 다시 대기열에 넣을 수 있습니다.",
-  "next.rss.forgetItemBody": "이 항목을 알리는 다음 확인에서는 새 항목으로 취급해 다시 대기열에 넣을 수 있습니다.",
+  "next.rss.clearSeenBody":
+    "다음 확인 때 모든 피드가 알리는 항목을 다시 대기열에 넣을 수 있습니다.",
+  "next.rss.forgetItemBody":
+    "이 항목을 알리는 다음 확인에서는 새 항목으로 취급해 다시 대기열에 넣을 수 있습니다.",
   "next.proxies.clearStored": "지우기",
   "next.proxies.keepStored": "유지",
   "next.proxies.clearedPlaceholder": "저장 시 삭제됨",
-  "next.proxies.storedCleared": "저장하면 저장된 값이 삭제됩니다. 대신 바꾸려면 새 값을 입력하세요.",
-  "next.proxies.typeLocked": "프로필의 유형은 바꿀 수 없습니다. 다른 유형을 쓰려면 새 프로필을 추가하세요.",
-  "next.routing.full": "한 경로에는 프록시를 최대 {{count}}개까지 둘 수 있습니다.",
+  "next.proxies.storedCleared":
+    "저장하면 저장된 값이 삭제됩니다. 대신 바꾸려면 새 값을 입력하세요.",
+  "next.proxies.typeLocked":
+    "프로필의 유형은 바꿀 수 없습니다. 다른 유형을 쓰려면 새 프로필을 추가하세요.",
+  "next.routing.full":
+    "한 경로에는 프록시를 최대 {{count}}개까지 둘 수 있습니다.",
   "next.inspector.removeFailed": "이 다운로드를 제거하지 못했습니다.",
   "next.schedules.pauseWatchFolder": "감시 폴더 스캔 일시정지",
   "next.schedules.resumeWatchFolder": "감시 폴더 스캔 재개",
@@ -1586,10 +1805,12 @@ export const nextKo: LocaleDictionary = {
   "next.schedules.profileTo": "{{profile}}(으)로 전환",
   "next.schedules.setSplit": "대역폭 배분",
   "next.schedules.splitLift": "해제",
-  "next.schedules.splitTo": "대역폭 배분: 유즈넷 {{usenet}}%, 토렌트 {{torrent}}%",
+  "next.schedules.splitTo":
+    "대역폭 배분: 유즈넷 {{usenet}}%, 토렌트 {{torrent}}%",
   "next.schedules.splitLifted": "대역폭 배분: 해제",
   "next.schedules.profile": "하드웨어 프로필",
-  "next.schedules.profileHelp": "다음 프로필 규칙이 실행될 때까지 유지됩니다. 이 컴퓨터에서 실행할 수 있는 프로필만 제공됩니다.",
+  "next.schedules.profileHelp":
+    "다음 프로필 규칙이 실행될 때까지 유지됩니다. 이 컴퓨터에서 실행할 수 있는 프로필만 제공됩니다.",
   "next.system.kernels": "커널",
   "next.system.kernelsNote": "빠른 순서 · 강조 표시가 사용 중",
   "next.system.kernelLadder": "이 라이브러리가 선택할 수 있는 커널, 빠른 순서",
@@ -1607,18 +1828,23 @@ export const nextKo: LocaleDictionary = {
   "next.login.password": "비밀번호",
   "next.login.submit": "로그인",
   "next.login.signingIn": "로그인 중…",
-  "next.login.invalid": "자격 증명이 올바르지 않습니다. 사용자 이름과 비밀번호를 확인하세요.",
+  "next.login.invalid":
+    "자격 증명이 올바르지 않습니다. 사용자 이름과 비밀번호를 확인하세요.",
   "next.login.tooMany": "로그인 시도가 너무 많습니다. 1분 후 다시 시도하세요.",
   "next.login.failed": "로그인할 수 없습니다: {{error}}",
-  "next.login.unreachable": "Weaver가 응답하지 않습니다. 실행 중인지 확인한 뒤 다시 시도하세요.",
+  "next.login.unreachable":
+    "Weaver가 응답하지 않습니다. 실행 중인지 확인한 뒤 다시 시도하세요.",
   "next.login.forgot": "비밀번호를 잊으셨나요?",
-  "next.login.resetHelp": "Weaver를 중지한 뒤 로그인 초기화와 새 부트스트랩 자격 증명으로 다시 시작하세요. 환경 변수의 비밀번호보다 비밀번호 파일이 더 안전합니다.",
+  "next.login.resetHelp":
+    "Weaver를 중지한 뒤 로그인 초기화와 새 부트스트랩 자격 증명으로 다시 시작하세요. 환경 변수의 비밀번호보다 비밀번호 파일이 더 안전합니다.",
   "next.login.docker": "Docker",
   "next.login.bareMetal": "직접 설치",
-  "next.login.trustedNetworks": "또는 {{variable}}에 신뢰할 네트워크를 지정하면 해당 네트워크의 브라우저가 로그인 없이 관리자로 접속합니다.",
+  "next.login.trustedNetworks":
+    "또는 {{variable}}에 신뢰할 네트워크를 지정하면 해당 네트워크의 브라우저가 로그인 없이 관리자로 접속합니다.",
   "next.job.deleteSaveFiles": "삭제, 파일 유지",
   "next.job.deleteAllTitle": "모든 파일과 함께 삭제",
-  "next.job.deleteAllBody": "항목이 기록에서 사라지고 다운로드한 파일도 디스크에서 삭제됩니다. 백그라운드에서 실행되며 되돌릴 수 없습니다.",
+  "next.job.deleteAllBody":
+    "항목이 기록에서 사라지고 다운로드한 파일도 디스크에서 삭제됩니다. 백그라운드에서 실행되며 되돌릴 수 없습니다.",
   // First-run setup
   "next.firstRun.title": "Weaver에 오신 것을 환영합니다",
   "next.firstRun.step": "{{total}}단계 중 {{step}}단계",
@@ -1631,71 +1857,100 @@ export const nextKo: LocaleDictionary = {
   "next.firstRun.continue": "계속",
   "next.firstRun.saving": "저장 중…",
   "next.firstRun.provider.title": "Usenet 제공업체 연결",
-  "next.firstRun.provider.body": "Weaver는 제공업체의 뉴스 서버에서 다운로드합니다. 서버 주소, 포트, 로그인 정보는 제공업체의 환영 이메일이나 계정 페이지에 있습니다.",
+  "next.firstRun.provider.body":
+    "Weaver는 제공업체의 뉴스 서버에서 다운로드합니다. 서버 주소, 포트, 로그인 정보는 제공업체의 환영 이메일이나 계정 페이지에 있습니다.",
   "next.firstRun.provider.tls": "암호화 연결 (TLS)",
-  "next.firstRun.provider.tlsHint": "거의 모든 제공업체가 지원합니다. 일반적인 포트는 TLS 사용 시 563, 미사용 시 119입니다.",
+  "next.firstRun.provider.tlsHint":
+    "거의 모든 제공업체가 지원합니다. 일반적인 포트는 TLS 사용 시 563, 미사용 시 119입니다.",
   "next.providers.certFingerprint": "SHA-256 지문: {{fingerprint}}",
-  "next.providers.certIssuedFor": "이 서버의 인증서는 {{host}}을(를) 포함하지 않습니다. 발급 대상: {{names}}. 제공업체의 서버가 확실할 때만 신뢰하세요.",
+  "next.providers.certIssuedFor":
+    "이 서버의 인증서는 {{host}}을(를) 포함하지 않습니다. 발급 대상: {{names}}. 제공업체의 서버가 확실할 때만 신뢰하세요.",
   "next.providers.certNames": "발급 대상: {{names}}",
   "next.providers.certificateTrusted": "이 제공업체의 인증서를 신뢰합니다.",
   "next.providers.trustTitle": "이 인증서를 신뢰할까요?",
-  "next.providers.trustBody": "Weaver는 인증서의 나머지 항목을 계속 검증합니다. 호스트 이름이 일치하지 않을 때만 바로 이 인증서를 허용하며, 다른 호스트를 가리키는 그 밖의 인증서는 거부합니다.",
+  "next.providers.trustBody":
+    "Weaver는 인증서의 나머지 항목을 계속 검증합니다. 호스트 이름이 일치하지 않을 때만 바로 이 인증서를 허용하며, 다른 호스트를 가리키는 그 밖의 인증서는 거부합니다.",
   "next.providers.trustConfirm": "인증서 신뢰",
   "next.providers.forgetCertificate": "인증서 삭제",
   "next.firstRun.provider.save": "제공업체 저장",
-  "next.firstRun.provider.saveFailed": "제공업체를 저장하지 못했습니다: {{message}}",
+  "next.firstRun.provider.saveFailed":
+    "제공업체를 저장하지 못했습니다: {{message}}",
   "next.firstRun.provider.saved": "내 제공업체",
   "next.firstRun.provider.addAnother": "다른 제공업체 추가",
   "next.firstRun.provider.skip": "지금은 건너뛰기",
   "next.firstRun.folders.title": "폴더 설정",
   "next.firstRun.folders.saveFailed": "폴더를 저장하지 못했습니다: {{message}}",
   "next.firstRun.categories.title": "카테고리",
-  "next.firstRun.categories.body": "카테고리는 해당 다운로드에 전용 폴더를 제공합니다. Weaver로 다운로드를 보내는 앱은 보통 tv나 movies 같은 카테고리를 지정합니다.",
+  "next.firstRun.categories.body":
+    "카테고리는 해당 다운로드에 전용 폴더를 제공합니다. Weaver로 다운로드를 보내는 앱은 보통 tv나 movies 같은 카테고리를 지정합니다.",
   "next.firstRun.categories.remove": "{{name}} 삭제",
-  "next.firstRun.categories.saveFailed": "카테고리를 저장하지 못했습니다: {{message}}",
+  "next.firstRun.categories.saveFailed":
+    "카테고리를 저장하지 못했습니다: {{message}}",
   "next.firstRun.done.title": "준비가 끝났습니다",
-  "next.firstRun.done.body": "NZB를 추가하면 첫 다운로드가 시작됩니다. 여기의 모든 항목은 나중에 설정에서 바꿀 수 있습니다.",
+  "next.firstRun.done.body":
+    "NZB를 추가하면 첫 다운로드가 시작됩니다. 여기의 모든 항목은 나중에 설정에서 바꿀 수 있습니다.",
   "next.firstRun.done.providers": "제공업체",
-  "next.firstRun.done.noProvider": "아직 없습니다. 다운로드하기 전에 설정에서 추가하세요.",
+  "next.firstRun.done.noProvider":
+    "아직 없습니다. 다운로드하기 전에 설정에서 추가하세요.",
   "next.firstRun.done.categoriesNone": "없음",
   "next.firstRun.done.open": "Weaver 열기",
   "next.firstRun.finishFailed": "설정을 완료하지 못했습니다: {{message}}",
   "next.performance.title": "성능",
   "next.performance.profile": "하드웨어 프로필",
-  "next.performance.body": "Weaver가 이 컴퓨터를 얼마나 사용할지 선택하세요. 이 컴퓨터에서 실행할 수 없는 프로필은 제공되지 않습니다.",
+  "next.performance.body":
+    "Weaver가 이 컴퓨터를 얼마나 사용할지 선택하세요. 이 컴퓨터에서 실행할 수 없는 프로필은 제공되지 않습니다.",
   "next.performance.efficient": "절약",
   "next.performance.balanced": "균형",
   "next.performance.performance": "성능",
-  "next.performance.efficientBody": "가장 작은 사용량. 소형 보드나 다른 작업과 함께 쓰는 컴퓨터에 적합합니다.",
-  "next.performance.balancedBody": "데스크톱이나 홈 서버를 위한 일반적인 선택입니다.",
-  "next.performance.performanceBody": "가장 넓은 한도. 메모리와 코어가 넉넉한 대형 컴퓨터에 적합합니다.",
+  "next.performance.efficientBody":
+    "가장 작은 사용량. 소형 보드나 다른 작업과 함께 쓰는 컴퓨터에 적합합니다.",
+  "next.performance.balancedBody":
+    "데스크톱이나 홈 서버를 위한 일반적인 선택입니다.",
+  "next.performance.performanceBody":
+    "가장 넓은 한도. 메모리와 코어가 넉넉한 대형 컴퓨터에 적합합니다.",
   "next.performance.recommendedTag": "권장",
   "next.performance.factDecodeMemory": "7z 디코딩 메모리 {{size}}",
-  "next.performance.factThreads": "스레드: 디코딩 {{decode}} · 압축 해제 {{extract}}",
+  "next.performance.factThreads":
+    "스레드: 디코딩 {{decode}} · 압축 해제 {{extract}}",
   "next.performance.factDownloads": "동시 다운로드 최대 {{count}}개",
   "next.performance.detected": "이 컴퓨터 권장: RAM {{memory}}, {{cores}}코어.",
-  "next.performance.timing": "변경 사항은 다음에 시작하는 다운로드나 압축 해제부터 적용됩니다. 이미 실행 중인 작업은 시작할 때의 설정으로 끝납니다.",
-  "next.performance.notConfirmed": "권장 프로필로 실행 중이며 아직 확인되지 않았습니다.",
-  "next.performance.scheduled": "현재 일정에 따라 {{profile}} 프로필이 적용되어 있습니다. 적용 중인 일정 규칙이 없으면 선택한 프로필이 사용됩니다.",
+  "next.performance.timing":
+    "변경 사항은 다음에 시작하는 다운로드나 압축 해제부터 적용됩니다. 이미 실행 중인 작업은 시작할 때의 설정으로 끝납니다.",
+  "next.performance.notConfirmed":
+    "권장 프로필로 실행 중이며 아직 확인되지 않았습니다.",
+  "next.performance.scheduled":
+    "현재 일정에 따라 {{profile}} 프로필이 적용되어 있습니다. 적용 중인 일정 규칙이 없으면 선택한 프로필이 사용됩니다.",
   "next.performance.saveFailed": "프로필을 저장하지 못했습니다: {{message}}",
   "next.securityNotice.title": "새 액세스 모델을 사용할 수 있습니다",
-  "next.securityNotice.intro": "이 설치는 아직 0.12.0 이전의 액세스 설정을 사용하므로 누가 들어올 수 있는지는 바뀌지 않았습니다. Weaver에는 이제 더 간단한 모델이 있으며, 준비되면 언제든 옮길 수 있습니다.",
+  "next.securityNotice.intro":
+    "이 설치는 아직 0.12.0 이전의 액세스 설정을 사용하므로 누가 들어올 수 있는지는 바뀌지 않았습니다. Weaver에는 이제 더 간단한 모델이 있으며, 준비되면 언제든 옮길 수 있습니다.",
   "next.securityNotice.changesTitle": "새 모델에서는",
-  "next.securityNotice.changeSignIn": "모든 브라우저가 로그인합니다. 전에 로그인 없이 들어오던 네트워크는 브라우저를 기억할 수 있는 곳만 정합니다.",
-  "next.securityNotice.changeProxies": "신뢰할 프록시는 설정 → 보안에서 지정합니다.",
-  "next.securityNotice.changeHosts": "어떤 호스트 이름도 WEAVER_HTTP_ALLOWED_HOSTS에 넣지 않고 사용할 수 있습니다.",
+  "next.securityNotice.changeSignIn":
+    "모든 브라우저가 로그인합니다. 전에 로그인 없이 들어오던 네트워크는 브라우저를 기억할 수 있는 곳만 정합니다.",
+  "next.securityNotice.changeProxies":
+    "신뢰할 프록시는 설정 → 보안에서 지정합니다.",
+  "next.securityNotice.changeHosts":
+    "어떤 호스트 이름도 WEAVER_HTTP_ALLOWED_HOSTS에 넣지 않고 사용할 수 있습니다.",
   "next.securityNotice.stepsTitle": "이 설치를 옮기려면",
-  "next.securityNotice.container": "컨테이너 환경에 이 변수를 추가하세요. Docker Compose에서는:",
-  "next.securityNotice.containerAfter": "그런 다음 docker compose up -d로 컨테이너를 다시 만드세요. Unraid에서는 컨테이너 템플릿의 Access Mode를 authenticated로 설정하세요.",
+  "next.securityNotice.container":
+    "컨테이너 환경에 이 변수를 추가하세요. Docker Compose에서는:",
+  "next.securityNotice.containerAfter":
+    "그런 다음 docker compose up -d로 컨테이너를 다시 만드세요. Unraid에서는 컨테이너 템플릿의 Access Mode를 authenticated로 설정하세요.",
   "next.securityNotice.windows": "PowerShell에서 실행하세요:",
-  "next.securityNotice.windowsAfter": "그런 다음 트레이 아이콘에서 'Exit'을 선택하고 시작 메뉴에서 Weaver를 다시 시작하세요.",
+  "next.securityNotice.windowsAfter":
+    "그런 다음 트레이 아이콘에서 'Exit'을 선택하고 시작 메뉴에서 Weaver를 다시 시작하세요.",
   "next.securityNotice.macos": "터미널에서 실행하세요:",
-  "next.securityNotice.macosAfter": "그런 다음 메뉴 막대 아이콘에서 'Quit Weaver'를 선택하고 Weaver를 다시 여세요. Homebrew라면 대신 brew services restart weaver-usenet을 실행하세요.",
-  "next.securityNotice.linux": "Weaver systemd 유닛의 [Service] 섹션에 이 줄을 추가하거나, Weaver를 시작하는 곳에 변수를 설정하세요:",
+  "next.securityNotice.macosAfter":
+    "그런 다음 메뉴 막대 아이콘에서 'Quit Weaver'를 선택하고 Weaver를 다시 여세요. Homebrew라면 대신 brew services restart weaver-usenet을 실행하세요.",
+  "next.securityNotice.linux":
+    "Weaver systemd 유닛의 [Service] 섹션에 이 줄을 추가하거나, Weaver를 시작하는 곳에 변수를 설정하세요:",
   "next.securityNotice.linuxAfter": "그런 다음 Weaver를 다시 시작하세요.",
-  "next.securityNotice.other": "Weaver를 시작하는 곳에 환경 변수 WEAVER_ACCESS_MODE=authenticated를 설정한 뒤 Weaver를 다시 시작하세요.",
-  "next.securityNotice.keepsLogin": "로그인과 API 키는 그대로 유지되며, 모든 브라우저가 다시 로그인합니다. 그 시작부터 전환은 영구적입니다.",
-  "next.securityNotice.createsLogin": "이 설치에는 로그인이 없으므로, 다시 시작하면 Weaver가 로그인을 만드는 설정을 엽니다.",
+  "next.securityNotice.other":
+    "Weaver를 시작하는 곳에 환경 변수 WEAVER_ACCESS_MODE=authenticated를 설정한 뒤 Weaver를 다시 시작하세요.",
+  "next.securityNotice.keepsLogin":
+    "로그인과 API 키는 그대로 유지되며, 모든 브라우저가 다시 로그인합니다. 그 시작부터 전환은 영구적입니다.",
+  "next.securityNotice.createsLogin":
+    "이 설치에는 로그인이 없으므로, 다시 시작하면 Weaver가 로그인을 만드는 설정을 엽니다.",
   "next.securityNotice.guide": "가이드 읽기",
   "next.securityNotice.dismiss": "확인",
   "next.securityNotice.dismissFailed": "저장하지 못했습니다: {{message}}",
@@ -1709,7 +1964,8 @@ export const nextKo: LocaleDictionary = {
   "next.schedules.trackQuota": "할당량 집계",
   "next.schedules.trackServers": "서버",
   "next.schedules.trackOneShot": "일회성 작업",
-  "next.schedules.scriptTimeHelp": "현지 시각. HH:MM 또는 매시를 뜻하는 *:MM. 여러 개는 쉼표로 구분합니다.",
+  "next.schedules.scriptTimeHelp":
+    "현지 시각. HH:MM 또는 매시를 뜻하는 *:MM. 여러 개는 쉼표로 구분합니다.",
   "next.schedules.runAtStartup": "시작할 때도 실행",
   "next.schedules.trackNote": "현지 시각 · 그룹의 다음 규칙까지 유지",
   "next.schedules.oneShotNote": "현지 시각 · 매번 한 번 실행",
@@ -1725,24 +1981,34 @@ export const nextKo: LocaleDictionary = {
   "next.schedules.pruneCancelled": "취소",
   "next.schedules.deleteFiles": "파일도 삭제",
   "next.schedules.oneShotHelp": "중지 중 놓친 실행은 건너뜁니다.",
-  "next.schedules.multipleTimesHelp": "선택 사항이며 쉼표로 구분합니다. 위의 단일 시각을 대체합니다.",
-  "next.schedules.pauseAllHelp": "다운로드, 폴더 스캔 및 RSS를 중지합니다. 재개하면 해제됩니다. 후처리는 계속됩니다.",
-  "next.schedules.postHelp": "실행 중인 작업은 완료되며 새 검증, 복구, 압축 해제, 이동 및 스크립트는 재개까지 기다립니다.",
-  "next.schedules.serverHelp": "연결 테스트 없이 활성 상태를 저장하고 모든 서버 연결을 다시 불러옵니다.",
-  "next.schedules.quotaHelp": "집계하지 않은 트래픽은 통계에 남지만 할당량에는 포함되지 않습니다. 설정된 한도는 바뀌지 않습니다.",
+  "next.schedules.multipleTimesHelp":
+    "선택 사항이며 쉼표로 구분합니다. 위의 단일 시각을 대체합니다.",
+  "next.schedules.pauseAllHelp":
+    "다운로드, 폴더 스캔 및 RSS를 중지합니다. 재개하면 해제됩니다. 후처리는 계속됩니다.",
+  "next.schedules.postHelp":
+    "실행 중인 작업은 완료되며 새 검증, 복구, 압축 해제, 이동 및 스크립트는 재개까지 기다립니다.",
+  "next.schedules.serverHelp":
+    "연결 테스트 없이 활성 상태를 저장하고 모든 서버 연결을 다시 불러옵니다.",
+  "next.schedules.quotaHelp":
+    "집계하지 않은 트래픽은 통계에 남지만 할당량에는 포함되지 않습니다. 설정된 한도는 바뀌지 않습니다.",
   "next.schedules.pruneWarning": "완료 기록을 정리하면 중복 방지도 제거됩니다.",
-  "next.schedules.pruneFilesWarning": "완료 파일을 삭제하면 출력 폴더도 삭제됩니다.",
+  "next.schedules.pruneFilesWarning":
+    "완료 파일을 삭제하면 출력 폴더도 삭제됩니다.",
   "next.backup.storage": "백업 저장소",
   "next.backup.customPath": "사용자 지정 백업 경로",
   "next.backup.saveStorage": "저장 경로 저장",
   "next.backup.automatic": "자동 백업",
-  "next.backup.retention": "현재 버전 3개와 이전 버전 1개를 보관합니다. 수동 백업은 삭제할 때까지 유지됩니다.",
-  "next.backup.verifyAccountPassword": "계속하려면 계정 비밀번호를 확인하세요. 보관 파일 암호화 키가 아닌 로그인 비밀번호입니다.",
+  "next.backup.retention":
+    "현재 버전 3개와 이전 버전 1개를 보관합니다. 수동 백업은 삭제할 때까지 유지됩니다.",
+  "next.backup.verifyAccountPassword":
+    "계속하려면 계정 비밀번호를 확인하세요. 보관 파일 암호화 키가 아닌 로그인 비밀번호입니다.",
   "next.backup.autoEnabled": "자동 백업 활성화",
   "next.backup.dailyTime": "매일 실행 시각 (현지)",
   "next.backup.autoKey": "자동 백업 키",
-  "next.backup.keyPresent": "키가 저장되어 있습니다. 교체하려면 새 키를 입력하세요.",
-  "next.backup.keyAbsent": "활성화 전에 공백을 제외한 8자 이상의 키를 설정하세요.",
+  "next.backup.keyPresent":
+    "키가 저장되어 있습니다. 교체하려면 새 키를 입력하세요.",
+  "next.backup.keyAbsent":
+    "활성화 전에 공백을 제외한 8자 이상의 키를 설정하세요.",
   "next.backup.clearKey": "자동 백업 키 삭제",
   "next.backup.nextRun": "다음 실행",
   "next.backup.notScheduled": "예약 없음",
@@ -1769,8 +2035,10 @@ export const nextKo: LocaleDictionary = {
   "next.networking.loadFailed": "네트워크를 불러오지 못했습니다",
   "next.networking.retry": "다시 시도",
   "next.networking.loading": "송신 인터페이스, 프록시, 경로를 읽는 중입니다.",
-  "next.networking.bridgeNotice": "컨테이너 브리지 네트워크는 컨테이너 인터페이스만 노출합니다. 독립된 회선을 선택하려면 호스트 네트워크를 사용하거나 컨테이너 네트워크를 여러 개 연결하세요.",
-  "next.networking.liveUnavailable": "실시간 업데이트를 사용할 수 없습니다. 마지막으로 받은 상태를 표시합니다.",
+  "next.networking.bridgeNotice":
+    "컨테이너 브리지 네트워크는 컨테이너 인터페이스만 노출합니다. 독립된 회선을 선택하려면 호스트 네트워크를 사용하거나 컨테이너 네트워크를 여러 개 연결하세요.",
+  "next.networking.liveUnavailable":
+    "실시간 업데이트를 사용할 수 없습니다. 마지막으로 받은 상태를 표시합니다.",
   "next.networking.close": "닫기",
   "next.networking.enabled": "사용",
   "next.networking.disabled": "사용 안 함",
@@ -1800,123 +2068,202 @@ export const nextKo: LocaleDictionary = {
   "next.networking.binding.interface": "네트워크 인터페이스",
   "next.networking.binding.sourceAddress": "소스 주소",
   "next.refusal.EGRESS_NAME_LENGTH": "송신 이름은 1~128자여야 합니다.",
-  "next.refusal.EGRESS_SYSTEM_IMMUTABLE": "System 송신은 이름 변경, 바인딩 변경, 비활성화를 할 수 없습니다.",
-  "next.refusal.EGRESS_SYSTEM_BINDING_RESERVED": "System 바인딩은 System 송신만 사용할 수 있습니다.",
-  "next.refusal.EGRESS_INTERFACE_NAME_INVALID": "올바른 인터페이스 이름을 입력하세요.",
-  "next.refusal.EGRESS_INTERFACE_NAME_REQUIRED": "인터페이스 이름을 입력하세요.",
-  "next.refusal.EGRESS_INTERFACE_BINDING_UNSUPPORTED": "Windows에서는 인터페이스에 바인딩할 수 없습니다. 소스 주소를 사용하세요.",
+  "next.refusal.EGRESS_SYSTEM_IMMUTABLE":
+    "System 송신은 이름 변경, 바인딩 변경, 비활성화를 할 수 없습니다.",
+  "next.refusal.EGRESS_SYSTEM_BINDING_RESERVED":
+    "System 바인딩은 System 송신만 사용할 수 있습니다.",
+  "next.refusal.EGRESS_INTERFACE_NAME_INVALID":
+    "올바른 인터페이스 이름을 입력하세요.",
+  "next.refusal.EGRESS_INTERFACE_NAME_REQUIRED":
+    "인터페이스 이름을 입력하세요.",
+  "next.refusal.EGRESS_INTERFACE_BINDING_UNSUPPORTED":
+    "Windows에서는 인터페이스에 바인딩할 수 없습니다. 소스 주소를 사용하세요.",
   "next.refusal.EGRESS_SOURCE_ADDRESS_REQUIRED": "소스 주소를 입력하세요.",
-  "next.refusal.EGRESS_SOURCE_ADDRESS_INVALID": "소스 주소가 올바른 IP 주소가 아닙니다.",
-  "next.refusal.EGRESS_SOURCE_ADDRESS_NOT_UNICAST": "소스 주소는 단일 호스트의 주소여야 합니다.",
+  "next.refusal.EGRESS_SOURCE_ADDRESS_INVALID":
+    "소스 주소가 올바른 IP 주소가 아닙니다.",
+  "next.refusal.EGRESS_SOURCE_ADDRESS_NOT_UNICAST":
+    "소스 주소는 단일 호스트의 주소여야 합니다.",
   "next.refusal.EGRESS_QUOTA_LIMIT_TOO_LARGE": "할당량 한도가 너무 큽니다.",
-  "next.refusal.EGRESS_QUOTA_SOFT_ABOVE_HARD": "업로드 소프트 할당량은 하드 할당량보다 클 수 없습니다.",
+  "next.refusal.EGRESS_QUOTA_SOFT_ABOVE_HARD":
+    "업로드 소프트 할당량은 하드 할당량보다 클 수 없습니다.",
   "next.refusal.BANDWIDTH_LIMIT_TOO_LARGE": "속도 제한이 너무 큽니다.",
-  "next.refusal.BANDWIDTH_SPLIT_RANGE": "대역폭 배분은 유즈넷에 1%에서 99%를 줍니다.",
+  "next.refusal.BANDWIDTH_SPLIT_RANGE":
+    "대역폭 배분은 유즈넷에 1%에서 99%를 줍니다.",
   "next.refusal.TORRENT_ROUTE_LEGS": "토렌트 경로의 레그는 하나입니다.",
-  "next.refusal.TORRENT_ROUTE_DIRECT_FALLBACK": "토렌트 경로는 직접 연결로 대체할 수 없습니다.",
+  "next.refusal.TORRENT_ROUTE_DIRECT_FALLBACK":
+    "토렌트 경로는 직접 연결로 대체할 수 없습니다.",
   "next.refusal.TORRENT_ROUTE_RUNGS": "토렌트 경로의 단계는 하나입니다.",
-  "next.refusal.EGRESS_QUOTA_RESET_TIME_RANGE": "할당량 초기화 시간이 범위를 벗어났습니다.",
-  "next.refusal.EGRESS_QUOTA_RESET_DAY_RANGE": "월별 초기화 날짜는 1~31이어야 합니다.",
+  "next.refusal.EGRESS_QUOTA_RESET_TIME_RANGE":
+    "할당량 초기화 시간이 범위를 벗어났습니다.",
+  "next.refusal.EGRESS_QUOTA_RESET_DAY_RANGE":
+    "월별 초기화 날짜는 1~31이어야 합니다.",
   "next.refusal.EGRESS_SPEED_LIMIT_TOO_LARGE": "속도 제한이 너무 큽니다.",
   "next.refusal.EGRESS_NOT_FOUND": "이 송신은 더 이상 존재하지 않습니다.",
   "next.refusal.EGRESS_SYSTEM_UNDELETABLE": "System 송신은 삭제할 수 없습니다.",
   "next.refusal.EGRESS_IN_USE": "아직 이 송신을 사용하는 경로가 있습니다.",
   "next.refusal.POOL_NAME_LENGTH": "풀 이름은 1~128자여야 합니다.",
-  "next.refusal.POOL_MEMBER_COUNT": "풀에는 프록시를 최대 16개까지 넣을 수 있습니다.",
+  "next.refusal.POOL_MEMBER_COUNT":
+    "풀에는 프록시를 최대 16개까지 넣을 수 있습니다.",
   "next.refusal.POOL_PROXY_REPEATED": "프록시는 풀에 한 번만 넣을 수 있습니다.",
-  "next.refusal.POOL_PROXY_MISSING": "이 풀의 프록시 하나가 더 이상 존재하지 않습니다.",
-  "next.refusal.POOL_MEMBER_KIND_MISMATCH": "풀의 모든 프록시는 풀과 같은 유형이어야 합니다.",
+  "next.refusal.POOL_PROXY_MISSING":
+    "이 풀의 프록시 하나가 더 이상 존재하지 않습니다.",
+  "next.refusal.POOL_MEMBER_KIND_MISMATCH":
+    "풀의 모든 프록시는 풀과 같은 유형이어야 합니다.",
   "next.refusal.POOL_NOT_FOUND": "이 풀은 더 이상 존재하지 않습니다.",
   "next.refusal.POOL_IN_USE": "아직 이 풀을 사용하는 경로가 있습니다.",
-  "next.refusal.POOL_EDIT_REPEATS_PROXY": "이 풀을 사용하는 경로가 이미 이 프록시 중 하나를 사용하고 있습니다.",
-  "next.refusal.POOL_IN_USE_EMPTY": "이 풀을 사용하는 경로가 있으므로 프록시가 하나 이상 필요합니다.",
+  "next.refusal.POOL_EDIT_REPEATS_PROXY":
+    "이 풀을 사용하는 경로가 이미 이 프록시 중 하나를 사용하고 있습니다.",
+  "next.refusal.POOL_IN_USE_EMPTY":
+    "이 풀을 사용하는 경로가 있으므로 프록시가 하나 이상 필요합니다.",
   "next.refusal.ROUTE_LEG_COUNT": "레그는 1개에서 8개 사이여야 합니다.",
-  "next.refusal.ROUTE_LEG_WEIGHT_RANGE": "각 레그의 가중치는 1~100이어야 합니다.",
+  "next.refusal.ROUTE_LEG_WEIGHT_RANGE":
+    "각 레그의 가중치는 1~100이어야 합니다.",
   "next.refusal.ROUTE_LEG_WEIGHT_SUM": "레그 가중치의 합은 100%여야 합니다.",
-  "next.refusal.ROUTE_LADDER_RUNG_COUNT": "프록시 사다리에는 단계가 1개에서 8개 필요합니다.",
-  "next.refusal.ROUTE_CHAIN_LENGTH": "체인에는 프록시가 2개 또는 3개 필요합니다.",
-  "next.refusal.ROUTE_EGRESS_MISSING": "경로가 더 이상 존재하지 않는 송신을 사용합니다.",
+  "next.refusal.ROUTE_LADDER_RUNG_COUNT":
+    "프록시 사다리에는 단계가 1개에서 8개 필요합니다.",
+  "next.refusal.ROUTE_CHAIN_LENGTH":
+    "체인에는 프록시가 2개 또는 3개 필요합니다.",
+  "next.refusal.ROUTE_EGRESS_MISSING":
+    "경로가 더 이상 존재하지 않는 송신을 사용합니다.",
   "next.refusal.ROUTE_EGRESS_DISABLED": "경로가 비활성화된 송신을 사용합니다.",
-  "next.refusal.ROUTE_POOL_MISSING": "경로가 더 이상 존재하지 않는 풀을 사용합니다.",
+  "next.refusal.ROUTE_POOL_MISSING":
+    "경로가 더 이상 존재하지 않는 풀을 사용합니다.",
   "next.refusal.ROUTE_POOL_EMPTY": "경로가 프록시가 없는 풀을 사용합니다.",
-  "next.refusal.ROUTE_PROXY_MISSING": "경로가 더 이상 존재하지 않는 프록시를 사용합니다.",
-  "next.refusal.ROUTE_CHAIN_TRANSPORT": "WireGuard와 HTTP/3는 체인의 첫 번째 프록시로만 둘 수 있습니다. WireGuard는 WireGuard 다음에도 둘 수 있습니다.",
-  "next.refusal.ROUTE_PROXY_REPEATED": "프록시는 풀과 체인을 포함해 프록시 사다리에 한 번만 쓸 수 있습니다.",
-  "next.refusal.ROUTE_PROXY_COUNT": "경로 하나에 프록시는 최대 8개까지 쓸 수 있습니다.",
+  "next.refusal.ROUTE_PROXY_MISSING":
+    "경로가 더 이상 존재하지 않는 프록시를 사용합니다.",
+  "next.refusal.ROUTE_CHAIN_TRANSPORT":
+    "WireGuard와 HTTP/3는 체인의 첫 번째 프록시로만 둘 수 있습니다. WireGuard는 WireGuard 다음에도 둘 수 있습니다.",
+  "next.refusal.ROUTE_PROXY_REPEATED":
+    "프록시는 풀과 체인을 포함해 프록시 사다리에 한 번만 쓸 수 있습니다.",
+  "next.refusal.ROUTE_PROXY_COUNT":
+    "경로 하나에 프록시는 최대 8개까지 쓸 수 있습니다.",
   "next.refusal.ROUTE_HAS_ADVANCED_LEGS": "이 경로는 네트워크에서 편집하세요.",
-  "next.refusal.ROUTE_CONSUMER_NOT_FOUND": "이 경로는 더 이상 존재하지 않습니다.",
-  "next.refusal.WIREGUARD_PROXY_PATH_CONFLICT": "WireGuard 프록시는 한 가지 경로로만 송신에 도달할 수 있습니다.",
-  "next.refusal.WIREGUARD_INSTANCE_LIMIT": "이 경로들에는 WireGuard 인스턴스가 {{required}}개 필요하지만 이 호스트는 {{limit}}개까지 허용합니다.",
+  "next.refusal.ROUTE_CONSUMER_NOT_FOUND":
+    "이 경로는 더 이상 존재하지 않습니다.",
+  "next.refusal.WIREGUARD_PROXY_PATH_CONFLICT":
+    "WireGuard 프록시는 한 가지 경로로만 송신에 도달할 수 있습니다.",
+  "next.refusal.WIREGUARD_INSTANCE_LIMIT":
+    "이 경로들에는 WireGuard 인스턴스가 {{required}}개 필요하지만 이 호스트는 {{limit}}개까지 허용합니다.",
   "next.refusal.PROXY_NAME_LENGTH": "프록시 이름은 1~128자여야 합니다.",
   "next.refusal.PROXY_ENDPOINT_INVALID": "올바른 호스트와 포트를 입력하세요.",
   "next.refusal.PROXY_TIMEOUT_RANGE": "시간 제한은 1~300초여야 합니다.",
-  "next.refusal.PROXY_ADDRESS_COUNT": "WireGuard 프록시의 터널 주소는 최대 {{limit}}개입니다.",
-  "next.refusal.PROXY_DNS_SERVER_COUNT": "DNS 서버는 최대 {{limit}}개까지 지정할 수 있습니다.",
+  "next.refusal.PROXY_ADDRESS_COUNT":
+    "WireGuard 프록시의 터널 주소는 최대 {{limit}}개입니다.",
+  "next.refusal.PROXY_DNS_SERVER_COUNT":
+    "DNS 서버는 최대 {{limit}}개까지 지정할 수 있습니다.",
   "next.refusal.PROXY_CREDENTIAL_TOO_LARGE": "자격 증명이 너무 큽니다.",
-  "next.refusal.PROXY_SSH_USERNAME_REQUIRED": "SSH에는 사용자 이름이 필요합니다.",
-  "next.refusal.PROXY_SSH_KEY_REQUIRED": "SSH에는 Ed25519 개인 키가 필요합니다.",
-  "next.refusal.PROXY_SSH_PASSWORD_UNSUPPORTED": "SSH는 비밀번호가 아니라 Ed25519 개인 키를 사용합니다.",
-  "next.refusal.PROXY_SOCKS5_PASSWORD_NEEDS_USERNAME": "SOCKS5 비밀번호에는 사용자 이름이 필요합니다.",
-  "next.refusal.PROXY_SOCKS5_CREDENTIAL_LENGTH": "SOCKS5 자격 증명은 255바이트 이내여야 합니다.",
-  "next.refusal.PROXY_HTTP_USERNAME_COLON": "HTTP 프록시 사용자 이름에는 콜론을 쓸 수 없습니다.",
-  "next.refusal.PROXY_HTTP3_PASSWORD_NEEDS_USERNAME": "HTTP/3 비밀번호에는 사용자 이름이 필요합니다.",
+  "next.refusal.PROXY_SSH_USERNAME_REQUIRED":
+    "SSH에는 사용자 이름이 필요합니다.",
+  "next.refusal.PROXY_SSH_KEY_REQUIRED":
+    "SSH에는 Ed25519 개인 키가 필요합니다.",
+  "next.refusal.PROXY_SSH_PASSWORD_UNSUPPORTED":
+    "SSH는 비밀번호가 아니라 Ed25519 개인 키를 사용합니다.",
+  "next.refusal.PROXY_SOCKS5_PASSWORD_NEEDS_USERNAME":
+    "SOCKS5 비밀번호에는 사용자 이름이 필요합니다.",
+  "next.refusal.PROXY_SOCKS5_CREDENTIAL_LENGTH":
+    "SOCKS5 자격 증명은 255바이트 이내여야 합니다.",
+  "next.refusal.PROXY_HTTP_USERNAME_COLON":
+    "HTTP 프록시 사용자 이름에는 콜론을 쓸 수 없습니다.",
+  "next.refusal.PROXY_HTTP3_PASSWORD_NEEDS_USERNAME":
+    "HTTP/3 비밀번호에는 사용자 이름이 필요합니다.",
   "next.refusal.PROXY_DNS_SERVER_INVALID": "DNS 서버는 IP 주소여야 합니다.",
-  "next.refusal.PROXY_DNS_SERVERS_REQUIRED": "목록의 서버가 응답하는 DNS 설정에는 서버가 하나 이상 필요합니다.",
-  "next.refusal.PROXY_DNS_TLS_NAME_INVALID": "DNS 서버의 TLS 이름은 올바른 호스트 이름이어야 합니다.",
-  "next.refusal.PROXY_DNS_URL_INVALID": "DNS over HTTPS 서버에는 IP 주소와 경로가 있는 https URL이 필요합니다.",
-  "next.refusal.PROXY_DNS_URL_HOSTNAME": "호스트 이름으로 지정한 DNS over HTTPS 서버에는 IP 주소도 필요합니다.",
-  "next.refusal.PROXY_DNS_PLAIN_AFTER_ENCRYPTED": "평문 DNS 서버는 암호화된 서버 뒤에 올 수 없습니다.",
-  "next.refusal.PROXY_DNS_SERVER_DUPLICATE": "DNS 서버는 한 번만 나열할 수 있습니다.",
+  "next.refusal.PROXY_DNS_SERVERS_REQUIRED":
+    "목록의 서버가 응답하는 DNS 설정에는 서버가 하나 이상 필요합니다.",
+  "next.refusal.PROXY_DNS_TLS_NAME_INVALID":
+    "DNS 서버의 TLS 이름은 올바른 호스트 이름이어야 합니다.",
+  "next.refusal.PROXY_DNS_URL_INVALID":
+    "DNS over HTTPS 서버에는 IP 주소와 경로가 있는 https URL이 필요합니다.",
+  "next.refusal.PROXY_DNS_URL_HOSTNAME":
+    "호스트 이름으로 지정한 DNS over HTTPS 서버에는 IP 주소도 필요합니다.",
+  "next.refusal.PROXY_DNS_PLAIN_AFTER_ENCRYPTED":
+    "평문 DNS 서버는 암호화된 서버 뒤에 올 수 없습니다.",
+  "next.refusal.PROXY_DNS_SERVER_DUPLICATE":
+    "DNS 서버는 한 번만 나열할 수 있습니다.",
   "next.refusal.DNS_LIST_NAME_LENGTH": "서버 목록 이름은 1~128자여야 합니다.",
   "next.refusal.DNS_LIST_NOT_FOUND": "해당 서버 목록은 더 이상 없습니다.",
   "next.refusal.DNS_LIST_LIMIT_REACHED": "서버 목록을 더 추가할 수 없습니다.",
-  "next.refusal.DNS_LIST_IN_USE": "다음 DNS 프로필이 아직 이 목록을 사용합니다: {{profiles}}.",
-  "next.refusal.DNS_PROFILE_NAME_LENGTH": "DNS 프로필 이름은 1~128자여야 합니다.",
+  "next.refusal.DNS_LIST_IN_USE":
+    "다음 DNS 프로필이 아직 이 목록을 사용합니다: {{profiles}}.",
+  "next.refusal.DNS_PROFILE_NAME_LENGTH":
+    "DNS 프로필 이름은 1~128자여야 합니다.",
   "next.refusal.DNS_PROFILE_NOT_FOUND": "해당 DNS 프로필은 더 이상 없습니다.",
-  "next.refusal.DNS_PROFILE_LIMIT_REACHED": "DNS 프로필을 더 추가할 수 없습니다.",
-  "next.refusal.DNS_PROFILE_BUILT_IN": "System 프로필은 기본 제공이라 변경하거나 삭제할 수 없습니다.",
-  "next.refusal.DNS_PROFILE_IN_USE": "다음 경로가 아직 이 프로필을 따릅니다: {{routes}}. 먼저 이 경로들에 다른 프로필을 고르세요.",
-  "next.refusal.DNS_PROFILE_KIND": "경로는 System이나 경로 프로필을 따르고, 프록시는 System이나 프록시 이름 프로필로 찾습니다.",
-  "next.refusal.DNS_PROFILE_PROXY_NAME_INVALID": "프록시 이름 프로필은 시스템이나, 이그레스에서 목록의 서버에 묻는 Weaver가 응답합니다.",
-  "next.refusal.DNS_PROFILE_KIND_IMMUTABLE": "프로필의 종류는 만들 때 그대로 유지됩니다. 대신 다른 종류의 새 프로필을 만드세요.",
-  "next.refusal.DNS_PROFILE_KIND_REQUIRED": "새 프로필에는 경로와 프록시 중 어느 쪽이 선택하는지 지정합니다.",
-  "next.refusal.DNS_PROFILE_LIST_REQUIRED": "Weaver가 응답할 때는 서버 목록을 고르세요.",
-  "next.refusal.DNS_PROFILE_TRUST_INVALID": "시스템의 응답은 받은 그대로 쓰고, 프록시의 응답은 그대로 쓰거나 여기서 검증합니다.",
-  "next.refusal.DNS_PROFILE_NEEDS_PROXY": "다음 경로에는 직접 레그나 직접 대체 경로가 있어 프록시가 DNS에 답할 수 없습니다: {{routes}}. 각각에 프록시를 주거나, 프로필에서 ‘프록시가 없는 레그에서는 시스템에 묻기’를 켜세요.",
-  "next.refusal.DNS_PROFILE_NEEDS_WIREGUARD": "여기서는 WireGuard 프록시의 응답만 검증할 수 있는데, 다음 경로에는 직접 레그, 직접 대체 경로 또는 다른 종류의 프록시가 있습니다: {{routes}}.",
-  "next.refusal.DNS_PROFILE_NEEDS_TUNNEL_DNS": "다음 경로에서는 프록시가 DNS에 응답합니다: {{routes}}. 이 경로가 쓰는 다음 WireGuard 프록시는 터널의 DNS 서버를 지정하지 않았습니다: {{proxies}}. 각각에 터널의 DNS 서버를 추가하거나 다른 프로필을 고르세요.",
-  "next.refusal.PROXY_KIND_IMMUTABLE": "프록시 유형은 바꿀 수 없습니다. 새 프록시를 추가하세요.",
-  "next.refusal.PROXY_LIMIT_REACHED": "프록시는 최대 128개까지 만들 수 있습니다.",
-  "next.refusal.PROXY_KIND_LOCKED_BY_POOL": "풀에 속한 프록시의 유형은 바꿀 수 없습니다.",
-  "next.refusal.PROXY_REVISION_CHANGED": "이 프록시가 다른 곳에서 변경되었습니다. 다시 열고 다시 시도하세요.",
+  "next.refusal.DNS_PROFILE_LIMIT_REACHED":
+    "DNS 프로필을 더 추가할 수 없습니다.",
+  "next.refusal.DNS_PROFILE_BUILT_IN":
+    "System 프로필은 기본 제공이라 변경하거나 삭제할 수 없습니다.",
+  "next.refusal.DNS_PROFILE_IN_USE":
+    "다음 경로가 아직 이 프로필을 따릅니다: {{routes}}. 먼저 이 경로들에 다른 프로필을 고르세요.",
+  "next.refusal.DNS_PROFILE_KIND":
+    "경로는 System이나 경로 프로필을 따르고, 프록시는 System이나 프록시 이름 프로필로 찾습니다.",
+  "next.refusal.DNS_PROFILE_PROXY_NAME_INVALID":
+    "프록시 이름 프로필은 시스템이나, 이그레스에서 목록의 서버에 묻는 Weaver가 응답합니다.",
+  "next.refusal.DNS_PROFILE_KIND_IMMUTABLE":
+    "프로필의 종류는 만들 때 그대로 유지됩니다. 대신 다른 종류의 새 프로필을 만드세요.",
+  "next.refusal.DNS_PROFILE_KIND_REQUIRED":
+    "새 프로필에는 경로와 프록시 중 어느 쪽이 선택하는지 지정합니다.",
+  "next.refusal.DNS_PROFILE_LIST_REQUIRED":
+    "Weaver가 응답할 때는 서버 목록을 고르세요.",
+  "next.refusal.DNS_PROFILE_TRUST_INVALID":
+    "시스템의 응답은 받은 그대로 쓰고, 프록시의 응답은 그대로 쓰거나 여기서 검증합니다.",
+  "next.refusal.DNS_PROFILE_NEEDS_PROXY":
+    "다음 경로에는 직접 레그나 직접 대체 경로가 있어 프록시가 DNS에 답할 수 없습니다: {{routes}}. 각각에 프록시를 주거나, 프로필에서 ‘프록시가 없는 레그에서는 시스템에 묻기’를 켜세요.",
+  "next.refusal.DNS_PROFILE_NEEDS_WIREGUARD":
+    "여기서는 WireGuard 프록시의 응답만 검증할 수 있는데, 다음 경로에는 직접 레그, 직접 대체 경로 또는 다른 종류의 프록시가 있습니다: {{routes}}.",
+  "next.refusal.DNS_PROFILE_NEEDS_TUNNEL_DNS":
+    "다음 경로에서는 프록시가 DNS에 응답합니다: {{routes}}. 이 경로가 쓰는 다음 WireGuard 프록시는 터널의 DNS 서버를 지정하지 않았습니다: {{proxies}}. 각각에 터널의 DNS 서버를 추가하거나 다른 프로필을 고르세요.",
+  "next.refusal.PROXY_KIND_IMMUTABLE":
+    "프록시 유형은 바꿀 수 없습니다. 새 프록시를 추가하세요.",
+  "next.refusal.PROXY_LIMIT_REACHED":
+    "프록시는 최대 128개까지 만들 수 있습니다.",
+  "next.refusal.PROXY_KIND_LOCKED_BY_POOL":
+    "풀에 속한 프록시의 유형은 바꿀 수 없습니다.",
+  "next.refusal.PROXY_REVISION_CHANGED":
+    "이 프록시가 다른 곳에서 변경되었습니다. 다시 열고 다시 시도하세요.",
   "next.refusal.PROXY_NOT_FOUND": "이 프록시는 더 이상 존재하지 않습니다.",
-  "next.refusal.PROXY_IN_POOL": "이 프록시는 풀에 속해 있습니다. 먼저 풀에서 제거하세요.",
+  "next.refusal.PROXY_IN_POOL":
+    "이 프록시는 풀에 속해 있습니다. 먼저 풀에서 제거하세요.",
   "next.refusal.PROXY_IN_USE": "아직 이 프록시를 사용하는 경로가 있습니다.",
   "next.refusal.PROXY_HOST_KEY_NOT_SSH": "호스트 키는 SSH 프록시에만 있습니다.",
-  "next.refusal.SPEED_TEST_ALREADY_RUNNING": "속도 테스트 {{runId}}이(가) 아직 실행 중입니다.",
-  "next.refusal.SPEED_TEST_QUEUE_BUSY": "이전 속도 테스트가 아직 대기열을 반환하는 중입니다.",
-  "next.refusal.SPEED_TEST_USENET_NEEDS_SERVER": "피드는 대역폭 테스트만 실행할 수 있습니다.",
-  "next.refusal.SPEED_TEST_TORRENT_NEEDS_TORRENT_ROUTE": "토렌트 경로만 토렌트 테스트를 실행할 수 있습니다.",
+  "next.refusal.SPEED_TEST_ALREADY_RUNNING":
+    "속도 테스트 {{runId}}이(가) 아직 실행 중입니다.",
+  "next.refusal.SPEED_TEST_QUEUE_BUSY":
+    "이전 속도 테스트가 아직 대기열을 반환하는 중입니다.",
+  "next.refusal.SPEED_TEST_USENET_NEEDS_SERVER":
+    "피드는 대역폭 테스트만 실행할 수 있습니다.",
+  "next.refusal.SPEED_TEST_TORRENT_NEEDS_TORRENT_ROUTE":
+    "토렌트 경로만 토렌트 테스트를 실행할 수 있습니다.",
   "next.refusal.SPEED_TEST_TORRENTS_OFF": "토렌트가 꺼져 있습니다.",
   "next.refusal.SPEED_TEST_LEG_DOWN_ALL": "레그를 하나 이상 켜 두세요.",
-  "next.refusal.SPEED_TEST_QUOTA_BLOCKED": "{{name}}의 다운로드 할당량이 소진되었습니다.",
-  "next.refusal.SPEED_TEST_LEASE_REFUSED": "{{name}}이(가) 연결을 빌려줄 수 없습니다: {{reason}}.",
+  "next.refusal.SPEED_TEST_QUOTA_BLOCKED":
+    "{{name}}의 다운로드 할당량이 소진되었습니다.",
+  "next.refusal.SPEED_TEST_LEASE_REFUSED":
+    "{{name}}이(가) 연결을 빌려줄 수 없습니다: {{reason}}.",
   "next.refusal.TEST_NEEDS_ROUTE": "테스트에는 거쳐 갈 경로가 필요합니다.",
-  "next.refusal.TEST_TARGET_REQUIRED": "경로를 테스트하려면 호스트와 포트를 입력하세요.",
-  "next.refusal.TEST_SUBJECT_IN_ROUTE": "경로가 테스트 중인 프록시를 사용합니다. 경로에서 빼세요.",
-  "next.refusal.TEST_PATH_COUNT": "테스트 한 번에 최대 {{limit}}개 경로까지 시도할 수 있습니다. 단계 또는 풀 구성원을 줄이세요.",
+  "next.refusal.TEST_TARGET_REQUIRED":
+    "경로를 테스트하려면 호스트와 포트를 입력하세요.",
+  "next.refusal.TEST_SUBJECT_IN_ROUTE":
+    "경로가 테스트 중인 프록시를 사용합니다. 경로에서 빼세요.",
+  "next.refusal.TEST_PATH_COUNT":
+    "테스트 한 번에 최대 {{limit}}개 경로까지 시도할 수 있습니다. 단계 또는 풀 구성원을 줄이세요.",
   "next.networking.problem.legCount": "레그는 1개에서 8개 사이여야 합니다.",
-  "next.networking.problem.weights": "가중치는 정수 백분율이어야 하며 합이 100%여야 합니다.",
-  "next.networking.problem.rungCount": "프록시 사다리에는 단계가 1개에서 8개 필요합니다.",
-  "next.networking.problem.rungTarget": "모든 단계에 프록시 또는 풀을 선택하세요.",
-  "next.networking.problem.chain": "체인에는 서로 다른 프록시가 2개 또는 3개 필요합니다.",
-  "next.networking.problem.egressDisabled": "이 경로는 비활성화된 송신를 사용합니다.",
-  "next.networking.problem.proxyRepeated": "프록시 사다리는 각 프록시를 한 번만 사용할 수 있습니다.",
+  "next.networking.problem.weights":
+    "가중치는 정수 백분율이어야 하며 합이 100%여야 합니다.",
+  "next.networking.problem.rungCount":
+    "프록시 사다리에는 단계가 1개에서 8개 필요합니다.",
+  "next.networking.problem.rungTarget":
+    "모든 단계에 프록시 또는 풀을 선택하세요.",
+  "next.networking.problem.chain":
+    "체인에는 서로 다른 프록시가 2개 또는 3개 필요합니다.",
+  "next.networking.problem.egressDisabled":
+    "이 경로는 비활성화된 송신를 사용합니다.",
+  "next.networking.problem.proxyRepeated":
+    "프록시 사다리는 각 프록시를 한 번만 사용할 수 있습니다.",
   "next.networking.overview.flow": "연결 흐름",
   "next.networking.flow.consumer": "엔드포인트",
   "next.networking.flow.allConsumers": "모든 엔드포인트",
   "next.networking.flow.groups": "송신 그룹",
-  "next.networking.flow.diagram": "송신 인터페이스는 경로 레그와 프록시를 거쳐 엔드포인트에 연결됩니다",
+  "next.networking.flow.diagram":
+    "송신 인터페이스는 경로 레그와 프록시를 거쳐 엔드포인트에 연결됩니다",
   "next.networking.flow.egressColumn": "송신 인터페이스",
   "next.networking.flow.legsColumn": "경로",
   "next.networking.flow.proxyColumn": "프록시",
@@ -1945,16 +2292,26 @@ export const nextKo: LocaleDictionary = {
   "next.networking.flow.dnsProxyCard": "{{proxy}} · 자체 리졸버",
   "next.networking.flow.dnsProxyNote": "Weaver가 알 수 없음",
   "next.networking.flow.dnsListMissing": "서버 목록",
-  "next.networking.flow.dnsSaysHost": "{{profile}}: 호스트 리졸버가 응답합니다. 아무것도 검증하지 않습니다.",
-  "next.networking.flow.dnsSaysFallback": "{{profile}}: 이 레그에는 이름을 넘길 프록시가 없으므로 호스트 리졸버가 응답합니다.",
-  "next.networking.flow.dnsSaysList": "{{profile}}: Weaver가 {{from}}에서 {{list}}에 질의합니다.",
-  "next.networking.flow.dnsSaysListThrough": "{{profile}}: Weaver가 {{proxy}}를 통해 {{list}}에 질의합니다.",
-  "next.networking.flow.dnsSaysTunnel": "{{profile}}: Weaver가 {{proxy}}를 통해 터널의 DNS 서버에 질의합니다.",
-  "next.networking.flow.dnsSaysProxy": "{{profile}}: {{proxy}}가 이름을 받아 해석합니다. Weaver는 그 조회를 보거나 검증할 수 없습니다.",
-  "next.networking.flow.dnsSaysValidates": "Weaver가 응답의 DNSSEC를 검증합니다.",
-  "next.networking.flow.dnsRefusedNoProxy": "{{profile}}는 이름을 프록시에 넘기지만 이 레그에는 프록시가 없으므로 연결이 실패합니다.",
-  "next.networking.flow.dnsRefusedNoTunnelDns": "{{profile}}는 {{proxy}}의 터널 DNS에 질의하지만 서버가 없으므로 이 레그의 연결이 실패합니다.",
-  "next.networking.flow.dnsRefusedValidate": "{{profile}}는 DNSSEC를 검증하지만 WireGuard 터널의 조회만 검증할 수 있으므로 이 레그의 연결이 실패합니다.",
+  "next.networking.flow.dnsSaysHost":
+    "{{profile}}: 호스트 리졸버가 응답합니다. 아무것도 검증하지 않습니다.",
+  "next.networking.flow.dnsSaysFallback":
+    "{{profile}}: 이 레그에는 이름을 넘길 프록시가 없으므로 호스트 리졸버가 응답합니다.",
+  "next.networking.flow.dnsSaysList":
+    "{{profile}}: Weaver가 {{from}}에서 {{list}}에 질의합니다.",
+  "next.networking.flow.dnsSaysListThrough":
+    "{{profile}}: Weaver가 {{proxy}}를 통해 {{list}}에 질의합니다.",
+  "next.networking.flow.dnsSaysTunnel":
+    "{{profile}}: Weaver가 {{proxy}}를 통해 터널의 DNS 서버에 질의합니다.",
+  "next.networking.flow.dnsSaysProxy":
+    "{{profile}}: {{proxy}}가 이름을 받아 해석합니다. Weaver는 그 조회를 보거나 검증할 수 없습니다.",
+  "next.networking.flow.dnsSaysValidates":
+    "Weaver가 응답의 DNSSEC를 검증합니다.",
+  "next.networking.flow.dnsRefusedNoProxy":
+    "{{profile}}는 이름을 프록시에 넘기지만 이 레그에는 프록시가 없으므로 연결이 실패합니다.",
+  "next.networking.flow.dnsRefusedNoTunnelDns":
+    "{{profile}}는 {{proxy}}의 터널 DNS에 질의하지만 서버가 없으므로 이 레그의 연결이 실패합니다.",
+  "next.networking.flow.dnsRefusedValidate":
+    "{{profile}}는 DNSSEC를 검증하지만 WireGuard 터널의 조회만 검증할 수 있으므로 이 레그의 연결이 실패합니다.",
   "next.networking.flow.dnsEditProfile": "DNS 프로필 {{profile}} 편집",
   "next.networking.flow.dnsEditList": "DNS 서버 목록 {{list}} 편집",
   "next.networking.flow.killSwitchNote": "프록시 없음, 직접 연결 꺼짐",
@@ -1972,22 +2329,26 @@ export const nextKo: LocaleDictionary = {
   "next.networking.flow.noLegs": "경로를 보려면 서버나 피드를 추가하세요.",
   "next.networking.flow.waiting": "실시간 샘플 대기 중",
   "next.networking.flow.emptyTitle": "아직 표시할 내용이 없습니다",
-  "next.networking.flow.emptyBody": "연결이 어디로 나가는지 보려면 서버나 RSS 피드를 추가하세요.",
-  "next.networking.flow.detailConnectionsValue": "{{open}}개 열림 · {{opening}}개 여는 중 · 목표 {{target}} · {{rate}}",
+  "next.networking.flow.emptyBody":
+    "연결이 어디로 나가는지 보려면 서버나 RSS 피드를 추가하세요.",
+  "next.networking.flow.detailConnectionsValue":
+    "{{open}}개 열림 · {{opening}}개 여는 중 · 목표 {{target}} · {{rate}}",
   "next.networking.flow.detailPin": "대상 고정",
   "next.networking.flow.noSocket": "열린 소켓 없음",
   "next.networking.egress.title": "송신 인터페이스",
   "next.networking.egress.add": "송신 추가",
   "next.networking.egress.save": "송신 저장",
   "next.networking.egress.delete": "송신 삭제",
-  "next.networking.egress.deleteBody": "{{name}}을(를) 삭제할까요? 이를 사용하는 경로를 먼저 변경해야 합니다.",
+  "next.networking.egress.deleteBody":
+    "{{name}}을(를) 삭제할까요? 이를 사용하는 경로를 먼저 변경해야 합니다.",
   "next.networking.egress.section": "송신",
   "next.networking.egress.newNote": "연결이 이 기기를 나가는 곳",
   "next.networking.egress.empty": "아직 송신 인터페이스가 없습니다.",
   "next.networking.egress.name": "이름",
   "next.networking.egress.bindingColumn": "바인딩 / 현재 주소",
   "next.networking.egress.binding": "바인딩",
-  "next.networking.egress.bindingHelp": "이름이 있는 인터페이스 또는 하나의 소스 주소에 바인딩합니다.",
+  "next.networking.egress.bindingHelp":
+    "이름이 있는 인터페이스 또는 하나의 소스 주소에 바인딩합니다.",
   "next.networking.egress.health": "상태",
   "next.networking.egress.limit": "제한",
   "next.networking.egress.interface": "인터페이스",
@@ -1997,7 +2358,8 @@ export const nextKo: LocaleDictionary = {
   "next.networking.egress.linkDown": "중단",
   "next.networking.egress.sourceAddress": "소스 주소",
   "next.networking.egress.downloadLimit": "다운로드 제한",
-  "next.attention.egressQuotaReached": "{{name}}의 다운로드 할당량에 도달했습니다",
+  "next.attention.egressQuotaReached":
+    "{{name}}의 다운로드 할당량에 도달했습니다",
   "next.monitoring.quotaNotEnforced": "적용 안 함",
   "next.monitoring.egressLink": "설정 → 네트워크 → Egress",
   "next.monitoring.quotaUsed": "{{name}}의 다운로드 할당량 사용량",
@@ -2006,23 +2368,31 @@ export const nextKo: LocaleDictionary = {
   "next.torrents.seeding": "시딩",
   "next.torrents.connection": "연결",
   "next.torrents.enabled": "사용",
-  "next.torrents.windingDown": "토렌트가 꺼져 있습니다. 실행 중인 토렌트는 끝날 때까지 계속되며 새 토렌트는 추가되지 않습니다.",
+  "next.torrents.windingDown":
+    "토렌트가 꺼져 있습니다. 실행 중인 토렌트는 끝날 때까지 계속되며 새 토렌트는 추가되지 않습니다.",
   "next.torrents.offTitle": "토렌트 끄기",
   "next.torrents.enableButton": "토렌트 사용",
-  "next.torrents.enableBody": "토렌트는 초기 베타 단계입니다. 사용에 따른 위험은 본인이 부담합니다.",
-  "next.torrents.offBody": "아직 실행 중인 토렌트가 있습니다. 어떻게 끝낼까요? 어느 경우든 새 토렌트는 추가되지 않습니다.",
-  "next.torrents.offIdleBody": "실행 중인 토렌트가 없습니다. 토렌트가 지금 꺼지며 새 토렌트는 추가되지 않습니다.",
+  "next.torrents.enableBody":
+    "토렌트는 초기 베타 단계입니다. 사용에 따른 위험은 본인이 부담합니다.",
+  "next.torrents.offBody":
+    "아직 실행 중인 토렌트가 있습니다. 어떻게 끝낼까요? 어느 경우든 새 토렌트는 추가되지 않습니다.",
+  "next.torrents.offIdleBody":
+    "실행 중인 토렌트가 없습니다. 토렌트가 지금 꺼지며 새 토렌트는 추가되지 않습니다.",
   "next.torrents.offFinishDownloadsBox": "진행 중인 토렌트 다운로드 완료",
-  "next.torrents.offFinishDownloadsOn": "아직 다운로드 중인 토렌트를 먼저 완료합니다.",
-  "next.torrents.offFinishDownloadsOff": "아직 다운로드 중인 토렌트는 지금 중지됩니다.",
+  "next.torrents.offFinishDownloadsOn":
+    "아직 다운로드 중인 토렌트를 먼저 완료합니다.",
+  "next.torrents.offFinishDownloadsOff":
+    "아직 다운로드 중인 토렌트는 지금 중지됩니다.",
   "next.torrents.offFinishSeedingBox": "진행 중인 작업의 시딩 완료",
   "next.torrents.offFinishSeedingOff": "시딩 중인 토렌트는 지금 중지됩니다.",
   "next.torrents.offForceTitle": "모든 토렌트 취소",
-  "next.torrents.offForceBody": "모든 토렌트가 강제로 취소되며 비공개 트래커에서 힛앤런이 될 수 있습니다.",
+  "next.torrents.offForceBody":
+    "모든 토렌트가 강제로 취소되며 비공개 트래커에서 힛앤런이 될 수 있습니다.",
   "next.torrents.offStopNow": "모든 토렌트 활동 즉시 중지",
   "next.torrents.offStopNowNote": "모든 토렌트가 즉시 중지됩니다.",
   "next.torrents.stopNow": "지금 중지",
-  "next.torrents.finishAllForced": "강제 실행 중이거나 시딩 한도가 없는 torrent는 '지금 중지'까지 시딩합니다.",
+  "next.torrents.finishAllForced":
+    "강제 실행 중이거나 시딩 한도가 없는 torrent는 '지금 중지'까지 시딩합니다.",
   "next.torrents.basePort": "기본 포트",
   "next.torrents.announcePort": "알림 포트",
   "next.torrents.upnp": "UPnP",
@@ -2038,13 +2408,17 @@ export const nextKo: LocaleDictionary = {
   "next.torrents.bittorrent": "BitTorrent",
   "next.torrents.advanced": "고급",
   "next.torrents.peerTcp": "TCP",
-  "next.torrents.peerTcpHelp": "피어 연결과 수락을 TCP로 합니다. TCP와 uTP 중 하나는 켜진 채로 있습니다.",
+  "next.torrents.peerTcpHelp":
+    "피어 연결과 수락을 TCP로 합니다. TCP와 uTP 중 하나는 켜진 채로 있습니다.",
   "next.torrents.peerUtp": "uTP",
-  "next.torrents.peerUtpHelp": "피어 연결과 수락을 uTP로 합니다. TCP와 uTP 중 하나는 켜진 채로 있습니다.",
+  "next.torrents.peerUtpHelp":
+    "피어 연결과 수락을 uTP로 합니다. TCP와 uTP 중 하나는 켜진 채로 있습니다.",
   "next.torrents.preferDownloading": "다운로드 중 우선",
-  "next.torrents.preferDownloadingHelp": "토렌트에 원하는 조각이 남아 있는 동안 각 피어에 먼저 시도하는 방식입니다. 실패하면 다른 방식을 시도합니다.",
+  "next.torrents.preferDownloadingHelp":
+    "토렌트에 원하는 조각이 남아 있는 동안 각 피어에 먼저 시도하는 방식입니다. 실패하면 다른 방식을 시도합니다.",
   "next.torrents.preferSeeding": "시딩 중 우선",
-  "next.torrents.preferSeedingHelp": "토렌트가 원하는 조각을 모두 가진 뒤 각 피어에 먼저 시도하는 방식입니다. 실패하면 다른 방식을 시도합니다.",
+  "next.torrents.preferSeedingHelp":
+    "토렌트가 원하는 조각을 모두 가진 뒤 각 피어에 먼저 시도하는 방식입니다. 실패하면 다른 방식을 시도합니다.",
   "next.torrents.connectionsLimit": "전체 연결 수",
   "next.torrents.unchokeSlots": "업로드 슬롯",
   "next.torrents.blocklistEnabled": "IP 필터",
@@ -2064,18 +2438,22 @@ export const nextKo: LocaleDictionary = {
   "next.torrents.trackerRule": "트래커 규칙",
   "next.torrents.trackerRuleAdd": "규칙 추가",
   "next.torrents.trackerRuleNewNote": "새 트래커 규칙",
-  "next.torrents.trackerRuleRemoveBody": "이 트래커의 토렌트는 카테고리 또는 전역 시딩 정책으로 돌아갑니다.",
+  "next.torrents.trackerRuleRemoveBody":
+    "이 트래커의 토렌트는 카테고리 또는 전역 시딩 정책으로 돌아갑니다.",
   "next.torrents.trackerRuleName": "이름",
   "next.torrents.trackerRuleHosts": "호스트",
-  "next.torrents.trackerRuleHostsNote": "트래커 중 하나가 체크한 호스트에 있는 토렌트가 이 규칙을 따릅니다. 변경 사항은 지금부터 추가되는 토렌트에, Weaver를 재시작한 뒤에는 모든 토렌트에 적용됩니다.",
+  "next.torrents.trackerRuleHostsNote":
+    "트래커 중 하나가 체크한 호스트에 있는 토렌트가 이 규칙을 따릅니다. 변경 사항은 지금부터 추가되는 토렌트에, Weaver를 재시작한 뒤에는 모든 토렌트에 적용됩니다.",
   "next.torrents.trackerRuleHostUnder": "및 그 아래의 모든 호스트",
   "next.torrents.trackerRuleHostOnly": "이 호스트만",
   "next.torrents.trackerRuleHostLocked": "{{name}} 트래커 파일이 설정함",
   "next.torrents.trackerRuleHostAdd": "추가",
   "next.torrents.trackerRuleHostsMore": "{{host}} +{{count}}",
   "next.torrents.trackerRuleHostsNone": "호스트를 하나 이상 추가하세요.",
-  "next.torrents.trackerRuleFilePrivate": "비공개 토렌트: 명시된 모든 트래커가 체크됩니다.",
-  "next.torrents.trackerRuleFilePublic": "공개 토렌트: 기본 트래커만 체크됩니다. 규칙에 포함할 다른 트래커도 체크하세요.",
+  "next.torrents.trackerRuleFilePrivate":
+    "비공개 토렌트: 명시된 모든 트래커가 체크됩니다.",
+  "next.torrents.trackerRuleFilePublic":
+    "공개 토렌트: 기본 트래커만 체크됩니다. 규칙에 포함할 다른 트래커도 체크하세요.",
   "next.torrents.trackerRuleHostKnown": "알려진 호스트",
   "next.torrents.trackerRuleHostCustom": "직접 입력",
   "next.torrents.trackerRuleHostFile": "토렌트 파일",
@@ -2091,7 +2469,8 @@ export const nextKo: LocaleDictionary = {
   "next.torrents.trackerRulePrivate": "비공개 트래커",
   "next.torrents.trackerRulePublic": "공개 트래커",
   "next.torrents.trackerRuleAdvanced": "고급 설정",
-  "next.torrents.trackerRuleCovers": "체크한 호스트에 트래커가 있는 토렌트에 적용되며, 그 토렌트의 모든 트래커와 피어에도 적용됩니다.",
+  "next.torrents.trackerRuleCovers":
+    "체크한 호스트에 트래커가 있는 토렌트에 적용되며, 그 토렌트의 모든 트래커와 피어에도 적용됩니다.",
   "next.torrents.trackerRuleEffective": "적용 값: {{value}}",
   "next.torrents.trackerRuleGoalInherited": "전역 시딩 설정에서",
   "next.torrents.trackerRuleRouteOwn": "경로에서 편집",
@@ -2111,7 +2490,8 @@ export const nextKo: LocaleDictionary = {
   "next.torrents.trackerFileRecommended": "권장",
   "next.torrents.trackerFileArchivePasswords": "압축 파일 비밀번호",
   "next.torrents.trackerFileUnbind": "해제",
-  "next.torrents.trackerFileUnbindBody": "모든 값이 유지되며 편집할 수 있습니다.",
+  "next.torrents.trackerFileUnbindBody":
+    "모든 값이 유지되며 편집할 수 있습니다.",
   "next.torrents.trackerRuleCertificatePem": "인증서",
   "next.torrents.trackerRulePrivateKey": "개인 키",
   "next.torrents.trackerRulesEmpty": "트래커 규칙이 없습니다.",
@@ -2146,8 +2526,10 @@ export const nextKo: LocaleDictionary = {
   "next.torrents.routeReason.LEG_OPEN_FAILED": "연결 구간을 열지 못함",
   "next.torrents.routeReason.STATE_DIRECTORY_FAILED": "상태 디렉터리 사용 불가",
   "next.torrents.routeReason.LISTEN_PORT_UNAVAILABLE": "수신 포트 사용 불가",
-  "next.torrents.routeReason.LISTEN_PORT_BIND_FAILED": "수신 포트를 바인딩하지 못함",
-  "next.torrents.routeReason.SESSION_STATE_UNREADABLE": "세션 상태를 읽을 수 없음",
+  "next.torrents.routeReason.LISTEN_PORT_BIND_FAILED":
+    "수신 포트를 바인딩하지 못함",
+  "next.torrents.routeReason.SESSION_STATE_UNREADABLE":
+    "세션 상태를 읽을 수 없음",
   "next.torrents.routeReason.SESSION_BUILD_FAILED": "세션을 열지 못함",
   "next.torrents.routeReason.UTP_UNAVAILABLE": "uTP 전용, 경로가 uTP 미지원",
   "next.torrents.routeReason.BLOCKLIST_FAILED": "차단 목록을 불러오지 못함",
@@ -2209,7 +2591,8 @@ export const nextKo: LocaleDictionary = {
   "next.quota.trickle": "저속",
   "next.quota.stopped": "중지됨",
   "next.monitoring.egressQuotas": "Egress 할당량",
-  "next.monitoring.noEgressQuota": "할당량이 설정된 Egress가 없습니다. {{link}}에서 설정하세요.",
+  "next.monitoring.noEgressQuota":
+    "할당량이 설정된 Egress가 없습니다. {{link}}에서 설정하세요.",
   "next.schedules.speedGlobalUpload": "전체 업로드 제한",
   "next.schedules.speedSet": "제한",
   "next.protocol.torrent": "토렌트",
@@ -2218,7 +2601,8 @@ export const nextKo: LocaleDictionary = {
   "next.torrent.removeTitle": "토렌트 제거",
   "next.torrent.deleteFiles": "파일도 삭제",
   "next.torrent.unmetGoalTitle": "시딩 목표 미달성",
-  "next.torrent.unmetGoalBody": "시딩 목표를 아직 달성하지 못했습니다: {{left}}.",
+  "next.torrent.unmetGoalBody":
+    "시딩 목표를 아직 달성하지 못했습니다: {{left}}.",
   "next.torrent.removeAnyway": "그래도 제거",
   "next.torrent.seedingCell": "비율 · 업로드",
   "next.torrent.force": "강제",
@@ -2230,7 +2614,8 @@ export const nextKo: LocaleDictionary = {
   "next.torrent.unforced": "강제 해제됨",
   "next.torrent.recheck": "다시 검사",
   "next.torrent.recheckBody": "모든 조각을 디스크에서 다시 읽어 확인합니다.",
-  "next.torrent.filesMissingBody": "이 토렌트의 파일이 폴더에 없어 재개할 수 없습니다. 파일을 되돌려 놓거나 파일이 있는 폴더로 토렌트를 이동하세요. 다운로드를 다시 시작해야 한다면 재확인하세요. 디스크에 있는 데이터는 유지되고 나머지는 다시 받습니다.",
+  "next.torrent.filesMissingBody":
+    "이 토렌트의 파일이 폴더에 없어 재개할 수 없습니다. 파일을 되돌려 놓거나 파일이 있는 폴더로 토렌트를 이동하세요. 다운로드를 다시 시작해야 한다면 재확인하세요. 디스크에 있는 데이터는 유지되고 나머지는 다시 받습니다.",
   "next.torrent.rechecking": "다시 검사 중",
   "next.torrent.move": "이동",
   "next.torrent.moved": "이동됨",
@@ -2291,7 +2676,8 @@ export const nextKo: LocaleDictionary = {
   "next.torrent.addTrackers": "트래커 추가",
   "next.torrent.editTracker": "트래커 편집",
   "next.torrent.trackerUrls": "트래커 URL 목록",
-  "next.torrent.privateTrackerWarning": "이 토렌트는 비공개입니다. 해당 트래커가 제공한 URL만 추가하세요.",
+  "next.torrent.privateTrackerWarning":
+    "이 토렌트는 비공개입니다. 해당 트래커가 제공한 URL만 추가하세요.",
   "next.torrent.trackerUrl": "트래커 URL",
   "next.torrent.trackerSource": "출처",
   "next.torrent.trackerStatus": "상태",
@@ -2322,9 +2708,11 @@ export const nextKo: LocaleDictionary = {
   "next.quota.remaining": "{{size}} 남음",
   "next.networking.egress.quota": "할당량",
   "next.networking.egress.enabled": "사용",
-  "next.networking.egress.systemHelp": "시스템 송신은 항상 켜져 있으며 운영체제 자체 라우팅입니다.",
+  "next.networking.egress.systemHelp":
+    "시스템 송신은 항상 켜져 있으며 운영체제 자체 라우팅입니다.",
   "next.networking.egress.nameRequired": "송신 이름을 입력하세요.",
-  "next.networking.egress.interfaceRequired": "바인딩할 인터페이스를 선택하세요.",
+  "next.networking.egress.interfaceRequired":
+    "바인딩할 인터페이스를 선택하세요.",
   "next.networking.egress.sourceRequired": "바인딩할 소스 주소를 입력하세요.",
   "next.networking.egress.test": "테스트",
   "next.networking.testVia.title": "경로 경유 테스트",
@@ -2344,7 +2732,8 @@ export const nextKo: LocaleDictionary = {
   "next.networking.testVia.resolvedSystem": "시스템",
   "next.networking.testVia.resolvedProxy": "프록시 ({{name}})",
   "next.networking.testVia.resolvedServers": "DNS {{servers}} ({{name}} 경유)",
-  "next.networking.testVia.resolvedWeaver": "Weaver: {{name}} 경유 DNS {{servers}}",
+  "next.networking.testVia.resolvedWeaver":
+    "Weaver: {{name}} 경유 DNS {{servers}}",
   "next.networking.testVia.cached": "캐시됨",
   "next.networking.testVia.torrent": "테스트 토렌트",
   "next.networking.testVia.step.TORRENT": "토렌트",
@@ -2357,21 +2746,25 @@ export const nextKo: LocaleDictionary = {
   "next.networking.pools.title": "프록시 풀",
   "next.networking.pools.count.one": "풀 {{count}}개",
   "next.networking.pools.count.other": "풀 {{count}}개",
-  "next.networking.pools.note": "풀은 같은 유형의 프록시를 경쟁시킨 뒤 전송 근거가 있는 구성원을 우선합니다. WireGuard는 모든 송신 경로에서 터널을 최대 {{count}}개까지 허용하며 터널마다 {{budget}} MiB를 예약합니다.",
+  "next.networking.pools.note":
+    "풀은 같은 유형의 프록시를 경쟁시킨 뒤 전송 근거가 있는 구성원을 우선합니다. WireGuard는 모든 송신 경로에서 터널을 최대 {{count}}개까지 허용하며 터널마다 {{budget}} MiB를 예약합니다.",
   "next.networking.pools.name": "이름",
   "next.networking.pools.type": "프록시 유형",
-  "next.networking.pools.typeHelp": "모든 구성원은 이 유형입니다. 바꾸면 구성원이 비워집니다.",
+  "next.networking.pools.typeHelp":
+    "모든 구성원은 이 유형입니다. 바꾸면 구성원이 비워집니다.",
   "next.networking.pools.members": "구성원",
   "next.networking.pools.noCandidates": "아직 {{kind}} 프록시가 없습니다.",
   "next.networking.pools.state": "상태",
   "next.networking.pools.enabled": "사용",
-  "next.networking.pools.empty": "아직 풀이 없습니다. 단일 프록시를 경로에서 바로 사용할 수도 있습니다.",
+  "next.networking.pools.empty":
+    "아직 풀이 없습니다. 단일 프록시를 경로에서 바로 사용할 수도 있습니다.",
   "next.networking.pools.add": "풀 추가",
   "next.networking.pools.save": "풀 저장",
   "next.networking.pools.section": "풀",
   "next.networking.pools.nameRequired": "풀 이름을 입력하세요.",
   "next.networking.pools.delete": "풀 삭제",
-  "next.networking.pools.deleteBody": "{{name}}을(를) 삭제할까요? 먼저 모든 경로에서 제거해야 합니다.",
+  "next.networking.pools.deleteBody":
+    "{{name}}을(를) 삭제할까요? 먼저 모든 경로에서 제거해야 합니다.",
   "next.networking.pools.test": "풀 테스트",
   "next.networking.pools.testVia": "테스트",
   "next.networking.routes.title": "소비자 경로",
@@ -2382,14 +2775,17 @@ export const nextKo: LocaleDictionary = {
   "next.networking.routes.typeUsenet": "Usenet",
   "next.networking.routes.typeTorrent": "토렌트",
   "next.networking.routes.live": "실시간",
-  "next.networking.routes.empty": "경로를 지정하기 전에 서버나 RSS 피드를 추가하세요.",
+  "next.networking.routes.empty":
+    "경로를 지정하기 전에 서버나 RSS 피드를 추가하세요.",
   "next.networking.routes.rssFeed": "RSS 피드",
   "next.networking.routes.editorTitle": "{{name}} 경로",
   "next.networking.routes.save": "경로 저장",
-  "next.networking.route.intro": "최대 {{count}}개의 연결을 독립된 경로로 나눕니다. 가중치를 바꿔도 진행 중인 전송은 원래 경로에서 끝납니다.",
+  "next.networking.route.intro":
+    "최대 {{count}}개의 연결을 독립된 경로로 나눕니다. 가중치를 바꿔도 진행 중인 전송은 원래 경로에서 끝납니다.",
   "next.networking.route.distribution": "레그별 가중치 분배",
   "next.networking.route.legWeight": "레그 {{position}} 가중치",
-  "next.networking.route.preview": "미리보기만: {{assigned}}개 할당, {{parked}}개 보류. 실행 중인 경로는 바뀌지 않습니다.",
+  "next.networking.route.preview":
+    "미리보기만: {{assigned}}개 할당, {{parked}}개 보류. 실행 중인 경로는 바뀌지 않습니다.",
   "next.networking.route.leg": "레그 {{position}}",
   "next.networking.route.live": "연결 {{open}}/{{target}} · {{source}}",
   "next.networking.route.noSource": "아직 소스 주소 없음",
@@ -2411,7 +2807,8 @@ export const nextKo: LocaleDictionary = {
   "next.networking.route.rungUp": "단계 위로",
   "next.networking.route.rungDown": "단계 아래로",
   "next.networking.route.removeRung": "단계 제거",
-  "next.networking.route.noRungs": "단계를 추가해 이 레그가 거칠 프록시를 선택하세요.",
+  "next.networking.route.noRungs":
+    "단계를 추가해 이 레그가 거칠 프록시를 선택하세요.",
   "next.networking.route.addRung": "단계 추가",
   "next.networking.route.directFallback": "이 송신에서 직접 연결 대체 허용",
   "next.networking.route.target": "목표: 연결 {{count}}개",
@@ -2447,15 +2844,19 @@ export const nextKo: LocaleDictionary = {
   "next.networking.speed.sab.GB_10": "10 GB",
   "next.networking.speed.run": "실행",
   "next.networking.speed.pauseTitle": "다운로드를 일시 중지할까요?",
-  "next.networking.speed.pauseBody": "테스트 중에는 다운로드가 일시 중지되고 끝나면 다시 시작됩니다.",
+  "next.networking.speed.pauseBody":
+    "테스트 중에는 다운로드가 일시 중지되고 끝나면 다시 시작됩니다.",
   "next.networking.speed.pauseConfirm": "일시 중지하고 실행",
   "next.networking.speed.cancel": "테스트 취소",
   "next.networking.speed.upSwitch": "정상",
   "next.networking.speed.downSwitch": "중단",
-  "next.networking.speed.usenetNeedsServer": "피드에는 테스트할 Usenet 서버가 없습니다.",
-  "next.networking.speed.torrentNeedsTorrentRoute": "토렌트 테스트에는 토렌트 경로가 필요합니다.",
+  "next.networking.speed.usenetNeedsServer":
+    "피드에는 테스트할 Usenet 서버가 없습니다.",
+  "next.networking.speed.torrentNeedsTorrentRoute":
+    "토렌트 테스트에는 토렌트 경로가 필요합니다.",
   "next.networking.speed.customUrlInvalid": "HTTPS URL을 입력하세요.",
-  "next.networking.speed.nzbUrlInvalid": "NZB의 http 또는 https URL을 입력하세요.",
+  "next.networking.speed.nzbUrlInvalid":
+    "NZB의 http 또는 https URL을 입력하세요.",
   "next.networking.speed.nzbFileMissing": ".nzb 파일을 선택하세요.",
   "next.networking.speed.phase.pausing": "다운로드 일시 중지 중",
   "next.networking.speed.phase.draining": "진행 중인 {{count}}개 마무리 중",
@@ -2477,7 +2878,8 @@ export const nextKo: LocaleDictionary = {
   "next.networking.speed.decoded": "디코딩됨",
   "next.networking.speed.upload": "업로드",
   "next.networking.speed.uploadPeers": "피어로 업로드(최소)",
-  "next.networking.speed.uploadOutcome.UNAVAILABLE": "{{provider}}은(는) 업로드를 받지 않습니다",
+  "next.networking.speed.uploadOutcome.UNAVAILABLE":
+    "{{provider}}은(는) 업로드를 받지 않습니다",
   "next.networking.speed.uploadOutcome.NO_DEMAND": "수요 없음",
   "next.networking.speed.uploadOutcome.FAILED": "실패",
   "next.networking.speed.uploadOutcome.MEASURED": "측정됨",
@@ -2485,60 +2887,107 @@ export const nextKo: LocaleDictionary = {
   "next.networking.speed.status.COMPLETED": "완료",
   "next.networking.speed.status.CANCELLED": "취소됨",
   "next.networking.speed.status.FAILED": "실패",
-  "next.networking.speed.failure.RATE_LIMITED": "제공자가 지금 IP를 제한하고 있습니다. 다른 제공자를 선택하세요.",
-  "next.networking.speed.failure.HTTP_STATUS": "제공자가 HTTP {{status}}(으)로 응답했습니다.",
-  "next.networking.speed.failure.TLS_VERIFICATION": "{{host}}의 TLS 검증에 실패했습니다.",
-  "next.networking.speed.failure.UNRESOLVED": "{{host}}의 이름을 확인할 수 없습니다.",
-  "next.networking.speed.failure.ADDRESS_NOT_ALLOWED": "{{host}}이(가) 허용되지 않는 주소로 확인됩니다.",
-  "next.networking.speed.failure.EGRESS_QUOTA_USED": "송신 인터페이스의 다운로드 할당량이 소진되었습니다.",
+  "next.networking.speed.failure.RATE_LIMITED":
+    "제공자가 지금 IP를 제한하고 있습니다. 다른 제공자를 선택하세요.",
+  "next.networking.speed.failure.HTTP_STATUS":
+    "제공자가 HTTP {{status}}(으)로 응답했습니다.",
+  "next.networking.speed.failure.TLS_VERIFICATION":
+    "{{host}}의 TLS 검증에 실패했습니다.",
+  "next.networking.speed.failure.UNRESOLVED":
+    "{{host}}의 이름을 확인할 수 없습니다.",
+  "next.networking.speed.failure.ADDRESS_NOT_ALLOWED":
+    "{{host}}이(가) 허용되지 않는 주소로 확인됩니다.",
+  "next.networking.speed.failure.EGRESS_QUOTA_USED":
+    "송신 인터페이스의 다운로드 할당량이 소진되었습니다.",
   "next.networking.speed.failure.NO_LEG_UP": "켜진 레그가 없습니다.",
-  "next.networking.speed.failure.LEASE_REFUSED": "{{name}}이(가) 연결을 빌려줄 수 없습니다: {{reason}}.",
-  "next.networking.speed.failure.SERVER_LEFT_POOL": "서버가 연결 풀에서 빠졌습니다.",
+  "next.networking.speed.failure.LEASE_REFUSED":
+    "{{name}}이(가) 연결을 빌려줄 수 없습니다: {{reason}}.",
+  "next.networking.speed.failure.SERVER_LEFT_POOL":
+    "서버가 연결 풀에서 빠졌습니다.",
   "next.networking.speed.failure.STOPPED": "속도 테스트가 중지되었습니다.",
-  "next.networking.speed.failure.STOPPED_UNEXPECTEDLY": "속도 테스트가 예기치 않게 중지되었습니다.",
+  "next.networking.speed.failure.STOPPED_UNEXPECTEDLY":
+    "속도 테스트가 예기치 않게 중지되었습니다.",
   "next.networking.speed.failure.NO_BYTES": "받은 바이트가 없습니다.",
-  "next.proxyFault.NAME_NOT_RESOLVED": "호스트 이름을 확인할 수 없습니다. 철자와 DNS 서버를 확인하세요.",
-  "next.proxyFault.CONNECTION_REFUSED": "연결이 거부되었습니다. 포트와 프록시가 실행 중인지 확인하세요.",
-  "next.proxyFault.HOST_UNREACHABLE": "호스트에 연결할 수 없습니다. 주소와 그곳까지의 네트워크 경로를 확인하세요.",
-  "next.proxyFault.NETWORK_UNREACHABLE": "네트워크에 연결할 수 없습니다. 이 컴퓨터의 네트워크 연결을 확인하세요.",
-  "next.proxyFault.NO_ROUTE_VIA": "{{via}}을(를) 통한 경로가 없습니다. 해당 인터페이스의 네트워크 연결을 확인하세요.",
-  "next.proxyFault.CONNECTION_CLOSED": "프록시가 응답하기 전에 연결이 닫혔습니다. 프록시 유형과 포트를 확인하세요.",
-  "next.proxyFault.TIMED_OUT": "{{seconds}}초 안에 응답이 없습니다. 주소, 포트, 방화벽을 확인하세요.",
-  "next.proxyFault.UDP_TIMED_OUT": "{{seconds}}초 안에 UDP 응답이 없습니다. 주소와 포트, 그리고 방화벽이 UDP를 허용하는지 확인하세요.",
-  "next.proxyFault.EGRESS_UNUSABLE": "송신 인터페이스를 사용할 수 없습니다. 활성 상태이고 주소가 있는지 확인하세요.",
-  "next.proxyFault.NOT_A_PROXY": "서버가 {{protocol}} 프록시 프로토콜로 응답하지 않았습니다. 프록시 유형과 포트를 확인하세요.",
-  "next.proxyFault.AUTH_REQUIRED": "프록시에 사용자 이름과 비밀번호가 필요합니다.",
-  "next.proxyFault.AUTH_UNSUPPORTED": "프록시가 사용자 이름과 비밀번호를 받지 않습니다. 둘 다 지우세요.",
-  "next.proxyFault.CREDENTIALS_REJECTED": "프록시가 사용자 이름 또는 비밀번호를 거부했습니다.",
-  "next.proxyFault.CREDENTIALS_INVALID": "SOCKS5에는 1~255바이트의 사용자 이름과 최대 255바이트의 비밀번호가 필요합니다.",
-  "next.proxyFault.CLOSED_DURING_SIGN_IN": "로그인 중에 프록시가 연결을 닫았습니다. 사용자 이름과 비밀번호를 확인하세요.",
-  "next.proxyFault.CONNECT_REFUSED": "프록시가 HTTP {{status}}(으)로 연결을 거부했습니다.",
-  "next.proxyFault.DESTINATION_REFUSED": "{{target}}이(가) 연결을 거부했습니다.",
-  "next.proxyFault.DESTINATION_UNREACHABLE": "{{target}}에 연결할 수 없습니다({{reply}}).",
-  "next.proxyFault.DESTINATION_TIMED_OUT": "{{target}}이(가) 제시간에 응답하지 않았습니다.",
-  "next.proxyFault.DESTINATION_FORBIDDEN": "프록시 규칙상 {{target}}(으)로 연결할 수 없습니다.",
+  "next.proxyFault.NAME_NOT_RESOLVED":
+    "호스트 이름을 확인할 수 없습니다. 철자와 DNS 서버를 확인하세요.",
+  "next.proxyFault.CONNECTION_REFUSED":
+    "연결이 거부되었습니다. 포트와 프록시가 실행 중인지 확인하세요.",
+  "next.proxyFault.HOST_UNREACHABLE":
+    "호스트에 연결할 수 없습니다. 주소와 그곳까지의 네트워크 경로를 확인하세요.",
+  "next.proxyFault.NETWORK_UNREACHABLE":
+    "네트워크에 연결할 수 없습니다. 이 컴퓨터의 네트워크 연결을 확인하세요.",
+  "next.proxyFault.NO_ROUTE_VIA":
+    "{{via}}을(를) 통한 경로가 없습니다. 해당 인터페이스의 네트워크 연결을 확인하세요.",
+  "next.proxyFault.CONNECTION_CLOSED":
+    "프록시가 응답하기 전에 연결이 닫혔습니다. 프록시 유형과 포트를 확인하세요.",
+  "next.proxyFault.TIMED_OUT":
+    "{{seconds}}초 안에 응답이 없습니다. 주소, 포트, 방화벽을 확인하세요.",
+  "next.proxyFault.UDP_TIMED_OUT":
+    "{{seconds}}초 안에 UDP 응답이 없습니다. 주소와 포트, 그리고 방화벽이 UDP를 허용하는지 확인하세요.",
+  "next.proxyFault.EGRESS_UNUSABLE":
+    "송신 인터페이스를 사용할 수 없습니다. 활성 상태이고 주소가 있는지 확인하세요.",
+  "next.proxyFault.NOT_A_PROXY":
+    "서버가 {{protocol}} 프록시 프로토콜로 응답하지 않았습니다. 프록시 유형과 포트를 확인하세요.",
+  "next.proxyFault.AUTH_REQUIRED":
+    "프록시에 사용자 이름과 비밀번호가 필요합니다.",
+  "next.proxyFault.AUTH_UNSUPPORTED":
+    "프록시가 사용자 이름과 비밀번호를 받지 않습니다. 둘 다 지우세요.",
+  "next.proxyFault.CREDENTIALS_REJECTED":
+    "프록시가 사용자 이름 또는 비밀번호를 거부했습니다.",
+  "next.proxyFault.CREDENTIALS_INVALID":
+    "SOCKS5에는 1~255바이트의 사용자 이름과 최대 255바이트의 비밀번호가 필요합니다.",
+  "next.proxyFault.CLOSED_DURING_SIGN_IN":
+    "로그인 중에 프록시가 연결을 닫았습니다. 사용자 이름과 비밀번호를 확인하세요.",
+  "next.proxyFault.CONNECT_REFUSED":
+    "프록시가 HTTP {{status}}(으)로 연결을 거부했습니다.",
+  "next.proxyFault.DESTINATION_REFUSED":
+    "{{target}}이(가) 연결을 거부했습니다.",
+  "next.proxyFault.DESTINATION_UNREACHABLE":
+    "{{target}}에 연결할 수 없습니다({{reply}}).",
+  "next.proxyFault.DESTINATION_TIMED_OUT":
+    "{{target}}이(가) 제시간에 응답하지 않았습니다.",
+  "next.proxyFault.DESTINATION_FORBIDDEN":
+    "프록시 규칙상 {{target}}(으)로 연결할 수 없습니다.",
   "next.proxyFault.SSH_KEY_MISSING": "SSH에는 Ed25519 개인 키가 필요합니다.",
-  "next.proxyFault.SSH_KEY_PASSPHRASE": "개인 키가 암호로 보호되어 있습니다. 키 암호를 입력하세요.",
-  "next.proxyFault.SSH_KEY_NOT_ED25519": "개인 키가 Ed25519가 아닙니다. ssh-keygen -t ed25519로 새로 만드세요.",
-  "next.proxyFault.SSH_KEY_UNREADABLE": "개인 키를 읽을 수 없습니다. BEGIN 줄과 END 줄을 포함해 키 전체를 붙여 넣으세요.",
-  "next.proxyFault.SSH_HOST_KEY_CHANGED": "서버의 호스트 키가 바뀌었습니다. 서버를 확인한 다음 이전 호스트 키를 지우세요.",
-  "next.proxyFault.SSH_KEY_REJECTED": "서버가 {{username}}의 개인 키를 받아들이지 않았습니다. authorized_keys를 확인하세요.",
-  "next.proxyFault.SSH_HANDSHAKE_FAILED": "SSH 핸드셰이크에 실패했습니다: {{detail}}",
-  "next.proxyFault.SSH_FORWARDING_REFUSED": "SSH 서버가 {{target}}(으)로의 전달을 거부했습니다. 이 사용자의 TCP 전달을 허용하세요.",
-  "next.proxyFault.WIREGUARD_KEY_INVALID": "WireGuard 키가 올바르지 않습니다. 각 키를 wg가 출력한 그대로 붙여 넣으세요.",
-  "next.proxyFault.WIREGUARD_PEER_IS_SELF": "피어 공개 키가 이 터널 자신의 키입니다. 서버의 공개 키를 사용하세요.",
-  "next.proxyFault.WIREGUARD_NO_DNS": "터널에 DNS 서버가 없습니다. 구성의 DNS 줄을 추가하거나 IP 주소를 사용하세요.",
-  "next.proxyFault.WIREGUARD_NO_HANDSHAKE": "{{seconds}}초 안에 핸드셰이크가 없습니다. 엔드포인트와, 서버의 피어 목록에 공개 키 {{publicKey}}이(가) 있는지 확인하세요.",
-  "next.proxyFault.WIREGUARD_FAILED": "WireGuard 터널을 시작할 수 없습니다: {{detail}}",
-  "next.proxyFault.HTTP3_TLS": "프록시와의 TLS에 실패했습니다. 호스트 이름과 프록시 인증서를 확인하세요.",
-  "next.proxyFault.HTTP3_HANDSHAKE_FAILED": "QUIC 핸드셰이크에 실패했습니다. 포트와 프록시가 HTTP/3을 제공하는지 확인하세요.",
-  "next.proxyFault.HTTP3_FAILED": "프록시로의 HTTP/3에 실패했습니다: {{detail}}",
-  "next.proxyFault.PROXY_UNAVAILABLE": "프록시가 비활성화되었거나 설정할 수 없습니다.",
+  "next.proxyFault.SSH_KEY_PASSPHRASE":
+    "개인 키가 암호로 보호되어 있습니다. 키 암호를 입력하세요.",
+  "next.proxyFault.SSH_KEY_NOT_ED25519":
+    "개인 키가 Ed25519가 아닙니다. ssh-keygen -t ed25519로 새로 만드세요.",
+  "next.proxyFault.SSH_KEY_UNREADABLE":
+    "개인 키를 읽을 수 없습니다. BEGIN 줄과 END 줄을 포함해 키 전체를 붙여 넣으세요.",
+  "next.proxyFault.SSH_HOST_KEY_CHANGED":
+    "서버의 호스트 키가 바뀌었습니다. 서버를 확인한 다음 이전 호스트 키를 지우세요.",
+  "next.proxyFault.SSH_KEY_REJECTED":
+    "서버가 {{username}}의 개인 키를 받아들이지 않았습니다. authorized_keys를 확인하세요.",
+  "next.proxyFault.SSH_HANDSHAKE_FAILED":
+    "SSH 핸드셰이크에 실패했습니다: {{detail}}",
+  "next.proxyFault.SSH_FORWARDING_REFUSED":
+    "SSH 서버가 {{target}}(으)로의 전달을 거부했습니다. 이 사용자의 TCP 전달을 허용하세요.",
+  "next.proxyFault.WIREGUARD_KEY_INVALID":
+    "WireGuard 키가 올바르지 않습니다. 각 키를 wg가 출력한 그대로 붙여 넣으세요.",
+  "next.proxyFault.WIREGUARD_PEER_IS_SELF":
+    "피어 공개 키가 이 터널 자신의 키입니다. 서버의 공개 키를 사용하세요.",
+  "next.proxyFault.WIREGUARD_NO_DNS":
+    "터널에 DNS 서버가 없습니다. 구성의 DNS 줄을 추가하거나 IP 주소를 사용하세요.",
+  "next.proxyFault.WIREGUARD_NO_HANDSHAKE":
+    "{{seconds}}초 안에 핸드셰이크가 없습니다. 엔드포인트와, 서버의 피어 목록에 공개 키 {{publicKey}}이(가) 있는지 확인하세요.",
+  "next.proxyFault.WIREGUARD_FAILED":
+    "WireGuard 터널을 시작할 수 없습니다: {{detail}}",
+  "next.proxyFault.HTTP3_TLS":
+    "프록시와의 TLS에 실패했습니다. 호스트 이름과 프록시 인증서를 확인하세요.",
+  "next.proxyFault.HTTP3_HANDSHAKE_FAILED":
+    "QUIC 핸드셰이크에 실패했습니다. 포트와 프록시가 HTTP/3을 제공하는지 확인하세요.",
+  "next.proxyFault.HTTP3_FAILED":
+    "프록시로의 HTTP/3에 실패했습니다: {{detail}}",
+  "next.proxyFault.PROXY_UNAVAILABLE":
+    "프록시가 비활성화되었거나 설정할 수 없습니다.",
   "next.proxyFault.STREAM_FAILED": "프록시를 통한 연결이 열린 뒤 실패했습니다.",
-  "next.proxyFault.TEST_NEEDS_DNS": "HTTP/3 프록시를 테스트하려면 호스트와 포트, 또는 이름 확인에 쓰는 DNS 서버가 필요합니다.",
+  "next.proxyFault.TEST_NEEDS_DNS":
+    "HTTP/3 프록시를 테스트하려면 호스트와 포트, 또는 이름 확인에 쓰는 DNS 서버가 필요합니다.",
   "next.proxyTest.CONNECTED": "연결되었습니다.",
   "next.proxyTest.FORWARDED": "연결되었고 프록시를 통해 전달되었습니다.",
-  "next.proxyTest.REACHABLE": "연결 가능합니다. 전달을 확인하려면 호스트와 포트를 지정하세요.",
+  "next.proxyTest.REACHABLE":
+    "연결 가능합니다. 전달을 확인하려면 호스트와 포트를 지정하세요.",
   "next.lookupError.NO_SUCH_NAME": "존재하지 않는 이름",
   "next.lookupError.NO_ADDRESS": "주소 없음",
   "next.lookupError.TIMED_OUT": "시간 초과",
@@ -2602,7 +3051,8 @@ export const nextKo: LocaleDictionary = {
   "next.overview.jobs.other": "{{count}}개 작업 · {{size}} 남음",
   "next.overview.queueEmpty": "대기열 비어 있음",
   "next.overview.finishedToday": "오늘 완료",
-  "next.overview.finished": "완료 {{complete}} · 부분 {{partial}} · 실패 {{failed}}",
+  "next.overview.finished":
+    "완료 {{complete}} · 부분 {{partial}} · 실패 {{failed}}",
   "next.overview.dataToday": "오늘 데이터",
   "next.overview.dataPeriods": "주 {{week}} · 월 {{month}} · 전체 {{all}}",
   "next.overview.last30": "최근 30일",
@@ -2650,7 +3100,8 @@ export const nextKo: LocaleDictionary = {
   "next.integrity.cause.other": "기타",
   "next.integrity.stages": "단계별 시간",
   "next.integrity.noStages": "단계 시간 없음",
-  "next.integrity.noStagesBody": "작업이 실행되면 각 단계의 시간이 여기에 표시됩니다.",
+  "next.integrity.noStagesBody":
+    "작업이 실행되면 각 단계의 시간이 여기에 표시됩니다.",
   "next.integrity.stage": "단계",
   "next.integrity.runs": "실행 횟수",
   "next.integrity.average": "평균",
@@ -2669,13 +3120,15 @@ export const nextKo: LocaleDictionary = {
   "next.torrentDash.peersNote": "시드: {{seeds}} · 토렌트: {{torrents}}",
   "next.torrentDash.perDay": "일별",
   "next.torrentDash.trackers": "트래커",
-  "next.torrentDash.trackersNote": "토렌트는 트래커 규칙에, 규칙이 없으면 나열된 각 트래커에 집계됩니다",
+  "next.torrentDash.trackersNote":
+    "토렌트는 트래커 규칙에, 규칙이 없으면 나열된 각 트래커에 집계됩니다",
   "next.torrentDash.tracker": "트래커",
   "next.torrentDash.downloaded": "다운로드",
   "next.torrentDash.uploaded": "업로드",
   "next.torrentDash.noTracker": "트래커 없음",
   "next.torrentDash.none": "토렌트 없음",
-  "next.torrentDash.noneBody": "토렌트를 추가하면 비율, 시드 시간, 트래커가 여기에 표시됩니다.",
+  "next.torrentDash.noneBody":
+    "토렌트를 추가하면 비율, 시드 시간, 트래커가 여기에 표시됩니다.",
   "next.completed.since": "{{time}} 이후",
   "next.completed.showAll": "모두 보기",
 };

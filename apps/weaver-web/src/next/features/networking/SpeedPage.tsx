@@ -28,8 +28,16 @@ import { CheckBox, SecondaryButton, Select } from "../../components/controls";
 import { Cell } from "../../components/rows";
 import { Eyebrow } from "../../components/chrome";
 import { splitBytes, splitSpeed } from "../../data/format";
-import { SettingsBlocks, type SettingsBlock } from "../../pages/settings/framework";
-import { consumerName, defaultRoute, type Consumer, type NetworkingData } from "./data";
+import {
+  SettingsBlocks,
+  type SettingsBlock,
+} from "../../pages/settings/framework";
+import {
+  consumerName,
+  defaultRoute,
+  type Consumer,
+  type NetworkingData,
+} from "./data";
 import type { FlowEndpoint } from "./NetworkFlow";
 import { ControlLabel, StatusMark, stateLabel } from "./presentation";
 import { RoutePlanView, type LiveLeg } from "./RouteView";
@@ -71,48 +79,103 @@ const RUN_STATE: Record<SpeedTestRun["status"], string> = {
 /** The egresses, proxies and pools a run took, under the names they had when it ran. */
 function namedAsTested(run: SpeedTestRun, data: NetworkingData) {
   const names = (kind: string) =>
-    new Map(run.tested.names.filter((entry) => entry.kind === kind).map((entry) => [entry.id, entry.name]));
+    new Map(
+      run.tested.names
+        .filter((entry) => entry.kind === kind)
+        .map((entry) => [entry.id, entry.name]),
+    );
   const egressNames = names("egress");
   const proxyNames = names("proxy");
   const poolNames = names("pool");
-  const egresses: Egress[] = data.egressInterfaces.map((egress) => ({ ...egress, name: egressNames.get(egress.id) ?? egress.name }));
+  const egresses: Egress[] = data.egressInterfaces.map((egress) => ({
+    ...egress,
+    name: egressNames.get(egress.id) ?? egress.name,
+  }));
   for (const [id, name] of egressNames) {
     if (!egresses.some((egress) => egress.id === id)) {
-      egresses.push({ id, name, bindingKind: "SYSTEM", interfaceName: null, sourceAddress: null, enabled: true, downloadBps: null, uploadBps: null, health: "UNKNOWN", reason: null });
+      egresses.push({
+        id,
+        name,
+        bindingKind: "SYSTEM",
+        interfaceName: null,
+        sourceAddress: null,
+        enabled: true,
+        downloadBps: null,
+        uploadBps: null,
+        health: "UNKNOWN",
+        reason: null,
+      });
     }
   }
-  const profiles: ProxyProfile[] = data.proxyProfiles.map((profile) => ({ ...profile, name: proxyNames.get(profile.id) ?? profile.name }));
-  const pools: ProxyPool[] = data.proxyPools.map((pool) => ({ ...pool, name: poolNames.get(pool.id) ?? pool.name }));
-  return { egresses, profiles, pools, proxyName: (id: number) => proxyNames.get(id) ?? profiles.find((profile) => profile.id === id)?.name };
+  const profiles: ProxyProfile[] = data.proxyProfiles.map((profile) => ({
+    ...profile,
+    name: proxyNames.get(profile.id) ?? profile.name,
+  }));
+  const pools: ProxyPool[] = data.proxyPools.map((pool) => ({
+    ...pool,
+    name: poolNames.get(pool.id) ?? pool.name,
+  }));
+  return {
+    egresses,
+    profiles,
+    pools,
+    proxyName: (id: number) =>
+      proxyNames.get(id) ?? profiles.find((profile) => profile.id === id)?.name,
+  };
 }
 
 /** What a run had down, shortly: "leg 2", "leg 1 rung 2", an egress's or a proxy's name. */
-function downSummary(t: Translate, overrides: PathOverride, name: (kind: string, id: number) => string): ReactNode {
+function downSummary(
+  t: Translate,
+  overrides: PathOverride,
+  name: (kind: string, id: number) => string,
+): ReactNode {
   const parts = [
-    ...overrides.downEgresses.map((id) => ({ key: `egress-${id}`, text: name("egress", id) })),
-    ...overrides.downLegs.map((leg) => ({ key: `leg-${leg}`, text: t("next.networking.speed.downLeg", { position: leg + 1 }) })),
+    ...overrides.downEgresses.map((id) => ({
+      key: `egress-${id}`,
+      text: name("egress", id),
+    })),
+    ...overrides.downLegs.map((leg) => ({
+      key: `leg-${leg}`,
+      text: t("next.networking.speed.downLeg", { position: leg + 1 }),
+    })),
     ...overrides.downRungs.map((rung) => ({
       key: `rung-${rung.leg}-${rung.rung}`,
-      text: t("next.networking.speed.downRung", { leg: rung.leg + 1, rung: rung.rung + 1 }),
+      text: t("next.networking.speed.downRung", {
+        leg: rung.leg + 1,
+        rung: rung.rung + 1,
+      }),
     })),
-    ...overrides.downProxies.map((id) => ({ key: `proxy-${id}`, text: name("proxy", id) })),
+    ...overrides.downProxies.map((id) => ({
+      key: `proxy-${id}`,
+      text: name("proxy", id),
+    })),
   ];
   return parts.length
     ? parts.map((part, index) => (
         <Fragment key={part.key}>
           {index > 0 ? ", " : null}
-          <span data-testid={networkIds.speedRunDown(part.key)}>{part.text}</span>
+          <span data-testid={networkIds.speedRunDown(part.key)}>
+            {part.text}
+          </span>
         </Fragment>
       ))
     : "—";
 }
 
 /** The NZB a Usenet run measured with, as the operator would know it. */
-function nzbLabel(t: Translate, usenet: NonNullable<SpeedTestRun["request"]["usenet"]>): string {
+function nzbLabel(
+  t: Translate,
+  usenet: NonNullable<SpeedTestRun["request"]["usenet"]>,
+): string {
   if (usenet.sabSize) {
     return sabLabel(t, usenet.sabSize);
   }
-  return usenet.nzbFilename ?? urlHost(usenet.nzbUrl ?? "") ?? t("next.networking.speed.nzbUrl");
+  return (
+    usenet.nzbFilename ??
+    urlHost(usenet.nzbUrl ?? "") ??
+    t("next.networking.speed.nzbUrl")
+  );
 }
 
 /** What a run measured with, as a key: a provider or a custom URL, the NZB's source, or a torrent. */
@@ -124,18 +187,30 @@ function kindKey(run: SpeedTestRun): string {
   if (bandwidth) {
     return bandwidth.providerId ? "bandwidth-provider" : "bandwidth-custom";
   }
-  return usenet?.sabSize ? "usenet-sab" : usenet?.nzbFilename ? "usenet-file" : "usenet-url";
+  return usenet?.sabSize
+    ? "usenet-sab"
+    : usenet?.nzbFilename
+      ? "usenet-file"
+      : "usenet-url";
 }
 
 /** What a run measured with, as it was asked: the provider, the NZB, or how long it pulled a torrent. */
-function kindSummary(t: Translate, run: SpeedTestRun, providers: BandwidthProvider[]): string {
+function kindSummary(
+  t: Translate,
+  run: SpeedTestRun,
+  providers: BandwidthProvider[],
+): string {
   const { bandwidth, usenet, torrent } = run.request;
   if (torrent) {
-    return t("next.networking.speed.kindTorrent", { seconds: torrent.maxDurationSeconds });
+    return t("next.networking.speed.kindTorrent", {
+      seconds: torrent.maxDurationSeconds,
+    });
   }
   if (bandwidth) {
     const id = bandwidth.providerId;
-    return id ? (providers.find((provider) => provider.id === id)?.name ?? id) : t("next.networking.speed.customUrl");
+    return id
+      ? (providers.find((provider) => provider.id === id)?.name ?? id)
+      : t("next.networking.speed.customUrl");
   }
   return t("next.networking.speed.kindUsenet", {
     size: usenet?.sabSize
@@ -145,7 +220,11 @@ function kindSummary(t: Translate, run: SpeedTestRun, providers: BandwidthProvid
 }
 
 /** What a run measured against, as the box its route's flow ends at: its name, then where it is. */
-function runEndpoint(t: Translate, run: SpeedTestRun, providers: BandwidthProvider[]): { title: string; detail: string } {
+function runEndpoint(
+  t: Translate,
+  run: SpeedTestRun,
+  providers: BandwidthProvider[],
+): { title: string; detail: string } {
   const { bandwidth, usenet, torrent } = run.request;
   if (usenet) {
     return {
@@ -156,13 +235,19 @@ function runEndpoint(t: Translate, run: SpeedTestRun, providers: BandwidthProvid
   if (torrent) {
     return {
       title: consumerName(t, run.consumer, run.consumerName),
-      detail: t("next.networking.speed.kindTorrent", { seconds: torrent.maxDurationSeconds }),
+      detail: t("next.networking.speed.kindTorrent", {
+        seconds: torrent.maxDurationSeconds,
+      }),
     };
   }
   const id = bandwidth?.providerId;
   return {
-    title: id ? (providers.find((provider) => provider.id === id)?.name ?? id) : t("next.networking.speed.customUrl"),
-    detail: urlHost(run.result?.bandwidth?.url ?? bandwidth?.customUrl ?? "") ?? t("next.networking.speed.bandwidth"),
+    title: id
+      ? (providers.find((provider) => provider.id === id)?.name ?? id)
+      : t("next.networking.speed.customUrl"),
+    detail:
+      urlHost(run.result?.bandwidth?.url ?? bandwidth?.customUrl ?? "") ??
+      t("next.networking.speed.bandwidth"),
   };
 }
 
@@ -171,13 +256,21 @@ function liveLegs(run: SpeedTestRun): LiveLeg[] {
   const now = lastSecond(run);
   const connections = run.result?.connections ?? [];
   return run.tested.legs.map((leg) => {
-    const held = connections.filter((connection) => connection.leg === leg.position && connection.error === null);
+    const held = connections.filter(
+      (connection) =>
+        connection.leg === leg.position && connection.error === null,
+    );
     const rungs = leg.path.kind === "LADDER" ? leg.path.rungs.length : 0;
     const rung = held.at(-1)?.path.rung;
     return {
       connections: held.length,
       // A rung past the ladder's own is its direct fallback.
-      rung: rung === undefined ? undefined : rung === null || rung >= rungs ? null : rung,
+      rung:
+        rung === undefined
+          ? undefined
+          : rung === null || rung >= rungs
+            ? null
+            : rung,
       bytesPerSecond: now.legs.get(leg.position) ?? 0,
     };
   });
@@ -191,7 +284,10 @@ function livePools(run: SpeedTestRun): PoolFlow[] {
     if (connection.error !== null || poolId == null || memberId == null) {
       continue;
     }
-    let pool = pools.find((candidate) => candidate.poolId === poolId && candidate.egressId === egressId);
+    let pool = pools.find(
+      (candidate) =>
+        candidate.poolId === poolId && candidate.egressId === egressId,
+    );
     if (!pool) {
       pool = { poolId, egressId, pinnedMember: null, members: [] };
       pools.push(pool);
@@ -232,7 +328,10 @@ function requestInput(run: SpeedTestRun, owner: Consumer): SpeedTestInput {
     route: routeInput(testedRoute(run)),
     overrides: {
       downLegs: run.tested.overrides.downLegs,
-      downRungs: run.tested.overrides.downRungs.map(({ leg, rung }) => ({ leg, rung })),
+      downRungs: run.tested.overrides.downRungs.map(({ leg, rung }) => ({
+        leg,
+        rung,
+      })),
       downProxies: run.tested.overrides.downProxies,
       downEgresses: run.tested.overrides.downEgresses,
     },
@@ -257,7 +356,9 @@ function requestInput(run: SpeedTestRun, owner: Consumer): SpeedTestInput {
           },
         }
       : {}),
-    ...(torrent ? { torrent: { maxDurationSeconds: torrent.maxDurationSeconds } } : {}),
+    ...(torrent
+      ? { torrent: { maxDurationSeconds: torrent.maxDurationSeconds } }
+      : {}),
   };
 }
 
@@ -281,9 +382,18 @@ function MiniTable({
   rows: ReactNode[][];
 }) {
   return (
-    <div role="table" aria-label={label} data-testid={networkIds.speedTable(table)} className="min-w-0 overflow-x-auto">
+    <div
+      role="table"
+      aria-label={label}
+      data-testid={networkIds.speedTable(table)}
+      className="min-w-0 overflow-x-auto"
+    >
       <div className="min-w-[560px]">
-        <div role="row" className="grid gap-4 border-b border-wv-hairline py-2" style={{ gridTemplateColumns: columns }}>
+        <div
+          role="row"
+          className="grid gap-4 border-b border-wv-hairline py-2"
+          style={{ gridTemplateColumns: columns }}
+        >
           {headers.map((header) => (
             <Eyebrow key={header} tone="rail" className="truncate">
               <span role="columnheader">{header}</span>
@@ -302,7 +412,11 @@ function MiniTable({
               <div
                 key={column}
                 role="cell"
-                data-testid={cellIds?.[column] === undefined ? undefined : networkIds.speedTableCell(table, cellIds[column])}
+                data-testid={
+                  cellIds?.[column] === undefined
+                    ? undefined
+                    : networkIds.speedTableCell(table, cellIds[column])
+                }
                 className="min-w-0 truncate font-wv-mono text-[12px] text-wv-secondary"
               >
                 {cell}
@@ -343,15 +457,26 @@ function RunDetail({
   const named = namedAsTested(run, data);
   const route = testedRoute(run);
   const result = run.result;
-  const egressName = (id: number) => named.egresses.find((egress) => egress.id === id)?.name ?? String(id);
-  const legs = [...new Set((result?.samples ?? []).map((sample) => sample.leg))].sort((a, b) => a - b);
-  const seconds = [...new Set((result?.samples ?? []).map((sample) => sample.atMs))].sort((a, b) => a - b);
+  const egressName = (id: number) =>
+    named.egresses.find((egress) => egress.id === id)?.name ?? String(id);
+  const legs = [
+    ...new Set((result?.samples ?? []).map((sample) => sample.leg)),
+  ].sort((a, b) => a - b);
+  const seconds = [
+    ...new Set((result?.samples ?? []).map((sample) => sample.atMs)),
+  ].sort((a, b) => a - b);
   const series = legs.map((leg, index) => ({
     key: `leg-${leg}`,
     label: t("next.networking.speed.legRate", { position: leg + 1 }),
     color: ["var(--wv-accent)", "#6aa7e8", "#b48ef0", "#d3a43e"][index % 4]!,
-    values: seconds.map((at) => (result?.samples ?? []).filter((sample) => sample.leg === leg && sample.atMs === at).reduce((sum, sample) => sum + sample.bytes, 0)),
-    value: rateLabel(result?.legs.find((entry) => entry.position === leg)?.averageBps ?? 0),
+    values: seconds.map((at) =>
+      (result?.samples ?? [])
+        .filter((sample) => sample.leg === leg && sample.atMs === at)
+        .reduce((sum, sample) => sum + sample.bytes, 0),
+    ),
+    value: rateLabel(
+      result?.legs.find((entry) => entry.position === leg)?.averageBps ?? 0,
+    ),
   }));
   const usenet = result?.usenet;
   const rungCount = (position: number) => {
@@ -395,11 +520,17 @@ function RunDetail({
           t("next.networking.speed.source"),
         ]}
         rows={run.tested.legs.map((leg) => {
-          const measured = result.legs.find((entry) => entry.position === leg.position);
+          const measured = result.legs.find(
+            (entry) => entry.position === leg.position,
+          );
           return [
             t("next.networking.speed.downLeg", { position: leg.position + 1 }),
-            leg.down ? t("next.networking.speed.downSwitch") : bytesLabel(measured?.bytes ?? 0),
-            leg.down ? (leg.downReason ?? "—") : rateLabel(measured?.averageBps ?? 0),
+            leg.down
+              ? t("next.networking.speed.downSwitch")
+              : bytesLabel(measured?.bytes ?? 0),
+            leg.down
+              ? (leg.downReason ?? "—")
+              : rateLabel(measured?.averageBps ?? 0),
             leg.down ? "—" : rateLabel(measured?.peakBps ?? 0),
             leg.down ? "0" : String(measured?.connections ?? 0),
             measured?.sourceAddresses.join(", ") || "—",
@@ -429,12 +560,23 @@ function RunDetail({
             // Through a pool, the member it dialled; otherwise each proxy in turn.
             ...(connection.path.poolId !== null
               ? [
-                  named.pools.find((pool) => pool.id === connection.path.poolId)?.name ?? String(connection.path.poolId),
-                  ...(connection.path.memberId !== null ? [named.proxyName(connection.path.memberId) ?? String(connection.path.memberId)] : []),
+                  named.pools.find((pool) => pool.id === connection.path.poolId)
+                    ?.name ?? String(connection.path.poolId),
+                  ...(connection.path.memberId !== null
+                    ? [
+                        named.proxyName(connection.path.memberId) ??
+                          String(connection.path.memberId),
+                      ]
+                    : []),
                 ]
-              : connection.path.proxyIds.map((id) => named.proxyName(id) ?? String(id))),
+              : connection.path.proxyIds.map(
+                  (id) => named.proxyName(id) ?? String(id),
+                )),
             // A rung past the ladder's own is its direct fallback.
-            ...(connection.path.rung !== null && connection.path.rung >= rungCount(connection.leg) ? [t("next.networking.speed.direct")] : []),
+            ...(connection.path.rung !== null &&
+            connection.path.rung >= rungCount(connection.leg)
+              ? [t("next.networking.speed.direct")]
+              : []),
           ].join(" > "),
           connection.sourceAddress ?? "—",
           `${connection.connectMs} ms`,
@@ -447,7 +589,15 @@ function RunDetail({
       <MiniTable
         key="articles"
         table="articles"
-        cellIds={["requested", "delivered", "missing", "failed", "declared", "transport", "pipelining"]}
+        cellIds={[
+          "requested",
+          "delivered",
+          "missing",
+          "failed",
+          "declared",
+          "transport",
+          "pipelining",
+        ]}
         label={t("next.networking.speed.articles")}
         columns="repeat(7, minmax(0, 1fr))"
         headers={[
@@ -466,7 +616,9 @@ function RunDetail({
             String(usenet.missing),
             String(usenet.failed),
             bytesLabel(usenet.declaredBytes),
-            usenet.tls ? `TLS${usenet.tlsCipherSuite ? ` · ${usenet.tlsCipherSuite}` : ""}` : t("next.networking.speed.plaintext"),
+            usenet.tls
+              ? `TLS${usenet.tlsCipherSuite ? ` · ${usenet.tlsCipherSuite}` : ""}`
+              : t("next.networking.speed.plaintext"),
             usenet.pipelining ? t("next.common.on") : t("next.common.off"),
           ],
         ]}
@@ -474,7 +626,9 @@ function RunDetail({
     ) : null,
     result?.bandwidth ? (
       <p key="url" className="truncate font-wv-mono text-[12px] text-wv-muted">
-        {result.bandwidth.server ? `${result.bandwidth.url} · ${result.bandwidth.server}` : result.bandwidth.url}
+        {result.bandwidth.server
+          ? `${result.bandwidth.url} · ${result.bandwidth.server}`
+          : result.bandwidth.url}
       </p>
     ) : null,
     seconds.length ? (
@@ -482,12 +636,21 @@ function RunDetail({
         key="chart"
         title={t("next.networking.speed.chart")}
         series={series}
-        xLabels={["0 s", `${Math.round(seconds.length / 2)} s`, `${seconds.length} s`]}
+        xLabels={[
+          "0 s",
+          `${Math.round(seconds.length / 2)} s`,
+          `${seconds.length} s`,
+        ]}
         formatValue={rateLabel}
       />
     ) : null,
     <div key="again" className="flex">
-      <SecondaryButton icon="refresh" size="compact" disabled={busy || run.status === "RUNNING"} onClick={() => onRunAgain(run)}>
+      <SecondaryButton
+        icon="refresh"
+        size="compact"
+        disabled={busy || run.status === "RUNNING"}
+        onClick={() => onRunAgain(run)}
+      >
         {t("next.networking.speed.runAgain")}
       </SecondaryButton>
     </div>,
@@ -508,23 +671,43 @@ function RunDetail({
  * down, run a bandwidth or a Usenet test through exactly what is left, and read
  * it against the runs before it.
  */
-export function SpeedPage({ data, consumers }: { data: NetworkingData; consumers: Consumer[] }) {
+export function SpeedPage({
+  data,
+  consumers,
+}: {
+  data: NetworkingData;
+  consumers: Consumer[];
+}) {
   const t = useTranslate();
   const location = useLocation();
   const requested = new URLSearchParams(location.search).get("consumer");
-  const [selected, setSelected] = useState<string>(requested ?? consumers[0]?.key ?? "");
-  const consumer = consumers.find((candidate) => candidate.key === selected) ?? consumers[0];
+  const [selected, setSelected] = useState<string>(
+    requested ?? consumers[0]?.key ?? "",
+  );
+  const consumer =
+    consumers.find((candidate) => candidate.key === selected) ?? consumers[0];
   const [overrides, setOverrides] = useState<PathOverride>(noOverrides());
-  const [form, setForm] = useState<TestForm>(() => defaultForm(consumer ?? { kind: "SERVER", cap: 1 }));
+  const [form, setForm] = useState<TestForm>(() =>
+    defaultForm(consumer ?? { kind: "SERVER", cap: 1 }),
+  );
   const [open, setOpen] = useState<Set<number>>(new Set());
   // Compare mode, and the run picked into each side of it: left first, then right.
   const [comparing, setComparing] = useState(false);
-  const [picked, setPicked] = useState<[number | null, number | null]>([null, null]);
+  const [picked, setPicked] = useState<[number | null, number | null]>([
+    null,
+    null,
+  ]);
   const { providers, runs, refresh } = useSpeedTestData();
   const speedTest = useSpeedTestRun(refresh);
   const { run: active, setRun } = speedTest;
-  const provider = providers.find((candidate) => candidate.id === form.providerId);
-  const servers = useProviderServers(form, consumer ?? { kind: "SERVER", id: 0 }, provider);
+  const provider = providers.find(
+    (candidate) => candidate.id === form.providerId,
+  );
+  const servers = useProviderServers(
+    form,
+    consumer ?? { kind: "SERVER", id: 0 },
+    provider,
+  );
 
   // A run already going when the page opens is followed here as if started here.
   const running = runs.find((run) => run.status === "RUNNING");
@@ -537,7 +720,17 @@ export function SpeedPage({ data, consumers }: { data: NetworkingData; consumers
   if (!consumer) {
     return (
       <SettingsBlocks
-        blocks={[{ kind: "table", id: "speed-runs", title: t("next.networking.speed.runs"), columns: "1fr", headers: [], rows: [], empty: t("next.networking.routes.empty") }]}
+        blocks={[
+          {
+            kind: "table",
+            id: "speed-runs",
+            title: t("next.networking.speed.runs"),
+            columns: "1fr",
+            headers: [],
+            rows: [],
+            empty: t("next.networking.routes.empty"),
+          },
+        ]}
       />
     );
   }
@@ -557,14 +750,18 @@ export function SpeedPage({ data, consumers }: { data: NetworkingData; consumers
         (current.kind === "USENET" && next.kind !== "SERVER") ||
         (current.kind === "TORRENT" && !isTorrentConsumer(next.kind))
           ? { ...current, kind: "BANDWIDTH" }
-          : { ...current, connections: Math.min(current.connections, Math.max(1, next.cap)) },
+          : {
+              ...current,
+              connections: Math.min(current.connections, Math.max(1, next.cap)),
+            },
       );
     }
   };
   const route = consumer.route ?? defaultRoute();
   const down = new Set(
-    testedPlan(route, overrides, data.proxyPools)
-      .legDown.flatMap((isDown, position) => (isDown ? [position] : [])),
+    testedPlan(route, overrides, data.proxyPools).legDown.flatMap(
+      (isDown, position) => (isDown ? [position] : []),
+    ),
   );
   // A bandwidth test opens one connection on each leg still up and adds more while the rate keeps rising;
   // a torrent test joins the swarm on the first leg still up.
@@ -576,7 +773,10 @@ export function SpeedPage({ data, consumers }: { data: NetworkingData; consumers
         ? route.legs.map((_, position) => (position === firstUp ? 1 : 0))
         : route.legs.map((_, position) => (down.has(position) ? 0 : 1));
   // While this route's test runs, the flow is the route it took, moving as it measures.
-  const measuring = active?.status === "RUNNING" && active.consumer === consumer.key ? active : null;
+  const measuring =
+    active?.status === "RUNNING" && active.consumer === consumer.key
+      ? active
+      : null;
   const endpoint: FlowEndpoint = measuring
     ? {
         ...runEndpoint(t, measuring, providers),
@@ -587,10 +787,21 @@ export function SpeedPage({ data, consumers }: { data: NetworkingData; consumers
             }
           : { state: "PROBING", label: phaseLabel(t, measuring.phase) }),
       }
-    : { ...formEndpoint(t, form, consumer, provider, servers), state: "IDLE", label: stateLabel(t, "IDLE") };
+    : {
+        ...formEndpoint(t, form, consumer, provider, servers),
+        state: "IDLE",
+        label: stateLabel(t, "IDLE"),
+      };
   const name = (kind: string, id: number) => {
-    if (kind === "egress") return data.egressInterfaces.find((egress) => egress.id === id)?.name ?? String(id);
-    return data.proxyProfiles.find((profile) => profile.id === id)?.name ?? String(id);
+    if (kind === "egress")
+      return (
+        data.egressInterfaces.find((egress) => egress.id === id)?.name ??
+        String(id)
+      );
+    return (
+      data.proxyProfiles.find((profile) => profile.id === id)?.name ??
+      String(id)
+    );
   };
 
   const runAgain = (run: SpeedTestRun) => {
@@ -612,8 +823,18 @@ export function SpeedPage({ data, consumers }: { data: NetworkingData; consumers
       return [right, id];
     });
   const compared = picked.map((id) => runs.find((run) => run.id === id));
-  const detail = (run: SpeedTestRun, compare?: { better: BetterStats; className: string }) => (
-    <RunDetail run={run} data={data} providers={providers} onRunAgain={runAgain} busy={speedTest.busy} {...compare} />
+  const detail = (
+    run: SpeedTestRun,
+    compare?: { better: BetterStats; className: string },
+  ) => (
+    <RunDetail
+      run={run}
+      data={data}
+      providers={providers}
+      onRunAgain={runAgain}
+      busy={speedTest.busy}
+      {...compare}
+    />
   );
 
   const blocks: (SettingsBlock | null)[] = [
@@ -648,7 +869,9 @@ export function SpeedPage({ data, consumers }: { data: NetworkingData; consumers
               profiles={data.proxyProfiles}
               pools={data.proxyPools}
               endpoint={endpoint}
-              onToggle={(target) => setOverrides((current) => toggleDown(current, target))}
+              onToggle={(target) =>
+                setOverrides((current) => toggleDown(current, target))
+              }
             />
           )}
         </div>
@@ -674,12 +897,26 @@ export function SpeedPage({ data, consumers }: { data: NetworkingData; consumers
                 value={consumer.key}
                 onChange={choose}
                 className="min-w-[240px]"
-                options={consumers.map((candidate) => ({ value: candidate.key, label: candidate.name }))}
+                options={consumers.map((candidate) => ({
+                  value: candidate.key,
+                  label: candidate.name,
+                }))}
               />
             </ControlLabel>
           </div>
-          <TestControls form={form} onChange={setForm} consumer={consumer} providers={providers} />
-          <SpeedTestRunner consumer={consumer} overrides={overrides} form={form} providers={providers} speedTest={speedTest} />
+          <TestControls
+            form={form}
+            onChange={setForm}
+            consumer={consumer}
+            providers={providers}
+          />
+          <SpeedTestRunner
+            consumer={consumer}
+            overrides={overrides}
+            form={form}
+            providers={providers}
+            speedTest={speedTest}
+          />
         </>
       ),
     },
@@ -687,7 +924,8 @@ export function SpeedPage({ data, consumers }: { data: NetworkingData; consumers
       kind: "table",
       id: "speed-runs",
       title: t("next.networking.speed.runs"),
-      columns: "20px 84px minmax(0, 1fr) minmax(0, 0.8fr) minmax(0, 0.8fr) 48px 88px 88px 80px 80px 104px",
+      columns:
+        "20px 84px minmax(0, 1fr) minmax(0, 0.8fr) minmax(0, 0.8fr) 48px 88px 88px 80px 80px 104px",
       headers: [
         "",
         t("next.networking.speed.started"),
@@ -736,16 +974,32 @@ export function SpeedPage({ data, consumers }: { data: NetworkingData; consumers
               <span key="compare" />
             ),
             <Cell key="started" mono title={startedAt.toLocaleString()}>
-              {startedAt.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" })}
+              {startedAt.toLocaleTimeString([], {
+                hour: "2-digit",
+                minute: "2-digit",
+                second: "2-digit",
+              })}
             </Cell>,
             <Cell key="route" title={owner}>
               {owner}
             </Cell>,
-            <Cell key="kind" mono className="text-wv-secondary" testId={networkIds.speedRunKind(kindKey(run))}>
+            <Cell
+              key="kind"
+              mono
+              className="text-wv-secondary"
+              testId={networkIds.speedRunKind(kindKey(run))}
+            >
               {kindSummary(t, run, providers)}
             </Cell>,
             <Cell key="down" mono className="text-wv-secondary">
-              {downSummary(t, run.tested.overrides, (kind, id) => run.tested.names.find((entry) => entry.kind === kind && entry.id === id)?.name ?? name(kind, id))}
+              {downSummary(
+                t,
+                run.tested.overrides,
+                (kind, id) =>
+                  run.tested.names.find(
+                    (entry) => entry.kind === kind && entry.id === id,
+                  )?.name ?? name(kind, id),
+              )}
             </Cell>,
             <Cell key="width" mono>
               {run.tested.legs.reduce((sum, leg) => sum + leg.target, 0)}
@@ -760,7 +1014,9 @@ export function SpeedPage({ data, consumers }: { data: NetworkingData; consumers
               {result ? bytesLabel(result.bytes) : "—"}
             </Cell>,
             <Cell key="decoded" mono>
-              {run.kind === "USENET" && result?.usenet ? bytesLabel(result.usenet.decodedBytes) : ""}
+              {run.kind === "USENET" && result?.usenet
+                ? bytesLabel(result.usenet.decodedBytes)
+                : ""}
             </Cell>,
             <StatusMark
               key="status"
@@ -773,7 +1029,11 @@ export function SpeedPage({ data, consumers }: { data: NetworkingData; consumers
       }),
       // Two runs are the least there is to compare.
       action: comparing
-        ? { label: t("next.networking.speed.stopComparing"), icon: "close", onClick: () => setComparing(false) }
+        ? {
+            label: t("next.networking.speed.stopComparing"),
+            icon: "close",
+            onClick: () => setComparing(false),
+          }
         : shown.length < 2
           ? undefined
           : {
@@ -798,14 +1058,18 @@ export function SpeedPage({ data, consumers }: { data: NetworkingData; consumers
             return (
               <Fragment key={run?.id ?? `side-${index}`}>
                 {index > 0 ? (
-                  <span aria-hidden="true" className="text-center font-wv-title text-[44px] font-semibold leading-none text-wv-accent xl:row-span-8">
+                  <span
+                    aria-hidden="true"
+                    className="text-center font-wv-title text-[44px] font-semibold leading-none text-wv-accent xl:row-span-8"
+                  >
                     {t("next.networking.speed.versus")}
                   </span>
                 ) : null}
                 {run ? (
                   detail(run, {
                     better: other ? betterStats(run, other) : {},
-                    className: "self-stretch border-2 border-wv-accent p-6 sm:p-8 xl:row-span-8 xl:grid xl:grid-rows-subgrid",
+                    className:
+                      "self-stretch border-2 border-wv-accent p-6 sm:p-8 xl:row-span-8 xl:grid xl:grid-rows-subgrid",
                   })
                 ) : (
                   <div className="flex min-h-[140px] items-center justify-center self-stretch border-2 border-wv-faint p-6 text-center text-[13px] text-wv-muted xl:row-span-8">

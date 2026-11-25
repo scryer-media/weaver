@@ -3,7 +3,12 @@
 
 import assert from "node:assert/strict";
 import test from "node:test";
-import { extendKept, LIST_PAGE_SIZE, prependOlder, showsMore } from "../src/next/data/list-pages.ts";
+import {
+  extendKept,
+  LIST_PAGE_SIZE,
+  prependOlder,
+  showsMore,
+} from "../src/next/data/list-pages.ts";
 
 test("a job page list loads 100 entries at a time", () => {
   assert.equal(LIST_PAGE_SIZE, 100);
@@ -62,10 +67,18 @@ test("a snapshot that moved past the kept events leaves no hole", () => {
   // Pages 1-200 are kept; 150 events arrive while the tab is in the
   // background, so the next snapshot is 251-350 and 201-250 were never seen.
   const kept = Array.from({ length: 200 }, (_, index) => event(index + 1));
-  const moved = Array.from({ length: LIST_PAGE_SIZE }, (_, index) => event(index + 251));
+  const moved = Array.from({ length: LIST_PAGE_SIZE }, (_, index) =>
+    event(index + 251),
+  );
   assert.equal(extendKept(kept, moved), null);
   // A window that still shares one event joins on.
-  const joined = extendKept(kept, Array.from({ length: LIST_PAGE_SIZE }, (_, index) => event(index + 200)));
+  const joined = extendKept(
+    kept,
+    Array.from({ length: LIST_PAGE_SIZE }, (_, index) => event(index + 200)),
+  );
   assert.ok(joined);
-  assert.deepEqual(ids(joined), Array.from({ length: 299 }, (_, index) => index + 1));
+  assert.deepEqual(
+    ids(joined),
+    Array.from({ length: 299 }, (_, index) => index + 1),
+  );
 });

@@ -13,7 +13,11 @@ import {
 } from "../src/next/data/history-deletes.ts";
 import { englishTranslate as t } from "./english-translate.ts";
 
-type Operation = { state: string; locked: boolean; action: "DELETE" | "ARCHIVE" };
+type Operation = {
+  state: string;
+  locked: boolean;
+  action: "DELETE" | "ARCHIVE";
+};
 
 const row = (id: number, deleteOperation: Operation | null = null) => ({
   id,
@@ -23,7 +27,9 @@ const row = (id: number, deleteOperation: Operation | null = null) => ({
 
 const lock: DeleteLock = { operationId: 7, deleteFiles: false };
 
-function operation(overrides: Partial<HistoryDeleteOperation>): HistoryDeleteOperation {
+function operation(
+  overrides: Partial<HistoryDeleteOperation>,
+): HistoryDeleteOperation {
   return {
     id: 7,
     state: "RUNNING",
@@ -43,12 +49,20 @@ test("a row handed to a delete reads as locked before the server says so", () =>
   const drawn = withDeleteLocks(rows, new Map([[2, lock]]));
 
   assert.equal(drawn[0], rows[0]);
-  assert.deepEqual(drawn[1].deleteOperation, { state: "QUEUED", locked: true, action: "DELETE" });
+  assert.deepEqual(drawn[1].deleteOperation, {
+    state: "QUEUED",
+    locked: true,
+    action: "DELETE",
+  });
   assert.equal(withDeleteLocks(rows, new Map()), rows);
 });
 
 test("the server's own delete state wins over the local stand-in", () => {
-  const running: Operation = { state: "RUNNING", locked: true, action: "DELETE" };
+  const running: Operation = {
+    state: "RUNNING",
+    locked: true,
+    action: "DELETE",
+  };
   const drawn = withDeleteLocks([row(1, running)], new Map([[1, lock]]));
   assert.equal(drawn[0].deleteOperation, running);
 });
@@ -59,7 +73,10 @@ test("a lock goes once its row is reported on or has left the page", () => {
     [2, lock],
     [3, lock],
   ]);
-  const settled = settleDeleteLocks(locks, [row(1), row(2, { state: "RUNNING", locked: true, action: "DELETE" })]);
+  const settled = settleDeleteLocks(locks, [
+    row(1),
+    row(2, { state: "RUNNING", locked: true, action: "DELETE" }),
+  ]);
   assert.deepEqual([...settled.keys()], [1]);
 
   const unchanged = new Map([[1, lock]]);
@@ -67,24 +84,48 @@ test("a lock goes once its row is reported on or has left the page", () => {
 });
 
 test("a failed archive on a row handed to a delete reads as the delete", () => {
-  const failedArchive: Operation = { state: "FAILED", locked: false, action: "ARCHIVE" };
+  const failedArchive: Operation = {
+    state: "FAILED",
+    locked: false,
+    action: "ARCHIVE",
+  };
   const locks = new Map([[1, lock]]);
   const drawn = withDeleteLocks([row(1, failedArchive)], locks);
-  assert.deepEqual(drawn[0].deleteOperation, { state: "QUEUED", locked: true, action: "DELETE" });
+  assert.deepEqual(drawn[0].deleteOperation, {
+    state: "QUEUED",
+    locked: true,
+    action: "DELETE",
+  });
   // The lock holds until the server reports the delete itself.
   assert.equal(settleDeleteLocks(locks, [row(1, failedArchive)]), locks);
-  assert.equal(settleDeleteLocks(locks, [row(1, { state: "QUEUED", locked: true, action: "DELETE" })]).size, 0);
+  assert.equal(
+    settleDeleteLocks(locks, [
+      row(1, { state: "QUEUED", locked: true, action: "DELETE" }),
+    ]).size,
+    0,
+  );
 });
 
 test("progress sums the active operations", () => {
   const progress = deleteProgress(
     [
-      operation({ totalTargets: 10, runningTargets: 2, queuedTargets: 6, completedTargets: 2 }),
+      operation({
+        totalTargets: 10,
+        runningTargets: 2,
+        queuedTargets: 6,
+        completedTargets: 2,
+      }),
       operation({ id: 8, totalTargets: 3, queuedTargets: 2, failedTargets: 1 }),
     ],
     13,
   );
-  assert.deepEqual(progress, { total: 13, queued: 8, running: 2, completed: 2, failed: 1 });
+  assert.deepEqual(progress, {
+    total: 13,
+    queued: 8,
+    running: 2,
+    completed: 2,
+    failed: 1,
+  });
   assert.equal(
     describeDeleteProgress(t, progress),
     "Deleting history items · 13 tracked · 2 running · 8 queued · 1 failed",
@@ -93,6 +134,15 @@ test("progress sums the active operations", () => {
 
 test("an accepted delete the operation list has not caught up with counts as queued", () => {
   const progress = deleteProgress([], 4);
-  assert.deepEqual(progress, { total: 4, queued: 4, running: 0, completed: 0, failed: 0 });
-  assert.equal(describeDeleteProgress(t, progress), "Deleting history items · 4 tracked · 4 queued");
+  assert.deepEqual(progress, {
+    total: 4,
+    queued: 4,
+    running: 0,
+    completed: 0,
+    failed: 0,
+  });
+  assert.equal(
+    describeDeleteProgress(t, progress),
+    "Deleting history items · 4 tracked · 4 queued",
+  );
 });

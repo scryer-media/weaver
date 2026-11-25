@@ -24,7 +24,10 @@ export function LanguagePicker({ className }: { className?: string }) {
       onChange={setLanguagePreference}
       label={t("next.general.language")}
       icon="language"
-      className={cn("h-[30px] min-w-[132px] gap-2 px-2.5 text-[12.5px]", className)}
+      className={cn(
+        "h-[30px] min-w-[132px] gap-2 px-2.5 text-[12.5px]",
+        className,
+      )}
     />
   );
 }

@@ -3,7 +3,12 @@
 
 import assert from "node:assert/strict";
 import test from "node:test";
-import { isActiveStatus, progressDisplayKind, statusI18nKey, statusToken } from "../src/lib/status-tokens.ts";
+import {
+  isActiveStatus,
+  progressDisplayKind,
+  statusI18nKey,
+  statusToken,
+} from "../src/lib/status-tokens.ts";
 
 test("every queue API state has an explicit first-party presentation", () => {
   const cases = [

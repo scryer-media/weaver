@@ -51,18 +51,31 @@ export function StorageUsage({
   className?: string;
 }) {
   const t = useTranslate();
-  const percent = capacity && capacity.totalBytes > 0 ? (capacity.usedBytes / capacity.totalBytes) * 100 : 0;
+  const percent =
+    capacity && capacity.totalBytes > 0
+      ? (capacity.usedBytes / capacity.totalBytes) * 100
+      : 0;
   return (
     <div className={cn("flex min-w-0 items-center gap-2.5", className)}>
-      <Pie percent={percent} color={capacity ? usageColor(percent) : WV.inert} size={size} />
+      <Pie
+        percent={percent}
+        color={capacity ? usageColor(percent) : WV.inert}
+        size={size}
+      />
       <div className="min-w-0">
         <div
-          className={cn("font-wv-mono text-[11px] text-wv-tertiary", wrap ? "[overflow-wrap:anywhere]" : "truncate")}
+          className={cn(
+            "font-wv-mono text-[11px] text-wv-tertiary",
+            wrap ? "[overflow-wrap:anywhere]" : "truncate",
+          )}
           title={title}
         >
           {label}
         </div>
-        <div className="truncate text-[11px] text-wv-muted" title={capacity ? undefined : (error ?? undefined)}>
+        <div
+          className="truncate text-[11px] text-wv-muted"
+          title={capacity ? undefined : (error ?? undefined)}
+        >
           {capacity
             ? t("next.storage.usage", {
                 percent: Math.round(percent),
@@ -91,15 +104,21 @@ export function StorageMounts({
   if (mounts.length === 0) {
     return (
       <div className={cn("min-w-0", className)}>
-        {stacked ? null : <Eyebrow tone="rail">{t("next.storage.title")}</Eyebrow>}
-        <div className="mt-1.5 text-[12px] text-wv-muted">{t("next.storage.noneConfigured")}</div>
+        {stacked ? null : (
+          <Eyebrow tone="rail">{t("next.storage.title")}</Eyebrow>
+        )}
+        <div className="mt-1.5 text-[12px] text-wv-muted">
+          {t("next.storage.noneConfigured")}
+        </div>
       </div>
     );
   }
 
   return (
     <div className={cn("min-w-0", className)}>
-      {stacked ? null : <Eyebrow tone="rail">{t("next.storage.title")}</Eyebrow>}
+      {stacked ? null : (
+        <Eyebrow tone="rail">{t("next.storage.title")}</Eyebrow>
+      )}
       <div
         className={cn(
           "min-w-0",

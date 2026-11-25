@@ -423,9 +423,15 @@ impl Live {
     // and run its durations to `now`: taken before anything changes what
     // the torrent is doing, so what came before the change counts as what
     // the torrent was doing then.
-    pub(super) fn settle(&mut self, now: i64) {
+    pub fn settle(&mut self, now: i64) {
         let reading = self.reading(now);
         self.keep(reading);
+    }
+
+    // The tick found the clock stepped back to `now`: its durations run
+    // from there.
+    pub(super) fn clock_stepped_back(&mut self, now: i64) {
+        self.timed = self.timed.stepped_back(now);
     }
 
     // Keep each file's bytes in hand, and their sum.
@@ -800,6 +806,17 @@ impl Timed {
         }
     }
 
+    // The clock was stepped back to `now`: the durations run from there,
+    // and the time the clock lost is credited to nothing. Only the tick,
+    // which reads the clock in turn, can tell a step back from a reading
+    // that came late.
+    pub fn stepped_back(self, now: i64) -> Self {
+        Self {
+            at_ms: now.min(self.at_ms),
+            ..self
+        }
+    }
+
     // The milliseconds each duration ran past its whole seconds: the time
     // active, the time seeding and the current seeding run.
     pub(super) fn parts(&self) -> [u64; 3] {
@@ -809,8 +826,10 @@ impl Timed {
     // Run on to `now`: the time since runs into the active duration while
     // `active`, and into the finished one and the current seeding run while
     // `seeding`; a reading that is not `seeding` ends the run, and it starts
-    // again from zero. A clock stepped back credits nothing for that
-    // reading, and the next runs from `now`. Readings further apart than
+    // again from zero. A reading earlier than the last credits nothing and
+    // leaves the instant where it was: a pass that read the clock before
+    // it had the torrent may come after one that read it later, and the
+    // time between the two is counted once. Readings further apart than
     // `SEEDING_RUN_GAP_MS` (the machine slept, or the process stood still)
     // end the run as a restart does: it starts again from zero at `now`,
     // while the active and finished durations take the whole time.
@@ -832,7 +851,7 @@ impl Timed {
             ms % 1000
         };
         Self {
-            at_ms: now,
+            at_ms: now.max(self.at_ms),
             active_ms: run(self.active_ms, active, &mut counters.active_duration_s),
             finished_ms: run(self.finished_ms, seeding, &mut counters.finished_duration_s),
             consecutive_ms: if seeding && !gap {

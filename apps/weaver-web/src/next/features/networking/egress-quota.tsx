@@ -4,7 +4,14 @@
 import { useQuery } from "urql";
 import { EGRESS_QUOTAS_QUERY } from "@/graphql/networking";
 import type { Translate } from "@/lib/context/translate-context";
-import type { Egress, EgressQuota, QuotaDirectionUsage, QuotaPeriod, QuotaState, Weekday } from "@/lib/networking";
+import type {
+  Egress,
+  EgressQuota,
+  QuotaDirectionUsage,
+  QuotaPeriod,
+  QuotaState,
+  Weekday,
+} from "@/lib/networking";
 import { Pie } from "../../components/chrome";
 import { Toggle } from "../../components/controls";
 import { testIds } from "../../testids";
@@ -26,21 +33,31 @@ import {
 /** The egress weaver falls back to; it always exists, so it is always listed. */
 const SYSTEM_EGRESS_ID = 0;
 
-export type EgressQuotaRow = Pick<Egress, "id" | "name" | "quota" | "quotaUsage">;
+export type EgressQuotaRow = Pick<
+  Egress,
+  "id" | "name" | "quota" | "quotaUsage"
+>;
 
 export type Direction = "down" | "up";
 
 /** The cap a direction is measured against: the download cap, or the upload's hard cap, else its soft one. */
-export function directionCap(quota: EgressQuota | undefined, direction: Direction): number | null {
+export function directionCap(
+  quota: EgressQuota | undefined,
+  direction: Direction,
+): number | null {
   if (!quota) {
     return null;
   }
-  return direction === "down" ? quota.downloadBytes : (quota.uploadHardBytes ?? quota.uploadSoftBytes);
+  return direction === "down"
+    ? quota.downloadBytes
+    : (quota.uploadHardBytes ?? quota.uploadSoftBytes);
 }
 
 /** The directions this egress has a cap on, download first. */
 export function cappedDirections(egress: EgressQuotaRow): Direction[] {
-  return (["down", "up"] as const).filter((direction) => directionCap(egress.quota, direction) !== null);
+  return (["down", "up"] as const).filter(
+    (direction) => directionCap(egress.quota, direction) !== null,
+  );
 }
 
 /** Whether this egress has a cap being counted in either direction. */
@@ -50,12 +67,18 @@ export function metered(egress: EgressQuotaRow): boolean {
 
 const ARROW: Record<Direction, string> = { down: "↓", up: "↑" };
 
-export function usageOf(egress: EgressQuotaRow, direction: Direction): QuotaDirectionUsage | null {
+export function usageOf(
+  egress: EgressQuotaRow,
+  direction: Direction,
+): QuotaDirectionUsage | null {
   return egress.quotaUsage?.[direction] ?? null;
 }
 
 /** "used / cap" for one direction. */
-function directionSummary(egress: EgressQuotaRow, direction: Direction): string {
+function directionSummary(
+  egress: EgressQuotaRow,
+  direction: Direction,
+): string {
   return `${formatSize(usageOf(egress, direction)?.usedBytes ?? 0)} / ${formatSize(directionCap(egress.quota, direction) ?? 0)}`;
 }
 
@@ -63,27 +86,45 @@ function directionSummary(egress: EgressQuotaRow, direction: Direction): string 
 export function quotaSummary(egress: EgressQuotaRow): string {
   const directions = cappedDirections(egress);
   return directions.length
-    ? directions.map((direction) => `${ARROW[direction]} ${directionSummary(egress, direction)}`).join(" · ")
+    ? directions
+        .map(
+          (direction) =>
+            `${ARROW[direction]} ${directionSummary(egress, direction)}`,
+        )
+        .join(" · ")
     : "—";
 }
 
 /** A direction that is held back: slowed to the trickle, or stopped. */
-export const quotaHolding = (state: QuotaState | null | undefined) => state === "TRICKLE" || state === "STOPPED";
+export const quotaHolding = (state: QuotaState | null | undefined) =>
+  state === "TRICKLE" || state === "STOPPED";
 
 /** The strongest hold the caps put on this egress: Stopped over Trickle, else null. */
 export function quotaHeldState(egress: EgressQuotaRow): QuotaState | null {
-  const states = cappedDirections(egress).map((direction) => usageOf(egress, direction)?.state ?? "NORMAL");
-  return states.includes("STOPPED") ? "STOPPED" : states.includes("TRICKLE") ? "TRICKLE" : null;
+  const states = cappedDirections(egress).map(
+    (direction) => usageOf(egress, direction)?.state ?? "NORMAL",
+  );
+  return states.includes("STOPPED")
+    ? "STOPPED"
+    : states.includes("TRICKLE")
+      ? "TRICKLE"
+      : null;
 }
 
 export function quotaStateLabel(t: Translate, state: QuotaState): string {
-  return state === "STOPPED" ? t("next.quota.stopped") : state === "TRICKLE" ? t("next.quota.trickle") : "";
+  return state === "STOPPED"
+    ? t("next.quota.stopped")
+    : state === "TRICKLE"
+      ? t("next.quota.trickle")
+      : "";
 }
 
 /** When the current period resets, for a metered egress. */
 function quotaDetail(t: Translate, egress: EgressQuotaRow): string {
   const end = egress.quotaUsage?.periodEndEpochMs;
-  return metered(egress) && end ? t("next.monitoring.resetsAt", { time: formatDayClock(end) }) : "";
+  return metered(egress) && end
+    ? t("next.monitoring.resetsAt", { time: formatDayClock(end) })
+    : "";
 }
 
 /** Everything the quota cell says, for the settings search. */
@@ -91,7 +132,9 @@ export function quotaSearchText(t: Translate, egress: EgressQuotaRow): string {
   return [
     quotaSummary(egress),
     quotaDetail(t, egress),
-    ...cappedDirections(egress).map((direction) => quotaStateLabel(t, usageOf(egress, direction)?.state ?? "NORMAL")),
+    ...cappedDirections(egress).map((direction) =>
+      quotaStateLabel(t, usageOf(egress, direction)?.state ?? "NORMAL"),
+    ),
   ].join(" ");
 }
 
@@ -101,14 +144,26 @@ export function quotaSearchText(t: Translate, egress: EgressQuotaRow): string {
  * what weaver enforces cannot disagree.
  */
 export function useEgressQuotas(t: Translate) {
-  const [{ data, fetching, error }] = useQuery<{ egressInterfaces: EgressQuotaRow[] }>({
+  const [{ data, fetching, error }] = useQuery<{
+    egressInterfaces: EgressQuotaRow[];
+  }>({
     query: EGRESS_QUOTAS_QUERY,
     requestPolicy: "cache-and-network",
   });
   const listed = data?.egressInterfaces ?? [];
-  const rows: EgressQuotaRow[] = listed.some((egress) => egress.id === SYSTEM_EGRESS_ID)
+  const rows: EgressQuotaRow[] = listed.some(
+    (egress) => egress.id === SYSTEM_EGRESS_ID,
+  )
     ? listed
-    : [{ id: SYSTEM_EGRESS_ID, name: t("next.networking.binding.system"), quota: undefined, quotaUsage: null }, ...listed];
+    : [
+        {
+          id: SYSTEM_EGRESS_ID,
+          name: t("next.networking.binding.system"),
+          quota: undefined,
+          quotaUsage: null,
+        },
+        ...listed,
+      ];
   return {
     rows: [...rows].sort((left, right) => left.id - right.id),
     loading: fetching && !data,
@@ -117,7 +172,13 @@ export function useEgressQuotas(t: Translate) {
 }
 
 /** A direction held back by its cap: Trickle, or Stopped. */
-export function QuotaStateChip({ t, state }: { t: Translate; state: QuotaState }) {
+export function QuotaStateChip({
+  t,
+  state,
+}: {
+  t: Translate;
+  state: QuotaState;
+}) {
   return (
     <span className="inline-flex h-[18px] flex-none items-center border border-wv-warn/60 px-[6px] font-wv-mono text-[10px] leading-none font-medium tracking-[0.1em] whitespace-nowrap text-wv-warn uppercase">
       {quotaStateLabel(t, state)}
@@ -126,14 +187,24 @@ export function QuotaStateChip({ t, state }: { t: Translate; state: QuotaState }
 }
 
 /** How full a direction's cap is, coloured as it nears the cap. */
-export function directionPercent(egress: EgressQuotaRow, direction: Direction): number {
+export function directionPercent(
+  egress: EgressQuotaRow,
+  direction: Direction,
+): number {
   const cap = directionCap(egress.quota, direction);
   const used = usageOf(egress, direction)?.usedBytes ?? 0;
   return cap === null ? 0 : cap === 0 ? 100 : Math.min(100, (used / cap) * 100);
 }
 
-export function usageColor(state: QuotaState | undefined, percent: number): string {
-  return state === "STOPPED" || percent >= 90 ? WV.error : state === "TRICKLE" || percent >= 70 ? WV.warn : WV.accent;
+export function usageColor(
+  state: QuotaState | undefined,
+  percent: number,
+): string {
+  return state === "STOPPED" || percent >= 90
+    ? WV.error
+    : state === "TRICKLE" || percent >= 70
+      ? WV.warn
+      : WV.accent;
 }
 
 /**
@@ -141,7 +212,13 @@ export function usageColor(state: QuotaState | undefined, percent: number): stri
  * spend against the cap, the figures, and whether the cap is holding that
  * direction back; then when the period resets. A dash for an egress with no cap.
  */
-export function QuotaCell({ t, egress }: { t: Translate; egress: EgressQuotaRow }) {
+export function QuotaCell({
+  t,
+  egress,
+}: {
+  t: Translate;
+  egress: EgressQuotaRow;
+}) {
   const directions = cappedDirections(egress);
   const detail = quotaDetail(t, egress);
   const zone = egress.quotaUsage?.timezoneName;
@@ -157,22 +234,44 @@ export function QuotaCell({ t, egress }: { t: Translate; egress: EgressQuotaRow 
       {directions.map((direction) => {
         const state = usageOf(egress, direction)?.state ?? "NORMAL";
         const percent = directionPercent(egress, direction);
-        const label = t(direction === "down" ? "next.quota.download" : "next.quota.upload");
+        const label = t(
+          direction === "down" ? "next.quota.download" : "next.quota.upload",
+        );
         return (
-          <div key={direction} className="flex min-w-0 items-center gap-2" title={label}>
-            <span aria-hidden="true" className="flex-none font-wv-mono text-[11px] text-wv-muted">
+          <div
+            key={direction}
+            className="flex min-w-0 items-center gap-2"
+            title={label}
+          >
+            <span
+              aria-hidden="true"
+              className="flex-none font-wv-mono text-[11px] text-wv-muted"
+            >
               {ARROW[direction]}
             </span>
-            <Pie percent={percent} color={usageColor(state, percent)} size={16} />
-            <Cell mono className={quotaHolding(state) ? "text-wv-warn" : undefined}>
+            <Pie
+              percent={percent}
+              color={usageColor(state, percent)}
+              size={16}
+            />
+            <Cell
+              mono
+              className={quotaHolding(state) ? "text-wv-warn" : undefined}
+            >
               {directionSummary(egress, direction)}
             </Cell>
-            {quotaHolding(state) ? <QuotaStateChip t={t} state={state} /> : null}
+            {quotaHolding(state) ? (
+              <QuotaStateChip t={t} state={state} />
+            ) : null}
           </div>
         );
       })}
       {detail ? (
-        <Cell mono className="text-[11px] text-wv-muted" title={zone ? `${detail} · ${zone}` : detail}>
+        <Cell
+          mono
+          className="text-[11px] text-wv-muted"
+          title={zone ? `${detail} · ${zone}` : detail}
+        >
           {detail}
         </Cell>
       ) : null}
@@ -205,9 +304,13 @@ export interface EgressQuotaDraft {
 const KIB = 1024;
 
 const capDraft = (bytes: number | null | undefined): CapDraft =>
-  bytes === null || bytes === undefined ? { on: false, limit: "", unit: "GB" } : { on: true, ...allowanceText(bytes) };
+  bytes === null || bytes === undefined
+    ? { on: false, limit: "", unit: "GB" }
+    : { on: true, ...allowanceText(bytes) };
 
-export function egressQuotaDraft(quota: EgressQuota | undefined): EgressQuotaDraft {
+export function egressQuotaDraft(
+  quota: EgressQuota | undefined,
+): EgressQuotaDraft {
   return {
     download: capDraft(quota?.downloadBytes),
     uploadSoft: capDraft(quota?.uploadSoftBytes),
@@ -220,7 +323,8 @@ export function egressQuotaDraft(quota: EgressQuota | undefined): EgressQuotaDra
   };
 }
 
-const capBytes = (cap: CapDraft) => (cap.on ? allowanceBytes(cap.limit, cap.unit) : null);
+const capBytes = (cap: CapDraft) =>
+  cap.on ? allowanceBytes(cap.limit, cap.unit) : null;
 
 /** The quota as `setEgressQuota` takes it. */
 export function egressQuotaInput(draft: EgressQuotaDraft): EgressQuota {
@@ -232,20 +336,34 @@ export function egressQuotaInput(draft: EgressQuotaDraft): EgressQuota {
     period: draft.period,
     resetTimeMinutesLocal: timeToMinutes(draft.resetTime),
     weeklyResetWeekday: draft.weeklyResetWeekday,
-    monthlyResetDay: Math.min(31, Math.max(1, Math.trunc(draft.monthlyResetDay))),
+    monthlyResetDay: Math.min(
+      31,
+      Math.max(1, Math.trunc(draft.monthlyResetDay)),
+    ),
   };
 }
 
 /** Why the quota cannot be saved: a cap switched on with no allowance typed. Null when it can. */
-export function egressQuotaProblem(t: Translate, draft: EgressQuotaDraft): string | null {
-  return [draft.download, draft.uploadSoft, draft.uploadHard].some((cap) => cap.on && capBytes(cap) === null)
+export function egressQuotaProblem(
+  t: Translate,
+  draft: EgressQuotaDraft,
+): string | null {
+  return [draft.download, draft.uploadSoft, draft.uploadHard].some(
+    (cap) => cap.on && capBytes(cap) === null,
+  )
     ? t("next.quota.sizeRequired")
     : null;
 }
 
 /** Whether the draft saves something other than `saved`. */
-export function egressQuotaChanged(draft: EgressQuotaDraft, saved: EgressQuota | undefined): boolean {
-  return JSON.stringify(egressQuotaInput(draft)) !== JSON.stringify(egressQuotaInput(egressQuotaDraft(saved)));
+export function egressQuotaChanged(
+  draft: EgressQuotaDraft,
+  saved: EgressQuota | undefined,
+): boolean {
+  return (
+    JSON.stringify(egressQuotaInput(draft)) !==
+    JSON.stringify(egressQuotaInput(egressQuotaDraft(saved)))
+  );
 }
 
 /** A cap's switch, and the allowance beside it while it is on. */
@@ -264,9 +382,19 @@ function CapControl({
   return (
     <div className="flex items-center gap-[10px]">
       {cap.on ? (
-        <AllowanceControl label={label} limit={cap.limit} unit={cap.unit} onChange={(next) => onChange({ ...cap, ...next })} />
+        <AllowanceControl
+          label={label}
+          limit={cap.limit}
+          unit={cap.unit}
+          onChange={(next) => onChange({ ...cap, ...next })}
+        />
       ) : null}
-      <Toggle checked={cap.on} label={label} onChange={(on) => onChange({ ...cap, on })} testId={testIds.field(fieldId)} />
+      <Toggle
+        checked={cap.on}
+        label={label}
+        onChange={(on) => onChange({ ...cap, on })}
+        testId={testIds.field(fieldId)}
+      />
     </div>
   );
 }
@@ -282,10 +410,17 @@ export function egressQuotaFields(
   onChange: (next: EgressQuotaDraft) => void,
   usage: { down?: number; up?: number },
 ): FieldSpec[] {
-  const patch = (next: Partial<EgressQuotaDraft>) => onChange({ ...draft, ...next });
+  const patch = (next: Partial<EgressQuotaDraft>) =>
+    onChange({ ...draft, ...next });
   const used = (bytes: number | undefined) =>
-    bytes === undefined ? undefined : t("next.providers.usedSoFar", { size: formatSize(bytes) });
-  const cap = (id: "download" | "uploadSoft" | "uploadHard", label: string, help: string | undefined): FieldSpec => ({
+    bytes === undefined
+      ? undefined
+      : t("next.providers.usedSoFar", { size: formatSize(bytes) });
+  const cap = (
+    id: "download" | "uploadSoft" | "uploadHard",
+    label: string,
+    help: string | undefined,
+  ): FieldSpec => ({
     id: `quota-${id}`,
     label,
     help,
@@ -293,11 +428,17 @@ export function egressQuotaFields(
     control: {
       kind: "custom",
       control: (
-        <CapControl label={label} fieldId={`quota-${id}`} cap={draft[id]} onChange={(next) => patch({ [id]: next })} />
+        <CapControl
+          label={label}
+          fieldId={`quota-${id}`}
+          cap={draft[id]}
+          onChange={(next) => patch({ [id]: next })}
+        />
       ),
     },
   });
-  const anyCap = draft.download.on || draft.uploadSoft.on || draft.uploadHard.on;
+  const anyCap =
+    draft.download.on || draft.uploadSoft.on || draft.uploadHard.on;
   return [
     cap("download", t("next.quota.downloadCap"), used(usage.down)),
     cap("uploadSoft", t("next.quota.uploadSoftCap"), used(usage.up)),

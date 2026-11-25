@@ -11,7 +11,8 @@
  * own field keeps its value and selection.
  */
 export async function copyText(text: string): Promise<boolean> {
-  const clipboard = typeof navigator === "undefined" ? undefined : navigator.clipboard;
+  const clipboard =
+    typeof navigator === "undefined" ? undefined : navigator.clipboard;
   if (clipboard && typeof clipboard.writeText === "function") {
     try {
       await clipboard.writeText(text);
@@ -24,7 +25,10 @@ export async function copyText(text: string): Promise<boolean> {
 }
 
 function copyBySelection(text: string): boolean {
-  if (typeof document === "undefined" || typeof document.execCommand !== "function") {
+  if (
+    typeof document === "undefined" ||
+    typeof document.execCommand !== "function"
+  ) {
     return false;
   }
   const previous = document.activeElement;

@@ -21,9 +21,18 @@ import {
   type TorrentsState,
 } from "../src/next/data/torrents-shown.ts";
 
-const STATES: readonly TorrentsState[] = ["on", "off", "unavailable", "unknown"];
+const STATES: readonly TorrentsState[] = [
+  "on",
+  "off",
+  "unavailable",
+  "unknown",
+];
 
-const presence = (enabled: boolean, jobs: boolean, running = jobs): TorrentPresence => ({
+const presence = (
+  enabled: boolean,
+  jobs: boolean,
+  running = jobs,
+): TorrentPresence => ({
   available: true,
   enabled,
   jobs,
@@ -43,18 +52,30 @@ test("torrent things show while torrents are on or any torrent job is left, and 
   assert.equal(torrentsStateFrom(undefined), "unknown");
   assert.equal(torrentsStateFrom(null), "unknown");
   assert.deepEqual(
-    [presence(true, false), presence(false, true), presence(false, false), undefined].map((answer) =>
-      torrentsShown(torrentsStateFrom(answer)),
-    ),
+    [
+      presence(true, false),
+      presence(false, true),
+      presence(false, false),
+      undefined,
+    ].map((answer) => torrentsShown(torrentsStateFrom(answer))),
     [true, true, false, false],
   );
 });
 
 test("a new torrent is offered only while torrents are on, even while torrent jobs left still show", () => {
-  const winding = { ...presence(false, true), windingDown: true, windDown: "FINISH_ALL" as const };
+  const winding = {
+    ...presence(false, true),
+    windingDown: true,
+    windDown: "FINISH_ALL" as const,
+  };
   assert.equal(torrentAddsOffered(presence(true, false)), true);
   assert.equal(torrentAddsOffered(presence(true, true)), true);
-  for (const off of [presence(false, false), presence(false, true), presence(false, true, false), winding]) {
+  for (const off of [
+    presence(false, false),
+    presence(false, true),
+    presence(false, true, false),
+    winding,
+  ]) {
     assert.equal(torrentAddsOffered(off), false);
   }
   // Jobs left keep torrent things showing, but offer no new torrent.
@@ -65,15 +86,23 @@ test("a new torrent is offered only while torrents are on, even while torrent jo
 
 test("the Torrents panel shows the switch alone while it is off, torrent jobs left or not", () => {
   const rest = ["seeding", "trackers", "connection"];
-  assert.deepEqual(torrentSettingsDisclosed(true, "enabled", rest), ["enabled", ...rest]);
-  assert.deepEqual(torrentSettingsDisclosed(false, "enabled", rest), ["enabled"]);
+  assert.deepEqual(torrentSettingsDisclosed(true, "enabled", rest), [
+    "enabled",
+    ...rest,
+  ]);
+  assert.deepEqual(torrentSettingsDisclosed(false, "enabled", rest), [
+    "enabled",
+  ]);
 });
 
 test("turning torrents off asks how they end while some torrent is running, or that is not known", () => {
   // On to off, a torrent running: ask.
   assert.equal(asksHowTorrentsEnd(true, false, presence(true, true)), true);
   // Torrent jobs left, none running (paused or stopped), or none at all: no prompt.
-  assert.equal(asksHowTorrentsEnd(true, false, presence(true, true, false)), false);
+  assert.equal(
+    asksHowTorrentsEnd(true, false, presence(true, true, false)),
+    false,
+  );
   assert.equal(asksHowTorrentsEnd(true, false, presence(true, false)), false);
   // Not known: ask, never stop them at once unasked.
   assert.equal(asksHowTorrentsEnd(true, false, undefined), true);
@@ -93,13 +122,19 @@ test("the Torrents switch waits to be turned off until the server says which tor
 });
 
 test("a wind-down under way offers Stop now, which sends torrents off to stop at once", () => {
-  const winding: TorrentPresence = { ...presence(false, true), windingDown: true, windDown: "FINISH_ALL" as const };
+  const winding: TorrentPresence = {
+    ...presence(false, true),
+    windingDown: true,
+    windDown: "FINISH_ALL" as const,
+  };
   assert.equal(windDownStoppable(false, winding), true);
   // Not winding down, not known, or the switch turned on again in the form: nothing to stop.
   assert.equal(windDownStoppable(false, presence(false, true)), false);
   assert.equal(windDownStoppable(false, undefined), false);
   assert.equal(windDownStoppable(true, winding), false);
-  assert.deepEqual(stopNowInput(), { torrent: { enabled: false, whenDisabled: "STOP_NOW" } });
+  assert.deepEqual(stopNowInput(), {
+    torrent: { enabled: false, whenDisabled: "STOP_NOW" },
+  });
 });
 
 test("torrent-only things show only once torrents are known to be on", () => {
@@ -121,13 +156,21 @@ const unavailable = (enabled: boolean, jobs: boolean): TorrentPresence => ({
 });
 
 test("a server without torrents is unavailable whatever else it says, and shows and offers nothing", () => {
-  for (const answer of [unavailable(false, false), unavailable(true, false), unavailable(false, true), unavailable(true, true)]) {
+  for (const answer of [
+    unavailable(false, false),
+    unavailable(true, false),
+    unavailable(false, true),
+    unavailable(true, true),
+  ]) {
     assert.equal(torrentsStateFrom(answer), "unavailable");
     assert.equal(torrentsShown(torrentsStateFrom(answer)), false);
     assert.equal(torrentAddsOffered(answer), false);
   }
   // A torrent-only screen leaves as it does while torrents are off.
-  assert.equal(torrentsView("unavailable", "page", "redirect", "loading"), "redirect");
+  assert.equal(
+    torrentsView("unavailable", "page", "redirect", "loading"),
+    "redirect",
+  );
 });
 
 test("the server has torrents while they are on or off, and not while unavailable or unsaid", () => {
@@ -142,18 +185,26 @@ test("the server has torrents while they are on or off, and not while unavailabl
   );
   // What a direct visit to the Torrents settings draws: the panel, no such panel, or nothing yet.
   assert.deepEqual(
-    STATES.map((state) => torrentsAvailableView(state, "panel", "none", "wait")),
+    STATES.map((state) =>
+      torrentsAvailableView(state, "panel", "none", "wait"),
+    ),
     ["panel", "panel", "none", "wait"],
   );
 });
 
 test("the settings rail and search hold the Torrents panel only while the server has torrents", () => {
   // The same shape as the settings panels list, in rail order.
-  const panels = [{ slug: "general" }, { slug: "torrents", torrentOnly: true as const }, { slug: "rss" }];
+  const panels = [
+    { slug: "general" },
+    { slug: "torrents", torrentOnly: true as const },
+    { slug: "rss" },
+  ];
   const slugs = (state: TorrentsState) =>
-    withoutTorrentOnly(panels, torrentsAvailable(state), (panel) => panel.torrentOnly === true).map(
-      (panel) => panel.slug,
-    );
+    withoutTorrentOnly(
+      panels,
+      torrentsAvailable(state),
+      (panel) => panel.torrentOnly === true,
+    ).map((panel) => panel.slug);
   assert.deepEqual(slugs("on"), ["general", "torrents", "rss"]);
   // Off in the settings: the panel stays, since its switch turns them on.
   assert.deepEqual(slugs("off"), ["general", "torrents", "rss"]);
@@ -172,10 +223,13 @@ test("a filter list keeps every item while on and drops only the torrent-only on
     { key: "torrent:tracker:4", kind: "TORRENT_TRACKER" },
   ];
   const keys = (state: TorrentsState) =>
-    withoutTorrentOnly(consumers, torrentsShown(state), (consumer) => isTorrentConsumer(consumer.kind)).map(
-      (consumer) => consumer.key,
-    );
-  assert.deepEqual(keys("on"), consumers.map((consumer) => consumer.key));
+    withoutTorrentOnly(consumers, torrentsShown(state), (consumer) =>
+      isTorrentConsumer(consumer.kind),
+    ).map((consumer) => consumer.key);
+  assert.deepEqual(
+    keys("on"),
+    consumers.map((consumer) => consumer.key),
+  );
   assert.deepEqual(keys("off"), ["outbound", "server:1", "rss:2"]);
   assert.deepEqual(keys("unavailable"), ["outbound", "server:1", "rss:2"]);
   assert.deepEqual(keys("unknown"), ["outbound", "server:1", "rss:2"]);
@@ -198,15 +252,36 @@ test("the monitoring nav drops the torrents dashboard unless on, and a direct vi
     { id: "engine" },
   ];
   const tabs = (state: TorrentsState) =>
-    withoutTorrentOnly(dashboards, torrentsShown(state), (dashboard) => dashboard.torrentOnly === true).map(
-      (dashboard) => dashboard.id,
-    );
-  assert.deepEqual(tabs("on"), ["overview", "providers", "integrity", "torrents", "engine"]);
-  assert.deepEqual(tabs("off"), ["overview", "providers", "integrity", "engine"]);
-  assert.deepEqual(tabs("unknown"), ["overview", "providers", "integrity", "engine"]);
+    withoutTorrentOnly(
+      dashboards,
+      torrentsShown(state),
+      (dashboard) => dashboard.torrentOnly === true,
+    ).map((dashboard) => dashboard.id);
+  assert.deepEqual(tabs("on"), [
+    "overview",
+    "providers",
+    "integrity",
+    "torrents",
+    "engine",
+  ]);
+  assert.deepEqual(tabs("off"), [
+    "overview",
+    "providers",
+    "integrity",
+    "engine",
+  ]);
+  assert.deepEqual(tabs("unknown"), [
+    "overview",
+    "providers",
+    "integrity",
+    "engine",
+  ]);
 
   // What /monitoring/torrents draws: the page, the redirect, or the loading state.
   assert.equal(torrentsView("on", "page", "redirect", "loading"), "page");
   assert.equal(torrentsView("off", "page", "redirect", "loading"), "redirect");
-  assert.equal(torrentsView("unknown", "page", "redirect", "loading"), "loading");
+  assert.equal(
+    torrentsView("unknown", "page", "redirect", "loading"),
+    "loading",
+  );
 });

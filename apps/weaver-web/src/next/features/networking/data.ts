@@ -4,7 +4,11 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useClient, useQuery, useSubscription, type Client } from "urql";
 import type { DocumentNode } from "graphql";
-import { NETWORK_FLOW_QUERY, NETWORK_FLOW_SUBSCRIPTION, NETWORKING_QUERY } from "@/graphql/networking";
+import {
+  NETWORK_FLOW_QUERY,
+  NETWORK_FLOW_SUBSCRIPTION,
+  NETWORKING_QUERY,
+} from "@/graphql/networking";
 import { useTranslate, type Translate } from "@/lib/context/translate-context";
 import { usePageVisible } from "@/lib/page-visible";
 import {
@@ -29,7 +33,12 @@ export type NetworkingData = {
   egressInterfaces: Egress[];
   proxyProfiles: ProxyProfile[];
   proxyPools: ProxyPool[];
-  discoverNetworkInterfaces: { name: string; index: number | null; up: boolean; addresses: string[] }[];
+  discoverNetworkInterfaces: {
+    name: string;
+    index: number | null;
+    up: boolean;
+    addresses: string[];
+  }[];
   platformNetworking: {
     platform: string;
     egressBindingKinds: Egress["bindingKind"][];
@@ -39,8 +48,19 @@ export type NetworkingData = {
     maxWireguardInstances: number;
     notes: string[];
   };
-  servers: { id: number; host: string; connections: number; active: boolean; routing: NetworkRoute | null }[];
-  rssFeeds: { id: number; name: string; enabled: boolean; routing: NetworkRoute | null }[];
+  servers: {
+    id: number;
+    host: string;
+    connections: number;
+    active: boolean;
+    routing: NetworkRoute | null;
+  }[];
+  rssFeeds: {
+    id: number;
+    name: string;
+    enabled: boolean;
+    routing: NetworkRoute | null;
+  }[];
 };
 
 /** A server, a feed, or Default outbound: something that owns a route. */
@@ -53,11 +73,19 @@ export type Consumer = {
   route: NetworkRoute | null;
 };
 
-export const NETWORKING_PAGES = ["overview", "egress", "proxies", "routes", "dns", "speed"] as const;
+export const NETWORKING_PAGES = [
+  "overview",
+  "egress",
+  "proxies",
+  "routes",
+  "dns",
+  "speed",
+] as const;
 export type NetworkingPage = (typeof NETWORKING_PAGES)[number];
 
 /** The speed test page with a route selected. */
-export const speedPage = (consumer: string) => `/settings/networking/speed?consumer=${encodeURIComponent(consumer)}`;
+export const speedPage = (consumer: string) =>
+  `/settings/networking/speed?consumer=${encodeURIComponent(consumer)}`;
 
 /** Run a mutation; resolves to the failure message, or null once it has landed. */
 /** `onData` hears what a mutation that landed returned, before the pages are read again. */
@@ -77,7 +105,10 @@ const TORRENT_CATEGORY_PREFIX = "torrent:category:";
 /** A tracker rule's own torrent route is keyed by this and the rule's id. */
 const TORRENT_TRACKER_PREFIX = "torrent:tracker:";
 
-export const defaultRoute = (): NetworkRoute => ({ legs: [directLeg()], failover: "REDISTRIBUTE" });
+export const defaultRoute = (): NetworkRoute => ({
+  legs: [directLeg()],
+  failover: "REDISTRIBUTE",
+});
 
 /** A consumer's name. Default outbound and the torrent routes are named here, in the reader's language, not by the daemon. */
 export const consumerName = (t: Translate, key: string, name: string) =>
@@ -98,9 +129,16 @@ export const consumerName = (t: Translate, key: string, name: string) =>
  * it: with no route to start from, its editor could only start on the
  * default one and save over what is there.
  */
-export function flowConsumers(measured: NetworkFlow, data: NetworkingData | undefined, t: Translate): Consumer[] {
+export function flowConsumers(
+  measured: NetworkFlow,
+  data: NetworkingData | undefined,
+  t: Translate,
+): Consumer[] {
   return (
-    measured.consumers?.map((consumer) => ({ ...consumer, name: consumerName(t, consumer.key, consumer.name) })) ??
+    measured.consumers?.map((consumer) => ({
+      ...consumer,
+      name: consumerName(t, consumer.key, consumer.name),
+    })) ??
     (data
       ? [
           ...data.servers.map((server) => ({
@@ -132,7 +170,10 @@ export function flowConsumers(measured: NetworkFlow, data: NetworkingData | unde
  * A leg behind a kill switch is blocked whatever was sampled: until something
  * dials through it the daemon knows only that its egress is up.
  */
-export function plannedFlow(measured: NetworkFlow, consumers: Consumer[]): NetworkFlow {
+export function plannedFlow(
+  measured: NetworkFlow,
+  consumers: Consumer[],
+): NetworkFlow {
   return {
     ...measured,
     legs: consumers.flatMap((consumer) => {
@@ -143,7 +184,8 @@ export function plannedFlow(measured: NetworkFlow, consumers: Consumer[]): Netwo
       );
       return route.legs.map((leg, position) => {
         const sampled = measured.legs.find(
-          (sample) => sample.consumer === consumer.key && sample.position === position,
+          (sample) =>
+            sample.consumer === consumer.key && sample.position === position,
         ) ?? {
           ...leg,
           consumer: consumer.key,
@@ -155,7 +197,9 @@ export function plannedFlow(measured: NetworkFlow, consumers: Consumer[]): Netwo
           reason: null,
           pinnedAddress: null,
         };
-        return closedPath(sampled.path) ? { ...sampled, state: "BLOCKED" } : sampled;
+        return closedPath(sampled.path)
+          ? { ...sampled, state: "BLOCKED" }
+          : sampled;
       });
     }),
   };
@@ -178,16 +222,23 @@ async function runNetworkingAction(
 ): Promise<string | null> {
   try {
     const result = await client.mutation(document, variables).toPromise();
-    const failure = result.error ? refusalMessage(t, result.error, names) : null;
+    const failure = result.error
+      ? refusalMessage(t, result.error, names)
+      : null;
     report(failure);
     if (failure === null) {
       onData?.(result.data);
       refresh();
-      await client.query(NETWORK_FLOW_QUERY, {}, { requestPolicy: "network-only" }).toPromise();
+      await client
+        .query(NETWORK_FLOW_QUERY, {}, { requestPolicy: "network-only" })
+        .toPromise();
     }
     return failure;
   } catch (caught) {
-    const failure = caught instanceof Error ? caught.message : t("next.networking.requestFailed");
+    const failure =
+      caught instanceof Error
+        ? caught.message
+        : t("next.networking.requestFailed");
     report(failure);
     return failure;
   }
@@ -229,49 +280,72 @@ export function useNetworkingWorkspace(page: string) {
 
   // Kept the same across renders, as is everything derived below, so a page
   // drawn again for some other reason hands its rows the same props.
-  const action = useCallback<NetworkingAction>(async (document, variables, onData) => {
-    setBusy(true);
-    setMessage(null);
-    const failure = await runNetworkingAction(
-      client,
-      t,
-      document,
-      variables,
-      () => refresh({ requestPolicy: "network-only" }),
-      (outcome) => {
-        setFailed(outcome !== null);
-        setMessage(outcome ?? t("next.networking.saved"));
-      },
-      {
-        route: (key) => consumersRef.current.find((consumer) => consumer.key === key)?.name ?? key,
-        proxy: (id) => profilesRef.current.find((profile) => profile.id === id)?.name,
-      },
-      onData,
-    );
-    setBusy(false);
-    return failure;
-  }, [client, refresh, t]);
-  const retry = useCallback(() => refresh({ requestPolicy: "network-only" }), [refresh]);
+  const action = useCallback<NetworkingAction>(
+    async (document, variables, onData) => {
+      setBusy(true);
+      setMessage(null);
+      const failure = await runNetworkingAction(
+        client,
+        t,
+        document,
+        variables,
+        () => refresh({ requestPolicy: "network-only" }),
+        (outcome) => {
+          setFailed(outcome !== null);
+          setMessage(outcome ?? t("next.networking.saved"));
+        },
+        {
+          route: (key) =>
+            consumersRef.current.find((consumer) => consumer.key === key)
+              ?.name ?? key,
+          proxy: (id) =>
+            profilesRef.current.find((profile) => profile.id === id)?.name,
+        },
+        onData,
+      );
+      setBusy(false);
+      return failure;
+    },
+    [client, refresh, t],
+  );
+  const retry = useCallback(
+    () => refresh({ requestPolicy: "network-only" }),
+    [refresh],
+  );
 
-  const measured = subscription.data?.networkFlow ?? initial.data?.networkFlow ?? EMPTY_FLOW;
+  const measured =
+    subscription.data?.networkFlow ?? initial.data?.networkFlow ?? EMPTY_FLOW;
   // Every sample carries the consumers, egresses and proxies afresh, and they
   // seldom change; what draws them is drawn again only when one of them has.
   // The torrent routes (default, per category, per tracker rule) are listed,
   // drawn and offered to the speed test only while torrents are on.
   const torrentsOn = useTorrentsShown();
   const consumers = useSameWhileUnchanged(
-    withoutTorrentOnly(flowConsumers(measured, data, t), torrentsOn, (consumer) => isTorrentConsumer(consumer.kind)),
+    withoutTorrentOnly(
+      flowConsumers(measured, data, t),
+      torrentsOn,
+      (consumer) => isTorrentConsumer(consumer.kind),
+    ),
   );
   useEffect(() => {
     consumersRef.current = consumers;
   }, [consumers]);
-  const flow = useMemo(() => plannedFlow(measured, consumers), [consumers, measured]);
-  const egresses = useSameWhileUnchanged(measured.egresses ?? data?.egressInterfaces ?? NO_EGRESSES);
-  const profiles = useSameWhileUnchanged(measured.proxies ?? data?.proxyProfiles ?? NO_PROFILES);
+  const flow = useMemo(
+    () => plannedFlow(measured, consumers),
+    [consumers, measured],
+  );
+  const egresses = useSameWhileUnchanged(
+    measured.egresses ?? data?.egressInterfaces ?? NO_EGRESSES,
+  );
+  const profiles = useSameWhileUnchanged(
+    measured.proxies ?? data?.proxyProfiles ?? NO_PROFILES,
+  );
   useEffect(() => {
     profilesRef.current = profiles;
   }, [profiles]);
-  const pools = useSameWhileUnchanged(measured.proxyPools ?? data?.proxyPools ?? NO_POOLS);
+  const pools = useSameWhileUnchanged(
+    measured.proxyPools ?? data?.proxyPools ?? NO_POOLS,
+  );
 
   return {
     data,
@@ -322,8 +396,10 @@ export function egressInput(egress: Egress) {
   return {
     name: egress.name,
     bindingKind: egress.bindingKind,
-    interfaceName: egress.bindingKind === "INTERFACE" ? egress.interfaceName : null,
-    sourceAddress: egress.bindingKind === "SOURCE_ADDRESS" ? egress.sourceAddress : null,
+    interfaceName:
+      egress.bindingKind === "INTERFACE" ? egress.interfaceName : null,
+    sourceAddress:
+      egress.bindingKind === "SOURCE_ADDRESS" ? egress.sourceAddress : null,
     enabled: egress.enabled,
     downloadBps: egress.downloadBps,
     uploadBps: egress.uploadBps,

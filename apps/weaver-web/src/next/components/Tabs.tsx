@@ -58,7 +58,9 @@ export function Tabs<T extends string>({
             <button
               key={tab.id}
               type="button"
-              data-testid={testId === undefined ? undefined : testIds.tab(testId, tab.id)}
+              data-testid={
+                testId === undefined ? undefined : testIds.tab(testId, tab.id)
+              }
               onClick={() => onSelect(tab.id)}
               aria-pressed={isActive}
               className={cn(
@@ -71,7 +73,11 @@ export function Tabs<T extends string>({
               {tab.label}
               {tab.count === undefined ? null : (
                 <span
-                  data-testid={testId === undefined ? undefined : testIds.tabCount(testId, tab.id)}
+                  data-testid={
+                    testId === undefined
+                      ? undefined
+                      : testIds.tabCount(testId, tab.id)
+                  }
                   className="ml-[6px] font-wv-mono text-[11.5px] font-normal text-wv-faint"
                 >
                   {tab.count}
@@ -88,7 +94,9 @@ export function Tabs<T extends string>({
         <div className="hidden items-center gap-2 xl:flex">{center}</div>
       )}
       {right === undefined && center === undefined ? null : (
-        <div className="ml-auto flex flex-none items-center gap-[10px] pl-3">{right}</div>
+        <div className="ml-auto flex flex-none items-center gap-[10px] pl-3">
+          {right}
+        </div>
       )}
     </div>
   );

@@ -28,10 +28,22 @@ import {
 } from "@/graphql/queries";
 import { authHeaders } from "@/graphql/client";
 import { copyText } from "@/lib/clipboard";
-import { criticalHealthMilli, HEALTH_TONE_CLASS, healthTone } from "@/lib/health-tone";
+import {
+  criticalHealthMilli,
+  HEALTH_TONE_CLASS,
+  healthTone,
+} from "@/lib/health-tone";
 import { useTranslate, type Translate } from "@/lib/context/translate-context";
-import { openUrlAsDownload, readDownloadErrorMessage, saveResponseAsDownload } from "@/lib/download";
-import { normalizeJobData, type GraphqlJobData, type JobData } from "@/lib/job-types";
+import {
+  openUrlAsDownload,
+  readDownloadErrorMessage,
+  saveResponseAsDownload,
+} from "@/lib/download";
+import {
+  normalizeJobData,
+  type GraphqlJobData,
+  type JobData,
+} from "@/lib/job-types";
 import { statusToken } from "@/lib/status-tokens";
 import { torrentStateLabelKey } from "@/lib/torrents";
 import {
@@ -68,18 +80,35 @@ import { useNow } from "../data/clock";
 import { statusColor, WV } from "../data/palette";
 import { ratePhase } from "../data/phase-bars";
 import { eventTone, useStatusLabel } from "../data/status";
-import { buildTimelineView, downloadingMs, type JobTimelineData } from "../data/timeline";
+import {
+  buildTimelineView,
+  downloadingMs,
+  type JobTimelineData,
+} from "../data/timeline";
 import { useNextData } from "../data/next-data";
 import { useSharedStructure } from "../data/share";
 import { usePageVisible } from "../data/timers";
 import { countLabel } from "../i18n/labels";
 import { NextShell } from "../shell/NextShell";
-import { describeFailedArchive, describeArchiveHistory, rowOperationKind } from "../data/history-archive";
+import {
+  describeFailedArchive,
+  describeArchiveHistory,
+  rowOperationKind,
+} from "../data/history-archive";
 import { useArchiveHistory } from "../data/use-archive-history";
-import { extendKept, LIST_PAGE_SIZE, prependOlder, showsMore } from "../data/list-pages";
+import {
+  extendKept,
+  LIST_PAGE_SIZE,
+  prependOlder,
+  showsMore,
+} from "../data/list-pages";
 import { jobIds, testIds, torrentIds } from "@/next/testids";
 import { SupportReportActions } from "../features/SupportReportActions";
-import { FilesMissingDialog, isFilesMissing, stillFilesMissing } from "../features/torrents/FilesMissingDialog";
+import {
+  FilesMissingDialog,
+  isFilesMissing,
+  stillFilesMissing,
+} from "../features/torrents/FilesMissingDialog";
 import { TorrentDetail, useTorrent } from "../features/torrents/TorrentDetail";
 import { TorrentRemoveDialog } from "../features/torrents/TorrentRemoveDialog";
 import { DownloadSummaryPanel } from "../components/DownloadSummary";
@@ -109,7 +138,8 @@ const FILE_COLUMNS = {
 
 // A file's actions fill their columns: an icon alone on a phone, the icon
 // and its label from `sm` up.
-const FILE_ACTION = "w-full px-0 sm:px-3 [&>svg]:mr-0 sm:[&>svg]:mr-[7px] [&>svg]:ml-0 sm:[&>svg]:-ml-[2px]";
+const FILE_ACTION =
+  "w-full px-0 sm:px-3 [&>svg]:mr-0 sm:[&>svg]:mr-[7px] [&>svg]:ml-0 sm:[&>svg]:-ml-[2px]";
 
 function FileActionLabel({ children }: { children: ReactNode }) {
   return <span className="sr-only sm:not-sr-only">{children}</span>;
@@ -134,7 +164,13 @@ const EVENT_TONE_CLASS = {
  * uses, in contribution order. A provider keeps its colour for as long as it
  * keeps its place, which is what the eye actually tracks down a short list.
  */
-const PROVIDER_COLORS = [WV.accent, WV.info, WV.violet, WV.green, WV.gold] as const;
+const PROVIDER_COLORS = [
+  WV.accent,
+  WV.info,
+  WV.violet,
+  WV.green,
+  WV.gold,
+] as const;
 
 interface JobEvent {
   kind: string;
@@ -238,7 +274,12 @@ function ShowMore({
 }) {
   return (
     <div className="flex justify-center border-t border-wv-hairline pt-[9px]">
-      <SecondaryButton size="compact" testId={testId} disabled={disabled} onClick={onClick}>
+      <SecondaryButton
+        size="compact"
+        testId={testId}
+        disabled={disabled}
+        onClick={onClick}
+      >
         {label}
       </SecondaryButton>
     </div>
@@ -250,14 +291,23 @@ function ShowMore({
  * session's auth header, which a plain anchor cannot carry. Answers with the
  * line the status bar reports.
  */
-async function saveJobNzb(t: Translate, jobId: number, title: string): Promise<string> {
+async function saveJobNzb(
+  t: Translate,
+  jobId: number,
+  title: string,
+): Promise<string> {
   try {
-    const response = await fetch(new URL(`api/jobs/${jobId}/nzb`, document.baseURI).href, {
-      headers: authHeaders(),
-      credentials: "same-origin",
-    });
+    const response = await fetch(
+      new URL(`api/jobs/${jobId}/nzb`, document.baseURI).href,
+      {
+        headers: authHeaders(),
+        credentials: "same-origin",
+      },
+    );
     if (!response.ok) {
-      throw new Error(await readDownloadErrorMessage(response, t("next.job.nzbFailed")));
+      throw new Error(
+        await readDownloadErrorMessage(response, t("next.job.nzbFailed")),
+      );
     }
     await saveResponseAsDownload(response, `${title}.nzb`);
     return t("next.job.nzbSaved", { name: title });
@@ -280,13 +330,17 @@ function JobDetailContent() {
   const active = useRef(false);
   useEffect(() => {
     active.current = true;
-    return () => { active.current = false; };
+    return () => {
+      active.current = false;
+    };
   }, []);
   const statusLabel = useStatusLabel();
   const { connection } = useNextData("connection");
   const variables = useMemo(() => ({ id: jobId }), [jobId]);
 
-  const [{ data, fetching }, refetch] = useQuery<{ jobDetailSnapshot: JobSnapshot | null }>({
+  const [{ data, fetching }, refetch] = useQuery<{
+    jobDetailSnapshot: JobSnapshot | null;
+  }>({
     query: JOB_QUERY,
     variables,
     pause: !Number.isFinite(jobId),
@@ -300,43 +354,72 @@ function JobDetailContent() {
     pause: connection.isDisconnected || !Number.isFinite(jobId) || !visible,
   });
   const client = useClient();
-  const filesVariables = useMemo(() => ({ jobId, first: LIST_PAGE_SIZE }), [jobId]);
+  const filesVariables = useMemo(
+    () => ({ jobId, first: LIST_PAGE_SIZE }),
+    [jobId],
+  );
   const [{ data: filesData }, refetchFiles] = useQuery<{
     jobOutputFiles: OutputFilesPage | null;
-  }>({ query: JOB_OUTPUT_FILES_QUERY, variables: filesVariables, pause: !Number.isFinite(jobId) });
+  }>({
+    query: JOB_OUTPUT_FILES_QUERY,
+    variables: filesVariables,
+    pause: !Number.isFinite(jobId),
+  });
   // Pages past the first load only when asked for; a fresh first page
   // drops them.
   const [moreFiles, setMoreFiles] = useState<MoreFiles | null>(null);
   const [pagedEvents, setPagedEvents] = useState<PagedEvents | null>(null);
-  const [loadingMore, setLoadingMore] = useState<"files" | "events" | null>(null);
+  const [loadingMore, setLoadingMore] = useState<"files" | "events" | null>(
+    null,
+  );
 
   const [, redownloadJob] = useMutation(REDOWNLOAD_JOB_MUTATION);
-  const [retryAction, setRetryAction] = useState<"redownload" | "reprocess" | "retryNoLimit" | null>(null);
+  const [retryAction, setRetryAction] = useState<
+    "redownload" | "reprocess" | "retryNoLimit" | null
+  >(null);
   const [, rerunPostProcessing] = useMutation(RERUN_POST_PROCESSING_MUTATION);
   const [, reprocessJob] = useMutation(REPROCESS_JOB_MUTATION);
   const [, acceptHistoryDelete] = useMutation(ACCEPT_HISTORY_DELETE_MUTATION);
   const requestArchiveHistory = useArchiveHistory();
-  const [, forgetDuplicateIdentity] = useMutation(FORGET_DUPLICATE_IDENTITY_MUTATION);
+  const [, forgetDuplicateIdentity] = useMutation(
+    FORGET_DUPLICATE_IDENTITY_MUTATION,
+  );
   const [, pauseJob] = useMutation(PAUSE_JOB_MUTATION);
   const [, resumeJob] = useMutation(RESUME_JOB_MUTATION);
   const [, cancelJob] = useMutation(CANCEL_JOB_MUTATION);
-  const [, cancelPostProcessing] = useMutation(CANCEL_JOB_POST_PROCESSING_MUTATION);
+  const [, cancelPostProcessing] = useMutation(
+    CANCEL_JOB_POST_PROCESSING_MUTATION,
+  );
   const [, setTorrentForced] = useMutation(SET_TORRENT_FORCED_MUTATION);
   const [, recheckTorrent] = useMutation(RECHECK_TORRENT_MUTATION);
   const [, setTorrentLocation] = useMutation(SET_TORRENT_LOCATION_MUTATION);
   const [, setTorrentCategory] = useMutation(SET_TORRENT_CATEGORY_MUTATION);
   const [removingTorrent, setRemovingTorrent] = useState(false);
   // The draft of the torrent's location or category while its editor is open.
-  const [torrentEdit, setTorrentEdit] = useState<{ kind: "move" | "category"; value: string } | null>(null);
+  const [torrentEdit, setTorrentEdit] = useState<{
+    kind: "move" | "category";
+    value: string;
+  } | null>(null);
   const { categories } = useNextData("categories");
 
-  const [confirm, setConfirm] = useState<"delete" | "deleteAll" | "archive" | "cancel" | "forget" | "recheck" | "filesMissing" | null>(null);
+  const [confirm, setConfirm] = useState<
+    | "delete"
+    | "deleteAll"
+    | "archive"
+    | "cancel"
+    | "forget"
+    | "recheck"
+    | "filesMissing"
+    | null
+  >(null);
   const [report, setReport] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
 
   // Every push carries the whole job again; the parts that did not move keep
   // their identity, so the blocks drawn from them are left alone.
-  const snapshot = useSharedStructure(live?.jobDetailUpdates ?? data?.jobDetailSnapshot ?? null);
+  const snapshot = useSharedStructure(
+    live?.jobDetailUpdates ?? data?.jobDetailSnapshot ?? null,
+  );
   const inQueue = Boolean(snapshot?.queueItem);
   const raw = snapshot?.queueItem ?? snapshot?.historyItem ?? null;
   const job = useMemo(() => (raw ? normalizeJobData(raw) : null), [raw]);
@@ -349,7 +432,11 @@ function JobDetailContent() {
   // Asked for once the job is known to be usenet: nothing else has one.
   const [{ data: duplicateData }, refetchDuplicate] = useQuery<{
     duplicateSnapshot: DuplicateSnapshot | null;
-  }>({ query: DUPLICATE_SNAPSHOT_QUERY, variables, pause: !Number.isFinite(jobId) || !usenet });
+  }>({
+    query: DUPLICATE_SNAPSHOT_QUERY,
+    variables,
+    pause: !Number.isFinite(jobId) || !usenet,
+  });
   const stateKey = torrentStateLabelKey(torrent?.state);
   // The output folder fills in as the job moves through post-processing and
   // settles when it finishes, so the listing is re-read on each status change
@@ -360,7 +447,11 @@ function JobDetailContent() {
     const previous = listedStatus.current;
     listedStatus.current = jobStatus;
     // The first status is the one the initial listing was read under.
-    if (previous !== undefined && jobStatus !== undefined && previous !== jobStatus) {
+    if (
+      previous !== undefined &&
+      jobStatus !== undefined &&
+      previous !== jobStatus
+    ) {
       refetchFiles({ requestPolicy: "network-only" });
     }
   }, [jobStatus, refetchFiles]);
@@ -377,7 +468,8 @@ function JobDetailContent() {
     }
   }, [archivedAt, refetchFiles]);
   // A history operation the entry waits on, or the archive that last failed for it.
-  const operation = !inQueue && job ? rowOperationKind(job.deleteOperation) : null;
+  const operation =
+    !inQueue && job ? rowOperationKind(job.deleteOperation) : null;
   // The snapshot carries the newest page of the log. Once older pages were
   // read, every event seen is kept, so the newest page moving on leaves no
   // gap between what was read and what arrives. A snapshot that moved past
@@ -395,7 +487,9 @@ function JobDetailContent() {
   }, [liveEvents]);
   const keptEvents = useMemo(
     () =>
-      (pagedEvents ? extendKept(pagedEvents.kept, liveEvents ?? []) : null) ?? liveEvents ?? [],
+      (pagedEvents ? extendKept(pagedEvents.kept, liveEvents ?? []) : null) ??
+      liveEvents ??
+      [],
     [liveEvents, pagedEvents],
   );
   // The engine appends; the log reads newest first, like every other log here.
@@ -407,11 +501,19 @@ function JobDetailContent() {
   // total that can be smaller than the download. Ordered and measured by
   // payload, which is the question the panel answers.
   const providers = useMemo(() => {
-    const credited = (snapshot?.serverAttribution ?? []).filter((entry) => entry.articles > 0);
-    const attributed = credited.reduce((sum, entry) => sum + entry.wireBytes, 0);
+    const credited = (snapshot?.serverAttribution ?? []).filter(
+      (entry) => entry.articles > 0,
+    );
+    const attributed = credited.reduce(
+      (sum, entry) => sum + entry.wireBytes,
+      0,
+    );
     return credited
       .slice()
-      .sort((left, right) => right.wireBytes - left.wireBytes || left.serverId - right.serverId)
+      .sort(
+        (left, right) =>
+          right.wireBytes - left.wireBytes || left.serverId - right.serverId,
+      )
       .map((entry) => ({
         ...entry,
         share: attributed > 0 ? (entry.wireBytes / attributed) * 100 : 0,
@@ -421,7 +523,13 @@ function JobDetailContent() {
   // finished one is fixed and needs no clock at all.
   const now = useNow(1000, inQueue);
   const timeline = useMemo(
-    () => buildTimelineView(t, snapshot?.jobTimeline, now, job?.status === "PROPAGATING"),
+    () =>
+      buildTimelineView(
+        t,
+        snapshot?.jobTimeline,
+        now,
+        job?.status === "PROPAGATING",
+      ),
     [job?.status, now, snapshot?.jobTimeline, t],
   );
 
@@ -433,7 +541,9 @@ function JobDetailContent() {
     () => [...(firstFiles?.files ?? []), ...(more?.files ?? [])],
     [firstFiles, more],
   );
-  const nextFilesCursor = more ? more.nextCursor : (firstFiles?.nextCursor ?? null);
+  const nextFilesCursor = more
+    ? more.nextCursor
+    : (firstFiles?.nextCursor ?? null);
   const fileTotal = Math.max(firstFiles?.totalCount ?? 0, files.length);
   const entryArchived = firstFiles?.archived ?? false;
   const outputDir = firstFiles?.outputDir || job?.outputDir || null;
@@ -443,9 +553,14 @@ function JobDetailContent() {
     return (
       <NextShell title={t("next.job.title")} note={`#${id}`}>
         <div className="flex min-h-0 flex-1 flex-col overflow-y-auto bg-wv-list">
-          <EmptyState title={t("next.job.missingTitle")} body={t("next.job.missingBody")} />
+          <EmptyState
+            title={t("next.job.missingTitle")}
+            body={t("next.job.missingBody")}
+          />
           <div className="px-4 sm:px-6">
-            <SecondaryButton icon="back" onClick={() => navigate("/history")}>{t("next.job.backToHistory")}</SecondaryButton>
+            <SecondaryButton icon="back" onClick={() => navigate("/history")}>
+              {t("next.job.backToHistory")}
+            </SecondaryButton>
           </div>
         </div>
       </NextShell>
@@ -456,7 +571,11 @@ function JobDetailContent() {
     return (
       <NextShell title={t("next.job.title")} note={`#${id}`}>
         <div className="flex min-h-0 flex-1 flex-col overflow-y-auto bg-wv-list">
-          <EmptyState loading title={t("next.common.loading")} body={t("next.job.loadingBody")} />
+          <EmptyState
+            loading
+            title={t("next.common.loading")}
+            body={t("next.job.loadingBody")}
+          />
         </div>
       </NextShell>
     );
@@ -478,7 +597,12 @@ function JobDetailContent() {
   // clean post fills it whatever recovery stayed held back.
   const payload =
     job.wantedBytes && job.wantedBytes > 0
-      ? { done: job.wantedBytes - Math.min(job.remainingBytes ?? 0, job.wantedBytes), total: job.wantedBytes }
+      ? {
+          done:
+            job.wantedBytes -
+            Math.min(job.remainingBytes ?? 0, job.wantedBytes),
+          total: job.wantedBytes,
+        }
       : { done: job.downloadedBytes, total: job.totalBytes };
   const phase = ratePhase(job.phaseProgress);
   const stageIds = new Set(timeline?.stages.map((stage) => stage.id) ?? []);
@@ -497,14 +621,17 @@ function JobDetailContent() {
   const outcome = partial
     ? t("next.job.outcomePartial")
     : failed
-    ? t("next.job.outcomeFailed")
-    : done
-      ? isTorrent
-        ? t("next.job.outcomeTorrent")
-        : repaired
-        ? t("next.job.outcomeRepaired")
-        : t("next.job.outcomeVerified")
-      : t("next.job.outcomeRunning", { status: statusLabel(progress.status), percent: Math.round(percent) });
+      ? t("next.job.outcomeFailed")
+      : done
+        ? isTorrent
+          ? t("next.job.outcomeTorrent")
+          : repaired
+            ? t("next.job.outcomeRepaired")
+            : t("next.job.outcomeVerified")
+        : t("next.job.outcomeRunning", {
+            status: statusLabel(progress.status),
+            percent: Math.round(percent),
+          });
 
   const statusSentence = partial
     ? t("next.job.deliveredInPart", {
@@ -512,33 +639,50 @@ function JobDetailContent() {
         reason: job.error || t("next.job.partialReason"),
       })
     : failed
-    ? t("next.job.stopped", {
-        time: formatClockSeconds(job.completedAt),
-        reason: job.error || t("next.job.stoppedReason"),
-      })
-    : done && isTorrent
-      ? // A torrent finishes when its last piece checks out and then seeds
-        // for days: its own completion date, with no pipeline after it.
-        t("next.job.finished", { time: formatDate(torrent?.completedAtMs ?? job.completedAt) })
-    : done
-      ? [
-          t("next.job.finished", { time: formatClockSeconds(job.completedAt) }),
-          elapsedMs === null ? null : t("next.job.endToEnd", { span: formatSpan(elapsedMs) }),
-          repaired ? t("next.job.repairedBeforeMoving") : verified ? t("next.job.verifiedWithoutRepair") : null,
-        ]
-          .filter(Boolean)
-          .join(" · ")
-      : [
-          t("next.job.started", { time: formatClockSeconds(job.createdAt) }),
-          phase?.rateBps ? formatRate(phase.rateBps) : null,
-          phase?.estimatedRemainingMs
-            ? t("next.job.remaining", { duration: formatDuration(phase.estimatedRemainingMs / 1000) })
-            : null,
-        ]
-          .filter(Boolean)
-          .join(" · ");
+      ? t("next.job.stopped", {
+          time: formatClockSeconds(job.completedAt),
+          reason: job.error || t("next.job.stoppedReason"),
+        })
+      : done && isTorrent
+        ? // A torrent finishes when its last piece checks out and then seeds
+          // for days: its own completion date, with no pipeline after it.
+          t("next.job.finished", {
+            time: formatDate(torrent?.completedAtMs ?? job.completedAt),
+          })
+        : done
+          ? [
+              t("next.job.finished", {
+                time: formatClockSeconds(job.completedAt),
+              }),
+              elapsedMs === null
+                ? null
+                : t("next.job.endToEnd", { span: formatSpan(elapsedMs) }),
+              repaired
+                ? t("next.job.repairedBeforeMoving")
+                : verified
+                  ? t("next.job.verifiedWithoutRepair")
+                  : null,
+            ]
+              .filter(Boolean)
+              .join(" · ")
+          : [
+              t("next.job.started", {
+                time: formatClockSeconds(job.createdAt),
+              }),
+              phase?.rateBps ? formatRate(phase.rateBps) : null,
+              phase?.estimatedRemainingMs
+                ? t("next.job.remaining", {
+                    duration: formatDuration(phase.estimatedRemainingMs / 1000),
+                  })
+                : null,
+            ]
+              .filter(Boolean)
+              .join(" · ");
 
-  const run = async (label: string, action: () => Promise<{ error?: unknown }>) => {
+  const run = async (
+    label: string,
+    action: () => Promise<{ error?: unknown }>,
+  ) => {
     setBusy(true);
     const result = await action();
     setBusy(false);
@@ -590,7 +734,11 @@ function JobDetailContent() {
       )
       .join("\n");
     void copyText(text).then((taken) =>
-      setReport(taken ? countLabel(t, "next.job.copiedEvents", events.length) : t("next.system.copyFailed")),
+      setReport(
+        taken
+          ? countLabel(t, "next.job.copiedEvents", events.length)
+          : t("next.system.copyFailed"),
+      ),
     );
   };
 
@@ -599,7 +747,9 @@ function JobDetailContent() {
     if (!firstFiles || !nextFilesCursor) return;
     setLoadingMore("files");
     const result = await client
-      .query<{ jobOutputFiles: Pick<OutputFilesPage, "files" | "nextCursor"> | null }>(
+      .query<{
+        jobOutputFiles: Pick<OutputFilesPage, "files" | "nextCursor"> | null;
+      }>(
         JOB_OUTPUT_FILES_PAGE_QUERY,
         { jobId, first: LIST_PAGE_SIZE, after: nextFilesCursor },
         { requestPolicy: "network-only" },
@@ -611,8 +761,13 @@ function JobDetailContent() {
     if (result.error) setReport(result.error.message);
     if (!page) return;
     setMoreFiles((previous) => {
-      const held = previous && previous.first === firstFiles ? previous.files : [];
-      return { first: firstFiles, files: [...held, ...page.files], nextCursor: page.nextCursor };
+      const held =
+        previous && previous.first === firstFiles ? previous.files : [];
+      return {
+        first: firstFiles,
+        files: [...held, ...page.files],
+        nextCursor: page.nextCursor,
+      };
     });
   };
 
@@ -636,7 +791,10 @@ function JobDetailContent() {
     if (!older) return;
     // The page goes in front of the events shown when it was asked for; the
     // snapshot extends them on each render, or replaces them if it moved past.
-    setPagedEvents({ kept: prependOlder(shown, older), exhausted: older.length === 0 });
+    setPagedEvents({
+      kept: prependOlder(shown, older),
+      exhausted: older.length === 0,
+    });
   };
 
   return (
@@ -658,7 +816,13 @@ function JobDetailContent() {
               {job.displayTitle || job.name}
             </h1>
             <StateChip
-              label={stateKey ? t(stateKey) : partial ? t("next.job.partial") : statusLabel(progress.status)}
+              label={
+                stateKey
+                  ? t(stateKey)
+                  : partial
+                    ? t("next.job.partial")
+                    : statusLabel(progress.status)
+              }
               tone={failed || partial ? "bad" : "ok"}
             />
           </div>
@@ -675,7 +839,11 @@ function JobDetailContent() {
                 {t("next.job.downloadNzb")}
               </SecondaryButton>
             )}
-            <SupportReportActions jobId={job.id} size="compact" onReport={setReport} />
+            <SupportReportActions
+              jobId={job.id}
+              size="compact"
+              onReport={setReport}
+            />
             {/* Only while scripts run: a job waiting for a script slot reports itself as queued. */}
             {job.status === "POST_PROCESSING" ? (
               <SecondaryButton
@@ -683,7 +851,9 @@ function JobDetailContent() {
                 size="compact"
                 disabled={busy}
                 onClick={() => {
-                  void run(t("next.job.report.stoppedScripts"), () => cancelPostProcessing({ jobId: job.id }));
+                  void run(t("next.job.report.stoppedScripts"), () =>
+                    cancelPostProcessing({ jobId: job.id }),
+                  );
                 }}
               >
                 {t("next.inspector.stopScripts")}
@@ -695,15 +865,29 @@ function JobDetailContent() {
                   icon={token === "paused" ? "resume" : "pause"}
                   size="compact"
                   disabled={busy}
-                  testId={token === "paused" ? torrentIds.jobResume : torrentIds.jobPause}
+                  testId={
+                    token === "paused"
+                      ? torrentIds.jobResume
+                      : torrentIds.jobPause
+                  }
                   onClick={() => {
-                    const wasMissing = token === "paused" && isFilesMissing(torrent?.state);
+                    const wasMissing =
+                      token === "paused" && isFilesMissing(torrent?.state);
                     void run(
-                      token === "paused" ? t("next.job.report.resumed") : t("next.job.report.paused"),
-                      () => (token === "paused" ? resumeJob({ id: job.id }) : pauseJob({ id: job.id })),
+                      token === "paused"
+                        ? t("next.job.report.resumed")
+                        : t("next.job.report.paused"),
+                      () =>
+                        token === "paused"
+                          ? resumeJob({ id: job.id })
+                          : pauseJob({ id: job.id }),
                     ).then(async () => {
                       refreshTorrent();
-                      if (wasMissing && (await stillFilesMissing(client, job.id))) setConfirm("filesMissing");
+                      if (
+                        wasMissing &&
+                        (await stillFilesMissing(client, job.id))
+                      )
+                        setConfirm("filesMissing");
                     });
                   }}
                 >
@@ -712,30 +896,55 @@ function JobDetailContent() {
                 <SecondaryButton
                   size="compact"
                   disabled={busy || torrent === null}
-                  testId={torrent?.forced ? torrentIds.jobUnforce : torrentIds.jobForce}
+                  testId={
+                    torrent?.forced
+                      ? torrentIds.jobUnforce
+                      : torrentIds.jobForce
+                  }
                   onClick={() => {
                     const forced = !(torrent?.forced ?? false);
-                    void run(t(forced ? "next.torrent.forced" : "next.torrent.unforced"), () =>
-                      setTorrentForced({ id: job.id, forced }),
+                    void run(
+                      t(
+                        forced
+                          ? "next.torrent.forced"
+                          : "next.torrent.unforced",
+                      ),
+                      () => setTorrentForced({ id: job.id, forced }),
                     ).then(refreshTorrent);
                   }}
                 >
-                  {torrent?.forced ? t("next.torrent.unforce") : t("next.torrent.force")}
+                  {torrent?.forced
+                    ? t("next.torrent.unforce")
+                    : t("next.torrent.force")}
                 </SecondaryButton>
-                <SecondaryButton size="compact" disabled={busy || torrent === null} onClick={() => setConfirm("recheck")}>
+                <SecondaryButton
+                  size="compact"
+                  disabled={busy || torrent === null}
+                  onClick={() => setConfirm("recheck")}
+                >
                   {t("next.torrent.recheck")}
                 </SecondaryButton>
                 <SecondaryButton
                   size="compact"
                   disabled={busy || torrent === null}
-                  onClick={() => setTorrentEdit({ kind: "move", value: torrent?.savePath ?? "" })}
+                  onClick={() =>
+                    setTorrentEdit({
+                      kind: "move",
+                      value: torrent?.savePath ?? "",
+                    })
+                  }
                 >
                   {t("next.torrent.move")}
                 </SecondaryButton>
                 <SecondaryButton
                   size="compact"
                   disabled={busy || torrent === null}
-                  onClick={() => setTorrentEdit({ kind: "category", value: torrent?.category ?? "" })}
+                  onClick={() =>
+                    setTorrentEdit({
+                      kind: "category",
+                      value: torrent?.category ?? "",
+                    })
+                  }
                 >
                   {t("next.categories.category")}
                 </SecondaryButton>
@@ -757,8 +966,13 @@ function JobDetailContent() {
                   disabled={busy}
                   onClick={() => {
                     void run(
-                      token === "paused" ? t("next.job.report.resumed") : t("next.job.report.paused"),
-                      () => (token === "paused" ? resumeJob({ id: job.id }) : pauseJob({ id: job.id })),
+                      token === "paused"
+                        ? t("next.job.report.resumed")
+                        : t("next.job.report.paused"),
+                      () =>
+                        token === "paused"
+                          ? resumeJob({ id: job.id })
+                          : pauseJob({ id: job.id }),
                     );
                   }}
                 >
@@ -776,23 +990,28 @@ function JobDetailContent() {
                 >
                   {t("next.completed.rerunScripts")}
                 </SecondaryButton>
-                <DangerButton icon="cancelDownload" size="compact" disabled={busy} onClick={() => setConfirm("cancel")}>
+                <DangerButton
+                  icon="cancelDownload"
+                  size="compact"
+                  disabled={busy}
+                  onClick={() => setConfirm("cancel")}
+                >
                   {t("action.cancel")}
                 </DangerButton>
               </>
             ) : (
               <>
                 {!usenet ? null : (
-                <SecondaryButton
-                  icon="redownload"
-                  size="compact"
-                  disabled={busy}
-                  onClick={() => {
-                    setRetryAction("redownload");
-                  }}
-                >
-                  {t("next.completed.redownload")}
-                </SecondaryButton>
+                  <SecondaryButton
+                    icon="redownload"
+                    size="compact"
+                    disabled={busy}
+                    onClick={() => {
+                      setRetryAction("redownload");
+                    }}
+                  >
+                    {t("next.completed.redownload")}
+                  </SecondaryButton>
                 )}
                 <SecondaryButton
                   icon="postProcessing"
@@ -807,16 +1026,16 @@ function JobDetailContent() {
                   {t("next.completed.rerunScripts")}
                 </SecondaryButton>
                 {!usenet ? null : (
-                <SecondaryButton
-                  icon="reprocess"
-                  size="compact"
-                  disabled={busy}
-                  onClick={() => {
-                    setRetryAction("reprocess");
-                  }}
-                >
-                  {t("next.job.reprocess")}
-                </SecondaryButton>
+                  <SecondaryButton
+                    icon="reprocess"
+                    size="compact"
+                    disabled={busy}
+                    onClick={() => {
+                      setRetryAction("reprocess");
+                    }}
+                  >
+                    {t("next.job.reprocess")}
+                  </SecondaryButton>
                 )}
                 {usenet && job.failedForMemory ? (
                   <SecondaryButton
@@ -850,18 +1069,34 @@ function JobDetailContent() {
                     <DangerButton
                       icon="remove"
                       size="compact"
-                      disabled={busy || (operation !== null && operation !== "archiveFailed")}
+                      disabled={
+                        busy ||
+                        (operation !== null && operation !== "archiveFailed")
+                      }
                       testId={jobIds.jobArchive}
                       onClick={() => setConfirm("archive")}
                     >
-                      {operation === "archiving" ? t("next.historyArchive.pending") : t("next.historyArchive.action")}
+                      {operation === "archiving"
+                        ? t("next.historyArchive.pending")
+                        : t("next.historyArchive.action")}
                     </DangerButton>
                   </>
                 )}
-                <DangerButton icon="remove" size="compact" disabled={busy} onClick={() => setConfirm("delete")}>
+                <DangerButton
+                  icon="remove"
+                  size="compact"
+                  disabled={busy}
+                  onClick={() => setConfirm("delete")}
+                >
                   {t("next.job.deleteSaveFiles")}
                 </DangerButton>
-                <DangerButton icon="remove" size="compact" solid disabled={busy} onClick={() => setConfirm("deleteAll")}>
+                <DangerButton
+                  icon="remove"
+                  size="compact"
+                  solid
+                  disabled={busy}
+                  onClick={() => setConfirm("deleteAll")}
+                >
                   {t("action.delete")}
                 </DangerButton>
               </>
@@ -901,7 +1136,9 @@ function JobDetailContent() {
             percentClassName="text-[13px] font-medium text-wv-fg"
             percentTestId={jobIds.jobProgress}
           />
-          <div className="font-wv-mono text-[11.5px] text-wv-muted">{statusSentence}</div>
+          <div className="font-wv-mono text-[11.5px] text-wv-muted">
+            {statusSentence}
+          </div>
         </div>
 
         <MetricStrip min={168}>
@@ -909,80 +1146,112 @@ function JobDetailContent() {
             variant="stat"
             eyebrow={t("next.job.downloaded")}
             value={formatSize(job.downloadedBytes)}
-            note={t(usenet ? "next.job.ofPosted" : "next.job.ofTotal", { size: formatSize(job.totalBytes) })}
+            note={t(usenet ? "next.job.ofPosted" : "next.job.ofTotal", {
+              size: formatSize(job.totalBytes),
+            })}
           />
           {/* PAR2 repair is a usenet job's; a torrent piece that fails its
               hash is fetched again and counted as wasted. */}
           {usenet ? (
-          <MetricCell
-            variant="stat"
-            eyebrow={t("next.job.integrity")}
-            value={verified || terminal ? `${(job.health / 10).toFixed(1)}%` : EM_DASH}
-            valueClassName={
-              !verified && !terminal
-                ? "text-wv-muted"
-                : HEALTH_TONE_CLASS[
-                    healthTone(job.health, criticalHealthMilli(job.totalBytes, job.optionalRecoveryBytes))
-                  ]
-            }
-            note={
-              verified || terminal
-                ? job.failedBytes > 0
-                  ? t("next.job.neverRecovered", { size: formatSize(job.failedBytes) })
-                  : t("next.job.noDamage")
-                : t("next.job.verifiesAfter")
-            }
-          />
+            <MetricCell
+              variant="stat"
+              eyebrow={t("next.job.integrity")}
+              value={
+                verified || terminal
+                  ? `${(job.health / 10).toFixed(1)}%`
+                  : EM_DASH
+              }
+              valueClassName={
+                !verified && !terminal
+                  ? "text-wv-muted"
+                  : HEALTH_TONE_CLASS[
+                      healthTone(
+                        job.health,
+                        criticalHealthMilli(
+                          job.totalBytes,
+                          job.optionalRecoveryBytes,
+                        ),
+                      )
+                    ]
+              }
+              note={
+                verified || terminal
+                  ? job.failedBytes > 0
+                    ? t("next.job.neverRecovered", {
+                        size: formatSize(job.failedBytes),
+                      })
+                    : t("next.job.noDamage")
+                  : t("next.job.verifiesAfter")
+              }
+            />
           ) : null}
           {/* A torrent has no download phases: its own reading, the average
               over its time active once it ends, its rate while it runs. */}
           {isTorrent ? (
             <>
-            <MetricCell
-              variant="stat"
-              eyebrow={terminal ? t("next.job.averageDownloadSpeed") : t("next.job.currentRate")}
-              value={
-                torrent === null
-                  ? EM_DASH
-                  : formatRate(terminal ? torrent.downloadAvgBps : torrent.downloadBps)
-              }
-            />
-            {/* It uploads for as long as it is held, so the average reads at any point. */}
-            <MetricCell
-              variant="stat"
-              eyebrow={t("next.job.averageUploadSpeed")}
-              value={torrent === null ? EM_DASH : formatRate(torrent.uploadAvgBps)}
-            />
+              <MetricCell
+                variant="stat"
+                eyebrow={
+                  terminal
+                    ? t("next.job.averageDownloadSpeed")
+                    : t("next.job.currentRate")
+                }
+                value={
+                  torrent === null
+                    ? EM_DASH
+                    : formatRate(
+                        terminal ? torrent.downloadAvgBps : torrent.downloadBps,
+                      )
+                }
+              />
+              {/* It uploads for as long as it is held, so the average reads at any point. */}
+              <MetricCell
+                variant="stat"
+                eyebrow={t("next.job.averageUploadSpeed")}
+                value={
+                  torrent === null ? EM_DASH : formatRate(torrent.uploadAvgBps)
+                }
+              />
             </>
           ) : (
-          <MetricCell
-            variant="stat"
-            eyebrow={terminal ? t("next.job.averageDownloadSpeed") : t("next.job.currentRate")}
-            value={
-              terminal
-                ? downloadMs !== null
-                  ? formatRate(job.downloadedBytes / (downloadMs / 1000))
-                  : EM_DASH
-                : phase?.rateBps
-                  ? formatRate(phase.rateBps)
-                  : EM_DASH
-            }
-            note={
-              terminal
-                ? downloadMs !== null
-                  ? t("next.job.overDownloading", { span: formatSpan(downloadMs) })
-                  : undefined
-                : phase
-                  ? t(`next.job.while.${phase.phase}`)
-                  : t("next.job.thisPhase")
-            }
-          />
+            <MetricCell
+              variant="stat"
+              eyebrow={
+                terminal
+                  ? t("next.job.averageDownloadSpeed")
+                  : t("next.job.currentRate")
+              }
+              value={
+                terminal
+                  ? downloadMs !== null
+                    ? formatRate(job.downloadedBytes / (downloadMs / 1000))
+                    : EM_DASH
+                  : phase?.rateBps
+                    ? formatRate(phase.rateBps)
+                    : EM_DASH
+              }
+              note={
+                terminal
+                  ? downloadMs !== null
+                    ? t("next.job.overDownloading", {
+                        span: formatSpan(downloadMs),
+                      })
+                    : undefined
+                  : phase
+                    ? t(`next.job.while.${phase.phase}`)
+                    : t("next.job.thisPhase")
+              }
+            />
           )}
           {/* Only a usenet job has a recovery set to fetch or skip. */}
           {!usenet ? null : (
             <MetricCell
               variant="stat"
-              eyebrow={job.optionalRecoveryDownloadedBytes > 0 ? t("next.job.recovery") : t("next.job.saved")}
+              eyebrow={
+                job.optionalRecoveryDownloadedBytes > 0
+                  ? t("next.job.recovery")
+                  : t("next.job.saved")
+              }
               value={
                 job.optionalRecoveryBytes === 0
                   ? EM_DASH
@@ -1001,7 +1270,9 @@ function JobDetailContent() {
                 job.optionalRecoveryBytes === 0
                   ? t("next.job.noSetPosted")
                   : job.optionalRecoveryDownloadedBytes > 0
-                    ? t("next.job.ofFetched", { size: formatSize(job.optionalRecoveryBytes) })
+                    ? t("next.job.ofFetched", {
+                        size: formatSize(job.optionalRecoveryBytes),
+                      })
                     : t("next.job.setSkipped")
               }
             />
@@ -1019,21 +1290,26 @@ function JobDetailContent() {
         {/* The stage waterfall and its wait for the first stage are the
             usenet pipeline's; another job shows only stages it recorded. */}
         {usenet || timeline ? (
-        <DetailBlock id="pipeline" title={t("next.job.pipeline")} note={timeline?.note} bodyClassName="gap-0">
-          {timeline ? (
-            <Waterfall
-              stages={timeline.stages}
-              members={timeline.members}
-              ticks={timeline.ticks}
-              window={timeline.window}
-              total={timeline.total}
-            />
-          ) : (
-            <span className="text-[12.5px] text-wv-muted">
-              {t("next.job.noStages")}
-            </span>
-          )}
-        </DetailBlock>
+          <DetailBlock
+            id="pipeline"
+            title={t("next.job.pipeline")}
+            note={timeline?.note}
+            bodyClassName="gap-0"
+          >
+            {timeline ? (
+              <Waterfall
+                stages={timeline.stages}
+                members={timeline.members}
+                ticks={timeline.ticks}
+                window={timeline.window}
+                total={timeline.total}
+              />
+            ) : (
+              <span className="text-[12.5px] text-wv-muted">
+                {t("next.job.noStages")}
+              </span>
+            )}
+          </DetailBlock>
         ) : null}
 
         <DetailBlock
@@ -1052,71 +1328,77 @@ function JobDetailContent() {
             </span>
           ) : (
             <>
-            {files.map((file) => (
-              <GridRow
-                key={file.path}
-                columns={FILE_COLUMNS}
-                gap={14}
-                className="h-[38px] border-t border-wv-hairline"
-                title={file.path}
-              >
-                <div className="min-w-0 truncate font-wv-mono text-[12px] text-wv-fg">
-                  {file.name}
-                </div>
-                <div className="text-right font-wv-mono text-[12px] text-wv-muted">
-                  {formatSize(file.sizeBytes)}
-                </div>
-                {/* A file of an archived entry is only a record: nothing to fetch. */}
-                {entryArchived ? (
-                  <span
-                    data-testid={jobIds.jobFileArchived}
-                    className="text-right font-wv-mono text-[11px] whitespace-nowrap text-wv-muted uppercase"
-                  >
-                    {t("next.job.fileRemoved")}
-                  </span>
-                ) : (
-                  <SecondaryButton
-                    icon="downloadFile"
-                    size="compact"
-                    title={t("next.job.downloadFileTitle", { name: file.name })}
-                    onClick={() => downloadOutputFile(file)}
-                    className={FILE_ACTION}
-                  >
-                    <FileActionLabel>{t("next.job.download")}</FileActionLabel>
-                  </SecondaryButton>
-                )}
-                {/* Nor a path to copy: nothing is there any more. */}
-                {entryArchived ? (
-                  <span aria-hidden="true" />
-                ) : (
-                  <SecondaryButton
-                    icon="copy"
-                    size="compact"
-                    title={t("next.job.copyPathTitle")}
-                    onClick={() => {
-                      void copyText(file.path).then((taken) =>
-                        setReport(
-                          taken ? t("next.job.copiedPath", { name: file.name }) : t("next.system.copyFailed"),
-                        ),
-                      );
-                    }}
-                    className={FILE_ACTION}
-                  >
-                    <FileActionLabel>{t("next.job.copy")}</FileActionLabel>
-                  </SecondaryButton>
-                )}
-              </GridRow>
-            ))}
-            {showsMore(fileTotal, files.length, nextFilesCursor !== null) ? (
-              <ShowMore
-                label={t("next.job.showMore")}
-                testId={jobIds.jobFilesShowMore}
-                disabled={loadingMore !== null}
-                onClick={() => {
-                  void loadMoreFiles();
-                }}
-              />
-            ) : null}
+              {files.map((file) => (
+                <GridRow
+                  key={file.path}
+                  columns={FILE_COLUMNS}
+                  gap={14}
+                  className="h-[38px] border-t border-wv-hairline"
+                  title={file.path}
+                >
+                  <div className="min-w-0 truncate font-wv-mono text-[12px] text-wv-fg">
+                    {file.name}
+                  </div>
+                  <div className="text-right font-wv-mono text-[12px] text-wv-muted">
+                    {formatSize(file.sizeBytes)}
+                  </div>
+                  {/* A file of an archived entry is only a record: nothing to fetch. */}
+                  {entryArchived ? (
+                    <span
+                      data-testid={jobIds.jobFileArchived}
+                      className="text-right font-wv-mono text-[11px] whitespace-nowrap text-wv-muted uppercase"
+                    >
+                      {t("next.job.fileRemoved")}
+                    </span>
+                  ) : (
+                    <SecondaryButton
+                      icon="downloadFile"
+                      size="compact"
+                      title={t("next.job.downloadFileTitle", {
+                        name: file.name,
+                      })}
+                      onClick={() => downloadOutputFile(file)}
+                      className={FILE_ACTION}
+                    >
+                      <FileActionLabel>
+                        {t("next.job.download")}
+                      </FileActionLabel>
+                    </SecondaryButton>
+                  )}
+                  {/* Nor a path to copy: nothing is there any more. */}
+                  {entryArchived ? (
+                    <span aria-hidden="true" />
+                  ) : (
+                    <SecondaryButton
+                      icon="copy"
+                      size="compact"
+                      title={t("next.job.copyPathTitle")}
+                      onClick={() => {
+                        void copyText(file.path).then((taken) =>
+                          setReport(
+                            taken
+                              ? t("next.job.copiedPath", { name: file.name })
+                              : t("next.system.copyFailed"),
+                          ),
+                        );
+                      }}
+                      className={FILE_ACTION}
+                    >
+                      <FileActionLabel>{t("next.job.copy")}</FileActionLabel>
+                    </SecondaryButton>
+                  )}
+                </GridRow>
+              ))}
+              {showsMore(fileTotal, files.length, nextFilesCursor !== null) ? (
+                <ShowMore
+                  label={t("next.job.showMore")}
+                  testId={jobIds.jobFilesShowMore}
+                  disabled={loadingMore !== null}
+                  onClick={() => {
+                    void loadMoreFiles();
+                  }}
+                />
+              ) : null}
             </>
           )}
         </DetailBlock>
@@ -1132,9 +1414,14 @@ function JobDetailContent() {
                 onClick={copyLog}
                 title={
                   events.length < eventTotal
-                    ? countLabel(t, "next.job.copyLoadedEvents", events.length, {
-                        count: formatCount(events.length),
-                      })
+                    ? countLabel(
+                        t,
+                        "next.job.copyLoadedEvents",
+                        events.length,
+                        {
+                          count: formatCount(events.length),
+                        },
+                      )
                     : undefined
                 }
                 className="cursor-pointer text-wv-dim hover:text-wv-fg"
@@ -1150,37 +1437,44 @@ function JobDetailContent() {
             </span>
           ) : (
             <>
-            {events.map((event) => (
-              <GridRow
-                key={event.cursor ?? `${event.timestamp}-${event.kind}-${event.fileId ?? ""}-${event.message}`}
-                columns={EVENT_COLUMNS}
-                className="items-baseline border-t border-wv-hairline py-[7px]"
-              >
-                <span className="font-wv-mono text-[11px] text-wv-disabled">
-                  {formatClockSeconds(event.timestamp)}
-                </span>
-                <span
-                  className={`hidden truncate font-wv-mono text-[11px] sm:block ${EVENT_TONE_CLASS[eventTone(event.kind)]}`}
+              {events.map((event) => (
+                <GridRow
+                  key={
+                    event.cursor ??
+                    `${event.timestamp}-${event.kind}-${event.fileId ?? ""}-${event.message}`
+                  }
+                  columns={EVENT_COLUMNS}
+                  className="items-baseline border-t border-wv-hairline py-[7px]"
                 >
-                  {event.kind}
-                </span>
-                <span
-                  className={`min-w-0 text-[12.5px] sm:text-wv-tertiary ${EVENT_TONE_CLASS[eventTone(event.kind)]}`}
-                >
-                  {event.message}
-                </span>
-              </GridRow>
-            ))}
-            {showsMore(eventTotal, events.length, !(pagedEvents?.exhausted ?? false)) ? (
-              <ShowMore
-                label={t("next.job.showMore")}
-                testId={jobIds.jobEventsShowMore}
-                disabled={loadingMore !== null}
-                onClick={() => {
-                  void loadOlderEvents();
-                }}
-              />
-            ) : null}
+                  <span className="font-wv-mono text-[11px] text-wv-disabled">
+                    {formatClockSeconds(event.timestamp)}
+                  </span>
+                  <span
+                    className={`hidden truncate font-wv-mono text-[11px] sm:block ${EVENT_TONE_CLASS[eventTone(event.kind)]}`}
+                  >
+                    {event.kind}
+                  </span>
+                  <span
+                    className={`min-w-0 text-[12.5px] sm:text-wv-tertiary ${EVENT_TONE_CLASS[eventTone(event.kind)]}`}
+                  >
+                    {event.message}
+                  </span>
+                </GridRow>
+              ))}
+              {showsMore(
+                eventTotal,
+                events.length,
+                !(pagedEvents?.exhausted ?? false),
+              ) ? (
+                <ShowMore
+                  label={t("next.job.showMore")}
+                  testId={jobIds.jobEventsShowMore}
+                  disabled={loadingMore !== null}
+                  onClick={() => {
+                    void loadOlderEvents();
+                  }}
+                />
+              ) : null}
             </>
           )}
         </DetailBlock>
@@ -1201,7 +1495,12 @@ function JobDetailContent() {
               title={job.displayTitle || job.name}
               onReport={setReport}
               proxyEditor={(proxyId, onClose, onChanged) => (
-                <ProxyEditorFor key={proxyId} id={proxyId} onClose={onClose} onChanged={onChanged} />
+                <ProxyEditorFor
+                  key={proxyId}
+                  id={proxyId}
+                  onClose={onClose}
+                  onChanged={onChanged}
+                />
               )}
             />
           ) : null}
@@ -1209,58 +1508,78 @@ function JobDetailContent() {
               a usenet job's only. The posts' summary is kept once the job
               has one; until then the route above stands in its place. */}
           {usenet ? (
-          <>
-          {snapshot?.downloadSummary ? (
-            <DownloadSummaryPanel inQueue={inQueue} summary={snapshot.downloadSummary} />
+            <>
+              {snapshot?.downloadSummary ? (
+                <DownloadSummaryPanel
+                  inQueue={inQueue}
+                  summary={snapshot.downloadSummary}
+                />
+              ) : null}
+
+              <DetailBlock
+                id="identity"
+                title={t("next.job.duplicateIdentity")}
+                tone="panel"
+                bodyClassName="gap-[9px]"
+              >
+                <Field
+                  variant="inline"
+                  label={t("next.job.lifecycle")}
+                  value={
+                    duplicate?.lifecycle
+                      ? sentenceCase(duplicate.lifecycle)
+                      : EM_DASH
+                  }
+                />
+                <Field
+                  variant="inline"
+                  label={t("next.job.normalised")}
+                  value={duplicate?.normalizedName || EM_DASH}
+                  title={duplicate?.normalizedName ?? undefined}
+                />
+                <Field
+                  variant="inline"
+                  label={t("next.job.group")}
+                  value={
+                    duplicate?.semantic?.state
+                      ? `${sentenceCase(duplicate.semantic.state)}${
+                          duplicate.semantic.score === null
+                            ? ""
+                            : ` · ${Math.round(duplicate.semantic.score * 100)}%`
+                        }`
+                      : t("next.job.noGroup")
+                  }
+                />
+                <DangerButton
+                  icon="forget"
+                  className="mt-1 h-[30px] w-full"
+                  disabled={busy || !duplicate}
+                  onClick={() => setConfirm("forget")}
+                >
+                  {t("next.job.forgetIdentity")}
+                </DangerButton>
+              </DetailBlock>
+            </>
           ) : null}
 
           <DetailBlock
-            id="identity"
-            title={t("next.job.duplicateIdentity")}
+            id="metadata"
+            title={t("next.job.metadata")}
             tone="panel"
-            bodyClassName="gap-[9px]"
+            bodyClassName="gap-[11px]"
           >
             <Field
-              variant="inline"
-              label={t("next.job.lifecycle")}
-              value={duplicate?.lifecycle ? sentenceCase(duplicate.lifecycle) : EM_DASH}
+              variant="stacked"
+              label={t("next.job.jobId")}
+              value={String(job.id)}
             />
-            <Field
-              variant="inline"
-              label={t("next.job.normalised")}
-              value={duplicate?.normalizedName || EM_DASH}
-              title={duplicate?.normalizedName ?? undefined}
-            />
-            <Field
-              variant="inline"
-              label={t("next.job.group")}
-              value={
-                duplicate?.semantic?.state
-                  ? `${sentenceCase(duplicate.semantic.state)}${
-                      duplicate.semantic.score === null
-                        ? ""
-                        : ` · ${Math.round(duplicate.semantic.score * 100)}%`
-                    }`
-                  : t("next.job.noGroup")
-              }
-            />
-            <DangerButton
-              icon="forget"
-              className="mt-1 h-[30px] w-full"
-              disabled={busy || !duplicate}
-              onClick={() => setConfirm("forget")}
-            >
-              {t("next.job.forgetIdentity")}
-            </DangerButton>
-          </DetailBlock>
-          </>
-          ) : null}
-
-          <DetailBlock id="metadata" title={t("next.job.metadata")} tone="panel" bodyClassName="gap-[11px]">
-            <Field variant="stacked" label={t("next.job.jobId")} value={String(job.id)} />
             <Field
               variant="stacked"
-              label={isTorrent ? t("next.job.originalTorrentName") : t("next.job.originalTitle")}
+              label={
+                isTorrent
+                  ? t("next.job.originalTorrentName")
+                  : t("next.job.originalTitle")
+              }
               value={job.originalTitle || job.name}
             />
             <Field
@@ -1305,10 +1624,18 @@ function JobDetailContent() {
                 providers.map((provider, index) => (
                   <ShareRow
                     key={provider.serverId}
-                    label={provider.serverHost ?? t("next.job.serverId", { id: provider.serverId })}
-                    title={countLabel(t, "next.job.articles", provider.articles, {
-                      count: provider.articles.toLocaleString(),
-                    })}
+                    label={
+                      provider.serverHost ??
+                      t("next.job.serverId", { id: provider.serverId })
+                    }
+                    title={countLabel(
+                      t,
+                      "next.job.articles",
+                      provider.articles,
+                      {
+                        count: provider.articles.toLocaleString(),
+                      },
+                    )}
                     note={`${formatSize(provider.wireBytes)} · ${Math.round(provider.share)}%`}
                     percent={provider.share}
                     color={PROVIDER_COLORS[index % PROVIDER_COLORS.length]}
@@ -1322,13 +1649,23 @@ function JobDetailContent() {
               job's. Anything else would show the payload alone, which the
               strip at the top already says. */}
           {usenet ? (
-          <DetailBlock id="recovery" title={t("next.job.bytes")} tone="panel" bodyClassName="gap-[11px]">
-            <ShareRow
-              label={t("next.job.payload")}
-              note={t("next.job.sizeOf", { done: formatSize(payload.done), total: formatSize(payload.total) })}
-              percent={payload.total > 0 ? (payload.done / payload.total) * 100 : 0}
-              color={color}
-            />
+            <DetailBlock
+              id="recovery"
+              title={t("next.job.bytes")}
+              tone="panel"
+              bodyClassName="gap-[11px]"
+            >
+              <ShareRow
+                label={t("next.job.payload")}
+                note={t("next.job.sizeOf", {
+                  done: formatSize(payload.done),
+                  total: formatSize(payload.total),
+                })}
+                percent={
+                  payload.total > 0 ? (payload.done / payload.total) * 100 : 0
+                }
+                color={color}
+              />
               <>
                 <ShareRow
                   label={t("next.job.recoverySet")}
@@ -1342,26 +1679,38 @@ function JobDetailContent() {
                   }
                   percent={
                     job.optionalRecoveryBytes > 0
-                      ? (job.optionalRecoveryDownloadedBytes / job.optionalRecoveryBytes) * 100
+                      ? (job.optionalRecoveryDownloadedBytes /
+                          job.optionalRecoveryBytes) *
+                        100
                       : 0
                   }
                   color={WV.info}
                 />
                 <ShareRow
                   label={t("next.job.unrecovered")}
-                  note={job.failedBytes > 0 ? formatSize(job.failedBytes) : t("next.job.none")}
-                  percent={job.totalBytes > 0 ? (job.failedBytes / job.totalBytes) * 100 : 0}
+                  note={
+                    job.failedBytes > 0
+                      ? formatSize(job.failedBytes)
+                      : t("next.job.none")
+                  }
+                  percent={
+                    job.totalBytes > 0
+                      ? (job.failedBytes / job.totalBytes) * 100
+                      : 0
+                  }
                   color={WV.error}
                 />
               </>
-          </DetailBlock>
+            </DetailBlock>
           ) : null}
         </PanelGrid>
       </div>
 
       {(["delete", "deleteAll"] as const).map((kind) => {
         const deleteFiles = kind === "deleteAll";
-        const title = deleteFiles ? t("next.job.deleteAllTitle") : t("next.job.deleteTitle");
+        const title = deleteFiles
+          ? t("next.job.deleteAllTitle")
+          : t("next.job.deleteTitle");
         return (
           <ConfirmDialog
             key={kind}
@@ -1369,9 +1718,15 @@ function JobDetailContent() {
             title={title}
             note={job.displayTitle || job.name}
             busy={busy}
-            confirmLabel={deleteFiles ? t("action.delete") : t("next.job.deleteSaveFiles")}
+            confirmLabel={
+              deleteFiles ? t("action.delete") : t("next.job.deleteSaveFiles")
+            }
             solid={deleteFiles}
-            body={deleteFiles ? t("next.job.deleteAllBody") : t("next.job.deleteBody")}
+            body={
+              deleteFiles
+                ? t("next.job.deleteAllBody")
+                : t("next.job.deleteBody")
+            }
             onDismiss={() => setConfirm(null)}
             onConfirm={() => {
               setConfirm(null);
@@ -1404,16 +1759,37 @@ function JobDetailContent() {
         }}
       />
 
-      {retryAction ? <ArchivePasswordDialog
-        title={t(retryAction === "redownload" ? "next.completed.redownload"
-          : retryAction === "retryNoLimit" ? "next.job.retryNoLimit" : "next.job.reprocess")}
-        busy={busy} onDismiss={() => setRetryAction(null)}
-        onConfirm={(password) => {
-          setRetryAction(null);
-          void run(t(retryAction === "redownload" ? "next.job.report.requeued" : "next.job.report.reprocessing"),
-            () => retryAction === "redownload" ? redownloadJob({ id: job.id, password })
-              : reprocessJob({ id: job.id, password, noMemoryLimit: retryAction === "retryNoLimit" }));
-        }} /> : null}
+      {retryAction ? (
+        <ArchivePasswordDialog
+          title={t(
+            retryAction === "redownload"
+              ? "next.completed.redownload"
+              : retryAction === "retryNoLimit"
+                ? "next.job.retryNoLimit"
+                : "next.job.reprocess",
+          )}
+          busy={busy}
+          onDismiss={() => setRetryAction(null)}
+          onConfirm={(password) => {
+            setRetryAction(null);
+            void run(
+              t(
+                retryAction === "redownload"
+                  ? "next.job.report.requeued"
+                  : "next.job.report.reprocessing",
+              ),
+              () =>
+                retryAction === "redownload"
+                  ? redownloadJob({ id: job.id, password })
+                  : reprocessJob({
+                      id: job.id,
+                      password,
+                      noMemoryLimit: retryAction === "retryNoLimit",
+                    }),
+            );
+          }}
+        />
+      ) : null}
       <ConfirmDialog
         open={confirm === "cancel"}
         title={t("next.job.cancelTitle")}
@@ -1424,7 +1800,9 @@ function JobDetailContent() {
         onDismiss={() => setConfirm(null)}
         onConfirm={() => {
           setConfirm(null);
-          void run(t("next.job.report.cancelled"), () => cancelJob({ id: job.id }));
+          void run(t("next.job.report.cancelled"), () =>
+            cancelJob({ id: job.id }),
+          );
         }}
       />
 
@@ -1452,7 +1830,9 @@ function JobDetailContent() {
         onDismiss={() => setConfirm(null)}
         onRecheck={() => {
           setConfirm(null);
-          void run(t("next.torrent.rechecking"), () => recheckTorrent({ id: job.id })).then(refreshTorrent);
+          void run(t("next.torrent.rechecking"), () =>
+            recheckTorrent({ id: job.id }),
+          ).then(refreshTorrent);
         }}
         other={{
           label: t("next.torrent.move"),
@@ -1472,22 +1852,33 @@ function JobDetailContent() {
         onDismiss={() => setConfirm(null)}
         onConfirm={() => {
           setConfirm(null);
-          void run(t("next.torrent.rechecking"), () => recheckTorrent({ id: job.id })).then(refreshTorrent);
+          void run(t("next.torrent.rechecking"), () =>
+            recheckTorrent({ id: job.id }),
+          ).then(refreshTorrent);
         }}
       />
       <RecordEditor
         open={torrentEdit !== null}
-        title={torrentEdit?.kind === "move" ? t("next.torrent.move") : t("next.categories.category")}
+        title={
+          torrentEdit?.kind === "move"
+            ? t("next.torrent.move")
+            : t("next.categories.category")
+        }
         note={job.displayTitle || job.name}
         busy={busy}
-        saveDisabled={torrentEdit?.kind === "move" && torrentEdit.value.trim() === ""}
+        saveDisabled={
+          torrentEdit?.kind === "move" && torrentEdit.value.trim() === ""
+        }
         sections={
           torrentEdit === null
             ? []
             : [
                 {
                   id: torrentEdit.kind,
-                  title: torrentEdit.kind === "move" ? t("next.torrent.savePath") : t("next.categories.category"),
+                  title:
+                    torrentEdit.kind === "move"
+                      ? t("next.torrent.savePath")
+                      : t("next.categories.category"),
                   fields: [
                     torrentEdit.kind === "move"
                       ? {
@@ -1496,7 +1887,8 @@ function JobDetailContent() {
                           control: {
                             kind: "path" as const,
                             value: torrentEdit.value,
-                            onChange: (value: string) => setTorrentEdit({ kind: "move", value }),
+                            onChange: (value: string) =>
+                              setTorrentEdit({ kind: "move", value }),
                           },
                         }
                       : {
@@ -1506,10 +1898,17 @@ function JobDetailContent() {
                             kind: "select" as const,
                             value: torrentEdit.value,
                             options: [
-                              { value: "", label: t("next.torrent.noCategory") },
-                              ...categories.map((category) => ({ value: category.name, label: category.name })),
+                              {
+                                value: "",
+                                label: t("next.torrent.noCategory"),
+                              },
+                              ...categories.map((category) => ({
+                                value: category.name,
+                                label: category.name,
+                              })),
                             ],
-                            onChange: (value: string) => setTorrentEdit({ kind: "category", value }),
+                            onChange: (value: string) =>
+                              setTorrentEdit({ kind: "category", value }),
                           },
                         },
                   ],
@@ -1522,11 +1921,16 @@ function JobDetailContent() {
           const { kind, value } = torrentEdit;
           setTorrentEdit(null);
           void run(
-            kind === "move" ? t("next.torrent.moved") : t("next.torrent.categoryChanged"),
+            kind === "move"
+              ? t("next.torrent.moved")
+              : t("next.torrent.categoryChanged"),
             () =>
               kind === "move"
                 ? setTorrentLocation({ id: job.id, path: value.trim() })
-                : setTorrentCategory({ id: job.id, category: value === "" ? null : value }),
+                : setTorrentCategory({
+                    id: job.id,
+                    category: value === "" ? null : value,
+                  }),
           ).then(refreshTorrent);
         }}
       />
@@ -1569,7 +1973,9 @@ function ShareRow({
         <span className="truncate text-wv-tertiary" title={title ?? label}>
           {label}
         </span>
-        <span className="flex-none font-wv-mono text-[11px] text-wv-muted">{note}</span>
+        <span className="flex-none font-wv-mono text-[11px] text-wv-muted">
+          {note}
+        </span>
       </div>
       <Bar percent={percent} color={color} />
     </div>

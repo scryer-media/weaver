@@ -4,7 +4,11 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { normalizeJobData, type GraphqlJobData } from "../src/lib/job-types.ts";
-import { isActiveStatus, progressDisplayKind, statusI18nKey } from "../src/lib/status-tokens.ts";
+import {
+  isActiveStatus,
+  progressDisplayKind,
+  statusI18nKey,
+} from "../src/lib/status-tokens.ts";
 
 function job(status: string, reason: string | null) {
   return normalizeJobData({

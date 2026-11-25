@@ -18,7 +18,11 @@ import {
   type TorrentSummaryData,
 } from "../src/lib/torrents.ts";
 import { EM_DASH, formatRate, formatSize } from "../src/next/data/format.ts";
-import { informationFields, transferFields, transferNote } from "../src/next/features/torrents/general.ts";
+import {
+  informationFields,
+  transferFields,
+  transferNote,
+} from "../src/next/features/torrents/general.ts";
 import { nextDe } from "../src/next/i18n/de.ts";
 import { nextEn } from "../src/next/i18n/en.ts";
 import { nextEs } from "../src/next/i18n/es.ts";
@@ -40,16 +44,26 @@ test("a remove either removed or failed with the daemon's words", () => {
     kind: "failed",
     message: "no such torrent",
   });
-  assert.deepEqual(removeOutcome({ message: "network down", graphQLErrors: [] }), {
-    kind: "failed",
-    message: "network down",
-  });
+  assert.deepEqual(
+    removeOutcome({ message: "network down", graphQLErrors: [] }),
+    {
+      kind: "failed",
+      message: "network down",
+    },
+  );
 });
 
 test("the seeding column shows while a torrent seeds or has stopped", () => {
   assert.equal(showsSeeding("SEEDING"), true);
   assert.equal(showsSeeding("STOPPED"), true);
-  for (const state of ["QUEUED", "FETCHING_METADATA", "CHECKING_FILES", "DOWNLOADING", "STALLED", "PAUSED"] as const) {
+  for (const state of [
+    "QUEUED",
+    "FETCHING_METADATA",
+    "CHECKING_FILES",
+    "DOWNLOADING",
+    "STALLED",
+    "PAUSED",
+  ] as const) {
     assert.equal(showsSeeding(state), false);
   }
 });
@@ -155,16 +169,32 @@ test("the transfer section reads as qBittorrent's, with the swarm's totals and a
   assert.equal(values["Seeds"], "2 (40 total)");
   // No tracker counted the leechers.
   assert.equal(values["Peers"], `3 (${EM_DASH} total)`);
-  assert.equal(values["Download speed"], `${formatRate(2048)} (${formatRate(512)} avg.)`);
+  assert.equal(
+    values["Download speed"],
+    `${formatRate(2048)} (${formatRate(512)} avg.)`,
+  );
   assert.equal(values["Wasted"], formatSize(16 * 1024));
   assert.equal(values["Share ratio"], "0.50");
   assert.equal(values["Reannounce in"], "10m");
   assert.equal(values["Last seen complete"], EM_DASH);
   // No session yet, no ETA, no announce due.
-  const idle = byLabel(transferFields(t, torrent({ activeSeconds: 0, etaSeconds: null, reannounceSeconds: null })));
-  assert.deepEqual([idle["Time active"], idle["ETA"], idle["Reannounce in"]], [EM_DASH, EM_DASH, EM_DASH]);
+  const idle = byLabel(
+    transferFields(
+      t,
+      torrent({ activeSeconds: 0, etaSeconds: null, reannounceSeconds: null }),
+    ),
+  );
+  assert.deepEqual(
+    [idle["Time active"], idle["ETA"], idle["Reannounce in"]],
+    [EM_DASH, EM_DASH, EM_DASH],
+  );
   // A seeding torrent names its seeding time and its current run.
-  const seeding = byLabel(transferFields(t, torrent({ seedingSeconds: 1800, consecutiveSeedingSeconds: 600 })));
+  const seeding = byLabel(
+    transferFields(
+      t,
+      torrent({ seedingSeconds: 1800, consecutiveSeedingSeconds: 600 }),
+    ),
+  );
   assert.equal(seeding["Time active"], "1h 0m (seeded for 30m, run 10m)");
 });
 
@@ -180,10 +210,17 @@ test("the information section names the pieces, the maker and where the torrent 
   assert.equal(values["Save path"], "/complete/set");
   assert.equal(values["Route"], undefined);
   assert.equal(values["Unpack"], "On");
-  const hybrid = byLabel(informationFields(t, torrent({ infohashV2: "cd".repeat(32) })));
+  const hybrid = byLabel(
+    informationFields(t, torrent({ infohashV2: "cd".repeat(32) })),
+  );
   assert.equal(hybrid["Info hash v2"], "cd".repeat(32));
   // A field the torrent has no value for is left out: a magnet without its metainfo has no pieces yet.
-  const magnet = byLabel(informationFields(t, torrent({ pieceCount: null, pieceSize: null, piecesHave: null })));
+  const magnet = byLabel(
+    informationFields(
+      t,
+      torrent({ pieceCount: null, pieceSize: null, piecesHave: null }),
+    ),
+  );
   assert.equal(magnet["Pieces"], undefined);
 });
 
@@ -209,17 +246,43 @@ test("a torrent route shows who resolves its names, and whether peers can reach 
   assert.equal(
     routeExposureText(t, {
       resolvedBy: "HOST",
-      exposure: { ...exposure, resolvedBy: "HOST", address: "203.0.113.7", announcedPort: 40001, inbound: true },
+      exposure: {
+        ...exposure,
+        resolvedBy: "HOST",
+        address: "203.0.113.7",
+        announcedPort: 40001,
+        inbound: true,
+      },
     }),
     "Resolved by Host DNS · Tracker sees 203.0.113.7 · Announced port 40001 · Inbound Yes · UDP trackers No · DHT No · uTP No",
   );
-  assert.equal(routeExposureText(t, { resolvedBy: "SERVERS", exposure: null }), "Resolved by DNS servers");
-  assert.equal(routeExposureText(t, { resolvedBy: null, exposure: null }), EM_DASH);
+  assert.equal(
+    routeExposureText(t, { resolvedBy: "SERVERS", exposure: null }),
+    "Resolved by DNS servers",
+  );
+  assert.equal(
+    routeExposureText(t, { resolvedBy: null, exposure: null }),
+    EM_DASH,
+  );
 });
 
 test("every locale renders route reasons and reuses its route refusal wording", () => {
-  const faults = ["TORRENT_ROUTE_LEGS", "TORRENT_ROUTE_DIRECT_FALLBACK", "TORRENT_ROUTE_RUNGS"] as const;
-  for (const [locale, dictionary] of Object.entries({ en: nextEn, de: nextDe, es: nextEs, fr: nextFr, it: nextIt, ja: nextJa, ko: nextKo, pt: nextPt, zh: nextZh })) {
+  const faults = [
+    "TORRENT_ROUTE_LEGS",
+    "TORRENT_ROUTE_DIRECT_FALLBACK",
+    "TORRENT_ROUTE_RUNGS",
+  ] as const;
+  for (const [locale, dictionary] of Object.entries({
+    en: nextEn,
+    de: nextDe,
+    es: nextEs,
+    fr: nextFr,
+    it: nextIt,
+    ja: nextJa,
+    ko: nextKo,
+    pt: nextPt,
+    zh: nextZh,
+  })) {
     const translate = (key: string) => {
       const value = dictionary[key];
       assert.ok(value?.trim(), `${locale}: missing ${key}`);
@@ -229,85 +292,209 @@ test("every locale renders route reasons and reuses its route refusal wording", 
       assert.ok(routeReasonText(translate, reason).trim());
     }
     for (const reason of faults) {
-      assert.equal(routeReasonText(translate, reason), dictionary[`next.refusal.${reason}`]);
-      assert.equal(dictionary[`next.torrents.routeReason.${reason}`], undefined);
+      assert.equal(
+        routeReasonText(translate, reason),
+        dictionary[`next.refusal.${reason}`],
+      );
+      assert.equal(
+        dictionary[`next.torrents.routeReason.${reason}`],
+        undefined,
+      );
     }
   }
   assert.equal(routeReasonText(t, "LEG_DOWN"), "Leg down");
   assert.equal(routeReasonText(t, "LEG_OPEN_FAILED"), "Leg failed to open");
-  assert.equal(routeReasonText(t, "STATE_DIRECTORY_FAILED"), "State directory unavailable");
-  assert.equal(routeReasonText(t, "LISTEN_PORT_UNAVAILABLE"), "Listen port unavailable");
+  assert.equal(
+    routeReasonText(t, "STATE_DIRECTORY_FAILED"),
+    "State directory unavailable",
+  );
+  assert.equal(
+    routeReasonText(t, "LISTEN_PORT_UNAVAILABLE"),
+    "Listen port unavailable",
+  );
 });
 
 test("the transfer section notes its route's reason in each locale, else the server's words", () => {
-  for (const [locale, dictionary] of Object.entries({ en: nextEn, de: nextDe, es: nextEs, fr: nextFr, it: nextIt, ja: nextJa, ko: nextKo, pt: nextPt, zh: nextZh })) {
+  for (const [locale, dictionary] of Object.entries({
+    en: nextEn,
+    de: nextDe,
+    es: nextEs,
+    fr: nextFr,
+    it: nextIt,
+    ja: nextJa,
+    ko: nextKo,
+    pt: nextPt,
+    zh: nextZh,
+  })) {
     const translate = (key: string) => {
       const value = dictionary[key];
       assert.ok(value?.trim(), `${locale}: missing ${key}`);
       return value;
     };
     for (const reason of TORRENT_ROUTE_REASONS) {
-      const key = reason.startsWith("TORRENT_ROUTE_") ? `next.refusal.${reason}` : `next.torrents.routeReason.${reason}`;
-      assert.equal(transferNote(translate, torrent({ state: "STALLED", routeReason: reason })), dictionary[key], `${locale}: ${reason}`);
+      const key = reason.startsWith("TORRENT_ROUTE_")
+        ? `next.refusal.${reason}`
+        : `next.torrents.routeReason.${reason}`;
+      assert.equal(
+        transferNote(
+          translate,
+          torrent({ state: "STALLED", routeReason: reason }),
+        ),
+        dictionary[key],
+        `${locale}: ${reason}`,
+      );
     }
     for (const reason of TORRENT_STATED_REASONS) {
       const key = `next.torrents.stated.${reason}`;
-      assert.equal(transferNote(translate, torrent({ state: "STALLED", stated: reason })), dictionary[key], `${locale}: ${reason}`);
+      assert.equal(
+        transferNote(translate, torrent({ state: "STALLED", stated: reason })),
+        dictionary[key],
+        `${locale}: ${reason}`,
+      );
     }
     // A torrent waiting for room on its disk reads as a usenet job waiting for the same does.
-    assert.equal(dictionary["next.torrents.stated.DISK_SPACE"], dictionary["next.status.wait.disk_space"], locale);
+    assert.equal(
+      dictionary["next.torrents.stated.DISK_SPACE"],
+      dictionary["next.status.wait.disk_space"],
+      locale,
+    );
     // Each code a torrent's job row waits with has words.
-    for (const code of ["disk_space", "disk_full", "goal_met", "fetch_trackers", "fetch_discovery", "fetch_waiting"]) {
+    for (const code of [
+      "disk_space",
+      "disk_full",
+      "goal_met",
+      "fetch_trackers",
+      "fetch_discovery",
+      "fetch_waiting",
+    ]) {
       translate(`next.status.wait.${code}`);
     }
   }
-  assert.equal(transferNote(t, torrent({ state: "STALLED", routeReason: "SESSION_LIMIT" })), "Session limit reached");
-  assert.equal(transferNote(t, torrent({ state: "STOPPED", detail: "disk gone" })), "disk gone");
-  assert.equal(transferNote(t, torrent({ state: "STALLED", stated: "DISK_SPACE" })), "Low disk space");
-  assert.equal(transferNote(t, torrent({ state: "STALLED", stated: "DISK_FULL" })), "Disk full: seeding only");
-  assert.equal(transferNote(t, torrent({ state: "STOPPED", stated: "GOAL_MET" })), "Seeding goal met");
+  assert.equal(
+    transferNote(
+      t,
+      torrent({ state: "STALLED", routeReason: "SESSION_LIMIT" }),
+    ),
+    "Session limit reached",
+  );
+  assert.equal(
+    transferNote(t, torrent({ state: "STOPPED", detail: "disk gone" })),
+    "disk gone",
+  );
+  assert.equal(
+    transferNote(t, torrent({ state: "STALLED", stated: "DISK_SPACE" })),
+    "Low disk space",
+  );
+  assert.equal(
+    transferNote(t, torrent({ state: "STALLED", stated: "DISK_FULL" })),
+    "Disk full: seeding only",
+  );
+  assert.equal(
+    transferNote(t, torrent({ state: "STOPPED", stated: "GOAL_MET" })),
+    "Seeding goal met",
+  );
   // Free words that look like a code are shown as they came.
-  assert.equal(transferNote(t, torrent({ state: "STALLED", detail: "disk_space" })), "disk_space");
+  assert.equal(
+    transferNote(t, torrent({ state: "STALLED", detail: "disk_space" })),
+    "disk_space",
+  );
   assert.equal(transferNote(t, torrent()), undefined);
 });
 
 test("a torrentUpdates push lands on the torrents held: whole when full, else what moved", () => {
   const row = (id: number, ratio: number) => ({ id, ratio });
-  const full = applyTorrentChanges(undefined, { fullUpdate: true, torrents: [row(1, 0), row(2, 0)], removedIds: [] });
+  const full = applyTorrentChanges(undefined, {
+    fullUpdate: true,
+    torrents: [row(1, 0), row(2, 0)],
+    removedIds: [],
+  });
   assert.deepEqual([...full.values()], [row(1, 0), row(2, 0)]);
-  const moved = applyTorrentChanges(full, { fullUpdate: false, torrents: [row(2, 1)], removedIds: [1] });
+  const moved = applyTorrentChanges(full, {
+    fullUpdate: false,
+    torrents: [row(2, 1)],
+    removedIds: [1],
+  });
   assert.deepEqual([...moved.values()], [row(2, 1)]);
   assert.deepEqual([...full.values()], [row(1, 0), row(2, 0)]);
-  const again = applyTorrentChanges(moved, { fullUpdate: true, torrents: [row(3, 0)], removedIds: [] });
+  const again = applyTorrentChanges(moved, {
+    fullUpdate: true,
+    torrents: [row(3, 0)],
+    removedIds: [],
+  });
   assert.deepEqual([...again.values()], [row(3, 0)]);
 });
 
 test("a torrent starting from what was saved, one needing a certificate and one missing its files name their own state", () => {
-  assert.equal(torrentStateLabelKey("CHECKING_RESUME_DATA"), "next.torrent.checkingResumeData");
-  assert.equal(torrentStateLabelKey("NEEDS_CERTIFICATE"), "next.torrent.needsCertificate");
-  assert.equal(torrentStateLabelKey("FILES_MISSING"), "next.torrent.filesMissing");
+  assert.equal(
+    torrentStateLabelKey("CHECKING_RESUME_DATA"),
+    "next.torrent.checkingResumeData",
+  );
+  assert.equal(
+    torrentStateLabelKey("NEEDS_CERTIFICATE"),
+    "next.torrent.needsCertificate",
+  );
+  assert.equal(
+    torrentStateLabelKey("FILES_MISSING"),
+    "next.torrent.filesMissing",
+  );
   assert.equal(t("next.torrent.filesMissing"), "Files missing");
   assert.equal(torrentStateLabelKey("QUEUED"), null);
   assert.equal(torrentStateLabelKey(undefined), null);
   assert.equal(t("next.torrent.checkingResumeData"), "Checking resume data");
-  for (const [locale, dictionary] of Object.entries({ en: nextEn, de: nextDe, es: nextEs, fr: nextFr, it: nextIt, ja: nextJa, ko: nextKo, pt: nextPt, zh: nextZh })) {
+  for (const [locale, dictionary] of Object.entries({
+    en: nextEn,
+    de: nextDe,
+    es: nextEs,
+    fr: nextFr,
+    it: nextIt,
+    ja: nextJa,
+    ko: nextKo,
+    pt: nextPt,
+    zh: nextZh,
+  })) {
     assert.ok(dictionary["next.torrent.checkingResumeData"], locale);
     assert.ok(dictionary["next.torrent.filesMissing"], locale);
   }
 });
 
 test("a seeding torrent's goals read as how far it has come, by the seconds its terms count", () => {
-  const torrent = (over: Partial<TorrentSummaryData>, policy: Partial<TorrentSummaryData["seedingPolicy"]>): TorrentSummaryData => ({
-    id: 1, state: "SEEDING", forced: false, ratio: 0.5, uploadBps: 0, seedingGoalLeft: null,
-    seedingSeconds: 7200, consecutiveSeedingSeconds: 1800,
-    seedingPolicy: { ratioGoal: 2, seedTimeGoalMinutes: 240, seedTimeCounting: "CUMULATIVE", ...policy },
+  const torrent = (
+    over: Partial<TorrentSummaryData>,
+    policy: Partial<TorrentSummaryData["seedingPolicy"]>,
+  ): TorrentSummaryData => ({
+    id: 1,
+    state: "SEEDING",
+    forced: false,
+    ratio: 0.5,
+    uploadBps: 0,
+    seedingGoalLeft: null,
+    seedingSeconds: 7200,
+    consecutiveSeedingSeconds: 1800,
+    seedingPolicy: {
+      ratioGoal: 2,
+      seedTimeGoalMinutes: 240,
+      seedTimeCounting: "CUMULATIVE",
+      ...policy,
+    },
     ...over,
   });
-  assert.deepEqual(seedingGoalProgress(torrent({}, {})), { ratio: 25, seedTime: 50 });
+  assert.deepEqual(seedingGoalProgress(torrent({}, {})), {
+    ratio: 25,
+    seedTime: 50,
+  });
   // Consecutive counting reads the current run, not every second seeded.
-  assert.equal(seedingGoalProgress(torrent({}, { seedTimeCounting: "CONSECUTIVE" })).seedTime, 12.5);
+  assert.equal(
+    seedingGoalProgress(torrent({}, { seedTimeCounting: "CONSECUTIVE" }))
+      .seedTime,
+    12.5,
+  );
   // No goal is no bar; a goal of zero is met at once; past the goal stays full.
-  assert.deepEqual(seedingGoalProgress(torrent({}, { ratioGoal: null, seedTimeGoalMinutes: null })), { ratio: null, seedTime: null });
+  assert.deepEqual(
+    seedingGoalProgress(
+      torrent({}, { ratioGoal: null, seedTimeGoalMinutes: null }),
+    ),
+    { ratio: null, seedTime: null },
+  );
   assert.equal(seedingGoalProgress(torrent({}, { ratioGoal: 0 })).ratio, 100);
   assert.equal(seedingGoalProgress(torrent({ ratio: 3 }, {})).ratio, 100);
 });

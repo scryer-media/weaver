@@ -3,12 +3,25 @@
 
 import { useRef, useState } from "react";
 import { useMutation } from "urql";
-import { ANALYZE_NZB_MUTATION, ANALYZE_TORRENT_MUTATION } from "@/graphql/queries";
+import {
+  ANALYZE_NZB_MUTATION,
+  ANALYZE_TORRENT_MUTATION,
+} from "@/graphql/queries";
 import { useTranslate } from "@/lib/context/translate-context";
 import { cn, toBase64 } from "@/lib/utils";
 import { DetailBlock, EmptyState } from "../components/chrome";
-import { PrimaryButton, SecondaryButton, TextField } from "../components/controls";
-import { ANALYZER_ACCEPT, ANALYZER_ACCEPT_NZB, fileKind, isMagnet, maxBytes } from "../data/analyzer";
+import {
+  PrimaryButton,
+  SecondaryButton,
+  TextField,
+} from "../components/controls";
+import {
+  ANALYZER_ACCEPT,
+  ANALYZER_ACCEPT_NZB,
+  fileKind,
+  isMagnet,
+  maxBytes,
+} from "../data/analyzer";
 import { formatSize } from "../data/format";
 import { useTorrentAddsOffered } from "../data/use-torrents-shown";
 import { runtimeIds } from "../testids";
@@ -25,7 +38,10 @@ type Outcome = { report: SupportReport } | { error: string };
 
 /** The report, or the message to show in its place. */
 function outcomeOf(
-  result: { error?: { graphQLErrors: { message: string }[] }; data?: SupportReport },
+  result: {
+    error?: { graphQLErrors: { message: string }[] };
+    data?: SupportReport;
+  },
   failed: string,
 ): Outcome {
   if (result.error || !result.data) {
@@ -47,11 +63,15 @@ export function AnalyzerPage() {
   // link, no .torrent in the picker.
   const torrentsOn = useTorrentAddsOffered();
   const [, analyzeNzb] = useMutation<AnalyzeNzbResponse>(ANALYZE_NZB_MUTATION);
-  const [, analyzeTorrent] = useMutation<AnalyzeTorrentResponse>(ANALYZE_TORRENT_MUTATION);
+  const [, analyzeTorrent] = useMutation<AnalyzeTorrentResponse>(
+    ANALYZE_TORRENT_MUTATION,
+  );
   const inputRef = useRef<HTMLInputElement>(null);
   const [dragging, setDragging] = useState(false);
   const [busy, setBusy] = useState(false);
-  const [source, setSource] = useState<{ name: string; size: number } | null>(null);
+  const [source, setSource] = useState<{ name: string; size: number } | null>(
+    null,
+  );
   const [magnet, setMagnet] = useState("");
   const [report, setReport] = useState<SupportReport | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -82,24 +102,46 @@ export function AnalyzerPage() {
     }
     // The picker's filter is only a hint: while torrent things are hidden a
     // dropped .torrent is ignored, as a dropped magnet is.
-    const head = await file.slice(0, 2).arrayBuffer().then((bytes) => new Uint8Array(bytes), () => null);
+    const head = await file
+      .slice(0, 2)
+      .arrayBuffer()
+      .then(
+        (bytes) => new Uint8Array(bytes),
+        () => null,
+      );
     if (!torrentsOn && head !== null && fileKind(head) === "torrent") {
       return;
     }
     setSource({ name: file.name, size: file.size });
     const failed = t("next.analyzer.failed");
     await run(async () => {
-      const kind = fileKind(head ?? new Uint8Array(await file.slice(0, 2).arrayBuffer()));
+      const kind = fileKind(
+        head ?? new Uint8Array(await file.slice(0, 2).arrayBuffer()),
+      );
       if (file.size > maxBytes(kind)) {
-        return { error: t("next.analyzer.tooLarge", { size: formatSize(maxBytes(kind)) }) };
+        return {
+          error: t("next.analyzer.tooLarge", {
+            size: formatSize(maxBytes(kind)),
+          }),
+        };
       }
       const bytes = new Uint8Array(await file.arrayBuffer());
       if (kind === "torrent") {
-        const result = await analyzeTorrent({ input: { torrentBase64: toBase64(bytes) } });
-        return outcomeOf({ error: result.error, data: result.data?.analyzeTorrent }, failed);
+        const result = await analyzeTorrent({
+          input: { torrentBase64: toBase64(bytes) },
+        });
+        return outcomeOf(
+          { error: result.error, data: result.data?.analyzeTorrent },
+          failed,
+        );
       }
-      const result = await analyzeNzb({ input: { nzbBase64: toBase64(bytes) } });
-      return outcomeOf({ error: result.error, data: result.data?.analyzeNzb }, failed);
+      const result = await analyzeNzb({
+        input: { nzbBase64: toBase64(bytes) },
+      });
+      return outcomeOf(
+        { error: result.error, data: result.data?.analyzeNzb },
+        failed,
+      );
     }, failed);
   };
 
@@ -108,7 +150,10 @@ export function AnalyzerPage() {
     const failed = t("next.analyzer.magnetFailed");
     await run(async () => {
       const result = await analyzeTorrent({ input: { magnet: link.trim() } });
-      return outcomeOf({ error: result.error, data: result.data?.analyzeTorrent }, failed);
+      return outcomeOf(
+        { error: result.error, data: result.data?.analyzeTorrent },
+        failed,
+      );
     }, failed);
   };
 
@@ -124,7 +169,11 @@ export function AnalyzerPage() {
               icon="copy"
               onClick={() => {
                 void copySupportReport(report).then((copied) =>
-                  setNotice(copied ? t("next.support.copied") : t("next.support.copyBlocked")),
+                  setNotice(
+                    copied
+                      ? t("next.support.copied")
+                      : t("next.support.copyBlocked"),
+                  ),
                 );
               }}
             >
@@ -145,7 +194,11 @@ export function AnalyzerPage() {
       }
     >
       <div className="flex min-h-0 flex-1 flex-col overflow-y-auto">
-        <DetailBlock title={t(torrentsOn ? "next.analyzer.source" : "next.analyzer.sourceNzb")}>
+        <DetailBlock
+          title={t(
+            torrentsOn ? "next.analyzer.source" : "next.analyzer.sourceNzb",
+          )}
+        >
           <button
             type="button"
             data-testid={runtimeIds.analyzerDrop}
@@ -188,7 +241,11 @@ export function AnalyzerPage() {
             <span className="font-medium text-wv-fg">
               {busy
                 ? t("next.analyzer.analyzing")
-                : t(torrentsOn ? "next.analyzer.dropZone" : "next.analyzer.dropZoneNzb")}
+                : t(
+                    torrentsOn
+                      ? "next.analyzer.dropZone"
+                      : "next.analyzer.dropZoneNzb",
+                  )}
             </span>
             {source === null ? null : (
               <span className="font-wv-mono text-[11px] text-wv-faint">
@@ -213,7 +270,11 @@ export function AnalyzerPage() {
                 autoComplete="off"
                 testId={runtimeIds.analyzerMagnet}
               />
-              <PrimaryButton type="submit" disabled={busy || !isMagnet(magnet)} testId={runtimeIds.analyzerAnalyze}>
+              <PrimaryButton
+                type="submit"
+                disabled={busy || !isMagnet(magnet)}
+                testId={runtimeIds.analyzerAnalyze}
+              >
                 {t("next.analyzer.analyze")}
               </PrimaryButton>
             </form>
@@ -227,11 +288,21 @@ export function AnalyzerPage() {
         {report === null ? (
           <EmptyState
             title={t("next.analyzer.emptyTitle")}
-            body={t(torrentsOn ? "next.analyzer.emptyBody" : "next.analyzer.emptyBodyNzb")}
+            body={t(
+              torrentsOn
+                ? "next.analyzer.emptyBody"
+                : "next.analyzer.emptyBodyNzb",
+            )}
           />
         ) : (
-          <DetailBlock title={t("next.analyzer.report")} right={notice ?? undefined}>
-            <pre data-testid={runtimeIds.analyzerReport} className="overflow-x-auto whitespace-pre font-wv-mono text-[12px] leading-[1.55] text-wv-fg">
+          <DetailBlock
+            title={t("next.analyzer.report")}
+            right={notice ?? undefined}
+          >
+            <pre
+              data-testid={runtimeIds.analyzerReport}
+              className="overflow-x-auto whitespace-pre font-wv-mono text-[12px] leading-[1.55] text-wv-fg"
+            >
               {report.text}
             </pre>
           </DetailBlock>

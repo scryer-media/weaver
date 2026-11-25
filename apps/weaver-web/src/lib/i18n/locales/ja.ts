@@ -6,7 +6,6 @@ import { duplicateLocaleEntries } from "../duplicate-locales";
 import { nextJa } from "@/next/i18n/ja";
 
 const ja: LocaleDictionary = {
-
   // Navigation
   "nav.settings": "設定",
   "nav.sponsor": "スポンサー",
@@ -15,18 +14,23 @@ const ja: LocaleDictionary = {
   "applicationUpgrade.upToDate": "Weaver v{{version}} は最新です。",
   "applicationUpgrade.available": "Weaver v{{version}} が利用できます。",
   "applicationUpgrade.install": "v{{version}} をインストール",
-  "applicationUpgrade.notEligible": "このインストールは Weaver 内から更新できません（{{reason}}）。",
+  "applicationUpgrade.notEligible":
+    "このインストールは Weaver 内から更新できません（{{reason}}）。",
   "applicationUpgrade.failed": "v{{version}} への更新に失敗しました: {{error}}",
-  "applicationUpgrade.githubUnavailable": "GitHub は一時的に利用できません。しばらくしてから更新を再試行してください。",
+  "applicationUpgrade.githubUnavailable":
+    "GitHub は一時的に利用できません。しばらくしてから更新を再試行してください。",
   "applicationUpgrade.completed": "v{{version}} に更新しました。",
   "applicationUpgrade.phase.checking": "リリースを確認しています…",
-  "applicationUpgrade.phase.downloading": "v{{version}} をダウンロードしています…",
+  "applicationUpgrade.phase.downloading":
+    "v{{version}} をダウンロードしています…",
   "applicationUpgrade.phase.verifying": "ダウンロードを検証しています…",
   "applicationUpgrade.phase.staging": "更新を展開しています…",
   "applicationUpgrade.phase.applying": "v{{version}} をインストールしています…",
-  "applicationUpgrade.phase.awaiting_elevation": "インストールの許可を待っています…",
+  "applicationUpgrade.phase.awaiting_elevation":
+    "インストールの許可を待っています…",
   "applicationUpgrade.phase.restarting": "Weaver を再起動しています…",
-  "applicationUpgrade.phase.reboot_required": "更新を完了するにはこのコンピューターを再起動してください。",
+  "applicationUpgrade.phase.reboot_required":
+    "更新を完了するにはこのコンピューターを再起動してください。",
   "update.newVersionAria": "GitHub で Weaver v{{version}} を新しいタブで開く",
 
   // Status labels
@@ -68,7 +72,8 @@ const ja: LocaleDictionary = {
   "action.next": "次へ",
 
   // Confirmation dialogs
-  "confirm.cancelSelectedMessage": "これらのダウンロードは停止され、再開できません。",
+  "confirm.cancelSelectedMessage":
+    "これらのダウンロードは停止され、再開できません。",
   "bulk.selected": "{{count}} 件選択中",
   "bulk.editSelected": "選択項目を編集",
   "bulk.pauseSelected": "選択項目を一時停止",
@@ -151,7 +156,8 @@ const ja: LocaleDictionary = {
   "action.edit": "編集",
   "action.save": "保存",
 
-  "upload.forceDesc": "意味的および記事フィンガープリントの重複ポリシーを無視して送信を受理します。冪等性の競合は引き続き適用されます。",
+  "upload.forceDesc":
+    "意味的および記事フィンガープリントの重複ポリシーを無視して送信を受理します。冪等性の競合は引き続き適用されます。",
 
   // System info
   "systemInfo.diagnosticsFailed": "診断パッケージを作成できませんでした。",

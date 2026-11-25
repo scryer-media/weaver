@@ -16,7 +16,8 @@ export const nextDe: LocaleDictionary = {
   "next.shell.openNavigation": "Navigation öffnen",
   "next.shell.signOut": "Abmelden",
   "next.shell.signOutFailed": "Abmelden fehlgeschlagen",
-  "next.shell.reconnectingPolling": "Verbindung wird wiederhergestellt — Abfrage läuft",
+  "next.shell.reconnectingPolling":
+    "Verbindung wird wiederhergestellt — Abfrage läuft",
   "next.shell.reconnecting": "Verbindung wird wiederhergestellt",
   "next.shell.connected": "Verbunden",
   "next.shell.updateAvailable": "Update verfügbar",
@@ -45,23 +46,29 @@ export const nextDe: LocaleDictionary = {
   "next.rail.activity.degraded": "beeinträchtigt",
   "next.rail.activity.disabled": "deaktiviert",
   "next.rail.cause.overLimit": "Zu viele Verbindungen",
-  "next.rail.cause.overLimitRetry": "Zu viele Verbindungen, neuer Versuch in {{time}}",
+  "next.rail.cause.overLimitRetry":
+    "Zu viele Verbindungen, neuer Versuch in {{time}}",
   "next.rail.cause.coolingDown": "nach wiederholten Fehlern pausiert",
-  "next.rail.cause.coolingDownResume": "nach wiederholten Fehlern pausiert, Fortsetzung in {{time}}",
+  "next.rail.cause.coolingDownResume":
+    "nach wiederholten Fehlern pausiert, Fortsetzung in {{time}}",
   "next.rail.cause.degraded": "Fehler bei den letzten Anfragen",
-  "next.rail.cause.disabled": "nach Anmelde- oder wiederholten Fehlern pausiert",
-  "next.rail.cause.disabledRetry": "nach Anmelde- oder wiederholten Fehlern pausiert, neuer Versuch in {{time}}",
+  "next.rail.cause.disabled":
+    "nach Anmelde- oder wiederholten Fehlern pausiert",
+  "next.rail.cause.disabledRetry":
+    "nach Anmelde- oder wiederholten Fehlern pausiert, neuer Versuch in {{time}}",
   "next.rail.cause.preparing": "Reparaturdaten werden geladen",
   "next.rail.addProvider": "Anbieter hinzufügen",
   "next.rail.sinceRestart": "seit dem letzten Neustart",
   "next.attention.title": "Hinweise",
-  "next.attention.overLimit": "{{server}} hat sein Verbindungslimit überschritten",
+  "next.attention.overLimit":
+    "{{server}} hat sein Verbindungslimit überschritten",
   "next.attention.backingOff": "wartet bis {{time}}",
   "next.attention.providerState": "{{host}} ist {{state}}",
   "next.attention.consecutiveFailures.one": "{{count}} Fehler in Folge",
   "next.attention.consecutiveFailures.other": "{{count}} Fehler in Folge",
   "next.attention.quotaReached": "Anbieter-Kontingent erreicht",
-  "next.attention.scheduleHold": "Downloads werden durch einen Zeitplan angehalten",
+  "next.attention.scheduleHold":
+    "Downloads werden durch einen Zeitplan angehalten",
   "next.attention.resumes": "weiter um {{time}}",
   "next.provider.state.healthy": "fehlerfrei",
   "next.provider.state.degraded": "beeinträchtigt",
@@ -79,13 +86,16 @@ export const nextDe: LocaleDictionary = {
   // Error page
   "next.errorPage.notFound": "Seite nicht gefunden",
   "next.errorPage.requestFailed": "Anfrage fehlgeschlagen ({{status}})",
-  "next.errorPage.routingBody": "Weaver ist auf einen Routing-Fehler gestoßen, bevor die Seite fertig geladen war.",
+  "next.errorPage.routingBody":
+    "Weaver ist auf einen Routing-Fehler gestoßen, bevor die Seite fertig geladen war.",
   "next.errorPage.title": "Etwas ist schiefgelaufen",
-  "next.errorPage.renderBody": "Weaver ist beim Anzeigen dieser Seite auf einen unerwarteten Fehler gestoßen.",
+  "next.errorPage.renderBody":
+    "Weaver ist beim Anzeigen dieser Seite auf einen unerwarteten Fehler gestoßen.",
   "next.errorPage.goBack": "Zurück",
   "next.errorPage.retry": "Erneut versuchen",
   "next.errorPage.checking": "Wird geprüft…",
-  "next.errorPage.unreachable": "Weaver antwortet nicht. Diese Seite öffnet Weaver, sobald es wieder antwortet.",
+  "next.errorPage.unreachable":
+    "Weaver antwortet nicht. Diese Seite öffnet Weaver, sobald es wieder antwortet.",
   "next.errorPage.details": "Technische Details",
 
   // Shared components
@@ -97,7 +107,8 @@ export const nextDe: LocaleDictionary = {
   "next.pagination.rows": "Zeilen",
   "next.pagination.range": "{{from}}–{{to}} von {{total}}",
   "next.pagination.empty": "0 von 0",
-  "next.routing.profilesUnreadable": "Proxy-Profile konnten nicht gelesen werden. Bestehende Zuweisungen bleiben unverändert.",
+  "next.routing.profilesUnreadable":
+    "Proxy-Profile konnten nicht gelesen werden. Bestehende Zuweisungen bleiben unverändert.",
   "next.routing.noRoutes": "keine Proxy-Routen",
   "next.routing.proxyId": "Proxy #{{id}}",
   "next.routing.disabled": "deaktiviert",
@@ -109,8 +120,10 @@ export const nextDe: LocaleDictionary = {
   "next.routing.manage": "Proxys verwalten",
   "next.routing.finalDirect": "Letzte Route: direkt",
   "next.routing.finalBlocked": "Letzte Route: blockiert",
-  "next.routing.allowDirect": "Direkte Verbindung als letzte Ausweichroute erlauben",
-  "next.routing.cannotConnect": "Ohne Proxy und ohne direkte Ausweichroute kann hier überhaupt keine Verbindung hergestellt werden.",
+  "next.routing.allowDirect":
+    "Direkte Verbindung als letzte Ausweichroute erlauben",
+  "next.routing.cannotConnect":
+    "Ohne Proxy und ohne direkte Ausweichroute kann hier überhaupt keine Verbindung hergestellt werden.",
   "next.routing.state.idle": "Route inaktiv",
   "next.routing.state.proxy": "Route über Proxy",
   "next.routing.state.direct": "Route direkt",
@@ -160,12 +173,16 @@ export const nextDe: LocaleDictionary = {
   "next.downloads.shown": "{{shown}} von {{total}} Downloads angezeigt",
   "next.downloads.loadingBody": "Die Warteschlange wird geladen.",
   "next.downloads.emptyTitle": "Keine aktiven Downloads",
-  "next.downloads.emptyBody": "Füge eine NZB oder einen Torrent hinzu oder lege sie irgendwo auf dieser Liste ab.",
-  "next.downloads.emptyBodyNzb": "Füge eine NZB hinzu oder lege sie irgendwo auf dieser Liste ab.",
+  "next.downloads.emptyBody":
+    "Füge eine NZB oder einen Torrent hinzu oder lege sie irgendwo auf dieser Liste ab.",
+  "next.downloads.emptyBodyNzb":
+    "Füge eine NZB hinzu oder lege sie irgendwo auf dieser Liste ab.",
   "next.downloads.noMatchTitle": "Nichts passt zu dieser Ansicht",
-  "next.downloads.noMatchBody": "Leere die Suche oder wähle einen anderen Filter.",
+  "next.downloads.noMatchBody":
+    "Leere die Suche oder wähle einen anderen Filter.",
   "next.downloads.selectGroup": "Alle Downloads in „{{group}}“ auswählen",
-  "next.downloads.dropHint": "Loslassen, um diese NZB- oder Torrent-Dateien hinzuzufügen",
+  "next.downloads.dropHint":
+    "Loslassen, um diese NZB- oder Torrent-Dateien hinzuzufügen",
   "next.downloads.dropHintNzb": "Loslassen, um diese NZB-Dateien hinzuzufügen",
   "next.downloads.waitPaused": "pausiert",
   "next.downloads.setPriority": "Priorität festlegen",
@@ -174,20 +191,28 @@ export const nextDe: LocaleDictionary = {
   "next.downloads.keepDownloading": "Weiter herunterladen",
   "next.downloads.bulk.paused.one": "1 Download pausiert",
   "next.downloads.bulk.paused.other": "{{count}} Downloads pausiert",
-  "next.downloads.bulk.pausedPartial": "{{done}} von {{total}} pausiert — {{refused}} abgelehnt",
+  "next.downloads.bulk.pausedPartial":
+    "{{done}} von {{total}} pausiert — {{refused}} abgelehnt",
   "next.downloads.bulk.resumed.one": "1 Download fortgesetzt",
   "next.downloads.bulk.resumed.other": "{{count}} Downloads fortgesetzt",
-  "next.downloads.bulk.resumedPartial": "{{done}} von {{total}} fortgesetzt — {{refused}} abgelehnt",
+  "next.downloads.bulk.resumedPartial":
+    "{{done}} von {{total}} fortgesetzt — {{refused}} abgelehnt",
   "next.downloads.bulk.priority.one": "Priorität für 1 Download festgelegt",
-  "next.downloads.bulk.priority.other": "Priorität für {{count}} Downloads festgelegt",
-  "next.downloads.bulk.priorityPartial": "Priorität für {{done}} von {{total}} festgelegt — {{refused}} abgelehnt",
+  "next.downloads.bulk.priority.other":
+    "Priorität für {{count}} Downloads festgelegt",
+  "next.downloads.bulk.priorityPartial":
+    "Priorität für {{done}} von {{total}} festgelegt — {{refused}} abgelehnt",
   "next.downloads.bulk.category.one": "Kategorie für 1 Download festgelegt",
-  "next.downloads.bulk.category.other": "Kategorie für {{count}} Downloads festgelegt",
-  "next.downloads.bulk.categoryPartial": "Kategorie für {{done}} von {{total}} festgelegt — {{refused}} abgelehnt",
+  "next.downloads.bulk.category.other":
+    "Kategorie für {{count}} Downloads festgelegt",
+  "next.downloads.bulk.categoryPartial":
+    "Kategorie für {{done}} von {{total}} festgelegt — {{refused}} abgelehnt",
   "next.downloads.bulk.cancelled.one": "1 Download abgebrochen",
   "next.downloads.bulk.cancelled.other": "{{count}} Downloads abgebrochen",
-  "next.downloads.bulk.cancelledPartial": "{{done}} von {{total}} abgebrochen — {{refused}} abgelehnt",
-  "next.downloads.bulk.failed": "Die ausgewählten Downloads wurden nicht geändert — {{message}}",
+  "next.downloads.bulk.cancelledPartial":
+    "{{done}} von {{total}} abgebrochen — {{refused}} abgelehnt",
+  "next.downloads.bulk.failed":
+    "Die ausgewählten Downloads wurden nicht geändert — {{message}}",
   "next.inspector.selected": "Ausgewählter Download",
   "next.inspector.openDetail": "Jobdetails öffnen",
   "next.inspector.filesShown": "{{shown}} von {{count}}",
@@ -195,25 +220,32 @@ export const nextDe: LocaleDictionary = {
   "next.inspector.rate": "Rate",
   "next.inspector.seedingTime": "Seed-Zeit",
   "next.inspector.destination": "Ziel",
-  "next.inspector.noFiles": "Noch nichts geschrieben — Dateien erscheinen, sobald der Download sein Ziel erreicht.",
+  "next.inspector.noFiles":
+    "Noch nichts geschrieben — Dateien erscheinen, sobald der Download sein Ziel erreicht.",
   "next.inspector.topOfQueue": "An den Anfang",
   "next.inspector.stopScripts": "Skripte stoppen",
   "next.inspector.removeDownload": "Download entfernen",
-  "next.speedLimit.saveFailed": "Das Geschwindigkeitslimit konnte nicht gespeichert werden.",
-  "next.speedLimit.bySchedule": "Geschwindigkeitslimit durch einen Zeitplan gesetzt",
+  "next.speedLimit.saveFailed":
+    "Das Geschwindigkeitslimit konnte nicht gespeichert werden.",
+  "next.speedLimit.bySchedule":
+    "Geschwindigkeitslimit durch einen Zeitplan gesetzt",
   "next.speedLimit.buttonTitle": "Download-Geschwindigkeitslimit",
   "next.speedLimit.title": "Geschwindigkeitslimit",
   "next.speedLimit.note": "bleibt nach Neustarts erhalten",
   "next.speedLimit.ceiling": "Download-Geschwindigkeit",
-  "next.speedLimit.ceilingAria": "Geschwindigkeitslimit in Megabyte pro Sekunde",
+  "next.speedLimit.ceilingAria":
+    "Geschwindigkeitslimit in Megabyte pro Sekunde",
   "next.speedLimit.upload": "Upload-Geschwindigkeit",
   "next.speedLimit.uploadAria": "Upload-Limit in Megabyte pro Sekunde",
-  "next.speedLimit.scheduleHolding": "Ein Zeitplan begrenzt Downloads gerade auf {{rate}}.",
+  "next.speedLimit.scheduleHolding":
+    "Ein Zeitplan begrenzt Downloads gerade auf {{rate}}.",
   "next.addNzb.title": "Hinzufügen",
   "next.addNzb.submitOne": "Download hinzufügen",
   "next.addNzb.submitMany": "{{count}} Downloads hinzufügen",
-  "next.addNzb.dropZone": "NZB- oder Torrent-Dateien hier ablegen oder klicken zum Auswählen",
-  "next.addNzb.dropZoneNzb": "NZB-Dateien hier ablegen oder klicken zum Auswählen",
+  "next.addNzb.dropZone":
+    "NZB- oder Torrent-Dateien hier ablegen oder klicken zum Auswählen",
+  "next.addNzb.dropZoneNzb":
+    "NZB-Dateien hier ablegen oder klicken zum Auswählen",
   "next.addNzb.status.queued": "eingereiht",
   "next.addNzb.status.staging": "wird vorbereitet",
   "next.addNzb.status.staged": "bereit",
@@ -223,8 +255,10 @@ export const nextDe: LocaleDictionary = {
   "next.addNzb.status.blocked": "blockiert",
   "next.addNzb.forceTitle": "Duplikate trotzdem hinzufügen?",
   "next.addNzb.forceNote": "{{count}} blockiert",
-  "next.addNzb.forceBody.one": "Diese NZB wurde von der Duplikatrichtlinie abgewiesen:",
-  "next.addNzb.forceBody.other": "Diese {{count}} NZBs wurden von der Duplikatrichtlinie abgewiesen:",
+  "next.addNzb.forceBody.one":
+    "Diese NZB wurde von der Duplikatrichtlinie abgewiesen:",
+  "next.addNzb.forceBody.other":
+    "Diese {{count}} NZBs wurden von der Duplikatrichtlinie abgewiesen:",
   "next.addNzb.andMore": "und {{count}} weitere",
   "next.addNzb.forceConfirm.one": "Trotzdem hinzufügen",
   "next.addNzb.forceConfirm.other": "{{count}} trotzdem hinzufügen",
@@ -261,7 +295,8 @@ export const nextDe: LocaleDictionary = {
   "next.rail.uptime": "Laufzeit",
   "next.downloads.tabDownloading": "Herunterladen",
   "next.downloads.tabSeeding": "Seeden",
-  "next.status.propagationUntil": "Warte auf Verbreitung. Der Download startet um {{time}}.",
+  "next.status.propagationUntil":
+    "Warte auf Verbreitung. Der Download startet um {{time}}.",
   "next.day.today": "Heute",
   "next.day.yesterday": "Gestern",
   "next.day.undated": "Ohne Datum",
@@ -294,7 +329,8 @@ export const nextDe: LocaleDictionary = {
   "next.timeline.member.FAILED": "fehlgeschlagen",
   "next.timeline.windowRunning": "gestartet {{time}} · läuft noch",
   "next.timeline.soFar": "bisher {{span}}",
-  "next.timeline.noteRunning": "Phase {{stage}} von {{stages}} · {{span}} vergangen",
+  "next.timeline.noteRunning":
+    "Phase {{stage}} von {{stages}} · {{span}} vergangen",
   "next.timeline.noteDone.one": "{{count}} Phase · {{span}} gesamt",
   "next.timeline.noteDone.other": "{{count}} Phasen · {{span}} gesamt",
   "next.completed.sort.newest": "Neueste zuerst",
@@ -303,14 +339,19 @@ export const nextDe: LocaleDictionary = {
   "next.completed.sortMenu": "Abgeschlossene sortieren",
   "next.completed.bulk.requeued.one": "{{count}} Eintrag erneut eingereiht",
   "next.completed.bulk.requeued.other": "{{count}} Einträge erneut eingereiht",
-  "next.completed.bulk.requeuedPartial": "{{done}} von {{total}} erneut eingereiht — {{refused}} abgelehnt",
-  "next.completed.bulk.rerun.one": "Skripte für {{count}} Eintrag erneut ausgeführt",
-  "next.completed.bulk.rerun.other": "Skripte für {{count}} Einträge erneut ausgeführt",
-  "next.completed.bulk.rerunPartial": "Skripte für {{done}} von {{total}} erneut ausgeführt — {{refused}} abgelehnt",
+  "next.completed.bulk.requeuedPartial":
+    "{{done}} von {{total}} erneut eingereiht — {{refused}} abgelehnt",
+  "next.completed.bulk.rerun.one":
+    "Skripte für {{count}} Eintrag erneut ausgeführt",
+  "next.completed.bulk.rerun.other":
+    "Skripte für {{count}} Einträge erneut ausgeführt",
+  "next.completed.bulk.rerunPartial":
+    "Skripte für {{done}} von {{total}} erneut ausgeführt — {{refused}} abgelehnt",
   "next.completed.redownload": "Erneut herunterladen",
   "next.completed.rerunScripts": "Skripte erneut ausführen",
   "next.completed.exported.one": "Diese Seite exportiert — {{count}} Eintrag",
-  "next.completed.exported.other": "Diese Seite exportiert — {{count}} Einträge",
+  "next.completed.exported.other":
+    "Diese Seite exportiert — {{count}} Einträge",
   "next.completed.kept.one": "{{count}} Job gespeichert",
   "next.completed.kept.other": "{{count}} Jobs gespeichert",
   "next.completed.filterLabel": "Abgeschlossene nach Name filtern",
@@ -353,7 +394,8 @@ export const nextDe: LocaleDictionary = {
   "next.download.recovery": "Wiederherstellung",
   "next.download.recoveryShown": "{{shown}} von {{count}} angezeigt",
   "next.download.setsShown": "{{shown}} von {{count}} Sätzen angezeigt",
-  "next.download.recoverySet": "{{blocks}} Blöcke · {{damaged}} beschädigt · {{repaired}} repariert",
+  "next.download.recoverySet":
+    "{{blocks}} Blöcke · {{damaged}} beschädigt · {{repaired}} repariert",
   "next.download.files": "Dateien",
   "next.download.articles": "Artikel",
   "next.download.missing": "Fehlend",
@@ -398,49 +440,60 @@ export const nextDe: LocaleDictionary = {
   "next.download.reason.too_deep": "Zu tief verschachtelt",
   "next.download.reason.invalid_archive": "Ungültiges Archiv",
   "next.download.reason.too_large": "Braucht zu viel Speicher",
-  "next.download.reason.over_machine": "Braucht mehr Speicher, als dieser Rechner hat",
+  "next.download.reason.over_machine":
+    "Braucht mehr Speicher, als dieser Rechner hat",
   "next.completed.outcome": "Ergebnis",
   "next.completed.done": "Fertig",
   "next.completed.freeOn": "{{size}} frei auf {{volume}}",
   "next.completed.freeAcross": "{{size}} frei auf {{count}} Volumes",
   "next.completed.loadingBody": "Die Verlaufsseite wird geladen.",
-  "next.completed.noMatchBody": "Leere den Filter oder wähle ein anderes Ergebnis.",
+  "next.completed.noMatchBody":
+    "Leere den Filter oder wähle ein anderes Ergebnis.",
   "next.completed.items.one": "{{count}} Eintrag",
   "next.completed.items.other": "{{count}} Einträge",
   "next.completed.dayTotal": "{{size}} abgeschlossen",
   "next.completed.deleting": "Wird gelöscht",
   "next.completed.took": "dauerte {{span}}",
-  "next.completed.deleteBody": "„Löschen, Dateien behalten“ entfernt die Einträge und lässt ihre Dateien auf der Festplatte. „Löschen“ entfernt auch die heruntergeladenen Dateien. Beides läuft im Hintergrund; die Einträge bleiben gesperrt hier, bis sie weg sind.",
+  "next.completed.deleteBody":
+    "„Löschen, Dateien behalten“ entfernt die Einträge und lässt ihre Dateien auf der Festplatte. „Löschen“ entfernt auch die heruntergeladenen Dateien. Beides läuft im Hintergrund; die Einträge bleiben gesperrt hier, bis sie weg sind.",
   "next.job.title": "Job",
   "next.job.missingTitle": "Job nicht gefunden",
-  "next.job.missingBody": "Er wurde aus dem Verlauf gelöscht, oder der Link verweist auf eine ID, die weaver nicht kennt.",
+  "next.job.missingBody":
+    "Er wurde aus dem Verlauf gelöscht, oder der Link verweist auf eine ID, die weaver nicht kennt.",
   "next.job.backToHistory": "Zurück zum Verlauf",
   "next.job.loadingBody": "Der Stand dieses Jobs wird geladen.",
   "next.job.outcomeFailed": "Fehlgeschlagen — unvollständig, nichts verschoben",
-  "next.job.outcomePartial": "Teilweise — teilweise geliefert, vollständige Dateien verschoben",
+  "next.job.outcomePartial":
+    "Teilweise — teilweise geliefert, vollständige Dateien verschoben",
   "next.job.partial": "Teilweise",
-  "next.job.outcomeRepaired": "Fertig — repariert, verschoben, Skripte ausgeführt",
-  "next.job.outcomeVerified": "Fertig — geprüft, verschoben, Skripte ausgeführt",
+  "next.job.outcomeRepaired":
+    "Fertig — repariert, verschoben, Skripte ausgeführt",
+  "next.job.outcomeVerified":
+    "Fertig — geprüft, verschoben, Skripte ausgeführt",
   "next.job.outcomeTorrent": "Fertig — jedes Stück per Hash geprüft",
   "next.job.outcomeRunning": "{{status}} — {{percent}} % dieses Jobs",
   "next.job.stopped": "Gestoppt {{time}} · {{reason}}",
   "next.job.stoppedReason": "die Pipeline konnte diesen Job nicht abschließen",
   "next.job.deliveredInPart": "Teilweise geliefert {{time}} · {{reason}}",
-  "next.job.partialReason": "einige Dateien konnten nicht vollständig geliefert werden",
+  "next.job.partialReason":
+    "einige Dateien konnten nicht vollständig geliefert werden",
   "next.job.finished": "Fertig {{time}}",
   "next.job.endToEnd": "{{span}} Ende zu Ende",
   "next.job.repairedBeforeMoving": "vor dem Verschieben repariert",
   "next.job.verifiedWithoutRepair": "ohne Reparatur geprüft",
   "next.job.started": "Gestartet {{time}}",
   "next.job.remaining": "noch {{duration}}",
-  "next.job.copiedEvents.one": "{{count}} Ereignis in die Zwischenablage kopiert",
-  "next.job.copiedEvents.other": "{{count}} Ereignisse in die Zwischenablage kopiert",
+  "next.job.copiedEvents.one":
+    "{{count}} Ereignis in die Zwischenablage kopiert",
+  "next.job.copiedEvents.other":
+    "{{count}} Ereignisse in die Zwischenablage kopiert",
   "next.job.report.stoppedScripts": "Nachbearbeitung gestoppt",
   "next.job.report.resumed": "Fortgesetzt",
   "next.job.report.paused": "Pausiert",
   "next.job.report.rerunning": "Nachbearbeitung läuft erneut",
   "next.job.report.requeued": "Erneut zum Download eingereiht",
-  "next.job.report.reprocessing": "Wird aus den Daten auf der Festplatte neu verarbeitet",
+  "next.job.report.reprocessing":
+    "Wird aus den Daten auf der Festplatte neu verarbeitet",
   "next.job.report.removed": "Aus dem Verlauf entfernt",
   "next.job.report.cancelled": "Download abgebrochen",
   "next.job.report.forgotten": "Identität vergessen",
@@ -476,11 +529,13 @@ export const nextDe: LocaleDictionary = {
   "next.job.noSetPosted": "kein Wiederherstellungssatz gepostet",
   "next.job.ofFetched": "von {{size}} geladen",
   "next.job.setSkipped": "par2-Satz übersprungen",
-  "next.job.noStages": "Noch keine Phase gestartet — die Pipeline erscheint, sobald der Job aufgenommen wird.",
+  "next.job.noStages":
+    "Noch keine Phase gestartet — die Pipeline erscheint, sobald der Job aufgenommen wird.",
   "next.job.nothingWritten": "noch nichts geschrieben",
   "next.job.fileCount.one": "{{count}} Datei",
   "next.job.fileCount.other": "{{count}} Dateien",
-  "next.job.filesAppear": "Dateien erscheinen hier, sobald der Job sein Ziel erreicht.",
+  "next.job.filesAppear":
+    "Dateien erscheinen hier, sobald der Job sein Ziel erreicht.",
   "next.job.copyPathTitle": "Vollständigen Pfad kopieren",
   "next.job.downloadNzb": "NZB herunterladen",
   "next.job.nzbSaved": "NZB für {{name}} gespeichert",
@@ -489,25 +544,34 @@ export const nextDe: LocaleDictionary = {
   "next.support.copy": "Kopieren",
   "next.support.copyReport": "Supportbericht kopieren",
   "next.support.downloadJson": "JSON herunterladen",
-  "next.support.copied": "Supportbericht kopiert. Namen, Gruppen und Message-IDs sind nicht enthalten.",
-  "next.support.copyBlocked": "Der Browser hat die Zwischenablage blockiert. Nutze stattdessen „JSON herunterladen“.",
+  "next.support.copied":
+    "Supportbericht kopiert. Namen, Gruppen und Message-IDs sind nicht enthalten.",
+  "next.support.copyBlocked":
+    "Der Browser hat die Zwischenablage blockiert. Nutze stattdessen „JSON herunterladen“.",
   "next.support.saved": "Supportbericht gespeichert.",
   "next.support.failed": "Der Supportbericht konnte nicht erstellt werden.",
-  "next.analyzer.note": "Eine NZB oder einen Torrent prüfen, ohne sie zur Warteschlange hinzuzufügen",
-  "next.analyzer.noteNzb": "Eine NZB prüfen, ohne sie zur Warteschlange hinzuzufügen",
+  "next.analyzer.note":
+    "Eine NZB oder einen Torrent prüfen, ohne sie zur Warteschlange hinzuzufügen",
+  "next.analyzer.noteNzb":
+    "Eine NZB prüfen, ohne sie zur Warteschlange hinzuzufügen",
   "next.analyzer.source": "NZB, Torrent oder Magnet-Link",
   "next.analyzer.sourceNzb": "NZB",
-  "next.analyzer.dropZone": "Eine .nzb, .nzb.gz oder .torrent hier ablegen oder klicken, um eine auszuwählen",
-  "next.analyzer.dropZoneNzb": "Eine .nzb oder .nzb.gz hier ablegen oder klicken, um eine auszuwählen",
+  "next.analyzer.dropZone":
+    "Eine .nzb, .nzb.gz oder .torrent hier ablegen oder klicken, um eine auszuwählen",
+  "next.analyzer.dropZoneNzb":
+    "Eine .nzb oder .nzb.gz hier ablegen oder klicken, um eine auszuwählen",
   "next.analyzer.magnet": "Magnet-Link",
   "next.analyzer.analyze": "Analysieren",
   "next.analyzer.analyzing": "Wird analysiert…",
   "next.analyzer.failed": "Die Datei konnte nicht analysiert werden.",
-  "next.analyzer.magnetFailed": "Der Magnet-Link konnte nicht analysiert werden.",
+  "next.analyzer.magnetFailed":
+    "Der Magnet-Link konnte nicht analysiert werden.",
   "next.analyzer.tooLarge": "Die Datei ist größer als {{size}}.",
   "next.analyzer.emptyTitle": "Noch nichts analysiert",
-  "next.analyzer.emptyBody": "Der Bericht zeigt Aufbau, Tracker und Warnsignale ohne Namen, Pfade, Gruppen, Message-IDs oder Passkeys und kann daher öffentlich geteilt werden.",
-  "next.analyzer.emptyBodyNzb": "Der Bericht zeigt Aufbau und Warnsignale ohne Namen, Pfade, Gruppen oder Message-IDs und kann daher öffentlich geteilt werden.",
+  "next.analyzer.emptyBody":
+    "Der Bericht zeigt Aufbau, Tracker und Warnsignale ohne Namen, Pfade, Gruppen, Message-IDs oder Passkeys und kann daher öffentlich geteilt werden.",
+  "next.analyzer.emptyBodyNzb":
+    "Der Bericht zeigt Aufbau und Warnsignale ohne Namen, Pfade, Gruppen oder Message-IDs und kann daher öffentlich geteilt werden.",
   "next.analyzer.report": "Bericht",
   "next.job.download": "Herunterladen",
   "next.job.downloadFileTitle": "{{name}} herunterladen",
@@ -520,7 +584,8 @@ export const nextDe: LocaleDictionary = {
   "next.job.eventCount.other": "{{count}} Ereignisse",
   "next.job.copyAsText": "Als Text kopieren",
   "next.job.copyLoadedEvents.one": "Kopiert das {{count}} geladene Ereignis",
-  "next.job.copyLoadedEvents.other": "Kopiert die {{count}} geladenen Ereignisse",
+  "next.job.copyLoadedEvents.other":
+    "Kopiert die {{count}} geladenen Ereignisse",
   "next.job.noEvents": "Die Engine hat für diesen Job nichts aufgezeichnet.",
   "next.job.scriptRuns": "Skriptläufe",
   "next.job.scriptRunCount.one": "{{count}} Lauf",
@@ -528,8 +593,10 @@ export const nextDe: LocaleDictionary = {
   "next.job.noScriptRuns": "Keine Skriptläufe aufgezeichnet.",
   "next.job.scriptOutputShow": "Aufbewahrte Ausgabe anzeigen",
   "next.job.scriptOutputExcerpt": "Auszug anzeigen",
-  "next.job.scriptOutputGone": "Die vollständige Ausgabe wird nicht mehr aufbewahrt.",
-  "next.job.scriptOutputTruncated": "Nur die letzten 32 KB der Ausgabe wurden behalten.",
+  "next.job.scriptOutputGone":
+    "Die vollständige Ausgabe wird nicht mehr aufbewahrt.",
+  "next.job.scriptOutputTruncated":
+    "Nur die letzten 32 KB der Ausgabe wurden behalten.",
   "next.job.duplicateIdentity": "Duplikat-Identität",
   "next.job.lifecycle": "Lebenszyklus",
   "next.job.normalised": "Normalisiert",
@@ -540,7 +607,8 @@ export const nextDe: LocaleDictionary = {
   "next.job.originalTitle": "Ursprünglicher NZB-Titel",
   "next.job.originalTorrentName": "Ursprünglicher Torrent-Name",
   "next.job.providersUsed": "Genutzte Anbieter",
-  "next.job.providersEmpty": "Für diesen Job nicht erfasst — entweder ist noch nichts angekommen, oder er endete, bevor weaver Zähler pro Anbieter führte.",
+  "next.job.providersEmpty":
+    "Für diesen Job nicht erfasst — entweder ist noch nichts angekommen, oder er endete, bevor weaver Zähler pro Anbieter führte.",
   "next.job.serverId": "Server {{id}}",
   "next.job.articles.one": "{{count}} Artikel",
   "next.job.articles.other": "{{count}} Artikel",
@@ -552,10 +620,13 @@ export const nextDe: LocaleDictionary = {
   "next.job.unrecovered": "Nicht wiederhergestellt",
   "next.job.none": "keine",
   "next.job.deleteTitle": "Aus dem Verlauf löschen",
-  "next.job.deleteBody": "Der Eintrag verlässt den Verlauf, seine Dateien bleiben auf der Festplatte.",
+  "next.job.deleteBody":
+    "Der Eintrag verlässt den Verlauf, seine Dateien bleiben auf der Festplatte.",
   "next.job.cancelTitle": "Download abbrechen",
-  "next.job.cancelBody": "Der Download stoppt und verlässt die Warteschlange. Teildaten werden wie üblich aufgeräumt.",
-  "next.job.forgetBody": "weaver erkennt dieses Release nicht mehr als Duplikat von etwas Bekanntem. Ein künftiger Abruf desselben Releases gilt als neu.",
+  "next.job.cancelBody":
+    "Der Download stoppt und verlässt die Warteschlange. Teildaten werden wie üblich aufgeräumt.",
+  "next.job.forgetBody":
+    "weaver erkennt dieses Release nicht mehr als Duplikat von etwas Bekanntem. Ein künftiger Abruf desselben Releases gilt als neu.",
   "next.common.yes": "Ja",
   "next.common.no": "Nein",
   "next.monitoring.note": "Pipeline-Last, Anbieter, Fehler",
@@ -574,7 +645,8 @@ export const nextDe: LocaleDictionary = {
   "next.monitoring.pipeline": "Pipeline",
   "next.monitoring.active": "Aktiv",
   "next.monitoring.idle": "Leerlauf",
-  "next.monitoring.pipelineNote": "{{downloads}} Downloads, {{repairs}} Reparaturen",
+  "next.monitoring.pipelineNote":
+    "{{downloads}} Downloads, {{repairs}} Reparaturen",
   "next.monitoring.peak": "Spitze {{value}} {{unit}} in dieser Sitzung",
   "next.monitoring.noTraffic": "noch kein Datenverkehr",
   "next.monitoring.connections": "Verbindungen",
@@ -587,13 +659,17 @@ export const nextDe: LocaleDictionary = {
   "next.monitoring.writeQueue": "Schreibwarteschlange",
   "next.monitoring.buffered": "{{unit}} gepuffert",
   "next.monitoring.sampled": "alle 5 s erfasst · Fenster {{window}}",
-  "next.monitoring.throughputNote": "Bytes pro Sekunde, heruntergeladen vs. geschrieben",
+  "next.monitoring.throughputNote":
+    "Bytes pro Sekunde, heruntergeladen vs. geschrieben",
   "next.monitoring.segments": "Artikel",
-  "next.monitoring.segmentsNote": "heruntergeladen, dekodiert und wiederholt pro Sekunde",
+  "next.monitoring.segmentsNote":
+    "heruntergeladen, dekodiert und wiederholt pro Sekunde",
   "next.monitoring.depths": "Warteschlangentiefen",
-  "next.monitoring.depthsNote": "Rückstau bei Download, Dekodierung und Schreiben",
+  "next.monitoring.depthsNote":
+    "Rückstau bei Download, Dekodierung und Schreiben",
   "next.monitoring.providersNote": "Verbindungslast, Antwortzeit und Fehler",
-  "next.monitoring.noProviders": "Keine Anbieter eingerichtet — füge einen unter Einstellungen → Anbieter hinzu.",
+  "next.monitoring.noProviders":
+    "Keine Anbieter eingerichtet — füge einen unter Einstellungen → Anbieter hinzu.",
   "next.monitoring.roundTrip": "Antwortzeit",
   "next.monitoring.pinnedAddress": "Adresse für neue Verbindungen",
   "next.monitoring.failuresSinceStart": "Fehler seit dem Start",
@@ -625,10 +701,12 @@ export const nextDe: LocaleDictionary = {
   "next.logs.filter.directives": "Filterdirektiven",
   "next.logs.filter.apply": "Anwenden",
   "next.logs.filter.note": "Bis zum Neustart",
-  "next.logs.filter.failed": "Protokollstufe konnte nicht geändert werden: {{error}}",
+  "next.logs.filter.failed":
+    "Protokollstufe konnte nicht geändert werden: {{error}}",
   "next.system.note": "Laufzeit, Hardware und Speicher",
   "next.system.usedOf": "{{used}} von {{total}}",
-  "next.system.copyFailed": "Konnte nicht in die Zwischenablage kopiert werden.",
+  "next.system.copyFailed":
+    "Konnte nicht in die Zwischenablage kopiert werden.",
   "next.system.copied": "Kopiert",
   "next.system.copyReport": "Für Fehlerbericht kopieren",
   "next.system.collecting": "Wird gesammelt",
@@ -673,7 +751,8 @@ export const nextDe: LocaleDictionary = {
   "next.system.volumeBufferedOf": "{{size}} von {{limit}} gepuffert",
   "next.system.noVolumes": "Es wurde noch nichts geschrieben.",
   "next.system.configuredStorage": "Eingerichteter Speicher",
-  "next.system.configuredStorageNote": "Pfade werden in exportierten Berichten ausgeblendet",
+  "next.system.configuredStorageNote":
+    "Pfade werden in exportierten Berichten ausgeblendet",
   "next.system.noStorage": "Noch keine Speicherorte eingerichtet.",
   "next.system.storageFallback": "Speicher",
   "next.settings.panel.general": "Allgemein",
@@ -689,13 +768,18 @@ export const nextDe: LocaleDictionary = {
   "next.settings.panel.scriptJobs": "Aufträge",
   "next.settings.panel.secrets": "Geheimnisse",
   "next.secrets.secret": "Geheimnis",
-  "next.secrets.note": "Ein Wert wird verschlüsselt unter seinem Namen gespeichert und nie wieder angezeigt. Skripteingaben verknüpfen ein Geheimnis über seinen Namen; eine Änderung hier gilt für jeden Auftrag, der es verknüpft.",
+  "next.secrets.note":
+    "Ein Wert wird verschlüsselt unter seinem Namen gespeichert und nie wieder angezeigt. Skripteingaben verknüpfen ein Geheimnis über seinen Namen; eine Änderung hier gilt für jeden Auftrag, der es verknüpft.",
   "next.secrets.name": "Name",
-  "next.secrets.nameHelp": "Darüber wählen Skripteingaben dieses Geheimnis. Eindeutig, ohne Beachtung der Groß-/Kleinschreibung.",
-  "next.secrets.nameInvalid": "Gib dem Geheimnis einen Namen mit höchstens 128 Bytes.",
+  "next.secrets.nameHelp":
+    "Darüber wählen Skripteingaben dieses Geheimnis. Eindeutig, ohne Beachtung der Groß-/Kleinschreibung.",
+  "next.secrets.nameInvalid":
+    "Gib dem Geheimnis einen Namen mit höchstens 128 Bytes.",
   "next.secrets.value": "Wert",
-  "next.secrets.valueHelp": "Wird verschlüsselt gespeichert. Nach dem Speichern wird er nie wieder angezeigt.",
-  "next.secrets.valueKeepHelp": "Leer lassen, um den gespeicherten Wert zu behalten, oder einen neuen eingeben, um ihn zu ersetzen.",
+  "next.secrets.valueHelp":
+    "Wird verschlüsselt gespeichert. Nach dem Speichern wird er nie wieder angezeigt.",
+  "next.secrets.valueKeepHelp":
+    "Leer lassen, um den gespeicherten Wert zu behalten, oder einen neuen eingeben, um ihn zu ersetzen.",
   "next.secrets.valueSaved": "Gespeichert · leer lassen zum Behalten",
   "next.secrets.valueRequired": "Gib den zu speichernden Wert ein.",
   "next.secrets.usedBy": "Verwendet von",
@@ -706,7 +790,8 @@ export const nextDe: LocaleDictionary = {
   "next.secrets.created": "Geheimnis {{name}} erstellt",
   "next.secrets.saved": "Geheimnis {{name}} gespeichert",
   "next.secrets.delete": "Geheimnis löschen",
-  "next.secrets.deleteBody": "{{name}} löschen? Solange ein Auftrag es verknüpft, kann es nicht gelöscht werden.",
+  "next.secrets.deleteBody":
+    "{{name}} löschen? Solange ein Auftrag es verknüpft, kann es nicht gelöscht werden.",
   "next.secrets.deleted": "Geheimnis {{name}} gelöscht",
   "next.settings.panel.scriptRuns": "Läufe",
   "next.settings.panel.watchFolder": "Überwachter Ordner",
@@ -721,41 +806,56 @@ export const nextDe: LocaleDictionary = {
   "next.settings.searchOpenPanel": "{{panel}} öffnen",
   "next.settings.searchOpenNow": "Geöffnet",
   "next.settings.searchPanelPath": "{{group}} / {{panel}}",
-  "next.settings.searchLoadingBody": "Alle Einstellungsbereiche werden durchsucht.",
+  "next.settings.searchLoadingBody":
+    "Alle Einstellungsbereiche werden durchsucht.",
   "next.settings.revert": "Verwerfen",
   "next.settings.saveChanges": "Änderungen speichern",
   "next.settings.saved": "Gespeichert",
-  "next.settings.saveFailed": "Diese Einstellungen konnten nicht gespeichert werden.",
+  "next.settings.saveFailed":
+    "Diese Einstellungen konnten nicht gespeichert werden.",
   "next.settings.noPanel": "Diesen Einstellungsbereich gibt es nicht",
-  "next.settings.noPanelBody": "Wähle einen aus der Einstellungsliste in der Navigation.",
+  "next.settings.noPanelBody":
+    "Wähle einen aus der Einstellungsliste in der Navigation.",
   "next.settings.loadingBody": "Diese Einstellungen werden abgerufen.",
   "next.settings.nothingHere": "Hier gibt es nichts einzustellen",
   "next.settings.noMatch": "Keine Einstellungen passen zu „{{search}}“",
-  "next.settings.nothingHereBody": "Dieser Bereich hat noch keine Einstellungen.",
-  "next.settings.noMatchBody": "Versuche einen anderen Begriff oder leere die Suche, um die Seite zu sehen.",
+  "next.settings.nothingHereBody":
+    "Dieser Bereich hat noch keine Einstellungen.",
+  "next.settings.noMatchBody":
+    "Versuche einen anderen Begriff oder leere die Suche, um die Seite zu sehen.",
   "next.settings.nothingConfigured": "Noch nichts eingerichtet.",
   "next.general.duplicateAction.accept": "Annehmen",
   "next.general.duplicateAction.warn": "Warnen",
   "next.general.duplicateAction.pause": "Pausieren",
   "next.general.duplicateAction.block": "Blockieren",
   "next.general.duplicate.strictActive": "Gleiches Release, bereits vorhanden",
-  "next.general.duplicate.strictActiveHelp": "Eine identische NZB, die gerade lädt oder erfolgreich abgeschlossen wurde.",
-  "next.general.duplicate.strictFailed": "Gleiches Release, zuvor fehlgeschlagen",
-  "next.general.duplicate.strictFailedHelp": "Eine identische NZB, deren früherer Versuch fehlschlug oder abgebrochen wurde.",
-  "next.general.duplicate.layoutActive": "Gleiche Artikelstruktur, bereits vorhanden",
-  "next.general.duplicate.layoutActiveHelp": "Eine andere NZB mit denselben Artikeln wie ein laufender oder abgeschlossener Job.",
-  "next.general.duplicate.layoutFailed": "Gleiche Artikelstruktur, zuvor fehlgeschlagen",
-  "next.general.duplicate.layoutFailedHelp": "Eine andere NZB mit denselben Artikeln wie ein fehlgeschlagener Versuch.",
+  "next.general.duplicate.strictActiveHelp":
+    "Eine identische NZB, die gerade lädt oder erfolgreich abgeschlossen wurde.",
+  "next.general.duplicate.strictFailed":
+    "Gleiches Release, zuvor fehlgeschlagen",
+  "next.general.duplicate.strictFailedHelp":
+    "Eine identische NZB, deren früherer Versuch fehlschlug oder abgebrochen wurde.",
+  "next.general.duplicate.layoutActive":
+    "Gleiche Artikelstruktur, bereits vorhanden",
+  "next.general.duplicate.layoutActiveHelp":
+    "Eine andere NZB mit denselben Artikeln wie ein laufender oder abgeschlossener Job.",
+  "next.general.duplicate.layoutFailed":
+    "Gleiche Artikelstruktur, zuvor fehlgeschlagen",
+  "next.general.duplicate.layoutFailedHelp":
+    "Eine andere NZB mit denselben Artikeln wie ein fehlgeschlagener Versuch.",
   "next.general.duplicate.articleSet": "Überlappende Artikelmenge",
-  "next.general.duplicate.articleSetHelp": "Eine teilweise Überschneidung mit etwas, das weaver schon gesehen hat.",
+  "next.general.duplicate.articleSetHelp":
+    "Eine teilweise Überschneidung mit etwas, das weaver schon gesehen hat.",
   "next.general.duplicate.normalizedName": "Gleicher normalisierter Name",
-  "next.general.duplicate.normalizedNameHelp": "Ein Release, dessen Name übereinstimmt, sobald Groß-/Kleinschreibung, Leerzeichen und Tags entfernt sind.",
+  "next.general.duplicate.normalizedNameHelp":
+    "Ein Release, dessen Name übereinstimmt, sobald Groß-/Kleinschreibung, Leerzeichen und Tags entfernt sind.",
   "next.general.language": "Sprache",
   "next.general.languageHelp": "Gilt nur für diesen Browser.",
   "next.general.interface": "Oberfläche",
   "next.general.updates": "Updates",
   "next.general.checkForUpdates": "Nach Updates suchen",
-  "next.general.checkForUpdatesHelp": "Weaver sucht alle sechs Stunden nach einer neuen Version.",
+  "next.general.checkForUpdatesHelp":
+    "Weaver sucht alle sechs Stunden nach einer neuen Version.",
   "next.general.checkNow": "Jetzt prüfen",
   "next.general.checking": "Wird geprüft…",
   "next.general.updateFound": "v{{version}} ist verfügbar",
@@ -767,71 +867,98 @@ export const nextDe: LocaleDictionary = {
   "next.general.attempts": "Versuche",
   "next.general.propagationDelay": "Verbreitungsverzögerung",
   "next.general.maxConcurrentNzbs": "Maximal gleichzeitige NZBs",
-  "next.general.maxConcurrentNzbsHelp": "Begrenzt Usenet-NZBs vom Start bis zum Abschluss einschließlich Reparatur und Entpacken. Gilt für alle Anbieter gemeinsam.",
+  "next.general.maxConcurrentNzbsHelp":
+    "Begrenzt Usenet-NZBs vom Start bis zum Abschluss einschließlich Reparatur und Entpacken. Gilt für alle Anbieter gemeinsam.",
   "next.status.wait.nzb_slot": "Warten auf einen freien NZB-Platz",
   "next.status.wait.disk_space": "Wenig Speicherplatz",
-  "next.status.wait.disk_space_need": "Wenig Speicherplatz: braucht {{need}}, {{free}} frei",
-  "next.status.wait.disk_space_unread": "Wartet auf eine Datenträgermessung: braucht {{need}}",
+  "next.status.wait.disk_space_need":
+    "Wenig Speicherplatz: braucht {{need}}, {{free}} frei",
+  "next.status.wait.disk_space_unread":
+    "Wartet auf eine Datenträgermessung: braucht {{need}}",
   "next.status.wait.disk_too_small": "Datenträger zu klein",
-  "next.status.wait.disk_too_small_need": "Datenträger zu klein: braucht {{need}}, fasst {{most}}",
+  "next.status.wait.disk_too_small_need":
+    "Datenträger zu klein: braucht {{need}}, fasst {{most}}",
   "next.status.wait.disk_full": "Datenträger voll: nur Seeden",
   "next.status.wait.goal_met": "Seeding-Ziel erreicht",
   "next.status.wait.fetch_trackers": "Frage Tracker nach Peers",
   "next.status.wait.fetch_discovery": "Frage Tracker, DHT und LSD nach Peers",
   "next.status.wait.fetch_waiting": "Keine Peers von Trackern",
-  "next.status.wait.login_refused": "Wartet: Anmeldung abgelehnt von {{server}}",
+  "next.status.wait.login_refused":
+    "Wartet: Anmeldung abgelehnt von {{server}}",
   "next.status.diskShort": "Schreibt auf die Festplatte",
-  "next.status.diskWriting": "Schreibt auf die Festplatte · {{waiting}} wartend auf {{volume}} · {{rate}}",
-  "next.status.diskWaiting": "Schreibt auf die Festplatte · {{waiting}} wartend auf {{volume}}",
-  "next.status.diskLeft": "Schreibt auf die Festplatte: noch {{left}} auf {{volume}} zu schreiben",
-  "next.attention.slowDisk": "Zielfestplatte ist langsam: schreibt mit {{rate}}",
+  "next.status.diskWriting":
+    "Schreibt auf die Festplatte · {{waiting}} wartend auf {{volume}} · {{rate}}",
+  "next.status.diskWaiting":
+    "Schreibt auf die Festplatte · {{waiting}} wartend auf {{volume}}",
+  "next.status.diskLeft":
+    "Schreibt auf die Festplatte: noch {{left}} auf {{volume}} zu schreiben",
+  "next.attention.slowDisk":
+    "Zielfestplatte ist langsam: schreibt mit {{rate}}",
   "next.attention.slowDiskUnmeasured": "Zielfestplatte ist langsam",
-  "next.general.propagationDelayHelp": "Eine neue NZB so lange zurückhalten, bis jeder Artikel die Server erreicht hat.",
+  "next.general.propagationDelayHelp":
+    "Eine neue NZB so lange zurückhalten, bis jeder Artikel die Server erreicht hat.",
   "next.general.seconds": "Sekunden",
   "next.general.srrdb": "SRRDB-Release-Suche",
-  "next.general.srrdbHelp": "Für verschleierte Archivteile nur deren CRC32-Prüfsumme an den öffentlichen SRRDB-Index senden, um einen Release-Namen zu ermitteln.",
+  "next.general.srrdbHelp":
+    "Für verschleierte Archivteile nur deren CRC32-Prüfsumme an den öffentlichen SRRDB-Index senden, um einen Release-Namen zu ermitteln.",
   "next.general.unacceptableExtensions": "Unzulässige Dateiendungen",
-  "next.general.unacceptableExtensionsHelp": "Kommagetrennt. Was mit einem fertigen Download mit einer dieser Endungen geschieht, legt die Aktion darunter fest.",
+  "next.general.unacceptableExtensionsHelp":
+    "Kommagetrennt. Was mit einem fertigen Download mit einer dieser Endungen geschieht, legt die Aktion darunter fest.",
   "next.general.unwantedExtensionAction": "Aktion bei unzulässigen Endungen",
   "next.general.unwantedExtensionActionHelp":
     "Eine Datei mit einer dieser Endungen wird nie als Archiv geöffnet. „Job fehlschlagen lassen“ weist den Download ab; „Nur unzulässige Dateien löschen“ entfernt diese Dateien und liefert den Rest als teilweise aus.",
   "next.general.unwantedExtensionAction.fail": "Job fehlschlagen lassen",
-  "next.general.unwantedExtensionAction.delete": "Nur unzulässige Dateien löschen",
+  "next.general.unwantedExtensionAction.delete":
+    "Nur unzulässige Dateien löschen",
   "next.archivePasswords.title": "Archivpasswörter",
   "next.archivePasswords.list": "Passwörter (eines pro Zeile)",
   "next.archivePasswords.edit": "Passwörter bearbeiten",
   "next.archivePasswords.clearTitle": "Gespeicherte Passwörter löschen",
-  "next.archivePasswords.clearBody": "Die gespeicherte Passwortliste löschen? Sie lässt sich weder anzeigen noch wiederherstellen.",
+  "next.archivePasswords.clearBody":
+    "Die gespeicherte Passwortliste löschen? Sie lässt sich weder anzeigen noch wiederherstellen.",
   "next.archivePasswords.file": "Passwortdatei",
   "next.archivePasswords.password": "Archivpasswort",
   "next.general.storage": "Speicher",
-  "next.general.dataDirHelp": "Wird beim Start des Dienstes festgelegt; Datenbank und Standardordner liegen hier.",
+  "next.general.dataDirHelp":
+    "Wird beim Start des Dienstes festgelegt; Datenbank und Standardordner liegen hier.",
   "next.general.workingDir": "Arbeitsverzeichnis",
-  "next.general.workingDirHelp": "Wo Downloads vor der Nachbearbeitung zusammengesetzt werden. Leer nutzt das Datenverzeichnis.",
+  "next.general.workingDirHelp":
+    "Wo Downloads vor der Nachbearbeitung zusammengesetzt werden. Leer nutzt das Datenverzeichnis.",
   "next.general.completeDir": "Zielverzeichnis",
-  "next.general.completeDirHelp": "Eine Kategorie ohne eigenes Ziel bekommt darin einen Unterordner.",
+  "next.general.completeDirHelp":
+    "Eine Kategorie ohne eigenes Ziel bekommt darin einen Unterordner.",
   "next.general.cleanup": "Nach dem Entpacken aufräumen",
-  "next.general.cleanupHelp": "Archive und Reparaturdateien löschen, sobald ein Release erfolgreich entpackt wurde.",
-  "next.general.deleteFailedJobFiles": "Unvollständige Dateien fehlgeschlagener Aufträge bei der Wartung löschen",
+  "next.general.cleanupHelp":
+    "Archive und Reparaturdateien löschen, sobald ein Release erfolgreich entpackt wurde.",
+  "next.general.deleteFailedJobFiles":
+    "Unvollständige Dateien fehlgeschlagener Aufträge bei der Wartung löschen",
   "next.general.historyRetentionDays": "Verlauf aufbewahren (Tage)",
-  "next.general.historyRetentionDaysHelp": "Ältere Einträge verlassen den Verlauf; ihre Dateien bleiben auf der Festplatte. 0 behält den Verlauf für immer.",
+  "next.general.historyRetentionDaysHelp":
+    "Ältere Einträge verlassen den Verlauf; ihre Dateien bleiben auf der Festplatte. 0 behält den Verlauf für immer.",
   "next.general.days": "Tage",
   "next.historyArchive.action": "Archivieren",
   "next.historyArchive.title": "Archivieren",
-  "next.historyArchive.body": "Beim Archivieren werden die heruntergeladenen Dateien dieser Einträge von der Festplatte gelöscht. Die Einträge und ihre NZBs bleiben als archiviert im Verlauf. Nur Ordner, die Weaver angelegt hat, werden angefasst. Das lässt sich nicht rückgängig machen.",
-  "next.historyArchive.jobBody": "Beim Archivieren werden die heruntergeladenen Dateien dieses Eintrags von der Festplatte gelöscht. Der Eintrag und seine NZB bleiben als archiviert im Verlauf. Nur Ordner, die Weaver angelegt hat, werden angefasst. Das lässt sich nicht rückgängig machen.",
+  "next.historyArchive.body":
+    "Beim Archivieren werden die heruntergeladenen Dateien dieser Einträge von der Festplatte gelöscht. Die Einträge und ihre NZBs bleiben als archiviert im Verlauf. Nur Ordner, die Weaver angelegt hat, werden angefasst. Das lässt sich nicht rückgängig machen.",
+  "next.historyArchive.jobBody":
+    "Beim Archivieren werden die heruntergeladenen Dateien dieses Eintrags von der Festplatte gelöscht. Der Eintrag und seine NZB bleiben als archiviert im Verlauf. Nur Ordner, die Weaver angelegt hat, werden angefasst. Das lässt sich nicht rückgängig machen.",
   "next.historyArchive.mark": "Archiviert",
-  "next.historyArchive.queued.one": "{{count}} Eintrag zum Archivieren eingereiht",
-  "next.historyArchive.queued.other": "{{count}} Einträge zum Archivieren eingereiht",
-  "next.historyArchive.queuedPartial": "{{done}} von {{total}} zum Archivieren eingereiht",
+  "next.historyArchive.queued.one":
+    "{{count}} Eintrag zum Archivieren eingereiht",
+  "next.historyArchive.queued.other":
+    "{{count}} Einträge zum Archivieren eingereiht",
+  "next.historyArchive.queuedPartial":
+    "{{done}} von {{total}} zum Archivieren eingereiht",
   "next.historyArchive.pending": "Wird archiviert",
   "next.historyArchive.failed": "Nicht archiviert",
   "next.historyArchive.notAccepted": "Konnte nicht archiviert werden.",
   "next.historyArchive.alreadyArchived.one": "{{count}} bereits archiviert",
   "next.historyArchive.alreadyArchived.other": "{{count}} bereits archiviert",
   "next.historyArchive.more": "und {{count}} weitere",
-  "next.historyArchive.unanswered.one": "{{count}} nicht gesendet, weiter ausgewählt",
-  "next.historyArchive.unanswered.other": "{{count}} nicht gesendet, weiter ausgewählt",
+  "next.historyArchive.unanswered.one":
+    "{{count}} nicht gesendet, weiter ausgewählt",
+  "next.historyArchive.unanswered.other":
+    "{{count}} nicht gesendet, weiter ausgewählt",
   "next.historyArchive.outcome.ARCHIVED": "Archiviert",
   "next.historyArchive.outcome.ALREADY_GONE": "Bereits weg",
   "next.historyArchive.outcome.NOT_MANAGED": "Nicht von Weaver verwaltet",
@@ -840,7 +967,8 @@ export const nextDe: LocaleDictionary = {
   "next.historyArchive.outcome.FAILED": "Fehlgeschlagen",
   "next.historyArchive.outcome.NOT_FINISHED": "Nicht abgeschlossen",
   "next.general.duplicates": "Duplikate",
-  "next.general.duplicatesNote": "was passiert, wenn eine neue NZB zu etwas Bekanntem passt",
+  "next.general.duplicatesNote":
+    "was passiert, wenn eine neue NZB zu etwas Bekanntem passt",
   "next.weekday.mon": "Montag",
   "next.weekday.tue": "Dienstag",
   "next.weekday.wed": "Mittwoch",
@@ -858,7 +986,8 @@ export const nextDe: LocaleDictionary = {
   "next.bandwidth.daily": "Täglich",
   "next.bandwidth.weekly": "Wöchentlich",
   "next.bandwidth.monthly": "Monatlich",
-  "next.bandwidth.saveFailed": "Die Bandbreiteneinstellungen konnten nicht gespeichert werden.",
+  "next.bandwidth.saveFailed":
+    "Die Bandbreiteneinstellungen konnten nicht gespeichert werden.",
   "next.bandwidth.allowance": "Kontingent",
   "next.bandwidth.resetAt": "Zurücksetzen um",
   "next.bandwidth.resetDay": "Rücksetztag",
@@ -877,21 +1006,26 @@ export const nextDe: LocaleDictionary = {
   "next.schedules.days": "Tage",
   "next.schedules.action": "Aktion",
   "next.schedules.label": "Bezeichnung",
-  "next.schedules.empty": "Noch keine Zeitpläne. Weaver lädt, sobald es Arbeit gibt.",
+  "next.schedules.empty":
+    "Noch keine Zeitpläne. Weaver lädt, sobald es Arbeit gibt.",
   "next.schedules.add": "Zeitplan hinzufügen",
   "next.schedules.enabledAria": "Zeitplan um {{time}} aktiv",
   "next.schedules.schedule": "Zeitplan",
   "next.schedules.remove": "Zeitplan entfernen",
   "next.schedules.when": "Wann",
-  "next.schedules.daysHelp": "Keinen Tag auswählen, um an allen Tagen auszuführen.",
+  "next.schedules.daysHelp":
+    "Keinen Tag auswählen, um an allen Tagen auszuführen.",
   "next.schedules.whatHappens": "Was passiert",
   "next.schedules.speedLimitHelp": "Mebibyte pro Sekunde.",
-  "next.schedules.labelHelp": "Optional. Wird in der Tabelle angezeigt, damit ein Eintragspaar als ein Fenster lesbar ist.",
+  "next.schedules.labelHelp":
+    "Optional. Wird in der Tabelle angezeigt, damit ein Eintragspaar als ein Fenster lesbar ist.",
   "next.schedules.labelPlaceholder": "Beginn Nebenzeit",
   "next.schedules.enabled": "Aktiv",
-  "next.schedules.removeBody": "Die Warteschlange behält ihren aktuellen Zustand; sonst ändert sich nichts.",
+  "next.schedules.removeBody":
+    "Die Warteschlange behält ihren aktuellen Zustand; sonst ändert sich nichts.",
   "next.categories.nameRequired": "Eine Kategorie braucht einen Namen.",
-  "next.categories.note": "ein leeres Ziel bedeutet den Zielordner für fertige Downloads",
+  "next.categories.note":
+    "ein leeres Ziel bedeutet den Zielordner für fertige Downloads",
   "next.categories.name": "Name",
   "next.categories.destination": "Ziel",
   "next.categories.aliases": "Auch bekannt als",
@@ -899,51 +1033,71 @@ export const nextDe: LocaleDictionary = {
   "next.categories.add": "Kategorie hinzufügen",
   "next.categories.category": "Kategorie",
   "next.categories.remove": "Kategorie entfernen",
-  "next.categories.nameHelp": "Wie Warteschlange, Seitenleiste und Indexer diese Kategorie nennen.",
+  "next.categories.nameHelp":
+    "Wie Warteschlange, Seitenleiste und Indexer diese Kategorie nennen.",
   "next.categories.destinationHelp": "Leer lassen, um {{path}} zu verwenden.",
   "next.categories.completedFolder": "das Zielverzeichnis",
   "next.categories.namePlaceholder": "<Name>",
-  "next.categories.aliasesHelp": "Kommagetrennte Namen, die ein Indexer stattdessen senden kann.",
-  "next.categories.removeBody": "Downloads, die bereits unter {{name}} abgelegt sind, behalten ihren Ordner; neue landen stattdessen im Zielverzeichnis.",
+  "next.categories.aliasesHelp":
+    "Kommagetrennte Namen, die ein Indexer stattdessen senden kann.",
+  "next.categories.removeBody":
+    "Downloads, die bereits unter {{name}} abgelegt sind, behalten ihren Ordner; neue landen stattdessen im Zielverzeichnis.",
   "next.watchFolder.polling": "Abfrage",
   "next.watchFolder.live": "Live",
-  "next.watchFolder.folderRequired": "Wähle einen Ordner, bevor du die Überwachung einschaltest.",
-  "next.watchFolder.saveFailed": "Der überwachte Ordner konnte nicht gespeichert werden.",
+  "next.watchFolder.folderRequired":
+    "Wähle einen Ordner, bevor du die Überwachung einschaltest.",
+  "next.watchFolder.saveFailed":
+    "Der überwachte Ordner konnte nicht gespeichert werden.",
   "next.watchFolder.watching": "Überwachung",
-  "next.watchFolder.watchingHelp": "Live nutzt Dateisystemereignisse; Abfrage liest den Ordner zeitgesteuert neu. Netzwerkfreigaben brauchen meist Abfrage.",
+  "next.watchFolder.watchingHelp":
+    "Live nutzt Dateisystemereignisse; Abfrage liest den Ordner zeitgesteuert neu. Netzwerkfreigaben brauchen meist Abfrage.",
   "next.watchFolder.folder": "Ordner",
-  "next.watchFolder.folderHelp": "Jede hier abgelegte .nzb wird eingereiht und dann beiseitegelegt.",
+  "next.watchFolder.folderHelp":
+    "Jede hier abgelegte .nzb wird eingereiht und dann beiseitegelegt.",
   "next.watchFolder.pollInterval": "Abfrageintervall",
   "next.watchFolder.settleTime": "Wartezeit",
-  "next.watchFolder.settleTimeHelp": "So lange warten, nachdem sich eine Datei nicht mehr ändert, bevor sie gelesen wird, damit nie eine halb geschriebene NZB eingereiht wird.",
+  "next.watchFolder.settleTimeHelp":
+    "So lange warten, nachdem sich eine Datei nicht mehr ändert, bevor sie gelesen wird, damit nie eine halb geschriebene NZB eingereiht wird.",
   "next.watchFolder.categoryFromSubfolder": "Kategorie aus Unterordner",
-  "next.watchFolder.categoryFromSubfolderHelp": "Eine Datei in `watch/tv` wird unter der Kategorie `tv` eingereiht.",
+  "next.watchFolder.categoryFromSubfolderHelp":
+    "Eine Datei in `watch/tv` wird unter der Kategorie `tv` eingereiht.",
   "next.watchFolder.pauseScanning": "Scannen pausieren",
   "next.watchFolder.lastScan": "Letzter Scan",
-  "next.watchFolder.lastScanNote": "{{queued}} von {{found}} gefundenen eingereiht",
+  "next.watchFolder.lastScanNote":
+    "{{queued}} von {{found}} gefundenen eingereiht",
   "next.watchFolder.filesFound": "Gefundene Dateien",
   "next.watchFolder.queued": "Eingereiht",
   "next.watchFolder.problems": "Probleme",
   "next.watchFolder.scanning": "Wird gescannt…",
   "next.watchFolder.scanNow": "Jetzt scannen",
   "next.proxies.needsPrivateKey": "WireGuard braucht einen privaten Schlüssel.",
-  "next.proxies.malformedPrivateKey": "Der private Schlüssel sieht nicht wie ein WireGuard-Schlüssel aus: 32 Byte Base64, genau so, wie wg genkey sie ausgibt.",
-  "next.proxies.malformedPeerKey": "Der öffentliche Schlüssel des Peers sieht nicht wie ein WireGuard-Schlüssel aus: 32 Byte Base64, genau so, wie wg genkey sie ausgibt.",
-  "next.proxies.malformedPresharedKey": "Der Pre-Shared Key sieht nicht wie ein WireGuard-Schlüssel aus: 32 Byte Base64, genau so, wie wg genkey sie ausgibt.",
-  "next.proxies.needsPeerKey": "WireGuard braucht den öffentlichen Schlüssel des Peers.",
-  "next.proxies.needsAddress": "WireGuard braucht mindestens eine Schnittstellenadresse, zum Beispiel 10.6.0.2/32.",
+  "next.proxies.malformedPrivateKey":
+    "Der private Schlüssel sieht nicht wie ein WireGuard-Schlüssel aus: 32 Byte Base64, genau so, wie wg genkey sie ausgibt.",
+  "next.proxies.malformedPeerKey":
+    "Der öffentliche Schlüssel des Peers sieht nicht wie ein WireGuard-Schlüssel aus: 32 Byte Base64, genau so, wie wg genkey sie ausgibt.",
+  "next.proxies.malformedPresharedKey":
+    "Der Pre-Shared Key sieht nicht wie ein WireGuard-Schlüssel aus: 32 Byte Base64, genau so, wie wg genkey sie ausgibt.",
+  "next.proxies.needsPeerKey":
+    "WireGuard braucht den öffentlichen Schlüssel des Peers.",
+  "next.proxies.needsAddress":
+    "WireGuard braucht mindestens eine Schnittstellenadresse, zum Beispiel 10.6.0.2/32.",
   "next.proxies.configTooLarge": "Diese Konfiguration ist größer als 64 KiB.",
-  "next.proxies.configNotWireguard": "Das sieht nicht wie eine WireGuard-Konfiguration aus.",
-  "next.proxies.configFilled": "Das Formular wurde aus der Konfiguration ausgefüllt.",
-  "next.proxies.configPeers": "Sie nennt {{count}} Peers; nur der erste wurde gelesen.",
-  "next.proxies.configIgnored": "{{fields}} ignoriert, da ein Tunnel-Proxy das nicht nutzt.",
+  "next.proxies.configNotWireguard":
+    "Das sieht nicht wie eine WireGuard-Konfiguration aus.",
+  "next.proxies.configFilled":
+    "Das Formular wurde aus der Konfiguration ausgefüllt.",
+  "next.proxies.configPeers":
+    "Sie nennt {{count}} Peers; nur der erste wurde gelesen.",
+  "next.proxies.configIgnored":
+    "{{fields}} ignoriert, da ein Tunnel-Proxy das nicht nutzt.",
   "next.proxies.nameRequired": "Ein Proxy braucht einen Namen.",
   "next.proxies.hostRequired": "Ein Proxy braucht einen Host.",
   "next.proxies.name": "Name",
   "next.proxies.type": "Typ",
   "next.proxies.endpoint": "Endpunkt",
   "next.proxies.host": "Host",
-  "next.proxies.endpointHelp": "Eine eingefügte Zeile `Endpoint = host:port` funktioniert hier ebenfalls.",
+  "next.proxies.endpointHelp":
+    "Eine eingefügte Zeile `Endpoint = host:port` funktioniert hier ebenfalls.",
   "next.proxies.port": "Port",
   "next.proxies.timeout": "Zeitlimit",
   "next.proxies.enabled": "Aktiv",
@@ -970,21 +1124,31 @@ export const nextDe: LocaleDictionary = {
   "next.dns.trust.AS_SENT": "DNSSEC aus",
   "next.dns.trust.VALIDATE": "DNSSEC an",
   "next.dns.tooMany": "Höchstens {{count}} DNS-Server angeben.",
-  "next.dns.orderHelp": "Die Server werden in dieser Reihenfolge gefragt, von oben nach unten. Höchstens {{count}}.",
-  "next.dns.badAddress": "DNS-Server {{number}} braucht eine IP-Adresse, mit Port nur, wenn er nicht der übliche ist.",
-  "next.dns.badUrl": "DNS-Server {{number}} braucht eine https://-Adresse mit Host und Pfad, etwa https://cloudflare-dns.com/dns-query.",
-  "next.dns.dohNeedsAddress": "DNS-Server {{number}}: Bitte die IP-Adresse angeben, unter der dieser Host erreichbar ist.",
-  "next.dns.badTlsName": "DNS-Server {{number}} hat einen TLS-Namen, der kein gültiger Hostname ist.",
+  "next.dns.orderHelp":
+    "Die Server werden in dieser Reihenfolge gefragt, von oben nach unten. Höchstens {{count}}.",
+  "next.dns.badAddress":
+    "DNS-Server {{number}} braucht eine IP-Adresse, mit Port nur, wenn er nicht der übliche ist.",
+  "next.dns.badUrl":
+    "DNS-Server {{number}} braucht eine https://-Adresse mit Host und Pfad, etwa https://cloudflare-dns.com/dns-query.",
+  "next.dns.dohNeedsAddress":
+    "DNS-Server {{number}}: Bitte die IP-Adresse angeben, unter der dieser Host erreichbar ist.",
+  "next.dns.badTlsName":
+    "DNS-Server {{number}} hat einen TLS-Namen, der kein gültiger Hostname ist.",
   "next.dns.title": "DNS",
-  "next.dns.note": "Gespeicherte DNS-Serverlisten und -Profile. Ein Proxy-Namensprofil findet einen Proxy, dessen Adresse ein Name ist, und wird im Editor des Proxys gewählt. Jede Route folgt einem Routenprofil, das in ihrem Editor gewählt wird. Eine Änderung gilt ab der nächsten Abfrage.",
+  "next.dns.note":
+    "Gespeicherte DNS-Serverlisten und -Profile. Ein Proxy-Namensprofil findet einen Proxy, dessen Adresse ein Name ist, und wird im Editor des Proxys gewählt. Jede Route folgt einem Routenprofil, das in ihrem Editor gewählt wird. Eine Änderung gilt ab der nächsten Abfrage.",
   "next.dns.who.SYSTEM": "Das System",
   "next.dns.who.WEAVER": "Weaver",
   "next.dns.who.HOST": "Der Host",
-  "next.dns.nameWhoHelp.SYSTEM": "Der Host schlägt diesen Proxy nach. In einer Kette tut es der Proxy, der ihn trägt.",
+  "next.dns.nameWhoHelp.SYSTEM":
+    "Der Host schlägt diesen Proxy nach. In einer Kette tut es der Proxy, der ihn trägt.",
   "next.dns.profiles.hostName": "Host",
-  "next.dns.whoHelp.SYSTEM": "Der eigene Resolver des Hosts antwortet, wie für jedes Programm.",
-  "next.dns.whoHelp.PROXY": "SOCKS5-, HTTP- und SSH-Proxys bekommen den Namen übergeben. Die eigenen DNS-Server eines WireGuard-Proxys werden durch den Tunnel gefragt.",
-  "next.dns.whoHelp.WEAVER": "Weaver fragt die Server einer gespeicherten Liste der Reihe nach.",
+  "next.dns.whoHelp.SYSTEM":
+    "Der eigene Resolver des Hosts antwortet, wie für jedes Programm.",
+  "next.dns.whoHelp.PROXY":
+    "SOCKS5-, HTTP- und SSH-Proxys bekommen den Namen übergeben. Die eigenen DNS-Server eines WireGuard-Proxys werden durch den Tunnel gefragt.",
+  "next.dns.whoHelp.WEAVER":
+    "Weaver fragt die Server einer gespeicherten Liste der Reihe nach.",
   "next.dns.list": "Serverliste",
   "next.dns.listChoose": "Liste wählen",
   "next.dns.listNew": "Neue Liste",
@@ -992,13 +1156,18 @@ export const nextDe: LocaleDictionary = {
   "next.dns.transit": "Weg",
   "next.dns.transit.EGRESS": "Über den Ausgang",
   "next.dns.transit.PROXY": "Über den Proxy",
-  "next.dns.transitHelp": "Über den Proxy fragt durch den letzten Hop des aktiven Proxys des Zweigs. Ein Zweig oder eine Stufe ohne Proxy fragt von seinem Ausgang aus.",
+  "next.dns.transitHelp":
+    "Über den Proxy fragt durch den letzten Hop des aktiven Proxys des Zweigs. Ein Zweig oder eine Stufe ohne Proxy fragt von seinem Ausgang aus.",
   "next.dns.systemFallback": "Auf einem Strang ohne Proxy das System fragen",
-  "next.dns.systemFallbackHelp": "Aus: Eine Route mit einem direkten Strang oder einem direkten Rückfall kann dieses Profil nicht verwenden.",
+  "next.dns.systemFallbackHelp":
+    "Aus: Eine Route mit einem direkten Strang oder einem direkten Rückfall kann dieses Profil nicht verwenden.",
   "next.dns.systemFallbackOn": "System, wo kein Proxy genutzt wird",
-  "next.dns.routeNeedsWireGuard": "Nur die Antworten eines WireGuard-Proxys lassen sich hier validieren, also muss jeder Strang dieser Route an einem WireGuard-Proxy enden, ohne direkten Strang oder direkten Rückfall.",
-  "next.dns.routeNeedsProxy": "Diese Route hat einen direkten Strang oder einen direkten Ausweg, wo der Proxy kein DNS beantworten kann. Gib ihr einen Proxy, oder schalte im Profil „Auf einem Strang ohne Proxy das System fragen“ ein.",
-  "next.dns.routeNeedsTunnelDns": "Der Proxy beantwortet hier DNS, aber diese WireGuard-Proxys nennen keine DNS-Server für ihren Tunnel: {{proxies}}. Trage bei jedem die DNS-Server des Tunnels ein.",
+  "next.dns.routeNeedsWireGuard":
+    "Nur die Antworten eines WireGuard-Proxys lassen sich hier validieren, also muss jeder Strang dieser Route an einem WireGuard-Proxy enden, ohne direkten Strang oder direkten Rückfall.",
+  "next.dns.routeNeedsProxy":
+    "Diese Route hat einen direkten Strang oder einen direkten Ausweg, wo der Proxy kein DNS beantworten kann. Gib ihr einen Proxy, oder schalte im Profil „Auf einem Strang ohne Proxy das System fragen“ ein.",
+  "next.dns.routeNeedsTunnelDns":
+    "Der Proxy beantwortet hier DNS, aber diese WireGuard-Proxys nennen keine DNS-Server für ihren Tunnel: {{proxies}}. Trage bei jedem die DNS-Server des Tunnels ein.",
   "next.dns.wireShort.PLAIN": "Klartext",
   "next.dns.wireShort.TLS": "TLS",
   "next.dns.wireShort.HTTPS": "HTTPS",
@@ -1014,7 +1183,8 @@ export const nextDe: LocaleDictionary = {
   "next.dns.lists.section": "Serverliste",
   "next.dns.lists.save": "Liste speichern",
   "next.dns.lists.delete": "Liste löschen",
-  "next.dns.lists.deleteBody": "Serverliste {{name}} löschen? Eine Liste, die ein Profil noch verwendet, kann nicht gelöscht werden.",
+  "next.dns.lists.deleteBody":
+    "Serverliste {{name}} löschen? Eine Liste, die ein Profil noch verwendet, kann nicht gelöscht werden.",
   "next.dns.lists.nameRequired": "Gib der Liste einen Namen.",
   "next.dns.lists.serverCount.one": "{{count}} Server",
   "next.dns.lists.serverCount.other": "{{count}} Server",
@@ -1031,15 +1201,20 @@ export const nextDe: LocaleDictionary = {
   "next.dns.profiles.section": "Profil",
   "next.dns.profiles.save": "Profil speichern",
   "next.dns.profiles.delete": "Profil löschen",
-  "next.dns.profiles.deleteBody": "DNS-Profil {{name}} löschen? Ein Profil, dem eine Route noch folgt, kann nicht gelöscht werden.",
+  "next.dns.profiles.deleteBody":
+    "DNS-Profil {{name}} löschen? Ein Profil, dem eine Route noch folgt, kann nicht gelöscht werden.",
   "next.dns.profiles.nameRequired": "Gib dem Profil einen Namen.",
   "next.dns.profiles.builtIn": "Eingebaut",
-  "next.dns.nameWhoHelp.WEAVER": "Weaver fragt die Server einer gespeicherten Liste der Reihe nach, über den Ausgang.",
-  "next.dns.nameProfiles.deleteBody": "DNS-Profil {{name}} löschen? Ein Profil, das ein Proxy noch verwendet, kann nicht gelöscht werden.",
+  "next.dns.nameWhoHelp.WEAVER":
+    "Weaver fragt die Server einer gespeicherten Liste der Reihe nach, über den Ausgang.",
+  "next.dns.nameProfiles.deleteBody":
+    "DNS-Profil {{name}} löschen? Ein Profil, das ein Proxy noch verwendet, kann nicht gelöscht werden.",
   "next.dns.nameProfiles.add": "Proxy-Namensprofil hinzufügen",
   "next.dns.nameProfiles.title": "Proxy-Namensprofile",
-  "next.dns.profiles.inUseByBoth": "Diese Routen folgen noch diesem Profil: {{routes}}. Diese Proxys finden ihre Adresse noch damit: {{proxies}}. Wähle zuerst ein anderes Profil für sie.",
-  "next.dns.profiles.inUseByProxies": "Diese Proxys finden ihre Adresse noch mit diesem Profil: {{proxies}}. Wähle zuerst ein anderes Profil für sie.",
+  "next.dns.profiles.inUseByBoth":
+    "Diese Routen folgen noch diesem Profil: {{routes}}. Diese Proxys finden ihre Adresse noch damit: {{proxies}}. Wähle zuerst ein anderes Profil für sie.",
+  "next.dns.profiles.inUseByProxies":
+    "Diese Proxys finden ihre Adresse noch mit diesem Profil: {{proxies}}. Wähle zuerst ein anderes Profil für sie.",
   "next.dns.profiles.proxyCount.other": "{{count}} Proxys",
   "next.dns.profiles.proxyCount.one": "{{count}} Proxy",
   "next.dns.profiles.proxies": "Proxys",
@@ -1054,15 +1229,18 @@ export const nextDe: LocaleDictionary = {
   "next.dns.test.ownWire": "das Protokoll dieser Zeile",
   "next.dns.test.signaturesValidated": "Signaturen geprüft",
   "next.proxies.tunnelDns": "DNS-Server",
-  "next.proxies.tunnelDnsHelp": "Die eigenen DNS-Server des Tunnels, eine IP-Adresse pro Zeile. Sie antworten, wenn im DNS-Profil einer Route der Proxy antwortet.",
+  "next.proxies.tunnelDnsHelp":
+    "Die eigenen DNS-Server des Tunnels, eine IP-Adresse pro Zeile. Sie antworten, wenn im DNS-Profil einer Route der Proxy antwortet.",
   "next.proxies.tunnelDnsBad": "Tunnel-DNS-Server müssen IP-Adressen sein.",
   "next.proxies.dnsProfileNumber": "DNS-Profil #{{id}}",
   "next.proxies.dnsProfileDetail": "Gefunden mit {{name}}",
-  "next.proxies.dnsProfileHelp": "Damit wird die Adresse dieses Proxys nachgeschlagen, wenn sie ein Name ist.",
+  "next.proxies.dnsProfileHelp":
+    "Damit wird die Adresse dieses Proxys nachgeschlagen, wenn sie ein Name ist.",
   "next.proxies.dnsProfile": "Diesen Proxy finden mit",
   "next.proxies.mtuHelp": "Leer nutzt {{value}}.",
   "next.proxies.keepalive": "Keepalive",
-  "next.proxies.keepaliveHelp": "Leer nutzt {{seconds}} Sekunden; 0 schaltet es ab.",
+  "next.proxies.keepaliveHelp":
+    "Leer nutzt {{seconds}} Sekunden; 0 schaltet es ab.",
   "next.proxies.natpmp": "Portweiterleitung per NAT-PMP",
   "next.proxies.forwardedPort": "Weitergeleiteter Port",
   "next.proxies.username": "Benutzername",
@@ -1092,38 +1270,54 @@ export const nextDe: LocaleDictionary = {
   "next.proxies.configBadKey": "{{key}} ist kein WireGuard-Schlüssel.",
   "next.proxies.configBadEndpoint": "Endpoint ist nicht host:port.",
   "next.proxies.configBadNumber": "{{key}} ist keine Zahl.",
-  "next.proxies.removeBody": "Alles, was über diesen Proxy läuft, weicht auf die nächste Route aus oder auf eine direkte Verbindung, wenn diese erlaubt ist.",
+  "next.proxies.removeBody":
+    "Alles, was über diesen Proxy läuft, weicht auf die nächste Route aus oder auf eine direkte Verbindung, wenn diese erlaubt ist.",
   "next.proxies.forgetKey": "Schlüssel vergessen",
-  "next.proxies.forgetBody": "Die nächste Verbindung vertraut jedem Schlüssel, den der Host vorlegt. Tu das nur, wenn du weißt, dass der Host neu aufgesetzt wurde.",
+  "next.proxies.forgetBody":
+    "Die nächste Verbindung vertraut jedem Schlüssel, den der Host vorlegt. Tu das nur, wenn du weißt, dass der Host neu aufgesetzt wurde.",
   "next.security.mode.required": "Anmeldung für jeden Browser erforderlich",
-  "next.security.mode.exceptTrusted": "Anmeldung erforderlich, außer in vertrauenswürdigen Netzen",
+  "next.security.mode.exceptTrusted":
+    "Anmeldung erforderlich, außer in vertrauenswürdigen Netzen",
   "next.security.mode.noLogin": "Keine Anmeldung (nur dieser Rechner)",
   "next.security.scope.read": "Nur lesen",
   "next.security.scope.control": "Warteschlange steuern",
   "next.security.scope.admin": "Vollständige Verwaltung",
-  "next.security.listenSaved": "Lauschadresse gespeichert — starte weaver neu, um sie anzuwenden",
-  "next.security.listenCleared": "Lauschadresse geleert — weaver ist beim nächsten Neustart wieder nur auf diesem Rechner erreichbar",
+  "next.security.listenSaved":
+    "Lauschadresse gespeichert — starte weaver neu, um sie anzuwenden",
+  "next.security.listenCleared":
+    "Lauschadresse geleert — weaver ist beim nächsten Neustart wieder nur auf diesem Rechner erreichbar",
   "next.security.policyApplied": "Zugriffsrichtlinie angewendet",
-  "next.security.passwordsMismatch": "Die beiden Passwörter stimmen nicht überein.",
-  "next.security.credentialsRequired": "Benutzername und Passwort sind beide erforderlich.",
-  "next.security.keyNameRequired": "Benenne den Schlüssel nach dem, was ihn nutzen wird.",
-  "next.security.keyCreateFailed": "Der Schlüssel konnte nicht erstellt werden.",
+  "next.security.passwordsMismatch":
+    "Die beiden Passwörter stimmen nicht überein.",
+  "next.security.credentialsRequired":
+    "Benutzername und Passwort sind beide erforderlich.",
+  "next.security.keyNameRequired":
+    "Benenne den Schlüssel nach dem, was ihn nutzen wird.",
+  "next.security.keyCreateFailed":
+    "Der Schlüssel konnte nicht erstellt werden.",
   "next.security.listenAddress": "Lauschadresse",
-  "next.security.listenHelp": "Weaver antwortet standardmäßig auf 127.0.0.1, das nur dieser Rechner erreicht. Nutze 0.0.0.0 für alle Schnittstellen. Wird beim nächsten Neustart wirksam.",
-  "next.security.listenPinnedHelp": "Durch {{variable}} in der Umgebung von weaver festgelegt; ändere es stattdessen in deiner Bereitstellung.",
+  "next.security.listenHelp":
+    "Weaver antwortet standardmäßig auf 127.0.0.1, das nur dieser Rechner erreicht. Nutze 0.0.0.0 für alle Schnittstellen. Wird beim nächsten Neustart wirksam.",
+  "next.security.listenPinnedHelp":
+    "Durch {{variable}} in der Umgebung von weaver festgelegt; ändere es stattdessen in deiner Bereitstellung.",
   "next.security.listenPlaceholder": "{{address}} (Standard)",
   "next.security.browserAccess": "Browserzugriff",
-  "next.security.accessPinnedHelp": "Wird durch {{variable}} in der Umgebung von weaver verwaltet.",
-  "next.security.accessHelp": "Wer die Weboberfläche ohne Anmeldung nutzen darf.",
+  "next.security.accessPinnedHelp":
+    "Wird durch {{variable}} in der Umgebung von weaver verwaltet.",
+  "next.security.accessHelp":
+    "Wer die Weboberfläche ohne Anmeldung nutzen darf.",
   "next.security.trustedNetworks": "Vertrauenswürdige Netze",
-  "next.security.trustedNetworksHelp": "Ein CIDR pro Zeile. Browser in diesen Bereichen überspringen die Anmeldung.",
+  "next.security.trustedNetworksHelp":
+    "Ein CIDR pro Zeile. Browser in diesen Bereichen überspringen die Anmeldung.",
   "next.security.mcpEnabled": "MCP-Server erlauben",
-  "next.security.mcpEnabledHelp": "Lässt Agenten mit einem API-Schlüssel die Operationen der Betreiber-Skills über /mcp ausführen.",
+  "next.security.mcpEnabledHelp":
+    "Lässt Agenten mit einem API-Schlüssel die Operationen der Betreiber-Skills über /mcp ausführen.",
   "next.security.signIn": "Anmeldung",
   "next.security.signedInAs": "angemeldet als {{name}}",
   "next.security.notConfigured": "nicht eingerichtet",
   "next.security.requireLogin": "Anmeldung verlangen",
-  "next.security.requireLoginOffHelp": "Wer weaver erreichen kann, hat vollen Verwaltungszugriff.",
+  "next.security.requireLoginOffHelp":
+    "Wer weaver erreichen kann, hat vollen Verwaltungszugriff.",
   "next.security.changePassword": "Passwort ändern",
   "next.security.turnOff": "Ausschalten",
   "next.security.setUpLogin": "Anmeldung einrichten",
@@ -1134,11 +1328,13 @@ export const nextDe: LocaleDictionary = {
   "next.security.scope": "Bereich",
   "next.security.created": "Erstellt",
   "next.security.lastUsed": "Zuletzt genutzt",
-  "next.security.keysEmpty": "Keine API-Schlüssel. Sonarr, Radarr und die NZBGet-Schnittstelle brauchen je einen.",
+  "next.security.keysEmpty":
+    "Keine API-Schlüssel. Sonarr, Radarr und die NZBGet-Schnittstelle brauchen je einen.",
   "next.security.addKey": "API-Schlüssel hinzufügen",
   "next.security.never": "nie",
   "next.security.revoke": "Widerrufen",
-  "next.security.exposedWarning": "Weaver ist nach dem nächsten Neustart über diesen Rechner hinaus erreichbar, solange keine Anmeldung eingerichtet ist.",
+  "next.security.exposedWarning":
+    "Weaver ist nach dem nächsten Neustart über diesen Rechner hinaus erreichbar, solange keine Anmeldung eingerichtet ist.",
   "next.security.appliesImmediately": "gilt sofort",
   "next.security.turnOnLogin": "Anmeldung einschalten",
   "next.security.administrator": "Administrator",
@@ -1152,86 +1348,117 @@ export const nextDe: LocaleDictionary = {
   "next.security.newKeyNote": "du siehst ihn nur einmal",
   "next.security.createKey": "Schlüssel erstellen",
   "next.security.key": "Schlüssel",
-  "next.security.scopeHelp": "Lesen sieht die Warteschlange; Steuern darf Arbeit hinzufügen und entfernen; Verwaltung darf Einstellungen ändern.",
+  "next.security.scopeHelp":
+    "Lesen sieht die Warteschlange; Steuern darf Arbeit hinzufügen und entfernen; Verwaltung darf Einstellungen ändern.",
   "next.security.keyCreated": "API-Schlüssel erstellt",
   "next.security.copied": "Kopiert",
   "next.security.copyFailed": "Kopieren fehlgeschlagen; Strg+C oder ⌘C drücken",
   "next.security.copyKey": "Schlüssel kopieren",
   "next.security.done": "Fertig",
-  "next.security.copyNow": "Kopiere ihn jetzt. Weaver speichert nur einen Hash davon, er kann also nicht erneut angezeigt werden.",
+  "next.security.copyNow":
+    "Kopiere ihn jetzt. Weaver speichert nur einen Hash davon, er kann also nicht erneut angezeigt werden.",
   "next.security.apiKey": "API-Schlüssel",
   "next.security.turnOffTitle": "Anmeldung ausschalten",
   "next.security.turnOffLogin": "Anmeldung ausschalten",
-  "next.security.turnOffBody": "Wer weaver erreichen kann, hat dann ohne Anmeldung vollen Verwaltungszugriff.",
+  "next.security.turnOffBody":
+    "Wer weaver erreichen kann, hat dann ohne Anmeldung vollen Verwaltungszugriff.",
   "next.security.revokeTitle": "API-Schlüssel widerrufen",
   "next.security.revokeKey": "Schlüssel widerrufen",
-  "next.security.revokeBody": "Alles, was noch {{name}} nutzt, funktioniert sofort nicht mehr.",
+  "next.security.revokeBody":
+    "Alles, was noch {{name}} nutzt, funktioniert sofort nicht mehr.",
   "next.security.thisKey": "diesen Schlüssel",
   "next.security.checkTitle": "Passwort bestätigen",
   "next.security.checkNote": "höchstens alle 15 Minuten gefragt",
   "next.security.checkCancel": "Abbrechen",
   "next.security.checkContinue": "Weiter",
   "next.security.checking": "Wird geprüft…",
-  "next.security.checkBusy": "Zu viele Versuche. Kurz warten und erneut versuchen.",
+  "next.security.checkBusy":
+    "Zu viele Versuche. Kurz warten und erneut versuchen.",
   "next.security.checkFailed": "Dieses Passwort ist nicht korrekt.",
-  "next.security.checkUnreachable": "Weaver war zur Passwortprüfung nicht erreichbar.",
-  "next.security.passwordHelp": "Eine Passwortänderung meldet alle Sitzungen ab.",
+  "next.security.checkUnreachable":
+    "Weaver war zur Passwortprüfung nicht erreichbar.",
+  "next.security.passwordHelp":
+    "Eine Passwortänderung meldet alle Sitzungen ab.",
   "next.security.signOutEverywhere": "Überall abmelden",
   "next.security.signOutEverywhereTitle": "Alle Browser abmelden",
-  "next.security.signOutEverywhereBody": "Jeder bei weaver angemeldete Browser, auch dieser, wird abgemeldet und muss sich neu anmelden. API-Schlüssel funktionieren weiter.",
-  "next.security.signOutEverywhereFailed": "Weaver konnte die anderen Sitzungen nicht abmelden. Erneut versuchen.",
+  "next.security.signOutEverywhereBody":
+    "Jeder bei weaver angemeldete Browser, auch dieser, wird abgemeldet und muss sich neu anmelden. API-Schlüssel funktionieren weiter.",
+  "next.security.signOutEverywhereFailed":
+    "Weaver konnte die anderen Sitzungen nicht abmelden. Erneut versuchen.",
   "next.security.listeningNow": "Lauscht gerade",
-  "next.security.listenPending": "Weaver lauscht noch auf dieser Adresse; die gespeicherte gilt ab dem nächsten Neustart.",
+  "next.security.listenPending":
+    "Weaver lauscht noch auf dieser Adresse; die gespeicherte gilt ab dem nächsten Neustart.",
   "next.security.rememberedNetworks": "Netzwerke für gemerkte Sitzungen",
-  "next.security.rememberedNetworksHelp": "Browser in diesen Bereichen dürfen bei der Anmeldung „Angemeldet bleiben“ nutzen. Ein CIDR pro Zeile; leer lässt jeden Client zu.",
+  "next.security.rememberedNetworksHelp":
+    "Browser in diesen Bereichen dürfen bei der Anmeldung „Angemeldet bleiben“ nutzen. Ein CIDR pro Zeile; leer lässt jeden Client zu.",
   "next.security.trustedProxies": "Vertrauenswürdige Proxys",
-  "next.security.trustedProxiesHelp": "Weiterleitungs-Header werden nur von diesen Adressen oder CIDRs übernommen. Nur Proxys Ihrer eigenen Installation eintragen.",
+  "next.security.trustedProxiesHelp":
+    "Weiterleitungs-Header werden nur von diesen Adressen oder CIDRs übernommen. Nur Proxys Ihrer eigenen Installation eintragen.",
   "next.security.thisBrowser": "Dieser Browser",
-  "next.security.connectionHelp": "Die Peer-Adresse der Verbindung und die daraus ermittelte Client-Adresse.",
+  "next.security.connectionHelp":
+    "Die Peer-Adresse der Verbindung und die daraus ermittelte Client-Adresse.",
   "next.security.headersIgnored": "Weiterleitungs-Header wurden ignoriert.",
   "next.security.unknown": "unbekannt",
   "next.security.draft": "Entwurf",
-  "next.security.draftHelp": "Worauf die ungespeicherten Änderungen hinauslaufen, von weaver beim Tippen geprüft.",
-  "next.security.draftResolves": "Gemerkte Sitzungen von {{networks}}; vertrauenswürdige Proxys: {{proxies}}.",
+  "next.security.draftHelp":
+    "Worauf die ungespeicherten Änderungen hinauslaufen, von weaver beim Tippen geprüft.",
+  "next.security.draftResolves":
+    "Gemerkte Sitzungen von {{networks}}; vertrauenswürdige Proxys: {{proxies}}.",
   "next.security.anyClient": "jedem Client",
-  "next.security.draftRestart": "Die Lauschadresse gilt ab dem nächsten Neustart.",
-  "next.security.draftLocksOut": "Dieser Browser dürfte keine gemerkte Sitzung mehr haben.",
-  "next.security.policyInvalid": "Die gespeicherten Netzwerke für gemerkte Sitzungen sind ungültig, daher lehnt weaver jede gemerkte Sitzung ab. Unten korrigieren.",
-  "next.security.networkSaved": "Netzwerkzugriff gespeichert. Eine geänderte Lauschadresse gilt ab dem nächsten Neustart.",
+  "next.security.draftRestart":
+    "Die Lauschadresse gilt ab dem nächsten Neustart.",
+  "next.security.draftLocksOut":
+    "Dieser Browser dürfte keine gemerkte Sitzung mehr haben.",
+  "next.security.policyInvalid":
+    "Die gespeicherten Netzwerke für gemerkte Sitzungen sind ungültig, daher lehnt weaver jede gemerkte Sitzung ab. Unten korrigieren.",
+  "next.security.networkSaved":
+    "Netzwerkzugriff gespeichert. Eine geänderte Lauschadresse gilt ab dem nächsten Neustart.",
   "next.security.lockoutTitle": "Dieser Browser verliert „Angemeldet bleiben“",
-  "next.security.lockoutBody": "Dieser Browser liegt außerhalb der Netzwerke, die Sie speichern. Wenn er mit „Angemeldet bleiben“ angemeldet ist, muss er sich neu anmelden.",
+  "next.security.lockoutBody":
+    "Dieser Browser liegt außerhalb der Netzwerke, die Sie speichern. Wenn er mit „Angemeldet bleiben“ angemeldet ist, muss er sich neu anmelden.",
   "next.security.lockoutConfirm": "Trotzdem speichern",
   "next.backup.requestFailed": "Anfrage mit Status {{status}} fehlgeschlagen",
   "next.backup.building": "Archiv wird erstellt…",
   "next.backup.savedFile": "{{name}} gespeichert",
   "next.backup.reading": "Archiv wird gelesen…",
-  "next.backup.readNeedsRemaps": "Archiv gelesen. Gib den Kategorien unten ein Ziel auf diesem Rechner.",
+  "next.backup.readNeedsRemaps":
+    "Archiv gelesen. Gib den Kategorien unten ein Ziel auf diesem Rechner.",
   "next.backup.readDone": "Archiv gelesen.",
   "next.backup.staging": "Wiederherstellung wird vorbereitet…",
-  "next.backup.staged.one": "Wiederherstellung vorbereitet · {{count}} Download im Verlauf · starte weaver neu, um sie anzuwenden",
-  "next.backup.staged.other": "Wiederherstellung vorbereitet · {{count}} Downloads im Verlauf · starte weaver neu, um sie anzuwenden",
-  "next.backup.restored.one": "{{count}} Download aus dem Verlauf wiederhergestellt",
-  "next.backup.restored.other": "{{count}} Downloads aus dem Verlauf wiederhergestellt",
+  "next.backup.staged.one":
+    "Wiederherstellung vorbereitet · {{count}} Download im Verlauf · starte weaver neu, um sie anzuwenden",
+  "next.backup.staged.other":
+    "Wiederherstellung vorbereitet · {{count}} Downloads im Verlauf · starte weaver neu, um sie anzuwenden",
+  "next.backup.restored.one":
+    "{{count}} Download aus dem Verlauf wiederhergestellt",
+  "next.backup.restored.other":
+    "{{count}} Downloads aus dem Verlauf wiederhergestellt",
   "next.backup.theDataDirectory": "das Datenverzeichnis",
   "next.backup.archive": "Archiv",
-  "next.backup.archiveHelp": "Die .enc-Datei einer Sicherung, von diesem oder einem anderen Rechner.",
+  "next.backup.archiveHelp":
+    "Die .enc-Datei einer Sicherung, von diesem oder einem anderen Rechner.",
   "next.backup.noFile": "keine Datei gewählt",
   "next.backup.chooseFile": "Datei wählen",
   "next.backup.password": "Passwort",
-  "next.backup.dataDirHelp": "Wohin die wiederhergestellte Datenbank und der Zustand auf diesem Rechner geschrieben werden.",
+  "next.backup.dataDirHelp":
+    "Wohin die wiederhergestellte Datenbank und der Zustand auf diesem Rechner geschrieben werden.",
   "next.backup.intermediateDir": "Zwischenverzeichnis",
   "next.backup.blankUses": "Leer nutzt {{path}}.",
   "next.backup.readTheArchive": "Archiv lesen",
-  "next.backup.readTheArchiveHelp": "Weaver prüft das Archiv und meldet, was eine Wiederherstellung bewirken würde, bevor es sie ausführt.",
+  "next.backup.readTheArchiveHelp":
+    "Weaver prüft das Archiv und meldet, was eine Wiederherstellung bewirken würde, bevor es sie ausführt.",
   "next.backup.checking": "wird geprüft…",
   "next.backup.restoreAvailable": "Wiederherstellung möglich",
   "next.backup.restoreUnavailable": "Wiederherstellung nicht möglich",
   "next.backup.readArchive": "Archiv lesen",
   "next.backup.restore": "Wiederherstellen",
-  "next.backup.restoreHelp": "Ersetzt Einstellungen, Anbieter, Kategorien und Verlauf dieses Rechners durch die des Archivs.",
+  "next.backup.restoreHelp":
+    "Ersetzt Einstellungen, Anbieter, Kategorien und Verlauf dieses Rechners durch die des Archivs.",
   "next.backup.restoreFromArchive": "Aus Archiv wiederherstellen",
-  "next.backup.exportNote": "Einstellungen, Anbieter, Kategorien, Zeitpläne und Verlauf",
-  "next.backup.passwordHelp": "Das Archiv wird damit verschlüsselt. Weaver kann es nicht für dich wiederherstellen.",
+  "next.backup.exportNote":
+    "Einstellungen, Anbieter, Kategorien, Zeitpläne und Verlauf",
+  "next.backup.passwordHelp":
+    "Das Archiv wird damit verschlüsselt. Weaver kann es nicht für dich wiederherstellen.",
   "next.backup.confirmPassword": "Passwort bestätigen",
   "next.backup.stagedRestore": "Vorbereitete Wiederherstellung",
   "next.backup.waitingRestart": "Wartet auf einen Neustart",
@@ -1249,31 +1476,40 @@ export const nextDe: LocaleDictionary = {
   "next.backup.sourceDataDir": "Quell-Datenverzeichnis",
   "next.backup.sourceCompleteDir": "Quell-Zielverzeichnis",
   "next.backup.sourceIntermediateDir": "Quell-Zwischenverzeichnis",
-  "next.backup.keyIncompatible": "Der Verschlüsselungsschlüssel dieses Archivs kann nicht in den eingerichteten Schlüsselspeicher übernommen werden, daher lässt es sich hier nicht wiederherstellen.",
+  "next.backup.keyIncompatible":
+    "Der Verschlüsselungsschlüssel dieses Archivs kann nicht in den eingerichteten Schlüsselspeicher übernommen werden, daher lässt es sich hier nicht wiederherstellen.",
   "next.backup.categoryDestinations": "Kategorieziele",
-  "next.backup.categoryDestinationsNote": "diese Ordner gibt es auf diesem Rechner nicht",
+  "next.backup.categoryDestinationsNote":
+    "diese Ordner gibt es auf diesem Rechner nicht",
   "next.backup.was": "Vorher",
   "next.backup.now": "Jetzt",
   "next.backup.destinationFor": "Ziel für {{name}}",
   "next.backup.download": "Sicherung herunterladen",
   "next.backup.stageRestore": "Wiederherstellung vorbereiten",
-  "next.backup.restoreBody": "Alles, was weaver weiß — Anbieter, Kategorien, Zeitpläne, Verlauf — wird durch den Inhalt des Archivs ersetzt. Die Wiederherstellung wird beiseitegeschrieben und beim nächsten Start des Dienstes angewendet.",
-  "next.postProcessing.directorySaved": "Skriptverzeichnis gespeichert · jeder Skriptauftrag wurde ausgeschaltet",
+  "next.backup.restoreBody":
+    "Alles, was weaver weiß — Anbieter, Kategorien, Zeitpläne, Verlauf — wird durch den Inhalt des Archivs ersetzt. Die Wiederherstellung wird beiseitegeschrieben und beim nächsten Start des Dienstes angewendet.",
+  "next.postProcessing.directorySaved":
+    "Skriptverzeichnis gespeichert · jeder Skriptauftrag wurde ausgeschaltet",
   "next.postProcessing.required": "Erforderlich.",
   "next.postProcessing.defaultValue": "Standard: {{value}}.",
   "next.postProcessing.execution": "Ausführung",
   "next.postProcessing.strictOn": "strenge Sicherheit ist aktiv",
   "next.postProcessing.runScripts": "Skripte ausführen",
-  "next.postProcessing.runScriptsHelp": "Ist dies aus, erkennt Weaver Skripte, führt aber keines aus.",
+  "next.postProcessing.runScriptsHelp":
+    "Ist dies aus, erkennt Weaver Skripte, führt aber keines aus.",
   "next.postProcessing.concurrency": "Gleichzeitige Skripte",
-  "next.postProcessing.concurrencyHelp": "Wie viele Skripte gleichzeitig laufen dürfen, über alle Downloads und Ereignisse hinweg. Die Skripte eines Downloads laufen weiterhin nacheinander.",
+  "next.postProcessing.concurrencyHelp":
+    "Wie viele Skripte gleichzeitig laufen dürfen, über alle Downloads und Ereignisse hinweg. Die Skripte eines Downloads laufen weiterhin nacheinander.",
   "next.postProcessing.grace": "Frist zum Beenden",
   "next.postProcessing.interpreters": "Interpreter",
-  "next.postProcessing.interpretersNote": "leer nutzt, was im PATH des Daemons liegt",
+  "next.postProcessing.interpretersNote":
+    "leer nutzt, was im PATH des Daemons liegt",
   "next.postProcessing.directory": "Skriptverzeichnis",
-  "next.postProcessing.directoryNote": "aus dem Dateisystem des Daemons gelesen",
+  "next.postProcessing.directoryNote":
+    "aus dem Dateisystem des Daemons gelesen",
   "next.postProcessing.directoryLabel": "Verzeichnis",
-  "next.postProcessing.directoryHelp": "Hier werden Skripte gefunden. Weaver lädt sie nie hoch, bearbeitet oder löscht sie nie.",
+  "next.postProcessing.directoryHelp":
+    "Hier werden Skripte gefunden. Weaver lädt sie nie hoch, bearbeitet oder löscht sie nie.",
   "next.postProcessing.change": "Ändern",
   "next.postProcessing.script": "Skript",
   "next.postProcessing.timeout": "Zeitlimit",
@@ -1285,40 +1521,52 @@ export const nextDe: LocaleDictionary = {
   "next.postProcessing.moveUp": "Nach oben",
   "next.postProcessing.moveDown": "Nach unten",
   "next.postProcessing.adapter": "Adapter",
-  "next.postProcessing.discoveredEmpty": "Keine Skripte gefunden. Lege eines in das Skriptverzeichnis und aktualisiere dann.",
+  "next.postProcessing.discoveredEmpty":
+    "Keine Skripte gefunden. Lege eines in das Skriptverzeichnis und aktualisiere dann.",
   "next.postProcessing.problems": "Skripte, die nicht gelesen werden konnten",
   "next.postProcessing.changeDirTitle": "Skriptverzeichnis ändern",
   "next.postProcessing.changeDirConfirm": "Verzeichnis ändern",
-  "next.postProcessing.changeDirBody": "Jeder Skriptauftrag wird ausgeschaltet, weil ein Name im neuen Verzeichnis nicht das Skript sein muss, das verdrahtet wurde. Alles in ihnen Gespeicherte bleibt erhalten. Keine Datei auf dem Datenträger wird angefasst.",
+  "next.postProcessing.changeDirBody":
+    "Jeder Skriptauftrag wird ausgeschaltet, weil ein Name im neuen Verzeichnis nicht das Skript sein muss, das verdrahtet wurde. Alles in ihnen Gespeicherte bleibt erhalten. Keine Datei auf dem Datenträger wird angefasst.",
   "next.postProcessing.events": "Ereignisskripte und Ausgabeaufbewahrung",
-  "next.postProcessing.eventsNote": "Warteschlangenereignisse eines Downloads laufen einzeln",
+  "next.postProcessing.eventsNote":
+    "Warteschlangenereignisse eines Downloads laufen einzeln",
   "next.postProcessing.eventTimeout": "Standard-Zeitlimit für Ereignisse",
-  "next.postProcessing.eventTimeoutHelp": "Gilt, wenn ein Skriptauftrag für Warteschlange, Scan, Zeitplan oder Feed kein eigenes Zeitlimit hat.",
+  "next.postProcessing.eventTimeoutHelp":
+    "Gilt, wenn ein Skriptauftrag für Warteschlange, Scan, Zeitplan oder Feed kein eigenes Zeitlimit hat.",
   "next.postProcessing.fileEventInterval": "Intervall für Dateiereignisse",
-  "next.postProcessing.fileEventIntervalHelp": "Der Mindestabstand zwischen Dateiereignissen eines Downloads. 0 drosselt sie nicht; -1 schaltet sie ab. Ein Direct-Store-Download hat womöglich keine Archivdatei, die ein Skript prüfen könnte.",
+  "next.postProcessing.fileEventIntervalHelp":
+    "Der Mindestabstand zwischen Dateiereignissen eines Downloads. 0 drosselt sie nicht; -1 schaltet sie ab. Ein Direct-Store-Download hat womöglich keine Archivdatei, die ein Skript prüfen könnte.",
   "next.postProcessing.outputRuns": "Aufbewahrte Läufe pro Download",
-  "next.postProcessing.outputRunsHelp": "Wie viele der neuesten Läufe für jeden Download und für jeden Scan, Zeitplan oder Feed behalten werden.",
+  "next.postProcessing.outputRunsHelp":
+    "Wie viele der neuesten Läufe für jeden Download und für jeden Scan, Zeitplan oder Feed behalten werden.",
   "next.postProcessing.outputFailedRuns": "Fehlgeschlagene Läufe aufbewahren",
-  "next.postProcessing.outputFailedRunsHelp": "Fehlgeschlagene Läufe, die für jeden Download über diese Anzahl hinaus behalten werden, damit Fehler nachvollziehbar bleiben.",
-  "next.postProcessing.outputLoweringDeletes": "Ein niedrigerer Wert löscht die älteren Läufe jedes Downloads, sobald Sie speichern.",
+  "next.postProcessing.outputFailedRunsHelp":
+    "Fehlgeschlagene Läufe, die für jeden Download über diese Anzahl hinaus behalten werden, damit Fehler nachvollziehbar bleiben.",
+  "next.postProcessing.outputLoweringDeletes":
+    "Ein niedrigerer Wert löscht die älteren Läufe jedes Downloads, sobald Sie speichern.",
   "next.postProcessing.outputTruncatedChip": "Gekürzt",
   "next.postProcessing.kindPostProcessing": "Nachbearbeitung",
   "next.postProcessing.kindQueue": "Warteschlange",
   "next.postProcessing.kindScan": "Scan",
   "next.postProcessing.kindFeed": "Feed",
   "next.postProcessing.instances": "Aufträge",
-  "next.postProcessing.instancesNote": "Aufträge für alle Kategorien laufen vor den eigenen einer Kategorie",
-  "next.postProcessing.instancesNoteOnlyWithout": "Aufträge für alle Kategorien laufen nur, wenn die Kategorie keine eigenen hat",
+  "next.postProcessing.instancesNote":
+    "Aufträge für alle Kategorien laufen vor den eigenen einer Kategorie",
+  "next.postProcessing.instancesNoteOnlyWithout":
+    "Aufträge für alle Kategorien laufen nur, wenn die Kategorie keine eigenen hat",
   "next.postProcessing.noInstances": "Noch keine Aufträge.",
   "next.postProcessing.createInstance": "Auftrag hinzufügen",
   "next.postProcessing.chooseScript": "Skript auswählen",
   "next.postProcessing.queueEvent": "Warteschlangenereignis",
   "next.postProcessing.instanceName": "Auftragsname",
-  "next.postProcessing.instanceNameHelp": "Leer wird der Name des Skripts verwendet.",
+  "next.postProcessing.instanceNameHelp":
+    "Leer wird der Name des Skripts verwendet.",
   "next.postProcessing.inputs": "Eingaben",
   "next.postProcessing.noInputs": "Dieser Auftrag hat keine Eingaben.",
   "next.postProcessing.secret": "Geheim",
-  "next.postProcessing.secretLinkHelp": "Verknüpft aus Einstellungen · Skripte · Geheimnisse. Das Skript erhält den Wert beim Ausführen; hier wird er nie angezeigt.",
+  "next.postProcessing.secretLinkHelp":
+    "Verknüpft aus Einstellungen · Skripte · Geheimnisse. Das Skript erhält den Wert beim Ausführen; hier wird er nie angezeigt.",
   "next.postProcessing.chooseSecret": "Geheimnis wählen",
   "next.postProcessing.noSecret": "Kein Geheimnis",
   "next.postProcessing.createSecret": "Neues Geheimnis erstellen…",
@@ -1330,54 +1578,74 @@ export const nextDe: LocaleDictionary = {
   "next.postProcessing.newInputIsSecret": "Die neue Eingabe ist ein Geheimnis",
   "next.postProcessing.ownSecretSaved": "Gespeichert. Tippen ersetzt.",
   "next.postProcessing.addInput": "Eingabe hinzufügen",
-  "next.postProcessing.inputNameInvalid": "Verwende Buchstaben, Ziffern, - und _, beginnend mit einem Buchstaben. Punkte dürfen solche Teile verbinden.",
-  "next.postProcessing.inputNameTaken": "Dieser Auftrag hat bereits eine Eingabe mit diesem Namen.",
+  "next.postProcessing.inputNameInvalid":
+    "Verwende Buchstaben, Ziffern, - und _, beginnend mit einem Buchstaben. Punkte dürfen solche Teile verbinden.",
+  "next.postProcessing.inputNameTaken":
+    "Dieser Auftrag hat bereits eine Eingabe mit diesem Namen.",
   "next.postProcessing.runPolicy": "Ausführungsweise",
   "next.postProcessing.categories": "Kategorien",
-  "next.postProcessing.categoriesHelp": "Läuft nur für Downloads in diesen Kategorien. Ist keine gewählt, läuft sie für jede Kategorie.",
+  "next.postProcessing.categoriesHelp":
+    "Läuft nur für Downloads in diesen Kategorien. Ist keine gewählt, läuft sie für jede Kategorie.",
   "next.postProcessing.everyCategory": "Jede Kategorie",
   "next.postProcessing.noCategories": "Keine Kategorien definiert",
   "next.postProcessing.runTimes": "Laufzeiten",
-  "next.postProcessing.runTimeNeeded": "Geben Sie diesem Auftrag eine Laufzeit oder schalten Sie die Ausführung beim Start ein.",
-  "next.postProcessing.runTimeInvalid": "{{time}} ist keine Uhrzeit. Verwenden Sie HH:MM oder *:MM für jede Stunde.",
-  "next.postProcessing.runModeHelp": "Auf Blockierend wird gewartet, bevor etwas anderes geschieht. Ohne Abwarten wird gestartet und sich selbst überlassen.",
-  "next.postProcessing.timeoutHelp": "0 verwendet den Standard: einen Tag für ein Nachbearbeitungsskript, sonst das Standard-Zeitlimit für Ereignisse. Höchstens 7 Tage.",
+  "next.postProcessing.runTimeNeeded":
+    "Geben Sie diesem Auftrag eine Laufzeit oder schalten Sie die Ausführung beim Start ein.",
+  "next.postProcessing.runTimeInvalid":
+    "{{time}} ist keine Uhrzeit. Verwenden Sie HH:MM oder *:MM für jede Stunde.",
+  "next.postProcessing.runModeHelp":
+    "Auf Blockierend wird gewartet, bevor etwas anderes geschieht. Ohne Abwarten wird gestartet und sich selbst überlassen.",
+  "next.postProcessing.timeoutHelp":
+    "0 verwendet den Standard: einen Tag für ein Nachbearbeitungsskript, sonst das Standard-Zeitlimit für Ereignisse. Höchstens 7 Tage.",
   "next.postProcessing.timeoutDefault": "Standard",
   "next.postProcessing.enabledFor": "{{name}} aktiviert",
-  "next.postProcessing.headerDrift": "Eingaben weichen vom Header des Skripts ab",
-  "next.postProcessing.headerDriftBody": "Die Eingaben dieses Auftrags stimmen nicht mehr mit dem überein, was der Header des Skripts deklariert. Erneutes Anwenden aus dem Header gleicht sie an; gespeicherte Werte bleiben erhalten.",
+  "next.postProcessing.headerDrift":
+    "Eingaben weichen vom Header des Skripts ab",
+  "next.postProcessing.headerDriftBody":
+    "Die Eingaben dieses Auftrags stimmen nicht mehr mit dem überein, was der Header des Skripts deklariert. Erneutes Anwenden aus dem Header gleicht sie an; gespeicherte Werte bleiben erhalten.",
   "next.postProcessing.reapply": "Aus Header neu anwenden",
-  "next.postProcessing.reapplyBody": "Gespeicherte Werte bleiben erhalten, neue Eingaben kommen mit ihren Standardwerten hinzu, und Eingaben, die der Header nicht mehr deklariert, entfallen. Der Auslöser ändert sich nicht.",
+  "next.postProcessing.reapplyBody":
+    "Gespeicherte Werte bleiben erhalten, neue Eingaben kommen mit ihren Standardwerten hinzu, und Eingaben, die der Header nicht mehr deklariert, entfallen. Der Auslöser ändert sich nicht.",
   "next.postProcessing.reapplied": "{{name}} aus dem Header neu angewendet",
   "next.postProcessing.setUpFromHeader": "Aufträge aus Header einrichten",
-  "next.postProcessing.setUpFromHeaderHelp": "Erstellt einen Auftrag für jeden Auslöser, den der Header des Skripts deklariert und der noch keinen hat.",
-  "next.postProcessing.setUpDone.one": "{{count}} Auftrag für {{name}} erstellt",
-  "next.postProcessing.setUpDone.other": "{{count}} Aufträge für {{name}} erstellt",
+  "next.postProcessing.setUpFromHeaderHelp":
+    "Erstellt einen Auftrag für jeden Auslöser, den der Header des Skripts deklariert und der noch keinen hat.",
+  "next.postProcessing.setUpDone.one":
+    "{{count}} Auftrag für {{name}} erstellt",
+  "next.postProcessing.setUpDone.other":
+    "{{count}} Aufträge für {{name}} erstellt",
   "next.postProcessing.instanceCreated": "{{name}} erstellt",
   "next.postProcessing.instanceSaved": "{{name}} gespeichert",
   "next.postProcessing.instanceDeleted": "{{name}} gelöscht",
   "next.postProcessing.deleteTitle": "Auftrag löschen",
-  "next.postProcessing.deleteBody": "Der Auftrag wird entfernt, zusammen mit seinem Platz in jedem Feed. Die Skriptdatei bleibt unberührt.",
-  "next.postProcessing.feedGroupNote": "läuft für die Feeds, an die sie angehängt ist",
+  "next.postProcessing.deleteBody":
+    "Der Auftrag wird entfernt, zusammen mit seinem Platz in jedem Feed. Die Skriptdatei bleibt unberührt.",
+  "next.postProcessing.feedGroupNote":
+    "läuft für die Feeds, an die sie angehängt ist",
   "next.postProcessing.globalScriptsRun": "Globale Skripte laufen",
-  "next.postProcessing.globalScriptsRunHelp": "Ein globales Skript ist ein Auftrag ohne eigene Kategorie und läuft vor den Skripten der Kategorie. Hier wird festgelegt, ob es auch für einen Download läuft, dessen Kategorie eigene Skripte hat.",
+  "next.postProcessing.globalScriptsRunHelp":
+    "Ein globales Skript ist ein Auftrag ohne eigene Kategorie und läuft vor den Skripten der Kategorie. Hier wird festgelegt, ob es auch für einen Download läuft, dessen Kategorie eigene Skripte hat.",
   "next.postProcessing.globalAlways": "Für jeden Download",
   "next.postProcessing.globalOnlyWithout": "Nur wenn die Kategorie keine hat",
   "next.postProcessing.test": "Testen",
   "next.postProcessing.testTitle": "{{name}} testen",
-  "next.postProcessing.testNote": "Der Auftrag, wie er gespeichert ist, einmal mit erfundenen Eingaben ausgeführt. Nichts, was das Skript anfordert, wird angewendet.",
+  "next.postProcessing.testNote":
+    "Der Auftrag, wie er gespeichert ist, einmal mit erfundenen Eingaben ausgeführt. Nichts, was das Skript anfordert, wird angewendet.",
   "next.postProcessing.testStarting": "Test wird gestartet…",
   "next.postProcessing.testRunning": "Läuft",
   "next.postProcessing.testGone": "Der Daemon hat diesen Testlauf nicht mehr.",
   "next.postProcessing.testInputs": "Simulierte Eingaben",
-  "next.postProcessing.testInputsNote": "für diesen Lauf erfunden · die eigenen Eingaben des Auftrags fehlen hier",
+  "next.postProcessing.testInputsNote":
+    "für diesen Lauf erfunden · die eigenen Eingaben des Auftrags fehlen hier",
   "next.postProcessing.testArguments": "Argumente",
   "next.postProcessing.testLog": "Laufprotokoll",
-  "next.postProcessing.testLogWaiting": "Das Skript hat noch nichts ausgegeben.",
+  "next.postProcessing.testLogWaiting":
+    "Das Skript hat noch nichts ausgegeben.",
   "next.postProcessing.testLogEmpty": "Das Skript hat nichts ausgegeben.",
   "next.postProcessing.testCommands": "Was das Skript angefordert hat",
   "next.postProcessing.testCommandsNote": "nichts davon wurde angewendet",
-  "next.postProcessing.testCommandsTruncated": "Das Skript hat mehr angefordert, als hier gezeigt wird.",
+  "next.postProcessing.testCommandsTruncated":
+    "Das Skript hat mehr angefordert, als hier gezeigt wird.",
   "next.postProcessing.testAgain": "Erneut ausführen",
   "next.postProcessing.cancelTest": "Test abbrechen",
   "next.scriptRuns.note": "neueste zuerst",
@@ -1390,7 +1658,8 @@ export const nextDe: LocaleDictionary = {
   "next.scriptRuns.allTriggers": "Alle Auslöser",
   "next.scriptRuns.copyOutput": "Ausgabe kopieren",
   "next.scriptRuns.copied": "Ausgabe in die Zwischenablage kopiert",
-  "next.scriptRuns.copyBlocked": "Der Browser hat die Zwischenablage blockiert.",
+  "next.scriptRuns.copyBlocked":
+    "Der Browser hat die Zwischenablage blockiert.",
   "next.scriptRuns.loadingOutput": "Ausgabe wird gelesen…",
   "next.scriptRuns.outputOf": "Ausgabe von {{name}}",
   "next.scriptRuns.status.all": "Alle",
@@ -1414,20 +1683,26 @@ export const nextDe: LocaleDictionary = {
   "next.providers.connections": "Verbindungen",
   "next.providers.transport": "Transport",
   "next.providers.role": "Rolle",
-  "next.providers.empty": "Noch keine Anbieter. Füge einen hinzu, um mit dem Herunterladen zu beginnen.",
+  "next.providers.empty":
+    "Noch keine Anbieter. Füge einen hinzu, um mit dem Herunterladen zu beginnen.",
   "next.providers.add": "Anbieter hinzufügen",
   "next.providers.enabledAria": "{{host}} aktiviert",
   "next.providers.connection": "Verbindung",
   "next.providers.port": "Port",
   "next.providers.username": "Benutzername",
   "next.providers.password": "Passwort",
-  "next.providers.passwordKeep": "Leer lassen, um das gespeicherte Passwort zu behalten.",
-  "next.providers.connectionsHelp": "Wie viele Verbindungen Weaver gleichzeitig öffnen darf. Nie mehr, als der Tarif erlaubt.",
+  "next.providers.passwordKeep":
+    "Leer lassen, um das gespeicherte Passwort zu behalten.",
+  "next.providers.connectionsHelp":
+    "Wie viele Verbindungen Weaver gleichzeitig öffnen darf. Nie mehr, als der Tarif erlaubt.",
   "next.providers.enabled": "Aktiviert",
-  "next.providers.killSwitchHelp": "Speichert diesen Anbieter deaktiviert und ungetestet, ohne Weg nach draußen. Route unter Netzwerk festlegen, dann hier aktivieren.",
+  "next.providers.killSwitchHelp":
+    "Speichert diesen Anbieter deaktiviert und ungetestet, ohne Weg nach draußen. Route unter Netzwerk festlegen, dann hier aktivieren.",
   "next.providers.priority": "Priorität",
-  "next.providers.priorityHelp": "Niedrigere Zahlen haben Vorrang. Anbieter mit gleicher Zahl teilen die Bandbreite. Höhere Zahlen werden nur genutzt, wenn die vorherigen Gruppen den Artikel nicht liefern können. Belegte Verbindungen lösen keinen Wechsel aus.",
-  "next.providers.backfillServerHelp": "Ergänzt nur Artikel, die die Hauptserver nicht haben. Wird nie genutzt, wenn ein Hauptserver ausfällt oder seine Zugangsdaten ablehnt.",
+  "next.providers.priorityHelp":
+    "Niedrigere Zahlen haben Vorrang. Anbieter mit gleicher Zahl teilen die Bandbreite. Höhere Zahlen werden nur genutzt, wenn die vorherigen Gruppen den Artikel nicht liefern können. Belegte Verbindungen lösen keinen Wechsel aus.",
+  "next.providers.backfillServerHelp":
+    "Ergänzt nur Artikel, die die Hauptserver nicht haben. Wird nie genutzt, wenn ein Hauptserver ausfällt oder seine Zugangsdaten ablehnt.",
   "next.providers.retention": "Vorhaltezeit",
   "next.providers.days": "Tage",
   "next.providers.unlimitedSpeed": "Unbegrenzte Geschwindigkeit",
@@ -1443,9 +1718,11 @@ export const nextDe: LocaleDictionary = {
   "next.providers.test": "Verbindung testen",
   "next.providers.loading": "Anbieter wird geladen…",
   "next.providers.pipelining": "Pipelining",
-  "next.providers.certMismatch": "Das Zertifikat dieses Servers nennt einen anderen Host. Vertraue ihm nur, wenn du sicher bist, dass es der Server deines Anbieters ist.",
+  "next.providers.certMismatch":
+    "Das Zertifikat dieses Servers nennt einen anderen Host. Vertraue ihm nur, wenn du sicher bist, dass es der Server deines Anbieters ist.",
   "next.providers.trustCert": "Diesem Zertifikat vertrauen",
-  "next.providers.removeBody": "Weaver nutzt {{host}} nicht mehr. Laufende Downloads weichen auf die übrigen Anbieter aus.",
+  "next.providers.removeBody":
+    "Weaver nutzt {{host}} nicht mehr. Laufende Downloads weichen auf die übrigen Anbieter aus.",
   "next.providers.thisProvider": "diesen Anbieter",
   "next.providers.quotaWindow": "Kontingentzeitraum",
   "next.providers.usedSoFar": "Bisher verbraucht: {{size}}.",
@@ -1487,17 +1764,20 @@ export const nextDe: LocaleDictionary = {
   "next.rss.url": "URL",
   "next.rss.interval": "Intervall",
   "next.rss.lastPoll": "Letzte Abfrage",
-  "next.rss.feedsEmpty": "Keine Feeds. Füge einen hinzu, damit Weaver die Suche eines Indexers beobachtet.",
+  "next.rss.feedsEmpty":
+    "Keine Feeds. Füge einen hinzu, damit Weaver die Suche eines Indexers beobachtet.",
   "next.rss.addFeed": "Feed hinzufügen",
   "next.rss.poll": "Abfragen",
   "next.rss.rules": "Regeln",
-  "next.rss.rulesNote": "der Reihe nach angewendet, der erste Treffer entscheidet",
+  "next.rss.rulesNote":
+    "der Reihe nach angewendet, der erste Treffer entscheidet",
   "next.rss.feed": "Feed",
   "next.rss.action": "Aktion",
   "next.rss.order": "Reihenfolge",
   "next.rss.titleMatches": "Titel passt auf",
   "next.rss.filesInto": "Ablage in",
-  "next.rss.rulesEmpty": "Keine Regeln. Jeder Eintrag eines Feeds wird angenommen.",
+  "next.rss.rulesEmpty":
+    "Keine Regeln. Jeder Eintrag eines Feeds wird angenommen.",
   "next.rss.addRule": "Regel hinzufügen",
   "next.rss.anything": "alles",
   "next.rss.recentlySeen": "Zuletzt gesehen",
@@ -1507,20 +1787,27 @@ export const nextDe: LocaleDictionary = {
   "next.rss.decisionColumn": "Entscheidung",
   "next.rss.size": "Größe",
   "next.rss.seen": "Gesehen",
-  "next.rss.seenEmpty": "Noch nichts gesehen. Einträge erscheinen hier, sobald ein Feed abgefragt wurde.",
+  "next.rss.seenEmpty":
+    "Noch nichts gesehen. Einträge erscheinen hier, sobald ein Feed abgefragt wurde.",
   "next.rss.clearHistory": "Verlauf leeren",
-  "next.rss.urlHelp": "Die RSS- oder Newznab-Suche des Indexers, samt API-Schlüssel.",
+  "next.rss.urlHelp":
+    "Die RSS- oder Newznab-Suche des Indexers, samt API-Schlüssel.",
   "next.rss.enabled": "Aktiviert",
-  "next.rss.killSwitchHelp": "Speichert diesen Feed deaktiviert, ohne Weg nach draußen. Route unter Netzwerk festlegen, dann hier aktivieren.",
+  "next.rss.killSwitchHelp":
+    "Speichert diesen Feed deaktiviert, ohne Weg nach draußen. Route unter Netzwerk festlegen, dann hier aktivieren.",
   "next.rss.pollInterval": "Abfrageintervall",
   "next.rss.defaultCategory": "Standardkategorie",
-  "next.rss.defaultCategoryHelp": "Unter welcher Kategorie ein angenommener Eintrag abgelegt wird, wenn keine Regel sie überschreibt.",
+  "next.rss.defaultCategoryHelp":
+    "Unter welcher Kategorie ein angenommener Eintrag abgelegt wird, wenn keine Regel sie überschreibt.",
   "next.rss.feedScripts": "Feed-Skripte",
-  "next.rss.feedScriptsHelp": "Die Feed-Aufträge, die dieser Feed ausführt, in dieser Reihenfolge. Ohne Eintrag läuft für ihn kein Skript.",
+  "next.rss.feedScriptsHelp":
+    "Die Feed-Aufträge, die dieser Feed ausführt, in dieser Reihenfolge. Ohne Eintrag läuft für ihn kein Skript.",
   "next.rss.attachScript": "Feed-Auftrag anhängen",
-  "next.rss.noFeedInstances": "Es gibt noch keine Feed-Aufträge. Erstelle einen unter Skripte.",
+  "next.rss.noFeedInstances":
+    "Es gibt noch keine Feed-Aufträge. Erstelle einen unter Skripte.",
   "next.rss.defaultMetadata": "Standard-Metadaten",
-  "next.rss.defaultMetadataHelp": "Ein Schlüssel = Wert pro Zeile, angehängt an jeden Eintrag, den dieser Feed einreiht.",
+  "next.rss.defaultMetadataHelp":
+    "Ein Schlüssel = Wert pro Zeile, angehängt an jeden Eintrag, den dieser Feed einreiht.",
   "next.rss.credentials": "Zugangsdaten",
   "next.rss.credentialsNote": "optional · nur schreibbar gespeichert",
   "next.rss.username": "Benutzername",
@@ -1528,39 +1815,52 @@ export const nextDe: LocaleDictionary = {
   "next.rss.passwordStored": "Gespeichert. Leer lassen, um es zu behalten.",
   "next.rss.forgetPassword": "Gespeichertes Passwort vergessen",
   "next.rss.orderHelp": "Niedrigere Zahlen werden zuerst versucht.",
-  "next.rss.titleMatchesHelp": "Ein regulärer Ausdruck. Leer passt auf jeden Titel.",
+  "next.rss.titleMatchesHelp":
+    "Ein regulärer Ausdruck. Leer passt auf jeden Titel.",
   "next.rss.feedCategories": "Feed-Kategorien",
-  "next.rss.feedCategoriesHelp": "Kommagetrennte Kategorien, wie der Indexer sie bezeichnet. Leer passt auf alle.",
+  "next.rss.feedCategoriesHelp":
+    "Kommagetrennte Kategorien, wie der Indexer sie bezeichnet. Leer passt auf alle.",
   "next.rss.minSize": "Mindestgröße",
   "next.rss.maxSize": "Höchstgröße",
   "next.rss.fileInto": "Ablegen in",
-  "next.rss.fileIntoHelp": "Überschreibt die Standardkategorie des Feeds für Einträge, die diese Regel annimmt.",
+  "next.rss.fileIntoHelp":
+    "Überschreibt die Standardkategorie des Feeds für Einträge, die diese Regel annimmt.",
   "next.rss.metadata": "Metadaten",
-  "next.rss.metadataHelp": "Ein Schlüssel = Wert pro Zeile, angehängt an Einträge, die diese Regel annimmt.",
+  "next.rss.metadataHelp":
+    "Ein Schlüssel = Wert pro Zeile, angehängt an Einträge, die diese Regel annimmt.",
   "next.rss.pollAll": "Alle abfragen",
   "next.rss.newFeed": "neuer Feed",
   "next.rss.removeFeed": "Feed entfernen",
   "next.rss.editRule": "Regel bearbeiten",
   "next.rss.rule": "Regel",
   "next.rss.removeRule": "Regel entfernen",
-  "next.rss.removeFeedBody": "Seine Regeln und alles, was er sich gemerkt hat, werden mit entfernt. Bereits eingereihte Downloads bleiben unberührt.",
-  "next.rss.removeRuleBody": "Einträge, über die diese Regel entschieden hat, fallen an die nachfolgenden Regeln durch.",
+  "next.rss.removeFeedBody":
+    "Seine Regeln und alles, was er sich gemerkt hat, werden mit entfernt. Bereits eingereihte Downloads bleiben unberührt.",
+  "next.rss.removeRuleBody":
+    "Einträge, über die diese Regel entschieden hat, fallen an die nachfolgenden Regeln durch.",
   "next.rss.clearSeenTitle": "Gesehen-Verlauf leeren",
   "next.rss.forgetItemTitle": "Diesen Eintrag vergessen",
   "next.rss.items.one": "{{count}} Eintrag",
   "next.rss.items.other": "{{count}} Einträge",
   "next.rss.forgetItem": "Eintrag vergessen",
-  "next.rss.clearSeenBody": "Jeder Feed darf bei seiner nächsten Abfrage alles, was er meldet, erneut einreihen.",
-  "next.rss.forgetItemBody": "Die nächste Abfrage, die diesen Eintrag meldet, behandelt ihn als neu und reiht ihn eventuell erneut ein.",
+  "next.rss.clearSeenBody":
+    "Jeder Feed darf bei seiner nächsten Abfrage alles, was er meldet, erneut einreihen.",
+  "next.rss.forgetItemBody":
+    "Die nächste Abfrage, die diesen Eintrag meldet, behandelt ihn als neu und reiht ihn eventuell erneut ein.",
   "next.proxies.clearStored": "Entfernen",
   "next.proxies.keepStored": "Behalten",
   "next.proxies.clearedPlaceholder": "Wird beim Speichern entfernt",
-  "next.proxies.storedCleared": "Der gespeicherte Wert wird beim Speichern entfernt. Gib stattdessen einen neuen ein, um ihn zu ersetzen.",
-  "next.proxies.typeLocked": "Ein Profil behält seinen Typ. Lege ein neues Profil an, um einen anderen zu verwenden.",
+  "next.proxies.storedCleared":
+    "Der gespeicherte Wert wird beim Speichern entfernt. Gib stattdessen einen neuen ein, um ihn zu ersetzen.",
+  "next.proxies.typeLocked":
+    "Ein Profil behält seinen Typ. Lege ein neues Profil an, um einen anderen zu verwenden.",
   "next.routing.full": "Eine Route umfasst höchstens {{count}} Proxys.",
-  "next.inspector.removeFailed": "Dieser Download konnte nicht entfernt werden.",
-  "next.schedules.pauseWatchFolder": "Scannen des Überwachungsordners pausieren",
-  "next.schedules.resumeWatchFolder": "Scannen des Überwachungsordners fortsetzen",
+  "next.inspector.removeFailed":
+    "Dieser Download konnte nicht entfernt werden.",
+  "next.schedules.pauseWatchFolder":
+    "Scannen des Überwachungsordners pausieren",
+  "next.schedules.resumeWatchFolder":
+    "Scannen des Überwachungsordners fortsetzen",
   "next.schedules.pauseRss": "RSS pausieren",
   "next.schedules.resumeRss": "RSS fortsetzen",
   "next.schedules.pauseTorrents": "Torrents pausieren",
@@ -1573,26 +1873,31 @@ export const nextDe: LocaleDictionary = {
   "next.schedules.speedServers": "Anbieter",
   "next.schedules.speedUnit": "MB/s",
   "next.schedules.speedLeaveAsIs": "unverändert",
-  "next.schedules.speedInvalid": "Ein Geschwindigkeitslimit ist eine Zahl in MB/s, 0 oder mehr.",
+  "next.schedules.speedInvalid":
+    "Ein Geschwindigkeitslimit ist eine Zahl in MB/s, 0 oder mehr.",
   "next.schedules.speedNeeded": "Setze mindestens ein Limit.",
   "next.schedules.speedNothing": "Setzt nichts",
   "next.schedules.unlimited": "unbegrenzt",
   "next.schedules.egress": "Egress",
   "next.schedules.quotaCounting": "Downloads",
   "next.schedules.quotaCountOn": "Downloads auf das Kontingent anrechnen",
-  "next.schedules.quotaCountOff": "Downloads nicht mehr auf das Kontingent anrechnen",
+  "next.schedules.quotaCountOff":
+    "Downloads nicht mehr auf das Kontingent anrechnen",
   "next.schedules.everyEgress": "Jede Egress-Schnittstelle",
   "next.schedules.setProfile": "Hardwareprofil wechseln",
   "next.schedules.profileTo": "Wechsel zu {{profile}}",
   "next.schedules.setSplit": "Bandbreitenaufteilung",
   "next.schedules.splitLift": "Aufheben",
-  "next.schedules.splitTo": "Bandbreitenaufteilung: Usenet {{usenet}} %, Torrents {{torrent}} %",
+  "next.schedules.splitTo":
+    "Bandbreitenaufteilung: Usenet {{usenet}} %, Torrents {{torrent}} %",
   "next.schedules.splitLifted": "Bandbreitenaufteilung: aufheben",
   "next.schedules.profile": "Hardwareprofil",
-  "next.schedules.profileHelp": "Bleibt bis zur nächsten Profilregel aktiv. Angeboten werden nur Profile, die dieser Rechner ausführen kann.",
+  "next.schedules.profileHelp":
+    "Bleibt bis zur nächsten Profilregel aktiv. Angeboten werden nur Profile, die dieser Rechner ausführen kann.",
   "next.system.kernels": "Kernel",
   "next.system.kernelsNote": "schnellster zuerst · hervorgehoben ist aktiv",
-  "next.system.kernelLadder": "Kernel, die diese Bibliothek wählen kann, schnellster zuerst",
+  "next.system.kernelLadder":
+    "Kernel, die diese Bibliothek wählen kann, schnellster zuerst",
   "next.system.kernelPinned": "festgelegt durch {{variable}}",
   "next.system.kernel.yencDecode": "yEnc-Dekodierung",
   "next.system.kernel.yencCrc32": "Artikel-CRC32",
@@ -1607,18 +1912,24 @@ export const nextDe: LocaleDictionary = {
   "next.login.password": "Passwort",
   "next.login.submit": "Anmelden",
   "next.login.signingIn": "Anmeldung läuft…",
-  "next.login.invalid": "Ungültige Anmeldedaten. Prüfe Benutzername und Passwort.",
-  "next.login.tooMany": "Zu viele Anmeldeversuche. Warte eine Minute und versuche es dann erneut.",
+  "next.login.invalid":
+    "Ungültige Anmeldedaten. Prüfe Benutzername und Passwort.",
+  "next.login.tooMany":
+    "Zu viele Anmeldeversuche. Warte eine Minute und versuche es dann erneut.",
   "next.login.failed": "Anmeldung fehlgeschlagen: {{error}}",
-  "next.login.unreachable": "Weaver antwortet nicht. Prüfe, ob es läuft, und versuche es dann erneut.",
+  "next.login.unreachable":
+    "Weaver antwortet nicht. Prüfe, ob es läuft, und versuche es dann erneut.",
   "next.login.forgot": "Passwort vergessen?",
-  "next.login.resetHelp": "Beende Weaver und starte es mit einem Login-Reset und neuen Bootstrap-Zugangsdaten erneut. Eine Passwortdatei ist sicherer als ein Passwort in der Umgebung.",
+  "next.login.resetHelp":
+    "Beende Weaver und starte es mit einem Login-Reset und neuen Bootstrap-Zugangsdaten erneut. Eine Passwortdatei ist sicherer als ein Passwort in der Umgebung.",
   "next.login.docker": "Docker",
   "next.login.bareMetal": "Direkt installiert",
-  "next.login.trustedNetworks": "Oder trage vertrauenswürdige Netzwerke in {{variable}} ein, damit Browser aus diesen Netzen ohne Anmeldung als Administrator zugreifen.",
+  "next.login.trustedNetworks":
+    "Oder trage vertrauenswürdige Netzwerke in {{variable}} ein, damit Browser aus diesen Netzen ohne Anmeldung als Administrator zugreifen.",
   "next.job.deleteSaveFiles": "Löschen, Dateien behalten",
   "next.job.deleteAllTitle": "Mit allen Dateien löschen",
-  "next.job.deleteAllBody": "Der Eintrag verlässt den Verlauf und seine heruntergeladenen Dateien werden von der Festplatte gelöscht. Das läuft im Hintergrund und lässt sich nicht rückgängig machen.",
+  "next.job.deleteAllBody":
+    "Der Eintrag verlässt den Verlauf und seine heruntergeladenen Dateien werden von der Festplatte gelöscht. Das läuft im Hintergrund und lässt sich nicht rückgängig machen.",
   // First-run setup
   "next.firstRun.title": "Willkommen bei Weaver",
   "next.firstRun.step": "Schritt {{step}} von {{total}}",
@@ -1631,71 +1942,105 @@ export const nextDe: LocaleDictionary = {
   "next.firstRun.continue": "Weiter",
   "next.firstRun.saving": "Wird gespeichert…",
   "next.firstRun.provider.title": "Usenet-Anbieter verbinden",
-  "next.firstRun.provider.body": "Weaver lädt von den News-Servern deines Anbieters. Serveradresse, Port und Zugangsdaten stehen in der Willkommens-E-Mail oder auf der Kontoseite deines Anbieters.",
+  "next.firstRun.provider.body":
+    "Weaver lädt von den News-Servern deines Anbieters. Serveradresse, Port und Zugangsdaten stehen in der Willkommens-E-Mail oder auf der Kontoseite deines Anbieters.",
   "next.firstRun.provider.tls": "Verschlüsselte Verbindung (TLS)",
-  "next.firstRun.provider.tlsHint": "Fast jeder Anbieter bietet das an. Üblich ist Port 563 mit TLS und 119 ohne.",
+  "next.firstRun.provider.tlsHint":
+    "Fast jeder Anbieter bietet das an. Üblich ist Port 563 mit TLS und 119 ohne.",
   "next.providers.certFingerprint": "SHA-256-Fingerabdruck: {{fingerprint}}",
-  "next.providers.certIssuedFor": "Das Zertifikat dieses Servers gilt nicht für {{host}}. Es ist ausgestellt für {{names}}. Vertraue ihm nur, wenn du sicher bist, dass es der Server deines Anbieters ist.",
+  "next.providers.certIssuedFor":
+    "Das Zertifikat dieses Servers gilt nicht für {{host}}. Es ist ausgestellt für {{names}}. Vertraue ihm nur, wenn du sicher bist, dass es der Server deines Anbieters ist.",
   "next.providers.certNames": "Ausgestellt für {{names}}",
-  "next.providers.certificateTrusted": "Zertifikat für diesen Anbieter vertraut.",
+  "next.providers.certificateTrusted":
+    "Zertifikat für diesen Anbieter vertraut.",
   "next.providers.trustTitle": "Diesem Zertifikat vertrauen?",
-  "next.providers.trustBody": "Weaver prüft alles andere am Zertifikat weiterhin. Es akzeptiert genau dieses Zertifikat nur, wenn der Hostname nicht passt, und lehnt jedes andere Zertifikat mit fremdem Host ab.",
+  "next.providers.trustBody":
+    "Weaver prüft alles andere am Zertifikat weiterhin. Es akzeptiert genau dieses Zertifikat nur, wenn der Hostname nicht passt, und lehnt jedes andere Zertifikat mit fremdem Host ab.",
   "next.providers.trustConfirm": "Zertifikat vertrauen",
   "next.providers.forgetCertificate": "Zertifikat vergessen",
   "next.firstRun.provider.save": "Anbieter speichern",
-  "next.firstRun.provider.saveFailed": "Anbieter konnte nicht gespeichert werden: {{message}}",
+  "next.firstRun.provider.saveFailed":
+    "Anbieter konnte nicht gespeichert werden: {{message}}",
   "next.firstRun.provider.saved": "Deine Anbieter",
   "next.firstRun.provider.addAnother": "Weiteren Anbieter hinzufügen",
   "next.firstRun.provider.skip": "Vorerst überspringen",
   "next.firstRun.folders.title": "Ordner einrichten",
-  "next.firstRun.folders.saveFailed": "Ordner konnten nicht gespeichert werden: {{message}}",
+  "next.firstRun.folders.saveFailed":
+    "Ordner konnten nicht gespeichert werden: {{message}}",
   "next.firstRun.categories.title": "Kategorien",
-  "next.firstRun.categories.body": "Eine Kategorie gibt ihren Downloads einen eigenen Ordner. Apps, die Weaver Downloads schicken, geben meist eine an, etwa tv oder movies.",
+  "next.firstRun.categories.body":
+    "Eine Kategorie gibt ihren Downloads einen eigenen Ordner. Apps, die Weaver Downloads schicken, geben meist eine an, etwa tv oder movies.",
   "next.firstRun.categories.remove": "{{name}} entfernen",
-  "next.firstRun.categories.saveFailed": "Kategorie konnte nicht gespeichert werden: {{message}}",
+  "next.firstRun.categories.saveFailed":
+    "Kategorie konnte nicht gespeichert werden: {{message}}",
   "next.firstRun.done.title": "Alles bereit",
-  "next.firstRun.done.body": "Füge eine NZB hinzu, um deinen ersten Download zu starten. Alles hier lässt sich später in den Einstellungen ändern.",
+  "next.firstRun.done.body":
+    "Füge eine NZB hinzu, um deinen ersten Download zu starten. Alles hier lässt sich später in den Einstellungen ändern.",
   "next.firstRun.done.providers": "Anbieter",
-  "next.firstRun.done.noProvider": "Noch keiner. Füge vor dem Herunterladen einen in den Einstellungen hinzu.",
+  "next.firstRun.done.noProvider":
+    "Noch keiner. Füge vor dem Herunterladen einen in den Einstellungen hinzu.",
   "next.firstRun.done.categoriesNone": "Keine",
   "next.firstRun.done.open": "Weaver öffnen",
-  "next.firstRun.finishFailed": "Einrichtung konnte nicht abgeschlossen werden: {{message}}",
+  "next.firstRun.finishFailed":
+    "Einrichtung konnte nicht abgeschlossen werden: {{message}}",
   "next.performance.title": "Leistung",
   "next.performance.profile": "Hardwareprofil",
-  "next.performance.body": "Wählen Sie, wie stark Weaver diesen Rechner beanspruchen darf. Profile, die dieser Rechner nicht ausführen kann, werden nicht angeboten.",
+  "next.performance.body":
+    "Wählen Sie, wie stark Weaver diesen Rechner beanspruchen darf. Profile, die dieser Rechner nicht ausführen kann, werden nicht angeboten.",
   "next.performance.efficient": "Sparsam",
   "next.performance.balanced": "Ausgewogen",
   "next.performance.performance": "Leistung",
-  "next.performance.efficientBody": "Der kleinste Fußabdruck. Für kleine Boards und Rechner, die sich Weaver mit anderer Arbeit teilt.",
-  "next.performance.balancedBody": "Die alltägliche Wahl für einen Desktop oder einen Heimserver.",
-  "next.performance.performanceBody": "Die weitesten Grenzen. Für große Rechner mit reichlich Speicher und Kernen.",
+  "next.performance.efficientBody":
+    "Der kleinste Fußabdruck. Für kleine Boards und Rechner, die sich Weaver mit anderer Arbeit teilt.",
+  "next.performance.balancedBody":
+    "Die alltägliche Wahl für einen Desktop oder einen Heimserver.",
+  "next.performance.performanceBody":
+    "Die weitesten Grenzen. Für große Rechner mit reichlich Speicher und Kernen.",
   "next.performance.recommendedTag": "Empfohlen",
   "next.performance.factDecodeMemory": "{{size}} 7z-Dekodierspeicher",
-  "next.performance.factThreads": "Threads: {{decode}} Dekodieren · {{extract}} Entpacken",
+  "next.performance.factThreads":
+    "Threads: {{decode}} Dekodieren · {{extract}} Entpacken",
   "next.performance.factDownloads": "bis zu {{count}} Downloads gleichzeitig",
-  "next.performance.detected": "Für diesen Rechner empfohlen: {{memory}} RAM, {{cores}} Kerne.",
-  "next.performance.timing": "Änderungen gelten für den nächsten Download und die nächste Entpackung, die beginnen; laufende Arbeit endet mit den Einstellungen, mit denen sie begonnen hat.",
-  "next.performance.notConfirmed": "Das empfohlene Profil läuft, noch nicht bestätigt.",
-  "next.performance.scheduled": "Ein Zeitplan hat gerade das Profil {{profile}} aktiv; Ihre Auswahl gilt, sobald keine Zeitplanregel greift.",
-  "next.performance.saveFailed": "Profil konnte nicht gespeichert werden: {{message}}",
+  "next.performance.detected":
+    "Für diesen Rechner empfohlen: {{memory}} RAM, {{cores}} Kerne.",
+  "next.performance.timing":
+    "Änderungen gelten für den nächsten Download und die nächste Entpackung, die beginnen; laufende Arbeit endet mit den Einstellungen, mit denen sie begonnen hat.",
+  "next.performance.notConfirmed":
+    "Das empfohlene Profil läuft, noch nicht bestätigt.",
+  "next.performance.scheduled":
+    "Ein Zeitplan hat gerade das Profil {{profile}} aktiv; Ihre Auswahl gilt, sobald keine Zeitplanregel greift.",
+  "next.performance.saveFailed":
+    "Profil konnte nicht gespeichert werden: {{message}}",
   "next.securityNotice.title": "Neues Zugriffsmodell verfügbar",
-  "next.securityNotice.intro": "Diese Installation nutzt noch die Zugriffseinstellungen von vor 0.12.0, daher hat sich nichts daran geändert, wer hineinkommt. Weaver hat jetzt ein einfacheres Modell, zu dem du wechseln kannst, wann du bereit bist.",
+  "next.securityNotice.intro":
+    "Diese Installation nutzt noch die Zugriffseinstellungen von vor 0.12.0, daher hat sich nichts daran geändert, wer hineinkommt. Weaver hat jetzt ein einfacheres Modell, zu dem du wechseln kannst, wann du bereit bist.",
   "next.securityNotice.changesTitle": "Im neuen Modell",
-  "next.securityNotice.changeSignIn": "Jeder Browser meldet sich an. Netzwerke, die bisher ohne Anmeldung auskamen, bestimmen nur noch, wo sich ein Browser merken lässt.",
-  "next.securityNotice.changeProxies": "Vertrauenswürdige Proxys werden unter Einstellungen → Sicherheit festgelegt.",
-  "next.securityNotice.changeHosts": "Jeder Hostname funktioniert, ohne ihn in WEAVER_HTTP_ALLOWED_HOSTS aufzuführen.",
+  "next.securityNotice.changeSignIn":
+    "Jeder Browser meldet sich an. Netzwerke, die bisher ohne Anmeldung auskamen, bestimmen nur noch, wo sich ein Browser merken lässt.",
+  "next.securityNotice.changeProxies":
+    "Vertrauenswürdige Proxys werden unter Einstellungen → Sicherheit festgelegt.",
+  "next.securityNotice.changeHosts":
+    "Jeder Hostname funktioniert, ohne ihn in WEAVER_HTTP_ALLOWED_HOSTS aufzuführen.",
   "next.securityNotice.stepsTitle": "So wechselt diese Installation",
-  "next.securityNotice.container": "Füge diese Variable zur Umgebung des Containers hinzu. In Docker Compose:",
-  "next.securityNotice.containerAfter": "Erstelle den Container dann mit docker compose up -d neu. Setze unter Unraid im Container-Template Access Mode auf authenticated.",
+  "next.securityNotice.container":
+    "Füge diese Variable zur Umgebung des Containers hinzu. In Docker Compose:",
+  "next.securityNotice.containerAfter":
+    "Erstelle den Container dann mit docker compose up -d neu. Setze unter Unraid im Container-Template Access Mode auf authenticated.",
   "next.securityNotice.windows": "Führe in PowerShell aus:",
-  "next.securityNotice.windowsAfter": "Wähle dann im Tray-Symbol „Exit“ und starte Weaver über das Startmenü neu.",
+  "next.securityNotice.windowsAfter":
+    "Wähle dann im Tray-Symbol „Exit“ und starte Weaver über das Startmenü neu.",
   "next.securityNotice.macos": "Führe im Terminal aus:",
-  "next.securityNotice.macosAfter": "Wähle dann im Menüleistensymbol „Quit Weaver“ und öffne Weaver erneut. Bei Homebrew führe stattdessen brew services restart weaver-usenet aus.",
-  "next.securityNotice.linux": "Füge diese Zeile im Abschnitt [Service] der systemd-Unit von Weaver hinzu oder setze die Variable dort, wo Weaver gestartet wird:",
+  "next.securityNotice.macosAfter":
+    "Wähle dann im Menüleistensymbol „Quit Weaver“ und öffne Weaver erneut. Bei Homebrew führe stattdessen brew services restart weaver-usenet aus.",
+  "next.securityNotice.linux":
+    "Füge diese Zeile im Abschnitt [Service] der systemd-Unit von Weaver hinzu oder setze die Variable dort, wo Weaver gestartet wird:",
   "next.securityNotice.linuxAfter": "Starte Weaver dann neu.",
-  "next.securityNotice.other": "Setze die Umgebungsvariable WEAVER_ACCESS_MODE=authenticated dort, wo Weaver gestartet wird, und starte Weaver neu.",
-  "next.securityNotice.keepsLogin": "Deine Anmeldung und API-Schlüssel bleiben erhalten, und jeder Browser meldet sich erneut an. Der Wechsel ist ab diesem Start dauerhaft.",
-  "next.securityNotice.createsLogin": "Diese Installation hat keine Anmeldung, daher öffnet Weaver nach dem Neustart die Einrichtung, um eine zu erstellen.",
+  "next.securityNotice.other":
+    "Setze die Umgebungsvariable WEAVER_ACCESS_MODE=authenticated dort, wo Weaver gestartet wird, und starte Weaver neu.",
+  "next.securityNotice.keepsLogin":
+    "Deine Anmeldung und API-Schlüssel bleiben erhalten, und jeder Browser meldet sich erneut an. Der Wechsel ist ab diesem Start dauerhaft.",
+  "next.securityNotice.createsLogin":
+    "Diese Installation hat keine Anmeldung, daher öffnet Weaver nach dem Neustart die Einrichtung, um eine zu erstellen.",
   "next.securityNotice.guide": "Anleitung lesen",
   "next.securityNotice.dismiss": "Verstanden",
   "next.securityNotice.dismissFailed": "Speichern fehlgeschlagen: {{message}}",
@@ -1709,9 +2054,11 @@ export const nextDe: LocaleDictionary = {
   "next.schedules.trackQuota": "Kontingentmessung",
   "next.schedules.trackServers": "Server",
   "next.schedules.trackOneShot": "Einmalige Aktionen",
-  "next.schedules.scriptTimeHelp": "Ortszeit. HH:MM oder *:MM für jede Stunde; mehrere durch Kommas trennen.",
+  "next.schedules.scriptTimeHelp":
+    "Ortszeit. HH:MM oder *:MM für jede Stunde; mehrere durch Kommas trennen.",
   "next.schedules.runAtStartup": "Auch beim Start ausführen",
-  "next.schedules.trackNote": "Ortszeit · gilt bis zur nächsten Regel der Gruppe",
+  "next.schedules.trackNote":
+    "Ortszeit · gilt bis zur nächsten Regel der Gruppe",
   "next.schedules.oneShotNote": "Ortszeit · läuft jedes Mal einmal",
   "next.schedules.deleteFilesOf": "{{kind}}: auch Dateien löschen",
   "next.schedules.hourly": "Jede Stunde",
@@ -1725,24 +2072,35 @@ export const nextDe: LocaleDictionary = {
   "next.schedules.pruneCancelled": "Abgebrochen",
   "next.schedules.deleteFiles": "Auch Dateien löschen",
   "next.schedules.oneShotHelp": "Im Stillstand verpasste Läufe entfallen.",
-  "next.schedules.multipleTimesHelp": "Optional, kommagetrennt. Diese ersetzen die einzelne Uhrzeit oben.",
-  "next.schedules.pauseAllHelp": "Pausiert Downloads, Ordnerscans und RSS. Fortsetzen beendet die Pause. Die Nachverarbeitung läuft weiter.",
-  "next.schedules.postHelp": "Laufende Arbeit wird beendet; neue Prüfung, Reparatur, Entpackvorgänge, Verschiebungen und Skripte warten auf Fortsetzen.",
-  "next.schedules.serverHelp": "Speichert den Aktivstatus ohne Verbindungstest und lädt die Verbindungen aller Server neu.",
-  "next.schedules.quotaHelp": "Nicht gemessene Daten bleiben in der Statistik, zählen aber nie zum Kontingent. Das konfigurierte Limit bleibt unverändert.",
-  "next.schedules.pruneWarning": "Das Bereinigen abgeschlossener Einträge entfernt den Duplikatschutz.",
-  "next.schedules.pruneFilesWarning": "Beim Löschen abgeschlossener Dateien wird auch deren Ausgabeordner entfernt.",
+  "next.schedules.multipleTimesHelp":
+    "Optional, kommagetrennt. Diese ersetzen die einzelne Uhrzeit oben.",
+  "next.schedules.pauseAllHelp":
+    "Pausiert Downloads, Ordnerscans und RSS. Fortsetzen beendet die Pause. Die Nachverarbeitung läuft weiter.",
+  "next.schedules.postHelp":
+    "Laufende Arbeit wird beendet; neue Prüfung, Reparatur, Entpackvorgänge, Verschiebungen und Skripte warten auf Fortsetzen.",
+  "next.schedules.serverHelp":
+    "Speichert den Aktivstatus ohne Verbindungstest und lädt die Verbindungen aller Server neu.",
+  "next.schedules.quotaHelp":
+    "Nicht gemessene Daten bleiben in der Statistik, zählen aber nie zum Kontingent. Das konfigurierte Limit bleibt unverändert.",
+  "next.schedules.pruneWarning":
+    "Das Bereinigen abgeschlossener Einträge entfernt den Duplikatschutz.",
+  "next.schedules.pruneFilesWarning":
+    "Beim Löschen abgeschlossener Dateien wird auch deren Ausgabeordner entfernt.",
   "next.backup.storage": "Sicherungsspeicher",
   "next.backup.customPath": "Eigener Sicherungspfad",
   "next.backup.saveStorage": "Speicherpfad speichern",
   "next.backup.automatic": "Automatische Sicherungen",
-  "next.backup.retention": "Drei Sicherungen dieser Version und eine der vorherigen bleiben erhalten. Manuelle Sicherungen bleiben bis zum Löschen.",
-  "next.backup.verifyAccountPassword": "Bestätigen Sie Ihr Kontopasswort, um fortzufahren. Gemeint ist das Anmeldepasswort, nicht der Archivschlüssel.",
+  "next.backup.retention":
+    "Drei Sicherungen dieser Version und eine der vorherigen bleiben erhalten. Manuelle Sicherungen bleiben bis zum Löschen.",
+  "next.backup.verifyAccountPassword":
+    "Bestätigen Sie Ihr Kontopasswort, um fortzufahren. Gemeint ist das Anmeldepasswort, nicht der Archivschlüssel.",
   "next.backup.autoEnabled": "Automatische Sicherungen aktivieren",
   "next.backup.dailyTime": "Tägliche Uhrzeit (lokal)",
   "next.backup.autoKey": "Schlüssel für automatische Sicherungen",
-  "next.backup.keyPresent": "Ein Schlüssel ist gespeichert. Zum Ersetzen einen neuen eingeben.",
-  "next.backup.keyAbsent": "Vor dem Aktivieren einen Schlüssel mit mindestens 8 Zeichen ohne Leerzeichen setzen.",
+  "next.backup.keyPresent":
+    "Ein Schlüssel ist gespeichert. Zum Ersetzen einen neuen eingeben.",
+  "next.backup.keyAbsent":
+    "Vor dem Aktivieren einen Schlüssel mit mindestens 8 Zeichen ohne Leerzeichen setzen.",
   "next.backup.clearKey": "Schlüssel für automatische Sicherungen löschen",
   "next.backup.nextRun": "Nächster Lauf",
   "next.backup.notScheduled": "Nicht geplant",
@@ -1760,7 +2118,8 @@ export const nextDe: LocaleDictionary = {
   "next.backup.failed": "Fehlgeschlagen",
   "next.backup.downloadStored": "Herunterladen",
   "next.backup.deleteStored": "Sicherung löschen",
-  "next.backup.deleteBody": "Dieses gespeicherte Archiv samt Metadaten löschen?",
+  "next.backup.deleteBody":
+    "Dieses gespeicherte Archiv samt Metadaten löschen?",
   "next.backup.createStored": "Ohne Download erstellen",
   // Networking
   "next.networking.saved": "Gespeichert",
@@ -1768,9 +2127,12 @@ export const nextDe: LocaleDictionary = {
   "next.networking.requestFailed": "Anfrage fehlgeschlagen",
   "next.networking.loadFailed": "Netzwerk konnte nicht geladen werden",
   "next.networking.retry": "Erneut versuchen",
-  "next.networking.loading": "Egress-Schnittstellen, Proxys und Routen werden gelesen.",
-  "next.networking.bridgeNotice": "Container-Bridge-Netzwerke zeigen nur Container-Schnittstellen. Nutze Host-Netzwerk oder binde mehrere Container-Netzwerke an, um unabhängige Leitungen zu wählen.",
-  "next.networking.liveUnavailable": "Live-Updates sind nicht verfügbar. Angezeigt wird der zuletzt empfangene Stand.",
+  "next.networking.loading":
+    "Egress-Schnittstellen, Proxys und Routen werden gelesen.",
+  "next.networking.bridgeNotice":
+    "Container-Bridge-Netzwerke zeigen nur Container-Schnittstellen. Nutze Host-Netzwerk oder binde mehrere Container-Netzwerke an, um unabhängige Leitungen zu wählen.",
+  "next.networking.liveUnavailable":
+    "Live-Updates sind nicht verfügbar. Angezeigt wird der zuletzt empfangene Stand.",
   "next.networking.close": "Schließen",
   "next.networking.enabled": "Aktiviert",
   "next.networking.disabled": "deaktiviert",
@@ -1799,124 +2161,217 @@ export const nextDe: LocaleDictionary = {
   "next.networking.binding.system": "Systemrouting",
   "next.networking.binding.interface": "Netzwerkschnittstelle",
   "next.networking.binding.sourceAddress": "Quelladresse",
-  "next.refusal.EGRESS_NAME_LENGTH": "Ein Egress-Name braucht 1 bis 128 Zeichen.",
-  "next.refusal.EGRESS_SYSTEM_IMMUTABLE": "Der System-Egress kann nicht umbenannt, neu gebunden oder deaktiviert werden.",
-  "next.refusal.EGRESS_SYSTEM_BINDING_RESERVED": "Nur der System-Egress kann die System-Bindung verwenden.",
-  "next.refusal.EGRESS_INTERFACE_NAME_INVALID": "Gib einen gültigen Schnittstellennamen ein.",
-  "next.refusal.EGRESS_INTERFACE_NAME_REQUIRED": "Gib einen Schnittstellennamen ein.",
-  "next.refusal.EGRESS_INTERFACE_BINDING_UNSUPPORTED": "Windows kann nicht an eine Schnittstelle binden. Verwende eine Quelladresse.",
+  "next.refusal.EGRESS_NAME_LENGTH":
+    "Ein Egress-Name braucht 1 bis 128 Zeichen.",
+  "next.refusal.EGRESS_SYSTEM_IMMUTABLE":
+    "Der System-Egress kann nicht umbenannt, neu gebunden oder deaktiviert werden.",
+  "next.refusal.EGRESS_SYSTEM_BINDING_RESERVED":
+    "Nur der System-Egress kann die System-Bindung verwenden.",
+  "next.refusal.EGRESS_INTERFACE_NAME_INVALID":
+    "Gib einen gültigen Schnittstellennamen ein.",
+  "next.refusal.EGRESS_INTERFACE_NAME_REQUIRED":
+    "Gib einen Schnittstellennamen ein.",
+  "next.refusal.EGRESS_INTERFACE_BINDING_UNSUPPORTED":
+    "Windows kann nicht an eine Schnittstelle binden. Verwende eine Quelladresse.",
   "next.refusal.EGRESS_SOURCE_ADDRESS_REQUIRED": "Gib eine Quelladresse ein.",
-  "next.refusal.EGRESS_SOURCE_ADDRESS_INVALID": "Die Quelladresse ist keine gültige IP-Adresse.",
-  "next.refusal.EGRESS_SOURCE_ADDRESS_NOT_UNICAST": "Die Quelladresse muss die Adresse eines einzelnen Hosts sein.",
-  "next.refusal.EGRESS_QUOTA_LIMIT_TOO_LARGE": "Das Kontingentlimit ist zu groß.",
-  "next.refusal.EGRESS_QUOTA_SOFT_ABOVE_HARD": "Das weiche Upload-Kontingent darf nicht über dem harten liegen.",
-  "next.refusal.BANDWIDTH_LIMIT_TOO_LARGE": "Das Geschwindigkeitslimit ist zu groß.",
-  "next.refusal.BANDWIDTH_SPLIT_RANGE": "Eine Bandbreitenaufteilung gibt Usenet 1 % bis 99 %.",
+  "next.refusal.EGRESS_SOURCE_ADDRESS_INVALID":
+    "Die Quelladresse ist keine gültige IP-Adresse.",
+  "next.refusal.EGRESS_SOURCE_ADDRESS_NOT_UNICAST":
+    "Die Quelladresse muss die Adresse eines einzelnen Hosts sein.",
+  "next.refusal.EGRESS_QUOTA_LIMIT_TOO_LARGE":
+    "Das Kontingentlimit ist zu groß.",
+  "next.refusal.EGRESS_QUOTA_SOFT_ABOVE_HARD":
+    "Das weiche Upload-Kontingent darf nicht über dem harten liegen.",
+  "next.refusal.BANDWIDTH_LIMIT_TOO_LARGE":
+    "Das Geschwindigkeitslimit ist zu groß.",
+  "next.refusal.BANDWIDTH_SPLIT_RANGE":
+    "Eine Bandbreitenaufteilung gibt Usenet 1 % bis 99 %.",
   "next.refusal.TORRENT_ROUTE_LEGS": "Eine Torrent-Route hat einen Strang.",
-  "next.refusal.TORRENT_ROUTE_DIRECT_FALLBACK": "Eine Torrent-Route kann nicht auf direkt zurückfallen.",
+  "next.refusal.TORRENT_ROUTE_DIRECT_FALLBACK":
+    "Eine Torrent-Route kann nicht auf direkt zurückfallen.",
   "next.refusal.TORRENT_ROUTE_RUNGS": "Eine Torrent-Route hat eine Stufe.",
-  "next.refusal.EGRESS_QUOTA_RESET_TIME_RANGE": "Die Rücksetzzeit des Kontingents liegt außerhalb des Bereichs.",
-  "next.refusal.EGRESS_QUOTA_RESET_DAY_RANGE": "Der monatliche Rücksetztag muss zwischen 1 und 31 liegen.",
-  "next.refusal.EGRESS_SPEED_LIMIT_TOO_LARGE": "Das Geschwindigkeitslimit ist zu groß.",
+  "next.refusal.EGRESS_QUOTA_RESET_TIME_RANGE":
+    "Die Rücksetzzeit des Kontingents liegt außerhalb des Bereichs.",
+  "next.refusal.EGRESS_QUOTA_RESET_DAY_RANGE":
+    "Der monatliche Rücksetztag muss zwischen 1 und 31 liegen.",
+  "next.refusal.EGRESS_SPEED_LIMIT_TOO_LARGE":
+    "Das Geschwindigkeitslimit ist zu groß.",
   "next.refusal.EGRESS_NOT_FOUND": "Dieser Egress existiert nicht mehr.",
-  "next.refusal.EGRESS_SYSTEM_UNDELETABLE": "Der System-Egress kann nicht gelöscht werden.",
+  "next.refusal.EGRESS_SYSTEM_UNDELETABLE":
+    "Der System-Egress kann nicht gelöscht werden.",
   "next.refusal.EGRESS_IN_USE": "Eine Route verwendet diesen Egress noch.",
   "next.refusal.POOL_NAME_LENGTH": "Ein Pool-Name braucht 1 bis 128 Zeichen.",
   "next.refusal.POOL_MEMBER_COUNT": "Ein Pool nimmt höchstens 16 Proxys auf.",
-  "next.refusal.POOL_PROXY_REPEATED": "Ein Proxy kann nur einmal in einem Pool sein.",
-  "next.refusal.POOL_PROXY_MISSING": "Ein Proxy in diesem Pool existiert nicht mehr.",
-  "next.refusal.POOL_MEMBER_KIND_MISMATCH": "Jeder Proxy in einem Pool muss den Typ des Pools haben.",
+  "next.refusal.POOL_PROXY_REPEATED":
+    "Ein Proxy kann nur einmal in einem Pool sein.",
+  "next.refusal.POOL_PROXY_MISSING":
+    "Ein Proxy in diesem Pool existiert nicht mehr.",
+  "next.refusal.POOL_MEMBER_KIND_MISMATCH":
+    "Jeder Proxy in einem Pool muss den Typ des Pools haben.",
   "next.refusal.POOL_NOT_FOUND": "Dieser Pool existiert nicht mehr.",
   "next.refusal.POOL_IN_USE": "Eine Route verwendet diesen Pool noch.",
-  "next.refusal.POOL_EDIT_REPEATS_PROXY": "Eine Route, die diesen Pool verwendet, nutzt bereits einen dieser Proxys.",
-  "next.refusal.POOL_IN_USE_EMPTY": "Eine Route verwendet diesen Pool, daher braucht er mindestens einen Proxy.",
+  "next.refusal.POOL_EDIT_REPEATS_PROXY":
+    "Eine Route, die diesen Pool verwendet, nutzt bereits einen dieser Proxys.",
+  "next.refusal.POOL_IN_USE_EMPTY":
+    "Eine Route verwendet diesen Pool, daher braucht er mindestens einen Proxy.",
   "next.refusal.ROUTE_LEG_COUNT": "Verwende einen bis acht Stränge.",
-  "next.refusal.ROUTE_LEG_WEIGHT_RANGE": "Das Gewicht jedes Strangs muss zwischen 1 und 100 liegen.",
-  "next.refusal.ROUTE_LEG_WEIGHT_SUM": "Die Gewichte der Stränge müssen zusammen 100 % ergeben.",
-  "next.refusal.ROUTE_LADDER_RUNG_COUNT": "Eine Proxy-Leiter braucht eine bis acht Stufen.",
-  "next.refusal.ROUTE_CHAIN_LENGTH": "Eine Kette braucht zwei oder drei Proxys.",
-  "next.refusal.ROUTE_EGRESS_MISSING": "Die Route verwendet einen Egress, der nicht mehr existiert.",
-  "next.refusal.ROUTE_EGRESS_DISABLED": "Die Route verwendet einen deaktivierten Egress.",
-  "next.refusal.ROUTE_POOL_MISSING": "Die Route verwendet einen Pool, der nicht mehr existiert.",
-  "next.refusal.ROUTE_POOL_EMPTY": "Die Route verwendet einen Pool ohne Proxys.",
-  "next.refusal.ROUTE_PROXY_MISSING": "Die Route verwendet einen Proxy, der nicht mehr existiert.",
-  "next.refusal.ROUTE_CHAIN_TRANSPORT": "WireGuard und HTTP/3 können nur der erste Proxy einer Kette sein; WireGuard kann auch auf WireGuard folgen.",
-  "next.refusal.ROUTE_PROXY_REPEATED": "Ein Proxy darf in einer Proxy-Leiter nur einmal vorkommen, Pools und Ketten eingeschlossen.",
-  "next.refusal.ROUTE_PROXY_COUNT": "Eine Route kann höchstens acht Proxys verwenden.",
-  "next.refusal.ROUTE_HAS_ADVANCED_LEGS": "Bearbeite diese Route unter Netzwerk.",
+  "next.refusal.ROUTE_LEG_WEIGHT_RANGE":
+    "Das Gewicht jedes Strangs muss zwischen 1 und 100 liegen.",
+  "next.refusal.ROUTE_LEG_WEIGHT_SUM":
+    "Die Gewichte der Stränge müssen zusammen 100 % ergeben.",
+  "next.refusal.ROUTE_LADDER_RUNG_COUNT":
+    "Eine Proxy-Leiter braucht eine bis acht Stufen.",
+  "next.refusal.ROUTE_CHAIN_LENGTH":
+    "Eine Kette braucht zwei oder drei Proxys.",
+  "next.refusal.ROUTE_EGRESS_MISSING":
+    "Die Route verwendet einen Egress, der nicht mehr existiert.",
+  "next.refusal.ROUTE_EGRESS_DISABLED":
+    "Die Route verwendet einen deaktivierten Egress.",
+  "next.refusal.ROUTE_POOL_MISSING":
+    "Die Route verwendet einen Pool, der nicht mehr existiert.",
+  "next.refusal.ROUTE_POOL_EMPTY":
+    "Die Route verwendet einen Pool ohne Proxys.",
+  "next.refusal.ROUTE_PROXY_MISSING":
+    "Die Route verwendet einen Proxy, der nicht mehr existiert.",
+  "next.refusal.ROUTE_CHAIN_TRANSPORT":
+    "WireGuard und HTTP/3 können nur der erste Proxy einer Kette sein; WireGuard kann auch auf WireGuard folgen.",
+  "next.refusal.ROUTE_PROXY_REPEATED":
+    "Ein Proxy darf in einer Proxy-Leiter nur einmal vorkommen, Pools und Ketten eingeschlossen.",
+  "next.refusal.ROUTE_PROXY_COUNT":
+    "Eine Route kann höchstens acht Proxys verwenden.",
+  "next.refusal.ROUTE_HAS_ADVANCED_LEGS":
+    "Bearbeite diese Route unter Netzwerk.",
   "next.refusal.ROUTE_CONSUMER_NOT_FOUND": "Diese Route existiert nicht mehr.",
-  "next.refusal.WIREGUARD_PROXY_PATH_CONFLICT": "Ein WireGuard-Proxy kann einen Egress nur über einen Pfad erreichen.",
-  "next.refusal.WIREGUARD_INSTANCE_LIMIT": "Diese Routen brauchen {{required}} WireGuard-Instanzen; dieser Host erlaubt {{limit}}.",
+  "next.refusal.WIREGUARD_PROXY_PATH_CONFLICT":
+    "Ein WireGuard-Proxy kann einen Egress nur über einen Pfad erreichen.",
+  "next.refusal.WIREGUARD_INSTANCE_LIMIT":
+    "Diese Routen brauchen {{required}} WireGuard-Instanzen; dieser Host erlaubt {{limit}}.",
   "next.refusal.PROXY_NAME_LENGTH": "Ein Proxy-Name braucht 1 bis 128 Zeichen.",
-  "next.refusal.PROXY_ENDPOINT_INVALID": "Gib einen gültigen Host und Port ein.",
-  "next.refusal.PROXY_TIMEOUT_RANGE": "Das Zeitlimit muss zwischen 1 und 300 Sekunden liegen.",
-  "next.refusal.PROXY_ADDRESS_COUNT": "Ein WireGuard-Proxy nimmt höchstens {{limit}} Tunneladressen.",
-  "next.refusal.PROXY_DNS_SERVER_COUNT": "Höchstens {{limit}} DNS-Server angeben.",
+  "next.refusal.PROXY_ENDPOINT_INVALID":
+    "Gib einen gültigen Host und Port ein.",
+  "next.refusal.PROXY_TIMEOUT_RANGE":
+    "Das Zeitlimit muss zwischen 1 und 300 Sekunden liegen.",
+  "next.refusal.PROXY_ADDRESS_COUNT":
+    "Ein WireGuard-Proxy nimmt höchstens {{limit}} Tunneladressen.",
+  "next.refusal.PROXY_DNS_SERVER_COUNT":
+    "Höchstens {{limit}} DNS-Server angeben.",
   "next.refusal.PROXY_CREDENTIAL_TOO_LARGE": "Die Zugangsdaten sind zu groß.",
-  "next.refusal.PROXY_SSH_USERNAME_REQUIRED": "SSH braucht einen Benutzernamen.",
-  "next.refusal.PROXY_SSH_KEY_REQUIRED": "SSH braucht einen privaten Ed25519-Schlüssel.",
-  "next.refusal.PROXY_SSH_PASSWORD_UNSUPPORTED": "SSH nimmt einen privaten Ed25519-Schlüssel, kein Passwort.",
-  "next.refusal.PROXY_SOCKS5_PASSWORD_NEEDS_USERNAME": "Ein SOCKS5-Passwort braucht einen Benutzernamen.",
-  "next.refusal.PROXY_SOCKS5_CREDENTIAL_LENGTH": "SOCKS5-Zugangsdaten dürfen höchstens 255 Byte lang sein.",
-  "next.refusal.PROXY_HTTP_USERNAME_COLON": "Ein HTTP-Proxy-Benutzername darf keinen Doppelpunkt enthalten.",
-  "next.refusal.PROXY_HTTP3_PASSWORD_NEEDS_USERNAME": "Ein HTTP/3-Passwort braucht einen Benutzernamen.",
-  "next.refusal.PROXY_DNS_SERVER_INVALID": "DNS-Server müssen IP-Adressen sein.",
-  "next.refusal.PROXY_DNS_SERVERS_REQUIRED": "Eine DNS-Einstellung, bei der die aufgeführten Server antworten, braucht mindestens einen.",
-  "next.refusal.PROXY_DNS_TLS_NAME_INVALID": "Der TLS-Name eines DNS-Servers muss ein gültiger Hostname sein.",
-  "next.refusal.PROXY_DNS_URL_INVALID": "Ein Server für DNS über HTTPS braucht eine https-URL mit einer IP-Adresse und einem Pfad.",
-  "next.refusal.PROXY_DNS_URL_HOSTNAME": "Ein Server für DNS über HTTPS, der über einen Hostnamen angegeben wird, braucht auch seine IP-Adresse.",
-  "next.refusal.PROXY_DNS_PLAIN_AFTER_ENCRYPTED": "Ein unverschlüsselter DNS-Server kann nicht auf einen verschlüsselten folgen.",
-  "next.refusal.PROXY_DNS_SERVER_DUPLICATE": "Ein DNS-Server wird nur einmal aufgeführt.",
-  "next.refusal.DNS_LIST_NAME_LENGTH": "Der Name einer Serverliste muss 1 bis 128 Zeichen lang sein.",
+  "next.refusal.PROXY_SSH_USERNAME_REQUIRED":
+    "SSH braucht einen Benutzernamen.",
+  "next.refusal.PROXY_SSH_KEY_REQUIRED":
+    "SSH braucht einen privaten Ed25519-Schlüssel.",
+  "next.refusal.PROXY_SSH_PASSWORD_UNSUPPORTED":
+    "SSH nimmt einen privaten Ed25519-Schlüssel, kein Passwort.",
+  "next.refusal.PROXY_SOCKS5_PASSWORD_NEEDS_USERNAME":
+    "Ein SOCKS5-Passwort braucht einen Benutzernamen.",
+  "next.refusal.PROXY_SOCKS5_CREDENTIAL_LENGTH":
+    "SOCKS5-Zugangsdaten dürfen höchstens 255 Byte lang sein.",
+  "next.refusal.PROXY_HTTP_USERNAME_COLON":
+    "Ein HTTP-Proxy-Benutzername darf keinen Doppelpunkt enthalten.",
+  "next.refusal.PROXY_HTTP3_PASSWORD_NEEDS_USERNAME":
+    "Ein HTTP/3-Passwort braucht einen Benutzernamen.",
+  "next.refusal.PROXY_DNS_SERVER_INVALID":
+    "DNS-Server müssen IP-Adressen sein.",
+  "next.refusal.PROXY_DNS_SERVERS_REQUIRED":
+    "Eine DNS-Einstellung, bei der die aufgeführten Server antworten, braucht mindestens einen.",
+  "next.refusal.PROXY_DNS_TLS_NAME_INVALID":
+    "Der TLS-Name eines DNS-Servers muss ein gültiger Hostname sein.",
+  "next.refusal.PROXY_DNS_URL_INVALID":
+    "Ein Server für DNS über HTTPS braucht eine https-URL mit einer IP-Adresse und einem Pfad.",
+  "next.refusal.PROXY_DNS_URL_HOSTNAME":
+    "Ein Server für DNS über HTTPS, der über einen Hostnamen angegeben wird, braucht auch seine IP-Adresse.",
+  "next.refusal.PROXY_DNS_PLAIN_AFTER_ENCRYPTED":
+    "Ein unverschlüsselter DNS-Server kann nicht auf einen verschlüsselten folgen.",
+  "next.refusal.PROXY_DNS_SERVER_DUPLICATE":
+    "Ein DNS-Server wird nur einmal aufgeführt.",
+  "next.refusal.DNS_LIST_NAME_LENGTH":
+    "Der Name einer Serverliste muss 1 bis 128 Zeichen lang sein.",
   "next.refusal.DNS_LIST_NOT_FOUND": "Diese Serverliste gibt es nicht mehr.",
-  "next.refusal.DNS_LIST_LIMIT_REACHED": "Es können keine weiteren Serverlisten hinzugefügt werden.",
-  "next.refusal.DNS_LIST_IN_USE": "Diese DNS-Profile verwenden die Liste noch: {{profiles}}.",
-  "next.refusal.DNS_PROFILE_NAME_LENGTH": "Der Name eines DNS-Profils muss 1 bis 128 Zeichen lang sein.",
+  "next.refusal.DNS_LIST_LIMIT_REACHED":
+    "Es können keine weiteren Serverlisten hinzugefügt werden.",
+  "next.refusal.DNS_LIST_IN_USE":
+    "Diese DNS-Profile verwenden die Liste noch: {{profiles}}.",
+  "next.refusal.DNS_PROFILE_NAME_LENGTH":
+    "Der Name eines DNS-Profils muss 1 bis 128 Zeichen lang sein.",
   "next.refusal.DNS_PROFILE_NOT_FOUND": "Dieses DNS-Profil gibt es nicht mehr.",
-  "next.refusal.DNS_PROFILE_LIMIT_REACHED": "Es können keine weiteren DNS-Profile hinzugefügt werden.",
-  "next.refusal.DNS_PROFILE_BUILT_IN": "Das Profil System ist eingebaut und kann weder geändert noch gelöscht werden.",
-  "next.refusal.DNS_PROFILE_IN_USE": "Diese Routen folgen noch diesem Profil: {{routes}}. Wähle zuerst ein anderes Profil für sie.",
-  "next.refusal.DNS_PROFILE_KIND": "Routen folgen System oder einem Routenprofil, Proxys werden mit System oder einem Proxy-Namensprofil gefunden.",
-  "next.refusal.DNS_PROFILE_PROXY_NAME_INVALID": "Ein Proxy-Namensprofil beantwortet das System oder Weaver, der gelistete Server über den Ausgang fragt.",
-  "next.refusal.DNS_PROFILE_KIND_IMMUTABLE": "Ein Profil bleibt von der Art, als die es angelegt wurde. Lege stattdessen ein neues Profil der anderen Art an.",
-  "next.refusal.DNS_PROFILE_KIND_REQUIRED": "Ein neues Profil gibt an, ob Routen oder Proxys es auswählen.",
-  "next.refusal.DNS_PROFILE_LIST_REQUIRED": "Wenn Weaver antwortet, wähle eine Serverliste.",
-  "next.refusal.DNS_PROFILE_TRUST_INVALID": "Antworten des Systems werden wie gesendet übernommen; die des Proxys wie gesendet oder hier geprüft.",
-  "next.refusal.DNS_PROFILE_NEEDS_PROXY": "Diese Routen haben einen direkten Strang oder einen direkten Ausweg, wo der Proxy kein DNS beantworten kann: {{routes}}. Gib jedem einen Proxy, oder schalte im Profil „Auf einem Strang ohne Proxy das System fragen“ ein.",
-  "next.refusal.DNS_PROFILE_NEEDS_WIREGUARD": "Nur die Antworten eines WireGuard-Proxys lassen sich hier validieren, und diese Routen haben einen direkten Strang, einen direkten Rückfall oder eine andere Art von Proxy: {{routes}}.",
-  "next.refusal.DNS_PROFILE_NEEDS_TUNNEL_DNS": "Bei diesen Routen beantwortet der Proxy DNS: {{routes}}. Diese WireGuard-Proxys darauf nennen keine DNS-Server für ihren Tunnel: {{proxies}}. Trage bei jedem die DNS-Server des Tunnels ein oder wähle ein anderes Profil.",
-  "next.refusal.PROXY_KIND_IMMUTABLE": "Der Typ eines Proxys kann nicht geändert werden. Füge stattdessen einen neuen Proxy hinzu.",
+  "next.refusal.DNS_PROFILE_LIMIT_REACHED":
+    "Es können keine weiteren DNS-Profile hinzugefügt werden.",
+  "next.refusal.DNS_PROFILE_BUILT_IN":
+    "Das Profil System ist eingebaut und kann weder geändert noch gelöscht werden.",
+  "next.refusal.DNS_PROFILE_IN_USE":
+    "Diese Routen folgen noch diesem Profil: {{routes}}. Wähle zuerst ein anderes Profil für sie.",
+  "next.refusal.DNS_PROFILE_KIND":
+    "Routen folgen System oder einem Routenprofil, Proxys werden mit System oder einem Proxy-Namensprofil gefunden.",
+  "next.refusal.DNS_PROFILE_PROXY_NAME_INVALID":
+    "Ein Proxy-Namensprofil beantwortet das System oder Weaver, der gelistete Server über den Ausgang fragt.",
+  "next.refusal.DNS_PROFILE_KIND_IMMUTABLE":
+    "Ein Profil bleibt von der Art, als die es angelegt wurde. Lege stattdessen ein neues Profil der anderen Art an.",
+  "next.refusal.DNS_PROFILE_KIND_REQUIRED":
+    "Ein neues Profil gibt an, ob Routen oder Proxys es auswählen.",
+  "next.refusal.DNS_PROFILE_LIST_REQUIRED":
+    "Wenn Weaver antwortet, wähle eine Serverliste.",
+  "next.refusal.DNS_PROFILE_TRUST_INVALID":
+    "Antworten des Systems werden wie gesendet übernommen; die des Proxys wie gesendet oder hier geprüft.",
+  "next.refusal.DNS_PROFILE_NEEDS_PROXY":
+    "Diese Routen haben einen direkten Strang oder einen direkten Ausweg, wo der Proxy kein DNS beantworten kann: {{routes}}. Gib jedem einen Proxy, oder schalte im Profil „Auf einem Strang ohne Proxy das System fragen“ ein.",
+  "next.refusal.DNS_PROFILE_NEEDS_WIREGUARD":
+    "Nur die Antworten eines WireGuard-Proxys lassen sich hier validieren, und diese Routen haben einen direkten Strang, einen direkten Rückfall oder eine andere Art von Proxy: {{routes}}.",
+  "next.refusal.DNS_PROFILE_NEEDS_TUNNEL_DNS":
+    "Bei diesen Routen beantwortet der Proxy DNS: {{routes}}. Diese WireGuard-Proxys darauf nennen keine DNS-Server für ihren Tunnel: {{proxies}}. Trage bei jedem die DNS-Server des Tunnels ein oder wähle ein anderes Profil.",
+  "next.refusal.PROXY_KIND_IMMUTABLE":
+    "Der Typ eines Proxys kann nicht geändert werden. Füge stattdessen einen neuen Proxy hinzu.",
   "next.refusal.PROXY_LIMIT_REACHED": "Es kann höchstens 128 Proxys geben.",
-  "next.refusal.PROXY_KIND_LOCKED_BY_POOL": "Der Typ eines Proxys kann nicht geändert werden, solange er in einem Pool ist.",
-  "next.refusal.PROXY_REVISION_CHANGED": "Dieser Proxy wurde anderswo geändert. Öffne ihn erneut und versuche es noch einmal.",
+  "next.refusal.PROXY_KIND_LOCKED_BY_POOL":
+    "Der Typ eines Proxys kann nicht geändert werden, solange er in einem Pool ist.",
+  "next.refusal.PROXY_REVISION_CHANGED":
+    "Dieser Proxy wurde anderswo geändert. Öffne ihn erneut und versuche es noch einmal.",
   "next.refusal.PROXY_NOT_FOUND": "Dieser Proxy existiert nicht mehr.",
-  "next.refusal.PROXY_IN_POOL": "Dieser Proxy ist in einem Pool. Entferne ihn zuerst aus dem Pool.",
+  "next.refusal.PROXY_IN_POOL":
+    "Dieser Proxy ist in einem Pool. Entferne ihn zuerst aus dem Pool.",
   "next.refusal.PROXY_IN_USE": "Eine Route verwendet diesen Proxy noch.",
-  "next.refusal.PROXY_HOST_KEY_NOT_SSH": "Nur SSH-Proxys haben einen Host-Schlüssel.",
-  "next.refusal.SPEED_TEST_ALREADY_RUNNING": "Geschwindigkeitstest {{runId}} läuft noch.",
-  "next.refusal.SPEED_TEST_QUEUE_BUSY": "Der letzte Geschwindigkeitstest gibt die Warteschlange noch frei.",
-  "next.refusal.SPEED_TEST_USENET_NEEDS_SERVER": "Ein Feed kann nur einen Bandbreitentest ausführen.",
-  "next.refusal.SPEED_TEST_TORRENT_NEEDS_TORRENT_ROUTE": "Nur eine Torrent-Route kann einen Torrent-Test ausführen.",
+  "next.refusal.PROXY_HOST_KEY_NOT_SSH":
+    "Nur SSH-Proxys haben einen Host-Schlüssel.",
+  "next.refusal.SPEED_TEST_ALREADY_RUNNING":
+    "Geschwindigkeitstest {{runId}} läuft noch.",
+  "next.refusal.SPEED_TEST_QUEUE_BUSY":
+    "Der letzte Geschwindigkeitstest gibt die Warteschlange noch frei.",
+  "next.refusal.SPEED_TEST_USENET_NEEDS_SERVER":
+    "Ein Feed kann nur einen Bandbreitentest ausführen.",
+  "next.refusal.SPEED_TEST_TORRENT_NEEDS_TORRENT_ROUTE":
+    "Nur eine Torrent-Route kann einen Torrent-Test ausführen.",
   "next.refusal.SPEED_TEST_TORRENTS_OFF": "Torrents sind aus.",
   "next.refusal.SPEED_TEST_LEG_DOWN_ALL": "Lass mindestens eine Strecke aktiv.",
-  "next.refusal.SPEED_TEST_QUOTA_BLOCKED": "{{name}} hat sein Download-Kontingent aufgebraucht.",
-  "next.refusal.SPEED_TEST_LEASE_REFUSED": "{{name}} kann seine Verbindungen nicht verleihen: {{reason}}.",
-  "next.refusal.TEST_NEEDS_ROUTE": "Ein Test braucht eine Route, über die er läuft.",
-  "next.refusal.TEST_TARGET_REQUIRED": "Gib einen Host und Port ein, um die Route zu testen.",
-  "next.refusal.TEST_SUBJECT_IN_ROUTE": "Die Route nutzt einen Proxy, der gerade getestet wird. Nimm ihn aus der Route.",
-  "next.refusal.TEST_PATH_COUNT": "Ein Test kann höchstens {{limit}} Pfade prüfen. Nutze weniger Stufen oder Pool-Mitglieder.",
+  "next.refusal.SPEED_TEST_QUOTA_BLOCKED":
+    "{{name}} hat sein Download-Kontingent aufgebraucht.",
+  "next.refusal.SPEED_TEST_LEASE_REFUSED":
+    "{{name}} kann seine Verbindungen nicht verleihen: {{reason}}.",
+  "next.refusal.TEST_NEEDS_ROUTE":
+    "Ein Test braucht eine Route, über die er läuft.",
+  "next.refusal.TEST_TARGET_REQUIRED":
+    "Gib einen Host und Port ein, um die Route zu testen.",
+  "next.refusal.TEST_SUBJECT_IN_ROUTE":
+    "Die Route nutzt einen Proxy, der gerade getestet wird. Nimm ihn aus der Route.",
+  "next.refusal.TEST_PATH_COUNT":
+    "Ein Test kann höchstens {{limit}} Pfade prüfen. Nutze weniger Stufen oder Pool-Mitglieder.",
   "next.networking.problem.legCount": "Verwende einen bis acht Stränge.",
-  "next.networking.problem.weights": "Die Gewichte müssen ganze Prozentwerte sein und zusammen 100 % ergeben.",
-  "next.networking.problem.rungCount": "Eine Proxy-Leiter braucht eine bis acht Stufen.",
-  "next.networking.problem.rungTarget": "Wähle für jede Stufe einen Proxy oder Pool.",
-  "next.networking.problem.chain": "Eine Kette braucht zwei oder drei verschiedene Proxys.",
-  "next.networking.problem.egressDisabled": "Diese Route nutzt einen deaktivierten Egress.",
-  "next.networking.problem.proxyRepeated": "Eine Proxy-Leiter kann jeden Proxy nur einmal nutzen.",
+  "next.networking.problem.weights":
+    "Die Gewichte müssen ganze Prozentwerte sein und zusammen 100 % ergeben.",
+  "next.networking.problem.rungCount":
+    "Eine Proxy-Leiter braucht eine bis acht Stufen.",
+  "next.networking.problem.rungTarget":
+    "Wähle für jede Stufe einen Proxy oder Pool.",
+  "next.networking.problem.chain":
+    "Eine Kette braucht zwei oder drei verschiedene Proxys.",
+  "next.networking.problem.egressDisabled":
+    "Diese Route nutzt einen deaktivierten Egress.",
+  "next.networking.problem.proxyRepeated":
+    "Eine Proxy-Leiter kann jeden Proxy nur einmal nutzen.",
   "next.networking.overview.flow": "Verbindungsfluss",
   "next.networking.flow.consumer": "Endpunkt",
   "next.networking.flow.allConsumers": "Alle Endpunkte",
   "next.networking.flow.groups": "Egress-Gruppen",
-  "next.networking.flow.diagram": "Egress-Schnittstellen verbinden sich über Routenstränge und Proxys mit Endpunkten",
+  "next.networking.flow.diagram":
+    "Egress-Schnittstellen verbinden sich über Routenstränge und Proxys mit Endpunkten",
   "next.networking.flow.egressColumn": "Egress-Schnittstellen",
   "next.networking.flow.legsColumn": "Routen",
   "next.networking.flow.proxyColumn": "Proxys",
@@ -1928,7 +2383,8 @@ export const nextDe: LocaleDictionary = {
   "next.networking.flow.shareMoved": "Anteil verschoben",
   "next.networking.flow.planned": "{{count}} geplant",
   "next.networking.flow.egressLoad": "{{open}} offen · {{rate}}",
-  "next.networking.flow.editLeg": "Route für {{name}} bearbeiten, Strang {{position}}",
+  "next.networking.flow.editLeg":
+    "Route für {{name}} bearbeiten, Strang {{position}}",
   "next.networking.flow.openKillSwitch": "Route für {{name}} festlegen",
   "next.networking.flow.legTitle": "{{name}} · Strang {{position}}",
   "next.networking.flow.legShort": "Strang {{position}}",
@@ -1945,16 +2401,26 @@ export const nextDe: LocaleDictionary = {
   "next.networking.flow.dnsProxyCard": "{{proxy}} · sein Resolver",
   "next.networking.flow.dnsProxyNote": "Weaver unbekannt",
   "next.networking.flow.dnsListMissing": "Serverliste",
-  "next.networking.flow.dnsSaysHost": "{{profile}}: Der Resolver des Hosts antwortet. Nichts wird geprüft.",
-  "next.networking.flow.dnsSaysFallback": "{{profile}}: Dieser Abschnitt hat keinen Proxy, dem Namen übergeben werden könnten, daher antwortet der Resolver des Hosts.",
-  "next.networking.flow.dnsSaysList": "{{profile}}: Weaver fragt {{list}} über {{from}}.",
-  "next.networking.flow.dnsSaysListThrough": "{{profile}}: Weaver fragt {{list}} durch {{proxy}}.",
-  "next.networking.flow.dnsSaysTunnel": "{{profile}}: Weaver fragt die DNS-Server des Tunnels durch {{proxy}}.",
-  "next.networking.flow.dnsSaysProxy": "{{profile}}: {{proxy}} erhält den Namen und löst ihn auf. Weaver kann diese Auflösung weder sehen noch prüfen.",
-  "next.networking.flow.dnsSaysValidates": "Weaver prüft das DNSSEC der Antwort.",
-  "next.networking.flow.dnsRefusedNoProxy": "{{profile}} übergibt Namen an den Proxy, und dieser Abschnitt hat keinen, daher schlagen seine Verbindungen fehl.",
-  "next.networking.flow.dnsRefusedNoTunnelDns": "{{profile}} fragt das Tunnel-DNS von {{proxy}}, das keine Server nennt, daher schlagen die Verbindungen dieses Abschnitts fehl.",
-  "next.networking.flow.dnsRefusedValidate": "{{profile}} prüft DNSSEC, und nur die Auflösungen eines WireGuard-Tunnels lassen sich prüfen, daher schlagen die Verbindungen dieses Abschnitts fehl.",
+  "next.networking.flow.dnsSaysHost":
+    "{{profile}}: Der Resolver des Hosts antwortet. Nichts wird geprüft.",
+  "next.networking.flow.dnsSaysFallback":
+    "{{profile}}: Dieser Abschnitt hat keinen Proxy, dem Namen übergeben werden könnten, daher antwortet der Resolver des Hosts.",
+  "next.networking.flow.dnsSaysList":
+    "{{profile}}: Weaver fragt {{list}} über {{from}}.",
+  "next.networking.flow.dnsSaysListThrough":
+    "{{profile}}: Weaver fragt {{list}} durch {{proxy}}.",
+  "next.networking.flow.dnsSaysTunnel":
+    "{{profile}}: Weaver fragt die DNS-Server des Tunnels durch {{proxy}}.",
+  "next.networking.flow.dnsSaysProxy":
+    "{{profile}}: {{proxy}} erhält den Namen und löst ihn auf. Weaver kann diese Auflösung weder sehen noch prüfen.",
+  "next.networking.flow.dnsSaysValidates":
+    "Weaver prüft das DNSSEC der Antwort.",
+  "next.networking.flow.dnsRefusedNoProxy":
+    "{{profile}} übergibt Namen an den Proxy, und dieser Abschnitt hat keinen, daher schlagen seine Verbindungen fehl.",
+  "next.networking.flow.dnsRefusedNoTunnelDns":
+    "{{profile}} fragt das Tunnel-DNS von {{proxy}}, das keine Server nennt, daher schlagen die Verbindungen dieses Abschnitts fehl.",
+  "next.networking.flow.dnsRefusedValidate":
+    "{{profile}} prüft DNSSEC, und nur die Auflösungen eines WireGuard-Tunnels lassen sich prüfen, daher schlagen die Verbindungen dieses Abschnitts fehl.",
   "next.networking.flow.dnsEditProfile": "DNS-Profil {{profile}} bearbeiten",
   "next.networking.flow.dnsEditList": "DNS-Serverliste {{list}} bearbeiten",
   "next.networking.flow.killSwitchNote": "kein Proxy, direkt ist aus",
@@ -1968,26 +2434,32 @@ export const nextDe: LocaleDictionary = {
   "next.networking.flow.holding.one": "{{count}} Verbindung",
   "next.networking.flow.holding.other": "{{count}} Verbindungen",
   "next.networking.flow.parked": "{{count}} geparkt",
-  "next.networking.flow.expandGroup": "Öffne eine Egress-Gruppe, um ihre Stränge zu sehen.",
-  "next.networking.flow.noLegs": "Füge einen Server oder Feed hinzu, um seine Route zu sehen.",
+  "next.networking.flow.expandGroup":
+    "Öffne eine Egress-Gruppe, um ihre Stränge zu sehen.",
+  "next.networking.flow.noLegs":
+    "Füge einen Server oder Feed hinzu, um seine Route zu sehen.",
   "next.networking.flow.waiting": "Warte auf Live-Messung",
   "next.networking.flow.emptyTitle": "Noch nichts darzustellen",
-  "next.networking.flow.emptyBody": "Füge einen Server oder RSS-Feed hinzu, um zu sehen, wo seine Verbindungen hinausgehen.",
-  "next.networking.flow.detailConnectionsValue": "{{open}} offen · {{opening}} im Aufbau · Ziel {{target}} · {{rate}}",
+  "next.networking.flow.emptyBody":
+    "Füge einen Server oder RSS-Feed hinzu, um zu sehen, wo seine Verbindungen hinausgehen.",
+  "next.networking.flow.detailConnectionsValue":
+    "{{open}} offen · {{opening}} im Aufbau · Ziel {{target}} · {{rate}}",
   "next.networking.flow.detailPin": "Ziel fixiert",
   "next.networking.flow.noSocket": "Kein Socket offen",
   "next.networking.egress.title": "Egress-Schnittstellen",
   "next.networking.egress.add": "Egress hinzufügen",
   "next.networking.egress.save": "Egress speichern",
   "next.networking.egress.delete": "Egress löschen",
-  "next.networking.egress.deleteBody": "{{name}} löschen? Routen, die es nutzen, müssen vorher geändert werden.",
+  "next.networking.egress.deleteBody":
+    "{{name}} löschen? Routen, die es nutzen, müssen vorher geändert werden.",
   "next.networking.egress.section": "Egress",
   "next.networking.egress.newNote": "wo Verbindungen diesen Rechner verlassen",
   "next.networking.egress.empty": "Noch keine Egress-Schnittstellen.",
   "next.networking.egress.name": "Name",
   "next.networking.egress.bindingColumn": "Bindung / aktuelle Adressen",
   "next.networking.egress.binding": "Bindung",
-  "next.networking.egress.bindingHelp": "An eine benannte Schnittstelle oder an eine Quelladresse binden.",
+  "next.networking.egress.bindingHelp":
+    "An eine benannte Schnittstelle oder an eine Quelladresse binden.",
   "next.networking.egress.health": "Zustand",
   "next.networking.egress.limit": "Limit",
   "next.networking.egress.interface": "Schnittstelle",
@@ -1997,32 +2469,42 @@ export const nextDe: LocaleDictionary = {
   "next.networking.egress.linkDown": "inaktiv",
   "next.networking.egress.sourceAddress": "Quelladresse",
   "next.networking.egress.downloadLimit": "Download-Limit",
-  "next.attention.egressQuotaReached": "Download-Kontingent auf {{name}} erreicht",
+  "next.attention.egressQuotaReached":
+    "Download-Kontingent auf {{name}} erreicht",
   "next.monitoring.quotaNotEnforced": "nicht erzwungen",
   "next.monitoring.egressLink": "Einstellungen → Netzwerk → Egress",
   "next.monitoring.quotaUsed": "Download-Kontingent auf {{name}} verbraucht",
   "next.monitoring.resetsAt": "Setzt zurück {{time}}",
-  "next.quota.sizeRequired": "Lege ein Kontingent fest, bevor du es einschaltest.",
+  "next.quota.sizeRequired":
+    "Lege ein Kontingent fest, bevor du es einschaltest.",
   "next.torrents.seeding": "Seeden",
   "next.torrents.connection": "Verbindung",
   "next.torrents.enabled": "Aktiviert",
-  "next.torrents.windingDown": "Torrents sind aus. Die noch laufenden Torrents dürfen fertig werden; neue Torrents werden nicht hinzugefügt.",
+  "next.torrents.windingDown":
+    "Torrents sind aus. Die noch laufenden Torrents dürfen fertig werden; neue Torrents werden nicht hinzugefügt.",
   "next.torrents.offTitle": "Torrents ausschalten",
   "next.torrents.enableButton": "Torrents aktivieren",
-  "next.torrents.enableBody": "Torrents befinden sich in einer frühen Beta, Nutzung auf eigenes Risiko.",
-  "next.torrents.offBody": "Einige Torrents laufen noch. Wie sollen sie enden? Neue Torrents werden in keinem Fall hinzugefügt.",
-  "next.torrents.offIdleBody": "Kein Torrent läuft. Torrents werden jetzt ausgeschaltet, und kein neuer Torrent wird hinzugefügt.",
+  "next.torrents.enableBody":
+    "Torrents befinden sich in einer frühen Beta, Nutzung auf eigenes Risiko.",
+  "next.torrents.offBody":
+    "Einige Torrents laufen noch. Wie sollen sie enden? Neue Torrents werden in keinem Fall hinzugefügt.",
+  "next.torrents.offIdleBody":
+    "Kein Torrent läuft. Torrents werden jetzt ausgeschaltet, und kein neuer Torrent wird hinzugefügt.",
   "next.torrents.offFinishDownloadsBox": "Aktive Torrent-Downloads abschließen",
-  "next.torrents.offFinishDownloadsOn": "Torrents, die noch laden, werden zuerst fertig.",
-  "next.torrents.offFinishDownloadsOff": "Torrents, die noch laden, stoppen jetzt.",
+  "next.torrents.offFinishDownloadsOn":
+    "Torrents, die noch laden, werden zuerst fertig.",
+  "next.torrents.offFinishDownloadsOff":
+    "Torrents, die noch laden, stoppen jetzt.",
   "next.torrents.offFinishSeedingBox": "Seeding aktiver Jobs abschließen",
   "next.torrents.offFinishSeedingOff": "Seedende Torrents stoppen jetzt.",
   "next.torrents.offForceTitle": "Alle Torrents abbrechen",
-  "next.torrents.offForceBody": "Dadurch werden alle Torrents zwangsweise abgebrochen, was auf privaten Trackern zu einem Hit and Run führen kann.",
+  "next.torrents.offForceBody":
+    "Dadurch werden alle Torrents zwangsweise abgebrochen, was auf privaten Trackern zu einem Hit and Run führen kann.",
   "next.torrents.offStopNow": "Alle Torrent-Aktivität jetzt stoppen",
   "next.torrents.offStopNowNote": "Jeder Torrent stoppt sofort.",
   "next.torrents.stopNow": "Jetzt stoppen",
-  "next.torrents.finishAllForced": "Ein erzwungener Torrent oder einer ohne Seeding-Limit seedet bis „Jetzt stoppen“.",
+  "next.torrents.finishAllForced":
+    "Ein erzwungener Torrent oder einer ohne Seeding-Limit seedet bis „Jetzt stoppen“.",
   "next.torrents.basePort": "Basisport",
   "next.torrents.announcePort": "Announce-Port",
   "next.torrents.upnp": "UPnP",
@@ -2038,20 +2520,25 @@ export const nextDe: LocaleDictionary = {
   "next.torrents.bittorrent": "BitTorrent",
   "next.torrents.advanced": "Erweitert",
   "next.torrents.peerTcp": "TCP",
-  "next.torrents.peerTcpHelp": "Peers werden über TCP angewählt und angenommen. TCP oder uTP bleibt an.",
+  "next.torrents.peerTcpHelp":
+    "Peers werden über TCP angewählt und angenommen. TCP oder uTP bleibt an.",
   "next.torrents.peerUtp": "uTP",
-  "next.torrents.peerUtpHelp": "Peers werden über uTP angewählt und angenommen. TCP oder uTP bleibt an.",
+  "next.torrents.peerUtpHelp":
+    "Peers werden über uTP angewählt und angenommen. TCP oder uTP bleibt an.",
   "next.torrents.preferDownloading": "Bevorzugt beim Herunterladen",
-  "next.torrents.preferDownloadingHelp": "Das Protokoll, das für jeden Peer zuerst versucht wird, solange einem Torrent gewünschte Stücke fehlen; scheitert es, wird das andere versucht.",
+  "next.torrents.preferDownloadingHelp":
+    "Das Protokoll, das für jeden Peer zuerst versucht wird, solange einem Torrent gewünschte Stücke fehlen; scheitert es, wird das andere versucht.",
   "next.torrents.preferSeeding": "Bevorzugt beim Seeden",
-  "next.torrents.preferSeedingHelp": "Das Protokoll, das für jeden Peer zuerst versucht wird, sobald ein Torrent alle gewünschten Stücke hat; scheitert es, wird das andere versucht.",
+  "next.torrents.preferSeedingHelp":
+    "Das Protokoll, das für jeden Peer zuerst versucht wird, sobald ein Torrent alle gewünschten Stücke hat; scheitert es, wird das andere versucht.",
   "next.torrents.connectionsLimit": "Verbindungen gesamt",
   "next.torrents.unchokeSlots": "Upload-Slots",
   "next.torrents.blocklistEnabled": "IP-Filter",
   "next.torrents.blocklist": "IP-Filter-Pfad oder -URL",
   "next.torrents.filterTrackers": "IP-Filter auf Tracker anwenden",
   "next.torrents.bannedIps": "Gesperrte IP-Adressen",
-  "next.torrents.blockPrivilegedPorts": "Peers auf privilegierten Ports blockieren",
+  "next.torrents.blockPrivilegedPorts":
+    "Peers auf privilegierten Ports blockieren",
   "next.torrents.connectionSpeed": "Ausgehende Verbindungen pro Sekunde",
   "next.torrents.multipleConnectionsPerIp": "Mehrere Verbindungen pro IP",
   "next.torrents.stopTrackerTimeout": "Tracker-Stopp-Zeitlimit",
@@ -2059,23 +2546,29 @@ export const nextDe: LocaleDictionary = {
   "next.torrents.unpack": "Entpacken",
   "next.torrents.unpackInherit": "Erben",
   "next.torrents.portInvalid": "Ein Port liegt zwischen 1 und 65535.",
-  "next.torrents.saveFailed": "Die Torrent-Einstellungen konnten nicht gespeichert werden.",
+  "next.torrents.saveFailed":
+    "Die Torrent-Einstellungen konnten nicht gespeichert werden.",
   "next.torrents.trackerRules": "Tracker-Regeln",
   "next.torrents.trackerRule": "Tracker-Regel",
   "next.torrents.trackerRuleAdd": "Regel hinzufügen",
   "next.torrents.trackerRuleNewNote": "neue Tracker-Regel",
-  "next.torrents.trackerRuleRemoveBody": "Torrents dieses Trackers folgen wieder der Seed-Regel ihrer Kategorie oder der globalen.",
+  "next.torrents.trackerRuleRemoveBody":
+    "Torrents dieses Trackers folgen wieder der Seed-Regel ihrer Kategorie oder der globalen.",
   "next.torrents.trackerRuleName": "Name",
   "next.torrents.trackerRuleHosts": "Hosts",
-  "next.torrents.trackerRuleHostsNote": "Ein Torrent folgt dieser Regel, wenn einer seiner Tracker auf einem angehakten Host liegt. Änderungen gelten für ab jetzt hinzugefügte Torrents und nach einem Neustart von Weaver für alle.",
+  "next.torrents.trackerRuleHostsNote":
+    "Ein Torrent folgt dieser Regel, wenn einer seiner Tracker auf einem angehakten Host liegt. Änderungen gelten für ab jetzt hinzugefügte Torrents und nach einem Neustart von Weaver für alle.",
   "next.torrents.trackerRuleHostUnder": "und jeder Host darunter",
   "next.torrents.trackerRuleHostOnly": "nur dieser Host",
-  "next.torrents.trackerRuleHostLocked": "von der Tracker-Datei von {{name}} gesetzt",
+  "next.torrents.trackerRuleHostLocked":
+    "von der Tracker-Datei von {{name}} gesetzt",
   "next.torrents.trackerRuleHostAdd": "Hinzufügen",
   "next.torrents.trackerRuleHostsMore": "{{host}} +{{count}}",
   "next.torrents.trackerRuleHostsNone": "Mindestens einen Host hinzufügen.",
-  "next.torrents.trackerRuleFilePrivate": "Privater Torrent: Jeder genannte Tracker ist angehakt.",
-  "next.torrents.trackerRuleFilePublic": "Öffentlicher Torrent: Nur der Haupt-Tracker ist angehakt. Weitere anhaken, die die Regel abdecken soll.",
+  "next.torrents.trackerRuleFilePrivate":
+    "Privater Torrent: Jeder genannte Tracker ist angehakt.",
+  "next.torrents.trackerRuleFilePublic":
+    "Öffentlicher Torrent: Nur der Haupt-Tracker ist angehakt. Weitere anhaken, die die Regel abdecken soll.",
   "next.torrents.trackerRuleHostKnown": "Bekannt",
   "next.torrents.trackerRuleHostCustom": "Eigener",
   "next.torrents.trackerRuleHostFile": "Torrent-Datei",
@@ -2091,9 +2584,11 @@ export const nextDe: LocaleDictionary = {
   "next.torrents.trackerRulePrivate": "Privater Tracker",
   "next.torrents.trackerRulePublic": "Öffentlicher Tracker",
   "next.torrents.trackerRuleAdvanced": "Erweiterte Einstellungen",
-  "next.torrents.trackerRuleCovers": "Gilt für jeden Torrent mit einem Tracker auf einem angehakten Host, und dann für alle Tracker und Peers dieses Torrents.",
+  "next.torrents.trackerRuleCovers":
+    "Gilt für jeden Torrent mit einem Tracker auf einem angehakten Host, und dann für alle Tracker und Peers dieses Torrents.",
   "next.torrents.trackerRuleEffective": "Wirksam: {{value}}",
-  "next.torrents.trackerRuleGoalInherited": "Aus den globalen Seeding-Einstellungen",
+  "next.torrents.trackerRuleGoalInherited":
+    "Aus den globalen Seeding-Einstellungen",
   "next.torrents.trackerRuleRouteOwn": "Unter Routen bearbeiten",
   "next.torrents.trackerRuleDht": "DHT",
   "next.torrents.trackerRulePex": "PEX",
@@ -2111,7 +2606,8 @@ export const nextDe: LocaleDictionary = {
   "next.torrents.trackerFileRecommended": "Empfohlen",
   "next.torrents.trackerFileArchivePasswords": "Archivpasswörter",
   "next.torrents.trackerFileUnbind": "Lösen",
-  "next.torrents.trackerFileUnbindBody": "Alle Werte bleiben und sind bearbeitbar.",
+  "next.torrents.trackerFileUnbindBody":
+    "Alle Werte bleiben und sind bearbeitbar.",
   "next.torrents.trackerRuleCertificatePem": "Zertifikat",
   "next.torrents.trackerRulePrivateKey": "Privater Schlüssel",
   "next.torrents.trackerRulesEmpty": "Keine Tracker-Regeln.",
@@ -2143,14 +2639,21 @@ export const nextDe: LocaleDictionary = {
   "next.torrents.routeReason.LEG_REVOKED": "Verbindung entzogen",
   "next.torrents.routeReason.QUOTA_SILENCED": "Kontingent erreicht",
   "next.torrents.routeReason.TORRENTS_DISABLED": "Torrents deaktiviert",
-  "next.torrents.routeReason.LEG_OPEN_FAILED": "Verbindung konnte nicht geöffnet werden",
-  "next.torrents.routeReason.STATE_DIRECTORY_FAILED": "Zustandsverzeichnis nicht verfügbar",
-  "next.torrents.routeReason.LISTEN_PORT_UNAVAILABLE": "Lauschport nicht verfügbar",
-  "next.torrents.routeReason.LISTEN_PORT_BIND_FAILED": "Lauschport konnte nicht gebunden werden",
-  "next.torrents.routeReason.SESSION_STATE_UNREADABLE": "Sitzungszustand nicht lesbar",
-  "next.torrents.routeReason.SESSION_BUILD_FAILED": "Sitzung konnte nicht geöffnet werden",
+  "next.torrents.routeReason.LEG_OPEN_FAILED":
+    "Verbindung konnte nicht geöffnet werden",
+  "next.torrents.routeReason.STATE_DIRECTORY_FAILED":
+    "Zustandsverzeichnis nicht verfügbar",
+  "next.torrents.routeReason.LISTEN_PORT_UNAVAILABLE":
+    "Lauschport nicht verfügbar",
+  "next.torrents.routeReason.LISTEN_PORT_BIND_FAILED":
+    "Lauschport konnte nicht gebunden werden",
+  "next.torrents.routeReason.SESSION_STATE_UNREADABLE":
+    "Sitzungszustand nicht lesbar",
+  "next.torrents.routeReason.SESSION_BUILD_FAILED":
+    "Sitzung konnte nicht geöffnet werden",
   "next.torrents.routeReason.UTP_UNAVAILABLE": "Nur uTP, Route ohne uTP",
-  "next.torrents.routeReason.BLOCKLIST_FAILED": "Blockliste konnte nicht geladen werden",
+  "next.torrents.routeReason.BLOCKLIST_FAILED":
+    "Blockliste konnte nicht geladen werden",
   "next.torrents.routeReason.SESSION_LIMIT": "Sitzungslimit erreicht",
   "next.torrents.routeReason.OPENING": "Wird geöffnet",
   "next.torrents.stated.DISK_SPACE": "Wenig Speicherplatz",
@@ -2159,9 +2662,11 @@ export const nextDe: LocaleDictionary = {
   "next.torrents.stated.GOAL_MET": "Seeding-Ziel erreicht",
   "next.torrents.stated.HELD_MANUAL": "Durch eine Pause angehalten",
   "next.torrents.stated.HELD_SCHEDULED": "Durch den Zeitplan angehalten",
-  "next.torrents.stated.HELD_SPEED_TEST": "Für einen Geschwindigkeitstest angehalten",
+  "next.torrents.stated.HELD_SPEED_TEST":
+    "Für einen Geschwindigkeitstest angehalten",
   "next.torrents.stated.FETCH_TRACKERS": "Frage Tracker nach Peers",
-  "next.torrents.stated.FETCH_DISCOVERY": "Frage Tracker, DHT und LSD nach Peers",
+  "next.torrents.stated.FETCH_DISCOVERY":
+    "Frage Tracker, DHT und LSD nach Peers",
   "next.torrents.stated.FETCH_WAITING": "Keine Peers von Trackern",
   "next.torrents.routesEmpty": "Keine Routen.",
   "next.seeding.ratioGoal": "Ratio-Ziel",
@@ -2209,7 +2714,8 @@ export const nextDe: LocaleDictionary = {
   "next.quota.trickle": "Gedrosselt",
   "next.quota.stopped": "Gestoppt",
   "next.monitoring.egressQuotas": "Egress-Kontingente",
-  "next.monitoring.noEgressQuota": "Kein Egress hat ein Kontingent. Lege eines fest unter {{link}}.",
+  "next.monitoring.noEgressQuota":
+    "Kein Egress hat ein Kontingent. Lege eines fest unter {{link}}.",
   "next.schedules.speedGlobalUpload": "Globales Upload-Limit",
   "next.schedules.speedSet": "Limit",
   "next.protocol.torrent": "Torrent",
@@ -2218,7 +2724,8 @@ export const nextDe: LocaleDictionary = {
   "next.torrent.removeTitle": "Torrent entfernen",
   "next.torrent.deleteFiles": "Dateien ebenfalls löschen",
   "next.torrent.unmetGoalTitle": "Seeding-Ziel nicht erreicht",
-  "next.torrent.unmetGoalBody": "Das Seeding-Ziel ist noch nicht erreicht: {{left}}.",
+  "next.torrent.unmetGoalBody":
+    "Das Seeding-Ziel ist noch nicht erreicht: {{left}}.",
   "next.torrent.removeAnyway": "Trotzdem entfernen",
   "next.torrent.seedingCell": "Verhältnis · Upload",
   "next.torrent.force": "Erzwingen",
@@ -2229,8 +2736,10 @@ export const nextDe: LocaleDictionary = {
   "next.torrent.forced": "Erzwungen",
   "next.torrent.unforced": "Nicht mehr erzwungen",
   "next.torrent.recheck": "Neu prüfen",
-  "next.torrent.recheckBody": "Jedes Stück wird erneut von der Festplatte gelesen und geprüft.",
-  "next.torrent.filesMissingBody": "Die Dateien dieses Torrents liegen nicht in seinem Ordner, daher kann er nicht fortgesetzt werden. Lege die Dateien zurück oder verschiebe den Torrent in den Ordner, der sie enthält. Soll der Download neu beginnen, prüfe ihn erneut: Was auf der Festplatte liegt, bleibt erhalten, der Rest wird neu geladen.",
+  "next.torrent.recheckBody":
+    "Jedes Stück wird erneut von der Festplatte gelesen und geprüft.",
+  "next.torrent.filesMissingBody":
+    "Die Dateien dieses Torrents liegen nicht in seinem Ordner, daher kann er nicht fortgesetzt werden. Lege die Dateien zurück oder verschiebe den Torrent in den Ordner, der sie enthält. Soll der Download neu beginnen, prüfe ihn erneut: Was auf der Festplatte liegt, bleibt erhalten, der Rest wird neu geladen.",
   "next.torrent.rechecking": "Wird neu geprüft",
   "next.torrent.move": "Verschieben",
   "next.torrent.moved": "Verschoben",
@@ -2243,7 +2752,8 @@ export const nextDe: LocaleDictionary = {
   "next.torrent.transfer": "Übertragung",
   "next.torrent.information": "Informationen",
   "next.torrent.timeActive": "Aktive Zeit",
-  "next.torrent.timeActiveSeeded": "{{active}} (geseedet {{seeded}}, Lauf {{run}})",
+  "next.torrent.timeActiveSeeded":
+    "{{active}} (geseedet {{seeded}}, Lauf {{run}})",
   "next.torrent.eta": "Restzeit",
   "next.torrent.connections": "Verbindungen",
   "next.torrent.connectionsValue": "{{count}} ({{max}} max.)",
@@ -2291,7 +2801,8 @@ export const nextDe: LocaleDictionary = {
   "next.torrent.addTrackers": "Tracker hinzufügen",
   "next.torrent.editTracker": "Tracker bearbeiten",
   "next.torrent.trackerUrls": "Tracker-URLs",
-  "next.torrent.privateTrackerWarning": "Dieser Torrent ist privat. Füge nur URLs hinzu, die dir sein Tracker gegeben hat.",
+  "next.torrent.privateTrackerWarning":
+    "Dieser Torrent ist privat. Füge nur URLs hinzu, die dir sein Tracker gegeben hat.",
   "next.torrent.trackerUrl": "Tracker-URL",
   "next.torrent.trackerSource": "Quelle",
   "next.torrent.trackerStatus": "Status",
@@ -2322,10 +2833,13 @@ export const nextDe: LocaleDictionary = {
   "next.quota.remaining": "{{size}} verbleibend",
   "next.networking.egress.quota": "Kontingent",
   "next.networking.egress.enabled": "Aktiviert",
-  "next.networking.egress.systemHelp": "Der System-Egress bleibt immer an; er ist das Routing des Betriebssystems.",
+  "next.networking.egress.systemHelp":
+    "Der System-Egress bleibt immer an; er ist das Routing des Betriebssystems.",
   "next.networking.egress.nameRequired": "Gib dem Egress einen Namen.",
-  "next.networking.egress.interfaceRequired": "Wähle die Schnittstelle für die Bindung.",
-  "next.networking.egress.sourceRequired": "Gib die Quelladresse für die Bindung ein.",
+  "next.networking.egress.interfaceRequired":
+    "Wähle die Schnittstelle für die Bindung.",
+  "next.networking.egress.sourceRequired":
+    "Gib die Quelladresse für die Bindung ein.",
   "next.networking.egress.test": "Testen",
   "next.networking.testVia.title": "Über Route testen",
   "next.networking.testVia.route": "Route",
@@ -2344,7 +2858,8 @@ export const nextDe: LocaleDictionary = {
   "next.networking.testVia.resolvedSystem": "das System",
   "next.networking.testVia.resolvedProxy": "der Proxy, {{name}}",
   "next.networking.testVia.resolvedServers": "DNS {{servers}} über {{name}}",
-  "next.networking.testVia.resolvedWeaver": "Weaver: DNS {{servers}} über {{name}}",
+  "next.networking.testVia.resolvedWeaver":
+    "Weaver: DNS {{servers}} über {{name}}",
   "next.networking.testVia.cached": "zwischengespeichert",
   "next.networking.testVia.torrent": "Test-Torrent",
   "next.networking.testVia.step.TORRENT": "Torrent",
@@ -2357,21 +2872,25 @@ export const nextDe: LocaleDictionary = {
   "next.networking.pools.title": "Proxy-Pools",
   "next.networking.pools.count.one": "{{count}} Pool",
   "next.networking.pools.count.other": "{{count}} Pools",
-  "next.networking.pools.note": "Pools lassen Proxys desselben Typs gegeneinander antreten und bevorzugen dann Mitglieder mit Liefernachweisen. WireGuard erlaubt bis zu {{count}} Tunnel über alle Egress-Pfade; jeder reserviert {{budget}} MiB.",
+  "next.networking.pools.note":
+    "Pools lassen Proxys desselben Typs gegeneinander antreten und bevorzugen dann Mitglieder mit Liefernachweisen. WireGuard erlaubt bis zu {{count}} Tunnel über alle Egress-Pfade; jeder reserviert {{budget}} MiB.",
   "next.networking.pools.name": "Name",
   "next.networking.pools.type": "Proxy-Typ",
-  "next.networking.pools.typeHelp": "Alle Mitglieder haben diesen Typ; eine Änderung leert die Mitgliederliste.",
+  "next.networking.pools.typeHelp":
+    "Alle Mitglieder haben diesen Typ; eine Änderung leert die Mitgliederliste.",
   "next.networking.pools.members": "Mitglieder",
   "next.networking.pools.noCandidates": "Noch keine {{kind}}-Proxys.",
   "next.networking.pools.state": "Status",
   "next.networking.pools.enabled": "Aktiviert",
-  "next.networking.pools.empty": "Noch keine Pools. Ein einzelner Proxy kann auch direkt in einer Route verwendet werden.",
+  "next.networking.pools.empty":
+    "Noch keine Pools. Ein einzelner Proxy kann auch direkt in einer Route verwendet werden.",
   "next.networking.pools.add": "Pool hinzufügen",
   "next.networking.pools.save": "Pool speichern",
   "next.networking.pools.section": "Pool",
   "next.networking.pools.nameRequired": "Gib dem Pool einen Namen.",
   "next.networking.pools.delete": "Pool löschen",
-  "next.networking.pools.deleteBody": "{{name}} löschen? Er muss zuerst aus allen Routen entfernt werden.",
+  "next.networking.pools.deleteBody":
+    "{{name}} löschen? Er muss zuerst aus allen Routen entfernt werden.",
   "next.networking.pools.test": "Pool testen",
   "next.networking.pools.testVia": "Testen",
   "next.networking.routes.title": "Routen der Verbraucher",
@@ -2382,14 +2901,17 @@ export const nextDe: LocaleDictionary = {
   "next.networking.routes.typeUsenet": "Usenet",
   "next.networking.routes.typeTorrent": "Torrent",
   "next.networking.routes.live": "Live",
-  "next.networking.routes.empty": "Füge einen Server oder RSS-Feed hinzu, bevor du eine Route zuweist.",
+  "next.networking.routes.empty":
+    "Füge einen Server oder RSS-Feed hinzu, bevor du eine Route zuweist.",
   "next.networking.routes.rssFeed": "RSS-Feed",
   "next.networking.routes.editorTitle": "Route für {{name}}",
   "next.networking.routes.save": "Route speichern",
-  "next.networking.route.intro": "Teile bis zu {{count}} Verbindungen auf unabhängige Pfade auf. Laufende Übertragungen enden auf ihrem Pfad, wenn sich die Gewichte ändern.",
+  "next.networking.route.intro":
+    "Teile bis zu {{count}} Verbindungen auf unabhängige Pfade auf. Laufende Übertragungen enden auf ihrem Pfad, wenn sich die Gewichte ändern.",
   "next.networking.route.distribution": "Gewichtsverteilung der Stränge",
   "next.networking.route.legWeight": "Gewicht Strang {{position}}",
-  "next.networking.route.preview": "Nur Vorschau: {{assigned}} zugewiesen, {{parked}} geparkt. Die laufende Route bleibt unverändert.",
+  "next.networking.route.preview":
+    "Nur Vorschau: {{assigned}} zugewiesen, {{parked}} geparkt. Die laufende Route bleibt unverändert.",
   "next.networking.route.leg": "Strang {{position}}",
   "next.networking.route.live": "{{open}}/{{target}} Verbindungen · {{source}}",
   "next.networking.route.noSource": "noch keine Quelladresse",
@@ -2411,9 +2933,11 @@ export const nextDe: LocaleDictionary = {
   "next.networking.route.rungUp": "Stufe nach oben",
   "next.networking.route.rungDown": "Stufe nach unten",
   "next.networking.route.removeRung": "Stufe entfernen",
-  "next.networking.route.noRungs": "Füge eine Stufe hinzu, um die Proxys dieses Strangs zu wählen.",
+  "next.networking.route.noRungs":
+    "Füge eine Stufe hinzu, um die Proxys dieses Strangs zu wählen.",
   "next.networking.route.addRung": "Stufe hinzufügen",
-  "next.networking.route.directFallback": "Direkten Rückfall über diesen Egress erlauben",
+  "next.networking.route.directFallback":
+    "Direkten Rückfall über diesen Egress erlauben",
   "next.networking.route.target": "Ziel: {{count}} Verbindungen",
   "next.networking.route.simulateDown": "Ausfall simulieren",
   "next.networking.route.legUp": "Nach oben",
@@ -2447,18 +2971,23 @@ export const nextDe: LocaleDictionary = {
   "next.networking.speed.sab.GB_10": "10 GB",
   "next.networking.speed.run": "Starten",
   "next.networking.speed.pauseTitle": "Downloads pausieren?",
-  "next.networking.speed.pauseBody": "Downloads pausieren während des Tests und laufen danach weiter.",
+  "next.networking.speed.pauseBody":
+    "Downloads pausieren während des Tests und laufen danach weiter.",
   "next.networking.speed.pauseConfirm": "Pausieren und starten",
   "next.networking.speed.cancel": "Test abbrechen",
   "next.networking.speed.upSwitch": "An",
   "next.networking.speed.downSwitch": "Aus",
-  "next.networking.speed.usenetNeedsServer": "Ein Feed hat keinen Usenet-Server zum Testen.",
-  "next.networking.speed.torrentNeedsTorrentRoute": "Ein Torrent-Test braucht eine Torrent-Route.",
+  "next.networking.speed.usenetNeedsServer":
+    "Ein Feed hat keinen Usenet-Server zum Testen.",
+  "next.networking.speed.torrentNeedsTorrentRoute":
+    "Ein Torrent-Test braucht eine Torrent-Route.",
   "next.networking.speed.customUrlInvalid": "Gib eine HTTPS-URL ein.",
-  "next.networking.speed.nzbUrlInvalid": "Gib die http- oder https-URL der NZB ein.",
+  "next.networking.speed.nzbUrlInvalid":
+    "Gib die http- oder https-URL der NZB ein.",
   "next.networking.speed.nzbFileMissing": "Wähle eine .nzb-Datei.",
   "next.networking.speed.phase.pausing": "Downloads werden pausiert",
-  "next.networking.speed.phase.draining": "{{count}} laufende werden abgeschlossen",
+  "next.networking.speed.phase.draining":
+    "{{count}} laufende werden abgeschlossen",
   "next.networking.speed.phase.measuring": "Messung läuft",
   "next.networking.speed.phase.preparing": "Vorbereitung",
   "next.networking.speed.phase.leasing": "Verbindungen werden geliehen",
@@ -2477,7 +3006,8 @@ export const nextDe: LocaleDictionary = {
   "next.networking.speed.decoded": "Dekodiert",
   "next.networking.speed.upload": "Upload",
   "next.networking.speed.uploadPeers": "Upload an Peers, mindestens",
-  "next.networking.speed.uploadOutcome.UNAVAILABLE": "{{provider}} nimmt keinen Upload an",
+  "next.networking.speed.uploadOutcome.UNAVAILABLE":
+    "{{provider}} nimmt keinen Upload an",
   "next.networking.speed.uploadOutcome.NO_DEMAND": "Keine Nachfrage",
   "next.networking.speed.uploadOutcome.FAILED": "Fehlgeschlagen",
   "next.networking.speed.uploadOutcome.MEASURED": "Gemessen",
@@ -2485,67 +3015,118 @@ export const nextDe: LocaleDictionary = {
   "next.networking.speed.status.COMPLETED": "Abgeschlossen",
   "next.networking.speed.status.CANCELLED": "Abgebrochen",
   "next.networking.speed.status.FAILED": "Fehlgeschlagen",
-  "next.networking.speed.failure.RATE_LIMITED": "Der Anbieter begrenzt gerade die Anfragen deiner IP; wähle einen anderen Anbieter.",
-  "next.networking.speed.failure.HTTP_STATUS": "Der Anbieter antwortete mit HTTP {{status}}.",
-  "next.networking.speed.failure.TLS_VERIFICATION": "{{host}} hat die TLS-Prüfung nicht bestanden.",
-  "next.networking.speed.failure.UNRESOLVED": "{{host}} konnte nicht aufgelöst werden.",
-  "next.networking.speed.failure.ADDRESS_NOT_ALLOWED": "{{host}} wird zu einer nicht erlaubten Adresse aufgelöst.",
-  "next.networking.speed.failure.EGRESS_QUOTA_USED": "Die Egress-Schnittstelle hat ihr Download-Kontingent aufgebraucht.",
+  "next.networking.speed.failure.RATE_LIMITED":
+    "Der Anbieter begrenzt gerade die Anfragen deiner IP; wähle einen anderen Anbieter.",
+  "next.networking.speed.failure.HTTP_STATUS":
+    "Der Anbieter antwortete mit HTTP {{status}}.",
+  "next.networking.speed.failure.TLS_VERIFICATION":
+    "{{host}} hat die TLS-Prüfung nicht bestanden.",
+  "next.networking.speed.failure.UNRESOLVED":
+    "{{host}} konnte nicht aufgelöst werden.",
+  "next.networking.speed.failure.ADDRESS_NOT_ALLOWED":
+    "{{host}} wird zu einer nicht erlaubten Adresse aufgelöst.",
+  "next.networking.speed.failure.EGRESS_QUOTA_USED":
+    "Die Egress-Schnittstelle hat ihr Download-Kontingent aufgebraucht.",
   "next.networking.speed.failure.NO_LEG_UP": "Keine Strecke ist aktiv.",
-  "next.networking.speed.failure.LEASE_REFUSED": "{{name}} kann seine Verbindungen nicht verleihen: {{reason}}.",
-  "next.networking.speed.failure.SERVER_LEFT_POOL": "Der Server hat den Verbindungspool verlassen.",
-  "next.networking.speed.failure.STOPPED": "Der Geschwindigkeitstest wurde gestoppt.",
-  "next.networking.speed.failure.STOPPED_UNEXPECTEDLY": "Der Geschwindigkeitstest wurde unerwartet beendet.",
+  "next.networking.speed.failure.LEASE_REFUSED":
+    "{{name}} kann seine Verbindungen nicht verleihen: {{reason}}.",
+  "next.networking.speed.failure.SERVER_LEFT_POOL":
+    "Der Server hat den Verbindungspool verlassen.",
+  "next.networking.speed.failure.STOPPED":
+    "Der Geschwindigkeitstest wurde gestoppt.",
+  "next.networking.speed.failure.STOPPED_UNEXPECTEDLY":
+    "Der Geschwindigkeitstest wurde unerwartet beendet.",
   "next.networking.speed.failure.NO_BYTES": "Es wurden keine Bytes empfangen.",
-  "next.proxyFault.NAME_NOT_RESOLVED": "Der Hostname wurde nicht aufgelöst. Prüfe die Schreibweise und die DNS-Server.",
-  "next.proxyFault.CONNECTION_REFUSED": "Die Verbindung wurde abgelehnt. Prüfe den Port und ob der Proxy läuft.",
-  "next.proxyFault.HOST_UNREACHABLE": "Der Host ist nicht erreichbar. Prüfe die Adresse und den Netzwerkpfad dorthin.",
-  "next.proxyFault.NETWORK_UNREACHABLE": "Das Netzwerk ist nicht erreichbar. Prüfe die Netzwerkverbindung dieses Rechners.",
-  "next.proxyFault.NO_ROUTE_VIA": "Keine Route über {{via}}. Prüfe die Netzwerkverbindung dieser Schnittstelle.",
-  "next.proxyFault.CONNECTION_CLOSED": "Die Verbindung wurde geschlossen, bevor der Proxy antwortete. Prüfe Proxy-Typ und Port.",
-  "next.proxyFault.TIMED_OUT": "Keine Antwort innerhalb von {{seconds}} Sekunden. Prüfe Adresse, Port und Firewall.",
-  "next.proxyFault.UDP_TIMED_OUT": "Keine Antwort über UDP innerhalb von {{seconds}} Sekunden. Prüfe Adresse und Port und ob die Firewall UDP durchlässt.",
-  "next.proxyFault.EGRESS_UNUSABLE": "Die Egress-Schnittstelle konnte nicht verwendet werden. Prüfe, ob sie aktiv ist und eine Adresse hat.",
-  "next.proxyFault.NOT_A_PROXY": "Der Server antwortete nicht mit dem {{protocol}}-Proxy-Protokoll. Prüfe Proxy-Typ und Port.",
-  "next.proxyFault.AUTH_REQUIRED": "Der Proxy verlangt Benutzername und Passwort.",
-  "next.proxyFault.AUTH_UNSUPPORTED": "Der Proxy akzeptiert keinen Benutzernamen und kein Passwort. Entferne sie.",
-  "next.proxyFault.CREDENTIALS_REJECTED": "Der Proxy hat Benutzername oder Passwort abgelehnt.",
-  "next.proxyFault.CREDENTIALS_INVALID": "SOCKS5 braucht einen Benutzernamen mit 1 bis 255 Bytes und ein Passwort mit höchstens 255 Bytes.",
-  "next.proxyFault.CLOSED_DURING_SIGN_IN": "Der Proxy hat die Verbindung bei der Anmeldung geschlossen. Prüfe Benutzername und Passwort.",
-  "next.proxyFault.CONNECT_REFUSED": "Der Proxy hat die Verbindung mit HTTP {{status}} abgelehnt.",
-  "next.proxyFault.DESTINATION_REFUSED": "{{target}} hat die Verbindung abgelehnt.",
-  "next.proxyFault.DESTINATION_UNREACHABLE": "{{target}} war nicht erreichbar ({{reply}}).",
-  "next.proxyFault.DESTINATION_TIMED_OUT": "{{target}} hat nicht rechtzeitig geantwortet.",
-  "next.proxyFault.DESTINATION_FORBIDDEN": "Die Regeln des Proxys erlauben keine Verbindungen zu {{target}}.",
-  "next.proxyFault.SSH_KEY_MISSING": "SSH braucht einen privaten Ed25519-Schlüssel.",
-  "next.proxyFault.SSH_KEY_PASSPHRASE": "Der private Schlüssel ist mit einer Passphrase geschützt. Gib die Passphrase ein.",
-  "next.proxyFault.SSH_KEY_NOT_ED25519": "Der private Schlüssel ist kein Ed25519-Schlüssel. Erzeuge einen mit ssh-keygen -t ed25519.",
-  "next.proxyFault.SSH_KEY_UNREADABLE": "Der private Schlüssel konnte nicht gelesen werden. Füge den ganzen Schlüssel ein, einschließlich der BEGIN- und END-Zeile.",
-  "next.proxyFault.SSH_HOST_KEY_CHANGED": "Der Host-Schlüssel des Servers hat sich geändert. Überprüfe den Server und vergiss dann den alten Host-Schlüssel.",
-  "next.proxyFault.SSH_KEY_REJECTED": "Der Server hat den privaten Schlüssel für {{username}} nicht akzeptiert. Prüfe dessen authorized_keys.",
-  "next.proxyFault.SSH_HANDSHAKE_FAILED": "Der SSH-Handshake ist fehlgeschlagen: {{detail}}",
-  "next.proxyFault.SSH_FORWARDING_REFUSED": "Der SSH-Server hat die Weiterleitung zu {{target}} abgelehnt. Erlaube TCP-Weiterleitung für diesen Benutzer.",
-  "next.proxyFault.WIREGUARD_KEY_INVALID": "Ein WireGuard-Schlüssel ist ungültig. Füge jeden Schlüssel genau so ein, wie wg ihn ausgibt.",
-  "next.proxyFault.WIREGUARD_PEER_IS_SELF": "Der öffentliche Schlüssel des Peers ist der dieses Tunnels. Verwende den öffentlichen Schlüssel des Servers.",
-  "next.proxyFault.WIREGUARD_NO_DNS": "Der Tunnel hat keinen DNS-Server. Übernimm die DNS-Zeile aus seiner Konfiguration oder verwende IP-Adressen.",
-  "next.proxyFault.WIREGUARD_NO_HANDSHAKE": "Kein Handshake innerhalb von {{seconds}} Sekunden. Prüfe den Endpunkt und ob die Peer-Liste des Servers den öffentlichen Schlüssel {{publicKey}} enthält.",
-  "next.proxyFault.WIREGUARD_FAILED": "Der WireGuard-Tunnel konnte nicht starten: {{detail}}",
-  "next.proxyFault.HTTP3_TLS": "TLS mit dem Proxy ist fehlgeschlagen. Prüfe den Hostnamen und das Zertifikat des Proxys.",
-  "next.proxyFault.HTTP3_HANDSHAKE_FAILED": "Der QUIC-Handshake ist fehlgeschlagen. Prüfe den Port und ob der Proxy HTTP/3 anbietet.",
-  "next.proxyFault.HTTP3_FAILED": "HTTP/3 zum Proxy ist fehlgeschlagen: {{detail}}",
-  "next.proxyFault.PROXY_UNAVAILABLE": "Der Proxy ist deaktiviert oder konnte nicht eingerichtet werden.",
-  "next.proxyFault.STREAM_FAILED": "Die Verbindung über den Proxy ist nach dem Öffnen fehlgeschlagen.",
-  "next.proxyFault.TEST_NEEDS_DNS": "Ein HTTP/3-Proxy lässt sich nur mit einem Host und Port testen oder mit den DNS-Servern, über die er auflöst.",
+  "next.proxyFault.NAME_NOT_RESOLVED":
+    "Der Hostname wurde nicht aufgelöst. Prüfe die Schreibweise und die DNS-Server.",
+  "next.proxyFault.CONNECTION_REFUSED":
+    "Die Verbindung wurde abgelehnt. Prüfe den Port und ob der Proxy läuft.",
+  "next.proxyFault.HOST_UNREACHABLE":
+    "Der Host ist nicht erreichbar. Prüfe die Adresse und den Netzwerkpfad dorthin.",
+  "next.proxyFault.NETWORK_UNREACHABLE":
+    "Das Netzwerk ist nicht erreichbar. Prüfe die Netzwerkverbindung dieses Rechners.",
+  "next.proxyFault.NO_ROUTE_VIA":
+    "Keine Route über {{via}}. Prüfe die Netzwerkverbindung dieser Schnittstelle.",
+  "next.proxyFault.CONNECTION_CLOSED":
+    "Die Verbindung wurde geschlossen, bevor der Proxy antwortete. Prüfe Proxy-Typ und Port.",
+  "next.proxyFault.TIMED_OUT":
+    "Keine Antwort innerhalb von {{seconds}} Sekunden. Prüfe Adresse, Port und Firewall.",
+  "next.proxyFault.UDP_TIMED_OUT":
+    "Keine Antwort über UDP innerhalb von {{seconds}} Sekunden. Prüfe Adresse und Port und ob die Firewall UDP durchlässt.",
+  "next.proxyFault.EGRESS_UNUSABLE":
+    "Die Egress-Schnittstelle konnte nicht verwendet werden. Prüfe, ob sie aktiv ist und eine Adresse hat.",
+  "next.proxyFault.NOT_A_PROXY":
+    "Der Server antwortete nicht mit dem {{protocol}}-Proxy-Protokoll. Prüfe Proxy-Typ und Port.",
+  "next.proxyFault.AUTH_REQUIRED":
+    "Der Proxy verlangt Benutzername und Passwort.",
+  "next.proxyFault.AUTH_UNSUPPORTED":
+    "Der Proxy akzeptiert keinen Benutzernamen und kein Passwort. Entferne sie.",
+  "next.proxyFault.CREDENTIALS_REJECTED":
+    "Der Proxy hat Benutzername oder Passwort abgelehnt.",
+  "next.proxyFault.CREDENTIALS_INVALID":
+    "SOCKS5 braucht einen Benutzernamen mit 1 bis 255 Bytes und ein Passwort mit höchstens 255 Bytes.",
+  "next.proxyFault.CLOSED_DURING_SIGN_IN":
+    "Der Proxy hat die Verbindung bei der Anmeldung geschlossen. Prüfe Benutzername und Passwort.",
+  "next.proxyFault.CONNECT_REFUSED":
+    "Der Proxy hat die Verbindung mit HTTP {{status}} abgelehnt.",
+  "next.proxyFault.DESTINATION_REFUSED":
+    "{{target}} hat die Verbindung abgelehnt.",
+  "next.proxyFault.DESTINATION_UNREACHABLE":
+    "{{target}} war nicht erreichbar ({{reply}}).",
+  "next.proxyFault.DESTINATION_TIMED_OUT":
+    "{{target}} hat nicht rechtzeitig geantwortet.",
+  "next.proxyFault.DESTINATION_FORBIDDEN":
+    "Die Regeln des Proxys erlauben keine Verbindungen zu {{target}}.",
+  "next.proxyFault.SSH_KEY_MISSING":
+    "SSH braucht einen privaten Ed25519-Schlüssel.",
+  "next.proxyFault.SSH_KEY_PASSPHRASE":
+    "Der private Schlüssel ist mit einer Passphrase geschützt. Gib die Passphrase ein.",
+  "next.proxyFault.SSH_KEY_NOT_ED25519":
+    "Der private Schlüssel ist kein Ed25519-Schlüssel. Erzeuge einen mit ssh-keygen -t ed25519.",
+  "next.proxyFault.SSH_KEY_UNREADABLE":
+    "Der private Schlüssel konnte nicht gelesen werden. Füge den ganzen Schlüssel ein, einschließlich der BEGIN- und END-Zeile.",
+  "next.proxyFault.SSH_HOST_KEY_CHANGED":
+    "Der Host-Schlüssel des Servers hat sich geändert. Überprüfe den Server und vergiss dann den alten Host-Schlüssel.",
+  "next.proxyFault.SSH_KEY_REJECTED":
+    "Der Server hat den privaten Schlüssel für {{username}} nicht akzeptiert. Prüfe dessen authorized_keys.",
+  "next.proxyFault.SSH_HANDSHAKE_FAILED":
+    "Der SSH-Handshake ist fehlgeschlagen: {{detail}}",
+  "next.proxyFault.SSH_FORWARDING_REFUSED":
+    "Der SSH-Server hat die Weiterleitung zu {{target}} abgelehnt. Erlaube TCP-Weiterleitung für diesen Benutzer.",
+  "next.proxyFault.WIREGUARD_KEY_INVALID":
+    "Ein WireGuard-Schlüssel ist ungültig. Füge jeden Schlüssel genau so ein, wie wg ihn ausgibt.",
+  "next.proxyFault.WIREGUARD_PEER_IS_SELF":
+    "Der öffentliche Schlüssel des Peers ist der dieses Tunnels. Verwende den öffentlichen Schlüssel des Servers.",
+  "next.proxyFault.WIREGUARD_NO_DNS":
+    "Der Tunnel hat keinen DNS-Server. Übernimm die DNS-Zeile aus seiner Konfiguration oder verwende IP-Adressen.",
+  "next.proxyFault.WIREGUARD_NO_HANDSHAKE":
+    "Kein Handshake innerhalb von {{seconds}} Sekunden. Prüfe den Endpunkt und ob die Peer-Liste des Servers den öffentlichen Schlüssel {{publicKey}} enthält.",
+  "next.proxyFault.WIREGUARD_FAILED":
+    "Der WireGuard-Tunnel konnte nicht starten: {{detail}}",
+  "next.proxyFault.HTTP3_TLS":
+    "TLS mit dem Proxy ist fehlgeschlagen. Prüfe den Hostnamen und das Zertifikat des Proxys.",
+  "next.proxyFault.HTTP3_HANDSHAKE_FAILED":
+    "Der QUIC-Handshake ist fehlgeschlagen. Prüfe den Port und ob der Proxy HTTP/3 anbietet.",
+  "next.proxyFault.HTTP3_FAILED":
+    "HTTP/3 zum Proxy ist fehlgeschlagen: {{detail}}",
+  "next.proxyFault.PROXY_UNAVAILABLE":
+    "Der Proxy ist deaktiviert oder konnte nicht eingerichtet werden.",
+  "next.proxyFault.STREAM_FAILED":
+    "Die Verbindung über den Proxy ist nach dem Öffnen fehlgeschlagen.",
+  "next.proxyFault.TEST_NEEDS_DNS":
+    "Ein HTTP/3-Proxy lässt sich nur mit einem Host und Port testen oder mit den DNS-Servern, über die er auflöst.",
   "next.proxyTest.CONNECTED": "Verbunden.",
   "next.proxyTest.FORWARDED": "Verbunden und über den Proxy weitergeleitet.",
-  "next.proxyTest.REACHABLE": "Erreichbar. Gib einen Host und Port an, um die Weiterleitung zu prüfen.",
+  "next.proxyTest.REACHABLE":
+    "Erreichbar. Gib einen Host und Port an, um die Weiterleitung zu prüfen.",
   "next.lookupError.NO_SUCH_NAME": "Name unbekannt",
   "next.lookupError.NO_ADDRESS": "keine Adresse",
   "next.lookupError.TIMED_OUT": "Zeitüberschreitung",
   "next.lookupError.SERVER_FAILURE": "Serverfehler",
   "next.lookupError.NO_REPLY": "keine Antwort",
   "next.lookupError.OTHER": "Auflösung fehlgeschlagen",
-  "next.lookupError.TLS_FAILED": "sichere Verbindung zum DNS-Server fehlgeschlagen",
+  "next.lookupError.TLS_FAILED":
+    "sichere Verbindung zum DNS-Server fehlgeschlagen",
   "next.lookupError.BOGUS": "Signaturen ungültig",
   "next.lookupError.DNSSEC_UNAVAILABLE": "keine DNSSEC-Einträge zum Prüfen",
   "next.dnsWire.PLAIN": "Unverschlüsselt",
@@ -2602,9 +3183,11 @@ export const nextDe: LocaleDictionary = {
   "next.overview.jobs.other": "{{count}} Aufträge · {{size}} übrig",
   "next.overview.queueEmpty": "Warteschlange leer",
   "next.overview.finishedToday": "Heute fertig",
-  "next.overview.finished": "{{complete}} fertig · {{partial}} teilweise · {{failed}} fehlgeschlagen",
+  "next.overview.finished":
+    "{{complete}} fertig · {{partial}} teilweise · {{failed}} fehlgeschlagen",
   "next.overview.dataToday": "Daten heute",
-  "next.overview.dataPeriods": "Woche {{week}} · Monat {{month}} · gesamt {{all}}",
+  "next.overview.dataPeriods":
+    "Woche {{week}} · Monat {{month}} · gesamt {{all}}",
   "next.overview.last30": "Letzte 30 Tage",
   "next.overview.allUp": "alle erreichbar",
   "next.overview.downloads": "Downloads",
@@ -2636,10 +3219,12 @@ export const nextDe: LocaleDictionary = {
   "next.integrity.failed": "Fehlgeschlagen",
   "next.integrity.repairsPerDay": "Repariert pro Tag",
   "next.integrity.noRepairs": "Keine Reparaturen",
-  "next.integrity.noRepairsBody": "Jobs, die eine Reparatur brauchten, erscheinen hier.",
+  "next.integrity.noRepairsBody":
+    "Jobs, die eine Reparatur brauchten, erscheinen hier.",
   "next.integrity.causes": "Fehler nach Ursache",
   "next.integrity.noFailures": "Keine Fehler",
-  "next.integrity.noFailuresBody": "Fehlgeschlagene Jobs erscheinen hier nach Ursache.",
+  "next.integrity.noFailuresBody":
+    "Fehlgeschlagene Jobs erscheinen hier nach Ursache.",
   "next.integrity.cause.repair": "Reparatur fehlgeschlagen",
   "next.integrity.cause.password": "Falsches oder fehlendes Passwort",
   "next.integrity.cause.disk_full": "Datenträger voll",
@@ -2650,7 +3235,8 @@ export const nextDe: LocaleDictionary = {
   "next.integrity.cause.other": "Sonstige",
   "next.integrity.stages": "Zeiten je Phase",
   "next.integrity.noStages": "Keine Phasenzeiten",
-  "next.integrity.noStagesBody": "Die Zeit jeder Phase erscheint hier, sobald ein Job läuft.",
+  "next.integrity.noStagesBody":
+    "Die Zeit jeder Phase erscheint hier, sobald ein Job läuft.",
   "next.integrity.stage": "Phase",
   "next.integrity.runs": "Läufe",
   "next.integrity.average": "Durchschnitt",
@@ -2669,13 +3255,15 @@ export const nextDe: LocaleDictionary = {
   "next.torrentDash.peersNote": "Seeds: {{seeds}} · Torrents: {{torrents}}",
   "next.torrentDash.perDay": "Pro Tag",
   "next.torrentDash.trackers": "Tracker",
-  "next.torrentDash.trackersNote": "Ein Torrent zählt bei seiner Tracker-Regel, ohne eine bei jedem Tracker, den er nennt",
+  "next.torrentDash.trackersNote":
+    "Ein Torrent zählt bei seiner Tracker-Regel, ohne eine bei jedem Tracker, den er nennt",
   "next.torrentDash.tracker": "Tracker",
   "next.torrentDash.downloaded": "Heruntergeladen",
   "next.torrentDash.uploaded": "Hochgeladen",
   "next.torrentDash.noTracker": "Kein Tracker",
   "next.torrentDash.none": "Keine Torrents",
-  "next.torrentDash.noneBody": "Verhältnis, Seed-Zeit und Tracker erscheinen hier, sobald ein Torrent hinzugefügt ist.",
+  "next.torrentDash.noneBody":
+    "Verhältnis, Seed-Zeit und Tracker erscheinen hier, sobald ein Torrent hinzugefügt ist.",
   "next.completed.since": "Seit {{time}}",
   "next.completed.showAll": "Alle zeigen",
 };

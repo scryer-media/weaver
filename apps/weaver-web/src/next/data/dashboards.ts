@@ -56,7 +56,8 @@ export interface UsageHistory {
   finishedInRange: FinishedJobs;
 }
 
-export type UsagePeriod = "TODAY" | "WEEK" | "MONTH" | "YEAR" | "ALL" | "CUSTOM";
+export type UsagePeriod =
+  "TODAY" | "WEEK" | "MONTH" | "YEAR" | "ALL" | "CUSTOM";
 
 export const NO_USAGE: UsageTotals = {
   bytes: 0,
@@ -77,9 +78,16 @@ export function dayKey(epochMs: number): string {
 }
 
 /** The `count` local dates ending today, as a custom range. */
-export function lastDays(nowMs: number, count: number): { fromDay: string; toDay: string } {
+export function lastDays(
+  nowMs: number,
+  count: number,
+): { fromDay: string; toDay: string } {
   const today = new Date(nowMs);
-  const first = new Date(today.getFullYear(), today.getMonth(), today.getDate() - (count - 1));
+  const first = new Date(
+    today.getFullYear(),
+    today.getMonth(),
+    today.getDate() - (count - 1),
+  );
   return { fromDay: dayKey(first.getTime()), toDay: dayKey(nowMs) };
 }
 
@@ -102,7 +110,11 @@ export function sumDays(days: readonly UsageTotals[]): UsageTotals {
 /** Articles found out of those asked for, 0 to 100; `null` when none were asked for. */
 export function foundPercent(totals: UsageTotals): number | null {
   if (totals.articlesTried <= 0) return null;
-  return (Math.min(totals.articlesSucceeded, totals.articlesTried) / totals.articlesTried) * 100;
+  return (
+    (Math.min(totals.articlesSucceeded, totals.articlesTried) /
+      totals.articlesTried) *
+    100
+  );
 }
 
 export interface RecoveryTotals {
@@ -150,9 +162,14 @@ export function percentOf(part: number, whole: number): number | null {
 }
 
 /** Each day's share of finished jobs that needed a repair, 0 to 100. */
-export function dailyRepairShare(finished: readonly UsageDay[], repaired: readonly UsageDay[]): number[] {
+export function dailyRepairShare(
+  finished: readonly UsageDay[],
+  repaired: readonly UsageDay[],
+): number[] {
   const byDay = new Map(repaired.map((day) => [day.day, day.events]));
-  return finished.map((day) => percentOf(byDay.get(day.day) ?? 0, day.events) ?? 0);
+  return finished.map(
+    (day) => percentOf(byDay.get(day.day) ?? 0, day.events) ?? 0,
+  );
 }
 
 /** A stage's average run in seconds; `null` when it never ran. */
@@ -166,25 +183,44 @@ export function shareRatio(totals: UsageTotals): number | null {
 }
 
 /** Job stages in the order a job meets them; the server names them. */
-export const STAGE_ORDER = ["download", "verify", "repair", "extract", "move", "post_process"] as const;
+export const STAGE_ORDER = [
+  "download",
+  "verify",
+  "repair",
+  "extract",
+  "move",
+  "post_process",
+] as const;
 
 /** Stages in job order; a stage the web does not know goes last. */
-export function stagesInOrder(stages: readonly UsageConsumer[]): UsageConsumer[] {
+export function stagesInOrder(
+  stages: readonly UsageConsumer[],
+): UsageConsumer[] {
   const rank = (id: string) => {
     const at = (STAGE_ORDER as readonly string[]).indexOf(id);
     return at < 0 ? STAGE_ORDER.length : at;
   };
-  return [...stages].sort((left, right) => rank(left.id) - rank(right.id) || left.id.localeCompare(right.id));
+  return [...stages].sort(
+    (left, right) =>
+      rank(left.id) - rank(right.id) || left.id.localeCompare(right.id),
+  );
 }
 
 /** Whether the server has never held or seeded a torrent. */
 export function noTorrents(history: TorrentHistory): boolean {
   const all = history.total.allTime;
-  return history.peers.torrents === 0 && all.bytes === 0 && all.bytesUploaded === 0 && all.durationMs === 0;
+  return (
+    history.peers.torrents === 0 &&
+    all.bytes === 0 &&
+    all.bytesUploaded === 0 &&
+    all.durationMs === 0
+  );
 }
 
 /** Trackers with the most sent in the range first; the no-tracker row last. */
-export function trackersInOrder(trackers: readonly UsageConsumer[]): UsageConsumer[] {
+export function trackersInOrder(
+  trackers: readonly UsageConsumer[],
+): UsageConsumer[] {
   return [...trackers].sort(
     (left, right) =>
       Number(left.id === "") - Number(right.id === "") ||
@@ -200,7 +236,10 @@ export const USAGE_KEPT_DAYS = 400;
 export function secondsInDay(day: string): number {
   const [year, month, date] = day.split("-").map(Number);
   if (!year || !month || !date) return 86_400;
-  const seconds = (new Date(year, month - 1, date + 1).getTime() - new Date(year, month - 1, date).getTime()) / 1000;
+  const seconds =
+    (new Date(year, month - 1, date + 1).getTime() -
+      new Date(year, month - 1, date).getTime()) /
+    1000;
   return seconds > 0 ? seconds : 86_400;
 }
 
@@ -214,7 +253,8 @@ export function averageDailySpeed(
   secondsIntoToday: number,
 ): number[] {
   return days.map((day) => {
-    const seconds = day.day === today ? Math.max(1, secondsIntoToday) : secondsInDay(day.day);
+    const seconds =
+      day.day === today ? Math.max(1, secondsIntoToday) : secondsInDay(day.day);
     return day.day > today ? 0 : day.bytes / seconds;
   });
 }
@@ -222,7 +262,9 @@ export function averageDailySpeed(
 /** Each bar's height out of the tallest, 0 to 100. */
 export function barHeights(values: readonly number[]): number[] {
   const tallest = values.reduce((max, value) => Math.max(max, value), 0);
-  return values.map((value) => (tallest > 0 ? (Math.max(0, value) / tallest) * 100 : 0));
+  return values.map((value) =>
+    tallest > 0 ? (Math.max(0, value) / tallest) * 100 : 0,
+  );
 }
 
 /**
@@ -259,7 +301,8 @@ export function providersUp(
   return { up: providers.length - down.length, total: providers.length, down };
 }
 
-export type DownloadsState = "running" | "paused" | "egressQuota" | "serverQuota" | "schedule";
+export type DownloadsState =
+  "running" | "paused" | "egressQuota" | "serverQuota" | "schedule";
 
 /** What is holding downloads, if anything, and when it lifts. */
 export function downloadsState(
@@ -267,9 +310,16 @@ export function downloadsState(
   block: DownloadBlockState,
 ): { state: DownloadsState; liftsAtEpochMs: number | null } {
   const lifts = block.windowEndsAtEpochMs ?? null;
-  if (isPaused || block.kind === "MANUAL_PAUSE" || block.kind === "SPEED_TEST") {
+  if (
+    isPaused ||
+    block.kind === "MANUAL_PAUSE" ||
+    block.kind === "SPEED_TEST"
+  ) {
     // A timed pause lifts by itself; any other pause waits for a resume.
-    return { state: "paused", liftsAtEpochMs: block.resumeAtEpochMs ?? (isPaused ? null : lifts) };
+    return {
+      state: "paused",
+      liftsAtEpochMs: block.resumeAtEpochMs ?? (isPaused ? null : lifts),
+    };
   }
   switch (block.kind) {
     case "EGRESS_QUOTA":
@@ -296,8 +346,13 @@ export interface ProviderRow {
  * configured, `removed` of the name it had, or of its id when the ledger
  * keeps no name.
  */
-export function providerRowName(row: ProviderRow, removed: (name: string) => string): string {
-  return row.provider?.host ?? removed(row.usage?.removedHost ?? row.serverId ?? "");
+export function providerRowName(
+  row: ProviderRow,
+  removed: (name: string) => string,
+): string {
+  return (
+    row.provider?.host ?? removed(row.usage?.removedHost ?? row.serverId ?? "")
+  );
 }
 
 /**
@@ -313,7 +368,8 @@ export function providerRows(
   const byId = new Map(servers.map((consumer) => [consumer.id, consumer]));
   const seen = new Set<string>();
   const rows: ProviderRow[] = providers.map((provider) => {
-    const serverId = provider.serverId == null ? null : String(provider.serverId);
+    const serverId =
+      provider.serverId == null ? null : String(provider.serverId);
     if (serverId !== null) seen.add(serverId);
     return {
       key: `${provider.host}:${provider.port}:${serverId ?? ""}`,
@@ -324,15 +380,20 @@ export function providerRows(
   });
   for (const usage of servers) {
     if (!seen.has(usage.id)) {
-      rows.push({ key: `ledger:${usage.id}`, serverId: usage.id, provider: null, usage });
+      rows.push({
+        key: `ledger:${usage.id}`,
+        serverId: usage.id,
+        provider: null,
+        usage,
+      });
     }
   }
   return rows
     .map((row, index) => ({ row, index }))
     .sort(
       (left, right) =>
-        (right.row.usage?.range.bytes ?? 0) - (left.row.usage?.range.bytes ?? 0) ||
-        left.index - right.index,
+        (right.row.usage?.range.bytes ?? 0) -
+          (left.row.usage?.range.bytes ?? 0) || left.index - right.index,
     )
     .map(({ row }) => row);
 }

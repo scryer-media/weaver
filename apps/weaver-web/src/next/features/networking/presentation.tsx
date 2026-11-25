@@ -101,7 +101,10 @@ export function stateLabel(t: Translate, state: string): string {
   }
 }
 
-export function bindingLabel(t: Translate, kind: Egress["bindingKind"]): string {
+export function bindingLabel(
+  t: Translate,
+  kind: Egress["bindingKind"],
+): string {
   switch (kind) {
     case "SYSTEM":
       return t("next.networking.binding.system");
@@ -142,7 +145,10 @@ export function formatRate(bytesPerSecond = 0): string {
 }
 
 /** A limit as a rate, or Unlimited for none; 0 is a limit like any other. */
-export function formatLimit(t: Translate, bytesPerSecond: number | null): string {
+export function formatLimit(
+  t: Translate,
+  bytesPerSecond: number | null,
+): string {
   return bytesPerSecond !== null
     ? `${(bytesPerSecond / MIB).toFixed(1)} MiB/s`
     : t("next.networking.unlimited");
@@ -170,9 +176,21 @@ export function StatusMark({
   testId?: string;
 }) {
   return (
-    <span data-testid={testId} className={cn("inline-flex min-w-0 gap-2", wrap ? "items-start" : "items-center", className)}>
-      <Square color={TONE_COLOR[tone ?? stateTone(state)]} className={wrap ? "mt-[6px]" : undefined} />
-      <span className="flex-none font-wv-mono text-[12px] leading-[1.5] text-wv-fg">{label}</span>
+    <span
+      data-testid={testId}
+      className={cn(
+        "inline-flex min-w-0 gap-2",
+        wrap ? "items-start" : "items-center",
+        className,
+      )}
+    >
+      <Square
+        color={TONE_COLOR[tone ?? stateTone(state)]}
+        className={wrap ? "mt-[6px]" : undefined}
+      />
+      <span className="flex-none font-wv-mono text-[12px] leading-[1.5] text-wv-fg">
+        {label}
+      </span>
       {detail === undefined ? null : (
         <span
           className={cn(
@@ -188,7 +206,13 @@ export function StatusMark({
 }
 
 /** A sentence of guidance under a section header. */
-export function Hint({ children, className }: { children: ReactNode; className?: string }) {
+export function Hint({
+  children,
+  className,
+}: {
+  children: ReactNode;
+  className?: string;
+}) {
   return (
     <p
       className={cn(
@@ -216,7 +240,9 @@ export function NoticeBand({
       role={role}
       className={cn(
         "flex flex-none items-start gap-[10px] border-b border-wv-hairline px-4 py-3 text-[12.5px] leading-[1.5] sm:px-6",
-        tone === "bad" ? "bg-wv-danger-bg text-wv-error-text" : "bg-wv-cell-hover text-wv-secondary",
+        tone === "bad"
+          ? "bg-wv-danger-bg text-wv-error-text"
+          : "bg-wv-cell-hover text-wv-secondary",
       )}
     >
       <Square color={TONE_COLOR[tone]} className="mt-[5px]" />
@@ -285,17 +311,33 @@ export function CheckRow({
         disabled ? "cursor-default" : "cursor-pointer",
       )}
     >
-      <CheckBox checked={checked} onChange={onChange} label={label} disabled={disabled} testId={testId} />
+      <CheckBox
+        checked={checked}
+        onChange={onChange}
+        label={label}
+        disabled={disabled}
+        testId={testId}
+      />
       <span className="min-w-0 truncate">{label}</span>
       {detail === undefined ? null : (
-        <span className="flex-none font-wv-mono text-[11px] text-wv-muted">{detail}</span>
+        <span className="flex-none font-wv-mono text-[11px] text-wv-muted">
+          {detail}
+        </span>
       )}
     </label>
   );
 }
 
 /** A small caption over a control that has no form row of its own. */
-export function ControlLabel({ label, children, className }: { label: string; children: ReactNode; className?: string }) {
+export function ControlLabel({
+  label,
+  children,
+  className,
+}: {
+  label: string;
+  children: ReactNode;
+  className?: string;
+}) {
   return (
     <div className={cn("flex min-w-0 flex-col gap-[6px]", className)}>
       <span aria-hidden="true" className="text-[11.5px] text-wv-muted">

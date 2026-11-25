@@ -18,7 +18,10 @@ import { splitSpeed } from "../data/format";
 import { Eyebrow } from "../components/chrome";
 import { Icon, type IconName } from "../components/icons";
 import { RateCounter } from "../components/RateCounter";
-import { useSpeedLimitDialog, useSpeedLimitInForce } from "../features/SpeedLimitDialog";
+import {
+  useSpeedLimitDialog,
+  useSpeedLimitInForce,
+} from "../features/SpeedLimitDialog";
 import { useNetworkingWorkspace } from "../features/networking/data";
 import { useFlowDns } from "../features/networking/dns-choices";
 import { FlowPreview } from "../features/networking/FlowPreview";
@@ -101,7 +104,9 @@ export function NextShell({
     "historyCount",
     "connection",
   );
-  const downloadCount = useNextDataSelector((data) => data.queue.summary.totalItems);
+  const downloadCount = useNextDataSelector(
+    (data) => data.queue.summary.totalItems,
+  );
   const upgradeInApp = upgradesInApp(useApplicationUpgradeStatus());
   const [navOpen, setNavOpen] = useState(false);
   const closeNav = useCallback(() => setNavOpen(false), []);
@@ -185,7 +190,10 @@ export function NextShell({
           <Icon name="menu" size={17} />
           {update === undefined ? null : (
             // The drawer is where the release notice lives; the dot says there is one to open it for.
-            <span aria-hidden="true" className="absolute top-[17px] right-[11px] size-[7px] bg-wv-accent" />
+            <span
+              aria-hidden="true"
+              className="absolute top-[17px] right-[11px] size-[7px] bg-wv-accent"
+            />
           )}
         </button>
 
@@ -211,7 +219,9 @@ export function NextShell({
                   )}
                 </div>
                 {controls === undefined ? null : (
-                  <div className="ml-auto flex min-w-0 flex-wrap items-center justify-end gap-x-[10px] gap-y-2">{controls}</div>
+                  <div className="ml-auto flex min-w-0 flex-wrap items-center justify-end gap-x-[10px] gap-y-2">
+                    {controls}
+                  </div>
                 )}
               </header>
             )}
@@ -221,16 +231,28 @@ export function NextShell({
 
         {beforeContent}
 
-        <main className={cn("flex min-h-0 flex-1", contentClassName)}>{children}</main>
+        <main className={cn("flex min-h-0 flex-1", contentClassName)}>
+          {children}
+        </main>
 
         {afterContent}
 
-        <footer data-testid={testIds.shellFooter} className="flex h-[34px] flex-none items-center gap-3 border-t border-wv-line-strong bg-wv-chrome px-4 font-wv-mono text-[11px] text-wv-muted sm:gap-4 sm:px-6">
-          <span data-testid={testIds.shellConnection} className="flex flex-none items-center gap-[7px] whitespace-nowrap">
+        <footer
+          data-testid={testIds.shellFooter}
+          className="flex h-[34px] flex-none items-center gap-3 border-t border-wv-line-strong bg-wv-chrome px-4 font-wv-mono text-[11px] text-wv-muted sm:gap-4 sm:px-6"
+        >
+          <span
+            data-testid={testIds.shellConnection}
+            className="flex flex-none items-center gap-[7px] whitespace-nowrap"
+          >
             <span
               aria-hidden="true"
               data-testid={testIds.shellConnectionState(
-                connection.isDisconnected ? (connection.isPolling ? "polling" : "reconnecting") : "connected",
+                connection.isDisconnected
+                  ? connection.isPolling
+                    ? "polling"
+                    : "reconnecting"
+                  : "connected",
               )}
               className={cn(
                 "size-1.5 flex-none",
@@ -247,7 +269,10 @@ export function NextShell({
             // The note is the first thing to go: on a phone the connection chip
             // and the right-hand figure are the two that have to survive.
             <>
-              <span aria-hidden="true" className="hidden flex-none text-wv-inert md:inline">
+              <span
+                aria-hidden="true"
+                className="hidden flex-none text-wv-inert md:inline"
+              >
                 |
               </span>
               <span className="hidden min-w-0 truncate whitespace-nowrap md:inline">
@@ -256,7 +281,12 @@ export function NextShell({
             </>
           )}
           {statusRight === undefined ? null : (
-            <span data-testid={testIds.shellStatus} className="ml-auto truncate whitespace-nowrap text-right">{statusRight}</span>
+            <span
+              data-testid={testIds.shellStatus}
+              className="ml-auto truncate whitespace-nowrap text-right"
+            >
+              {statusRight}
+            </span>
           )}
         </footer>
       </div>
@@ -286,12 +316,27 @@ const RailHead = memo(function RailHead({
   // different subsets. In the product the list is always whole — otherwise
   // Monitoring is unreachable from Downloads.
   const nav: NavEntry[] = [
-    { to: "/", label: t("next.nav.downloads"), icon: "downloads", count: downloadCount, end: false },
-    { to: "/history", label: t("next.nav.history"), icon: "history", count: historyCount },
+    {
+      to: "/",
+      label: t("next.nav.downloads"),
+      icon: "downloads",
+      count: downloadCount,
+      end: false,
+    },
+    {
+      to: "/history",
+      label: t("next.nav.history"),
+      icon: "history",
+      count: historyCount,
+    },
     { to: "/monitoring", label: t("next.nav.monitoring"), icon: "monitoring" },
     { to: "/system-info", label: t("next.nav.systemInfo"), icon: "systemInfo" },
     { to: "/logs", label: t("next.nav.logs"), icon: "logs" },
-    { to: "/tools/analyzer", label: t("next.nav.analyzer"), icon: "inspectFile" },
+    {
+      to: "/tools/analyzer",
+      label: t("next.nav.analyzer"),
+      icon: "inspectFile",
+    },
     { to: "/settings", label: t("nav.settings"), icon: "settings" },
   ];
 
@@ -299,7 +344,9 @@ const RailHead = memo(function RailHead({
     <>
       <div className="flex h-14 flex-none items-center gap-[9px] border-b border-wv-line-strong px-[18px]">
         <BrandLockup className="h-[16px] w-auto flex-none" />
-        <span className="ml-auto font-wv-mono text-[10px] text-wv-faint">{version || "—"}</span>
+        <span className="ml-auto font-wv-mono text-[10px] text-wv-faint">
+          {version || "—"}
+        </span>
         {onDismiss === undefined ? null : (
           <button
             type="button"
@@ -312,7 +359,10 @@ const RailHead = memo(function RailHead({
         )}
       </div>
 
-      <nav data-testid={testIds.shellNav} className="flex flex-col gap-0.5 px-[10px] py-[14px]">
+      <nav
+        data-testid={testIds.shellNav}
+        className="flex flex-col gap-0.5 px-[10px] py-[14px]"
+      >
         {nav.map((entry) => (
           <NavLink
             key={entry.to}
@@ -322,7 +372,9 @@ const RailHead = memo(function RailHead({
             className={({ isActive }) =>
               cn(
                 "flex h-8 items-center gap-[10px] px-[10px] text-[13.5px] hover:bg-wv-nav-hover",
-                isActive ? "bg-wv-nav-active font-medium text-wv-strong" : "text-wv-fg",
+                isActive
+                  ? "bg-wv-nav-active font-medium text-wv-strong"
+                  : "text-wv-fg",
               )
             }
           >
@@ -330,12 +382,18 @@ const RailHead = memo(function RailHead({
               <>
                 <span
                   aria-hidden="true"
-                  className={cn("h-[14px] w-[3px] flex-none", isActive && "bg-wv-accent")}
+                  className={cn(
+                    "h-[14px] w-[3px] flex-none",
+                    isActive && "bg-wv-accent",
+                  )}
                 />
                 <Icon
                   name={entry.icon}
                   size={16}
-                  className={cn("-ml-[1px] flex-none", isActive ? "text-wv-accent" : "text-wv-faint")}
+                  className={cn(
+                    "-ml-[1px] flex-none",
+                    isActive ? "text-wv-accent" : "text-wv-faint",
+                  )}
                 />
                 <span className="truncate">{entry.label}</span>
                 {entry.count === undefined ? null : (
@@ -366,9 +424,15 @@ function SignOutControl() {
   return (
     <div className="flex flex-none flex-col border-b border-wv-line-strong bg-wv-chrome pr-4 sm:pr-6">
       <div className="flex max-h-14 flex-1 items-center gap-3">
-        <span aria-hidden="true" className="hidden h-5 w-px bg-wv-line-strong sm:block" />
+        <span
+          aria-hidden="true"
+          className="hidden h-5 w-px bg-wv-line-strong sm:block"
+        />
         {failed ? (
-          <span role="alert" className="font-wv-mono text-[11px] whitespace-nowrap text-wv-error">
+          <span
+            role="alert"
+            className="font-wv-mono text-[11px] whitespace-nowrap text-wv-error"
+          >
             {t("next.shell.signOutFailed")}
           </span>
         ) : null}
@@ -382,10 +446,12 @@ function SignOutControl() {
             setBusy(true);
             setFailed(false);
             // Success leaves the page for the sign-in screen; only a refusal returns here.
-            signOut(document.baseURI, fetch, undefined, authHeaders()).catch(() => {
-              setBusy(false);
-              setFailed(true);
-            });
+            signOut(document.baseURI, fetch, undefined, authHeaders()).catch(
+              () => {
+                setBusy(false);
+                setFailed(true);
+              },
+            );
           }}
           className={cn(
             "flex h-8 items-center justify-center gap-[7px] border !border-wv-error bg-wv-danger-bg px-[9px] text-[12.5px] font-medium whitespace-nowrap sm:px-3",
@@ -440,7 +506,9 @@ const UpdateBlock = memo(function UpdateBlock({
           {t("next.shell.updateVersion", { version })}
         </span>
       </span>
-      {inApp ? null : <Icon name="external" size={15} className="ml-auto flex-none" />}
+      {inApp ? null : (
+        <Icon name="external" size={15} className="ml-auto flex-none" />
+      )}
     </>
   );
   return (
@@ -480,13 +548,14 @@ const UpdateBlock = memo(function UpdateBlock({
  */
 const ThroughputBlock = memo(function ThroughputBlock() {
   const t = useTranslate();
-  const { speed, peakSpeed, isPaused, torrentDownSpeed, torrentUpSpeed } = useNextData(
-    "speed",
-    "peakSpeed",
-    "isPaused",
-    "torrentDownSpeed",
-    "torrentUpSpeed",
-  );
+  const { speed, peakSpeed, isPaused, torrentDownSpeed, torrentUpSpeed } =
+    useNextData(
+      "speed",
+      "peakSpeed",
+      "isPaused",
+      "torrentDownSpeed",
+      "torrentUpSpeed",
+    );
   // The torrent rates only while torrents are switched on, not for jobs left after.
   const torrentsShown = useTorrentsEnabled();
   const { inForce, bySchedule } = useSpeedLimitInForce();
@@ -496,11 +565,16 @@ const ThroughputBlock = memo(function ThroughputBlock() {
   const now = splitSpeed(usenet);
   const peak = splitSpeed(peakSpeed);
   const limit = splitSpeed(inForce ?? 0);
-  const title = bySchedule ? t("next.speedLimit.bySchedule") : t("next.speedLimit.buttonTitle");
+  const title = bySchedule
+    ? t("next.speedLimit.bySchedule")
+    : t("next.speedLimit.buttonTitle");
   const limitLine =
     inForce !== null ? (
       <div
-        className={cn("font-wv-mono text-[11px] text-wv-warn", torrentsShown ? null : "-mt-[4px]")}
+        className={cn(
+          "font-wv-mono text-[11px] text-wv-warn",
+          torrentsShown ? null : "-mt-[4px]",
+        )}
       >
         {t(bySchedule ? "next.shell.scheduledLimit" : "next.shell.limit", {
           value: limit.value,
@@ -541,7 +615,10 @@ const ThroughputBlock = memo(function ThroughputBlock() {
           />
           <RailRates
             label={t("next.protocol.torrent")}
-            down={{ rate: torrentDownSpeed, title: t("next.shell.torrentDown") }}
+            down={{
+              rate: torrentDownSpeed,
+              title: t("next.shell.torrentDown"),
+            }}
             up={{ rate: torrentUpSpeed, title: t("next.shell.torrentUp") }}
           />
         </dl>
@@ -587,8 +664,11 @@ export const NetworkBlock = memo(function NetworkBlock() {
     return null;
   }
   return (
-    // No label and no padding: the drawing is the whole block.
-    <div className="flex flex-none flex-col border-t border-wv-line-strong">
+    // No label and no padding: the drawing is the whole block. It grows with
+    // the servers and routes drawn, so it is held to a share of the rail and
+    // cut off below that: the screen links above it keep their room, and
+    // picking the drawing still shows all of it.
+    <div className="flex max-h-[30%] flex-none flex-col overflow-hidden border-t border-wv-line-strong">
       <FlowPreview
         workspace={{ ...workspace, data }}
         dns={flowDns}
@@ -597,13 +677,20 @@ export const NetworkBlock = memo(function NetworkBlock() {
         editing={editing}
         onEdit={setEditing}
         proxyEditor={(id, onClose, onChanged) => (
-          <ProxyEditorFor key={id} id={id} onClose={onClose} onChanged={onChanged} />
+          <ProxyEditorFor
+            key={id}
+            id={id}
+            onClose={onClose}
+            onChanged={onChanged}
+          />
         )}
         className="min-w-0 cursor-zoom-in hover:bg-wv-cell-hover"
       />
       {/* An edit made from the drawing that the daemon refused; a saved one says nothing here. */}
       {failed && message !== null ? (
-        <div className="px-5 pb-2 font-wv-mono text-[11px] text-wv-warn">{message}</div>
+        <div className="px-5 pb-2 font-wv-mono text-[11px] text-wv-warn">
+          {message}
+        </div>
       ) : null}
     </div>
   );
@@ -625,12 +712,17 @@ function RailRates({
 }) {
   return (
     <>
-      <dt className="whitespace-nowrap font-wv-mono text-[10.5px] text-wv-muted">{label}</dt>
+      <dt className="whitespace-nowrap font-wv-mono text-[10.5px] text-wv-muted">
+        {label}
+      </dt>
       <RateCounter as="dd" arrow="down" {...down} />
       {up ? (
         <RateCounter as="dd" arrow="up" {...up} />
       ) : (
-        <dd className="m-0 text-right font-wv-mono text-[11px] text-wv-faint" aria-hidden>
+        <dd
+          className="m-0 text-right font-wv-mono text-[11px] text-wv-faint"
+          aria-hidden
+        >
           —
         </dd>
       )}

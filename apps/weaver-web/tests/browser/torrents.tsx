@@ -17,7 +17,15 @@ import { AddNzbDialog } from "@/next/features/AddNzbDialog";
 import { TorrentDetail } from "@/next/features/torrents/TorrentDetail";
 import { TorrentRemoveDialog } from "@/next/features/torrents/TorrentRemoveDialog";
 import { DownloadRow } from "@/next/pages/downloads/DownloadRow";
-import type { SeedingPolicyData, SettingLevel, TorrentChangesData, TorrentData, TorrentFileData, TorrentSummaryData, TorrentTrackerData } from "@/lib/torrents";
+import type {
+  SeedingPolicyData,
+  SettingLevel,
+  TorrentChangesData,
+  TorrentData,
+  TorrentFileData,
+  TorrentSummaryData,
+  TorrentTrackerData,
+} from "@/lib/torrents";
 import { nextEn } from "@/next/i18n/en";
 import "@/next/fonts.css";
 import "@/next/theme.css";
@@ -26,7 +34,10 @@ const query = new URLSearchParams(location.search);
 const screen = query.get("screen") ?? "tag";
 const dictionary = { ...en, ...nextEn } as Record<string, string>;
 const t = (key: string, values?: Record<string, unknown>) =>
-  Object.entries(values ?? {}).reduce((text, [name, value]) => text.replaceAll(`{{${name}}}`, String(value)), dictionary[key] ?? key);
+  Object.entries(values ?? {}).reduce(
+    (text, [name, value]) => text.replaceAll(`{{${name}}}`, String(value)),
+    dictionary[key] ?? key,
+  );
 const status = document.getElementById("status")!;
 
 // Every mutation the page sends. A remove is never refused.
@@ -46,76 +57,181 @@ const publish = () => {
 Object.assign(window, { torrentsFixture: { sent, publish } });
 const holdChange = (name: string, variables: Record<string, unknown>) => {
   if (pending === null) return;
-  if (name === "SetTorrentSequential") pending = { ...pending, sequential: variables.sequential as boolean };
-  if (name === "SetTorrentFirstLastPieceFirst") pending = { ...pending, firstLastPieceFirst: variables.firstLastPieceFirst as boolean };
+  if (name === "SetTorrentSequential")
+    pending = { ...pending, sequential: variables.sequential as boolean };
+  if (name === "SetTorrentFirstLastPieceFirst")
+    pending = {
+      ...pending,
+      firstLastPieceFirst: variables.firstLastPieceFirst as boolean,
+    };
   if (name === "SetTorrentFilePriorities") {
-    const levels = new Map((variables.priorities as { index: number; priority: TorrentFileData["priority"] }[]).map((entry) => [entry.index, entry.priority]));
-    pending = { ...pending, files: pending.files.map((file) => ({ ...file, priority: levels.get(file.index) ?? file.priority })) };
+    const levels = new Map(
+      (
+        variables.priorities as {
+          index: number;
+          priority: TorrentFileData["priority"];
+        }[]
+      ).map((entry) => [entry.index, entry.priority]),
+    );
+    pending = {
+      ...pending,
+      files: pending.files.map((file) => ({
+        ...file,
+        priority: levels.get(file.index) ?? file.priority,
+      })),
+    };
   }
 };
 
-const client = new Client({ url: "http://fixture.invalid/graphql", exchanges: [() => (operations) => pipe(operations, mergeMap((operation) => {
-  const definition = operation.query.definitions.find((entry) => entry.kind === "OperationDefinition");
-  const name = definition?.kind === "OperationDefinition" ? definition.name?.value ?? "" : "";
-  const variables = operation.variables as Record<string, unknown>;
-  if (operation.kind === "teardown") return empty;
-  if (operation.kind === "mutation") {
-    sent.push({ name, variables });
-    holdChange(name, variables);
-  }
-  if (name === "TorrentUpdates") {
-    // A subscription's answers go on while each says another may follow.
-    return make<{ operation: typeof operation; data: { torrentUpdates: TorrentChangesData<TorrentData> }; hasNext: boolean }>((observer) => {
-      const follower = (torrent: TorrentData) =>
-        observer.next({ operation, data: { torrentUpdates: { fullUpdate: true, torrents: [torrent], removedIds: [] } }, hasNext: true });
-      followers.add(follower);
-      // A daemon answers once the page is listening, never inside the request.
-      queueMicrotask(() => follower(held!));
-      return () => followers.delete(follower);
-    });
-  }
-  if (name === "RemoveTorrent") return fromValue({ operation, data: { removeTorrent: true } });
-  const answer = name === "Categories" ? { categories: [{ id: 1, name: "movies", destDir: null, aliases: "", seeding: null, torrentRoute: false }] } : {};
-  return fromValue({ operation, data: answer });
-}))] });
+const client = new Client({
+  url: "http://fixture.invalid/graphql",
+  exchanges: [
+    () => (operations) =>
+      pipe(
+        operations,
+        mergeMap((operation) => {
+          const definition = operation.query.definitions.find(
+            (entry) => entry.kind === "OperationDefinition",
+          );
+          const name =
+            definition?.kind === "OperationDefinition"
+              ? (definition.name?.value ?? "")
+              : "";
+          const variables = operation.variables as Record<string, unknown>;
+          if (operation.kind === "teardown") return empty;
+          if (operation.kind === "mutation") {
+            sent.push({ name, variables });
+            holdChange(name, variables);
+          }
+          if (name === "TorrentUpdates") {
+            // A subscription's answers go on while each says another may follow.
+            return make<{
+              operation: typeof operation;
+              data: { torrentUpdates: TorrentChangesData<TorrentData> };
+              hasNext: boolean;
+            }>((observer) => {
+              const follower = (torrent: TorrentData) =>
+                observer.next({
+                  operation,
+                  data: {
+                    torrentUpdates: {
+                      fullUpdate: true,
+                      torrents: [torrent],
+                      removedIds: [],
+                    },
+                  },
+                  hasNext: true,
+                });
+              followers.add(follower);
+              // A daemon answers once the page is listening, never inside the request.
+              queueMicrotask(() => follower(held!));
+              return () => followers.delete(follower);
+            });
+          }
+          if (name === "RemoveTorrent")
+            return fromValue({ operation, data: { removeTorrent: true } });
+          const answer =
+            name === "Categories"
+              ? {
+                  categories: [
+                    {
+                      id: 1,
+                      name: "movies",
+                      destDir: null,
+                      aliases: "",
+                      seeding: null,
+                      torrentRoute: false,
+                    },
+                  ],
+                }
+              : {};
+          return fromValue({ operation, data: answer });
+        }),
+      ),
+  ],
+});
 
 // The Add dialog speaks to the daemon with fetch, a file as multipart. The daemon reads what each one is:
 // a bencoded dictionary is a torrent, an NZB document is staged, anything else is refused.
-const answer = (data: unknown) => new Response(JSON.stringify(data), { headers: { "Content-Type": "application/json" } });
+const answer = (data: unknown) =>
+  new Response(JSON.stringify(data), {
+    headers: { "Content-Type": "application/json" },
+  });
 const passThrough = window.fetch.bind(window);
 window.fetch = async (input, init) => {
   const url = String(input instanceof Request ? input.url : input);
   if (url.endsWith("/api/auth/csrf")) return answer({ csrfToken: "fixture" });
   if (!url.endsWith("/graphql")) return passThrough(input, init);
   const body = init?.body;
-  const operations = JSON.parse(body instanceof FormData ? String(body.get("operations")) : String(body));
+  const operations = JSON.parse(
+    body instanceof FormData ? String(body.get("operations")) : String(body),
+  );
   const file = body instanceof FormData ? (body.get("0") as File | null) : null;
   const content = file ? await file.text() : "";
   const name = /mutation (\w+)/.exec(operations.query)?.[1] ?? "";
-  sent.push({ name, variables: file ? { ...operations.variables, file: file.name } : operations.variables });
+  sent.push({
+    name,
+    variables: file
+      ? { ...operations.variables, file: file.name }
+      : operations.variables,
+  });
   if (name === "StageNzbUpload") {
-    if (/^d\d/.test(content)) return answer({ data: { stageNzbUpload: { kind: "TORRENT", accepted: false } } });
+    if (/^d\d/.test(content))
+      return answer({
+        data: { stageNzbUpload: { kind: "TORRENT", accepted: false } },
+      });
     return answer({
       data: {
         stageNzbUpload: content.includes("<nzb")
-          ? { kind: "NZB", accepted: true, stagedUploadId: `staged-${sent.length}`, displayName: file?.name }
+          ? {
+              kind: "NZB",
+              accepted: true,
+              stagedUploadId: `staged-${sent.length}`,
+              displayName: file?.name,
+            }
           : { kind: "NZB", accepted: false, error: "not an NZB" },
       },
     });
   }
   if (name === "Submit") {
-    const text = (operations.variables.input as { text?: string | null }).text ?? "";
+    const text =
+      (operations.variables.input as { text?: string | null }).text ?? "";
     return text.includes("duplicate")
-      ? answer({ errors: [{ message: "This torrent is already in the queue.", extensions: { code: "DUPLICATE" } }] })
-      : answer({ data: { submit: { accepted: true, status: "ACCEPTED", message: null } } });
+      ? answer({
+          errors: [
+            {
+              message: "This torrent is already in the queue.",
+              extensions: { code: "DUPLICATE" },
+            },
+          ],
+        })
+      : answer({
+          data: {
+            submit: { accepted: true, status: "ACCEPTED", message: null },
+          },
+        });
   }
   return answer({ data: {} });
 };
 
 const job = (rest: Partial<JobData>): JobData => ({
-  id: 1, name: "fixture", displayTitle: "fixture", originalTitle: "fixture",
-  status: "DOWNLOADING", progress: 0, totalBytes: 0, downloadedBytes: 0, optionalRecoveryBytes: 0, optionalRecoveryDownloadedBytes: 0,
-  phaseProgress: [], failedBytes: 0, health: 1000, hasPassword: false, category: null, metadata: [], ...rest,
+  id: 1,
+  name: "fixture",
+  displayTitle: "fixture",
+  originalTitle: "fixture",
+  status: "DOWNLOADING",
+  progress: 0,
+  totalBytes: 0,
+  downloadedBytes: 0,
+  optionalRecoveryBytes: 0,
+  optionalRecoveryDownloadedBytes: 0,
+  phaseProgress: [],
+  failedBytes: 0,
+  health: 1000,
+  hasPassword: false,
+  category: null,
+  metadata: [],
+  ...rest,
 });
 
 // A torrent short of its goal, with what is left as its row reads it, or one with none left.
@@ -126,17 +242,34 @@ function Remove({ goalLeft }: { goalLeft: string | null }) {
       id={open ? 5 : null}
       name="fixture torrent"
       goalLeft={goalLeft}
-      onRemoved={(id) => { setOpen(false); status.textContent = `removed ${id}`; }}
-      onFailed={(message) => { setOpen(false); status.textContent = `failed ${message}`; }}
-      onDismiss={() => { setOpen(false); status.textContent = "dismissed"; }}
+      onRemoved={(id) => {
+        setOpen(false);
+        status.textContent = `removed ${id}`;
+      }}
+      onFailed={(message) => {
+        setOpen(false);
+        status.textContent = `failed ${message}`;
+      }}
+      onDismiss={() => {
+        setOpen(false);
+        status.textContent = "dismissed";
+      }}
     />
   );
 }
 
 /** A release name longer than any row is wide. */
-const LONG_NAME = Array.from({ length: 24 }, (_, index) => `Segment${index}`).join(".");
+const LONG_NAME = Array.from(
+  { length: 24 },
+  (_, index) => `Segment${index}`,
+).join(".");
 
-const TORRENT_STATES = ["FETCHING_METADATA", "CHECKING_FILES", "SEEDING", "STALLED"] as const;
+const TORRENT_STATES = [
+  "FETCHING_METADATA",
+  "CHECKING_FILES",
+  "SEEDING",
+  "STALLED",
+] as const;
 
 /**
  * The queue's rows for each torrent state, labelled by the one status renderer every row uses, and
@@ -145,9 +278,28 @@ const TORRENT_STATES = ["FETCHING_METADATA", "CHECKING_FILES", "SEEDING", "STALL
 function Queue() {
   const statusLabel = useStatusLabel();
   const rows: [string, JobData][] = [
-    ...TORRENT_STATES.map((state, index): [string, JobData] => [state, job({ id: index + 1, status: state, protocol: "TORRENT" })]),
-    ["older", job({ id: 9, name: "older job", displayTitle: "older job", originalTitle: "older job" })],
-    ["long", job({ id: 10, name: LONG_NAME, displayTitle: LONG_NAME, originalTitle: LONG_NAME })],
+    ...TORRENT_STATES.map((state, index): [string, JobData] => [
+      state,
+      job({ id: index + 1, status: state, protocol: "TORRENT" }),
+    ]),
+    [
+      "older",
+      job({
+        id: 9,
+        name: "older job",
+        displayTitle: "older job",
+        originalTitle: "older job",
+      }),
+    ],
+    [
+      "long",
+      job({
+        id: 10,
+        name: LONG_NAME,
+        displayTitle: LONG_NAME,
+        originalTitle: LONG_NAME,
+      }),
+    ],
   ];
   return (
     <ul className="@container">
@@ -156,8 +308,12 @@ function Queue() {
           <DownloadRow
             job={entry}
             selected={false}
-            onSelect={(id) => { status.textContent = `selected ${id}`; }}
-            onOpen={(id) => { status.textContent = `opened ${id}`; }}
+            onSelect={(id) => {
+              status.textContent = `selected ${id}`;
+            }}
+            onOpen={(id) => {
+              status.textContent = `opened ${id}`;
+            }}
             picked={false}
             onPick={() => {}}
             statusLabel={statusLabel}
@@ -176,28 +332,101 @@ const INHERIT = { state: "INHERIT", value: null } as const;
 
 /** A torrent's own terms: its ratio goal, every other term inherited. */
 const ratioOverride = (ratioGoal: number): SeedingPolicyData => ({
-  ratioGoal: { state: "SET", value: ratioGoal }, seedTimeGoalMinutes: INHERIT, inactiveGoalMinutes: INHERIT, mode: INHERIT, action: INHERIT, seedTimeCounting: INHERIT,
+  ratioGoal: { state: "SET", value: ratioGoal },
+  seedTimeGoalMinutes: INHERIT,
+  inactiveGoalMinutes: INHERIT,
+  mode: INHERIT,
+  action: INHERIT,
+  seedTimeCounting: INHERIT,
 });
 
 /** A torrent whose ratio goal comes from `level`, and every other term from the global settings. */
-const torrent = (id: number, level: SettingLevel, override: SeedingPolicyData | null): TorrentData => ({
-  id, name: `torrent ${id}`, infohash: "00".repeat(20), infohashV2: null, state: "SEEDING", stated: null, detail: null, routeReason: null, category: "movies", private: false,
-  forced: false, progress: 1, totalBytes: 2048, haveBytes: 2048, uploadedBytes: 0, downloadedBytes: 2048, ratio: 0.4,
-  downloadBps: 0, uploadBps: 0, uploadLimit: null, downloadLimit: null, etaSeconds: null,
-  peers: 9, seeds: 3, leechers: 6, maxPeers: 50, swarmSeeds: 12, swarmLeechers: 20, reannounceSeconds: null,
-  activeSeconds: 0, seedingSeconds: 0, consecutiveSeedingSeconds: 0, downloadAvgBps: 0, uploadAvgBps: 0, wastedBytes: 0, lastSeenCompleteMs: null,
-  pieceCount: null, pieceSize: null, piecesHave: null, createdBy: null, createdAtMs: null, comment: null,
-  addedAtMs: 0, completedAtMs: null, savePath: null, unpack: false, unpackOverride: null, seedingLeft: null, seedingGoalLeft: null, route: null, routeConsumer: "torrent:default",
+const torrent = (
+  id: number,
+  level: SettingLevel,
+  override: SeedingPolicyData | null,
+): TorrentData => ({
+  id,
+  name: `torrent ${id}`,
+  infohash: "00".repeat(20),
+  infohashV2: null,
+  state: "SEEDING",
+  stated: null,
+  detail: null,
+  routeReason: null,
+  category: "movies",
+  private: false,
+  forced: false,
+  progress: 1,
+  totalBytes: 2048,
+  haveBytes: 2048,
+  uploadedBytes: 0,
+  downloadedBytes: 2048,
+  ratio: 0.4,
+  downloadBps: 0,
+  uploadBps: 0,
+  uploadLimit: null,
+  downloadLimit: null,
+  etaSeconds: null,
+  peers: 9,
+  seeds: 3,
+  leechers: 6,
+  maxPeers: 50,
+  swarmSeeds: 12,
+  swarmLeechers: 20,
+  reannounceSeconds: null,
+  activeSeconds: 0,
+  seedingSeconds: 0,
+  consecutiveSeedingSeconds: 0,
+  downloadAvgBps: 0,
+  uploadAvgBps: 0,
+  wastedBytes: 0,
+  lastSeenCompleteMs: null,
+  pieceCount: null,
+  pieceSize: null,
+  piecesHave: null,
+  createdBy: null,
+  createdAtMs: null,
+  comment: null,
+  addedAtMs: 0,
+  completedAtMs: null,
+  savePath: null,
+  unpack: false,
+  unpackOverride: null,
+  seedingLeft: null,
+  seedingGoalLeft: null,
+  route: null,
+  routeConsumer: "torrent:default",
   seedingOverride: override,
   seedingPolicy: {
     ratioGoal: override?.ratioGoal.value ?? (level === "CATEGORY" ? 1.5 : 1),
-    seedTimeGoalMinutes: null, inactiveGoalMinutes: null, mode: "ANY", action: "STOP", seedTimeCounting: "CUMULATIVE", uploadCap: null,
+    seedTimeGoalMinutes: null,
+    inactiveGoalMinutes: null,
+    mode: "ANY",
+    action: "STOP",
+    seedTimeCounting: "CUMULATIVE",
+    uploadCap: null,
     levels: {
-      ratioGoal: level, seedTimeGoalMinutes: "GLOBAL", inactiveGoalMinutes: "GLOBAL", mode: "GLOBAL", action: "GLOBAL", seedTimeCounting: "GLOBAL", uploadCap: "GLOBAL",
+      ratioGoal: level,
+      seedTimeGoalMinutes: "GLOBAL",
+      inactiveGoalMinutes: "GLOBAL",
+      mode: "GLOBAL",
+      action: "GLOBAL",
+      seedTimeCounting: "GLOBAL",
+      uploadCap: "GLOBAL",
     },
   },
   trackerRule: null,
-  files: [{ index: 0, path: "fixture.mkv", length: 2048, selected: true, priority: "NORMAL", progress: 0.25 }],
+  files: [
+    {
+      index: 0,
+      path: "fixture.mkv",
+      length: 2048,
+      selected: true,
+      priority: "NORMAL",
+      progress: 0.25,
+    },
+  ],
   sequential: false,
   firstLastPieceFirst: false,
   trackers: [],
@@ -216,8 +445,12 @@ function Seeding() {
         <div key={entry.id} aria-label={entry.seedingPolicy.levels.ratioGoal}>
           <TorrentDetail
             torrent={entry}
-            onChanged={() => { status.textContent = `changed ${entry.id}`; }}
-            onReport={(message) => { status.textContent = message; }}
+            onChanged={() => {
+              status.textContent = `changed ${entry.id}`;
+            }}
+            onReport={(message) => {
+              status.textContent = message;
+            }}
           />
         </div>
       ))}
@@ -225,19 +458,36 @@ function Seeding() {
   );
 }
 
-const file = (index: number, path: string, priority: TorrentFileData["priority"]): TorrentFileData => ({
-  index, path, length: 1024 * (index + 1), selected: priority !== "IGNORED", priority, progress: 0,
+const file = (
+  index: number,
+  path: string,
+  priority: TorrentFileData["priority"],
+): TorrentFileData => ({
+  index,
+  path,
+  length: 1024 * (index + 1),
+  selected: priority !== "IGNORED",
+  priority,
+  progress: 0,
 });
 
 /** One torrent's detail as the job page shows it: read from its subscription, and read again on each change. */
 function Files() {
-  const [{ data }, follow] = useSubscription<{ torrentUpdates: TorrentChangesData<TorrentData> }>({
+  const [{ data }, follow] = useSubscription<{
+    torrentUpdates: TorrentChangesData<TorrentData>;
+  }>({
     query: TORRENT_UPDATES_SUBSCRIPTION,
     variables: { id: 4 },
   });
   const live = data?.torrentUpdates.torrents[0];
   return live ? (
-    <TorrentDetail torrent={live} onChanged={() => follow()} onReport={(message) => { status.textContent = message; }} />
+    <TorrentDetail
+      torrent={live}
+      onChanged={() => follow()}
+      onReport={(message) => {
+        status.textContent = message;
+      }}
+    />
   ) : null;
 }
 
@@ -247,21 +497,57 @@ function Files() {
  */
 function SeedingRows() {
   const statusLabel = useStatusLabel();
-  const summary = (id: number, policy: TorrentSummaryData["seedingPolicy"]): TorrentSummaryData => ({
-    id, state: "SEEDING", forced: false, ratio: 0.5, uploadBps: 419_000, seedingGoalLeft: null,
-    seedingSeconds: 7200, consecutiveSeedingSeconds: 60, seedingPolicy: policy,
+  const summary = (
+    id: number,
+    policy: TorrentSummaryData["seedingPolicy"],
+  ): TorrentSummaryData => ({
+    id,
+    state: "SEEDING",
+    forced: false,
+    ratio: 0.5,
+    uploadBps: 419_000,
+    seedingGoalLeft: null,
+    seedingSeconds: 7200,
+    consecutiveSeedingSeconds: 60,
+    seedingPolicy: policy,
   });
   const rows: [string, TorrentSummaryData][] = [
-    ["ratio only", summary(1, { ratioGoal: 2, seedTimeGoalMinutes: null, seedTimeCounting: "CUMULATIVE" })],
-    ["ratio and time", summary(2, { ratioGoal: 2, seedTimeGoalMinutes: 240, seedTimeCounting: "CUMULATIVE" })],
-    ["no goal", summary(3, { ratioGoal: null, seedTimeGoalMinutes: null, seedTimeCounting: "CUMULATIVE" })],
+    [
+      "ratio only",
+      summary(1, {
+        ratioGoal: 2,
+        seedTimeGoalMinutes: null,
+        seedTimeCounting: "CUMULATIVE",
+      }),
+    ],
+    [
+      "ratio and time",
+      summary(2, {
+        ratioGoal: 2,
+        seedTimeGoalMinutes: 240,
+        seedTimeCounting: "CUMULATIVE",
+      }),
+    ],
+    [
+      "no goal",
+      summary(3, {
+        ratioGoal: null,
+        seedTimeGoalMinutes: null,
+        seedTimeCounting: "CUMULATIVE",
+      }),
+    ],
   ];
   return (
     <ul className="@container">
       {rows.map(([label, seeding]) => (
         <li key={label} aria-label={label}>
           <DownloadRow
-            job={job({ id: seeding.id, status: "SEEDING", protocol: "TORRENT", progress: 1 })}
+            job={job({
+              id: seeding.id,
+              status: "SEEDING",
+              protocol: "TORRENT",
+              progress: 1,
+            })}
             selected={false}
             onSelect={() => {}}
             onOpen={() => {}}
@@ -285,9 +571,18 @@ function Fixture() {
   if (screen === "tag") {
     return (
       <ul>
-        <li aria-label="torrent row"><ProtocolTag protocol="TORRENT" />torrent job</li>
-        <li aria-label="nzb row"><ProtocolTag protocol="NZB" />nzb job</li>
-        <li aria-label="older row"><ProtocolTag protocol={undefined} />older job</li>
+        <li aria-label="torrent row">
+          <ProtocolTag protocol="TORRENT" />
+          torrent job
+        </li>
+        <li aria-label="nzb row">
+          <ProtocolTag protocol="NZB" />
+          nzb job
+        </li>
+        <li aria-label="older row">
+          <ProtocolTag protocol={undefined} />
+          older job
+        </li>
       </ul>
     );
   }
@@ -297,7 +592,13 @@ function Fixture() {
       job({ downloadWaitReason: "PROPAGATION_DELAY" }),
       job({ downloadWaitReason: "SOME_NEW_CODE" }),
     ].map((entry) => statusDetail(t, entry, null));
-    return <ul aria-label="details">{details.map((detail, index) => <li key={index}>{detail}</li>)}</ul>;
+    return (
+      <ul aria-label="details">
+        {details.map((detail, index) => (
+          <li key={index}>{detail}</li>
+        ))}
+      </ul>
+    );
   }
   if (screen === "remove") return <Remove goalLeft="ratio 0.40 of 1.00" />;
   if (screen === "removeMet") return <Remove goalLeft={null} />;
@@ -305,30 +606,93 @@ function Fixture() {
   if (screen === "seeding") return <Seeding />;
   if (screen === "seedingRows") return <SeedingRows />;
   if (screen === "trackers" || screen === "privateTrackers") {
-    const tracker = (url: string, source: TorrentTrackerData["source"]): TorrentTrackerData => ({
-      tier: 0, url, source, resolvedBy: null, status: "WORKING", updating: false, message: null, seeders: 1, leechers: 0, peers: 1,
+    const tracker = (
+      url: string,
+      source: TorrentTrackerData["source"],
+    ): TorrentTrackerData => ({
+      tier: 0,
+      url,
+      source,
+      resolvedBy: null,
+      status: "WORKING",
+      updating: false,
+      message: null,
+      seeders: 1,
+      leechers: 0,
+      peers: 1,
     });
     const named = {
       ...torrent(5, "GLOBAL", null),
       private: screen === "privateTrackers",
-      trackers: [tracker("http://a.test/announce", "TORRENT"), tracker("http://b.test/announce", "OPERATOR")],
+      trackers: [
+        tracker("http://a.test/announce", "TORRENT"),
+        tracker("http://b.test/announce", "OPERATOR"),
+      ],
     };
-    return <TorrentDetail torrent={named} onChanged={() => {}} onReport={(message) => { status.textContent = message; }} />;
+    return (
+      <TorrentDetail
+        torrent={named}
+        onChanged={() => {}}
+        onReport={(message) => {
+          status.textContent = message;
+        }}
+      />
+    );
   }
   if (screen === "files") {
     held ??= {
       ...torrent(4, "GLOBAL", null),
       state: "DOWNLOADING",
-      files: [file(0, "set/a.mkv", "NORMAL"), file(1, "set/b.nfo", "NORMAL"), file(2, "set/c.srt", "IGNORED")],
+      files: [
+        file(0, "set/a.mkv", "NORMAL"),
+        file(1, "set/b.nfo", "NORMAL"),
+        file(2, "set/c.srt", "IGNORED"),
+      ],
     };
     pending ??= held;
     return <Files />;
   }
-  return <AddNzbDialog open onClose={() => { status.textContent = "closed"; }} />;
+  return (
+    <AddNzbDialog
+      open
+      onClose={() => {
+        status.textContent = "closed";
+      }}
+    />
+  );
 }
 
 createRoot(document.getElementById("root")!).render(
-  <Provider value={client}><TranslateContext.Provider value={{
-    t, uiLanguage: "eng", selectedLanguage: { code: "eng", label: "English" }, setLanguagePreference: () => {},
-  }}><MemoryRouter><NextDataContext.Provider value={{ torrents: "on", torrentPresence: { available: true, enabled: true, jobs: false, running: false, windingDown: false, windDown: null } } as NextData}><main className="mx-auto max-w-[1000px] p-8"><Fixture /></main></NextDataContext.Provider></MemoryRouter></TranslateContext.Provider></Provider>,
+  <Provider value={client}>
+    <TranslateContext.Provider
+      value={{
+        t,
+        uiLanguage: "eng",
+        selectedLanguage: { code: "eng", label: "English" },
+        setLanguagePreference: () => {},
+      }}
+    >
+      <MemoryRouter>
+        <NextDataContext.Provider
+          value={
+            {
+              torrents: "on",
+              torrentPresence: {
+                available: true,
+                enabled: true,
+                jobs: false,
+                running: false,
+                windingDown: false,
+                windDown: null,
+              },
+            } as NextData
+          }
+        >
+          <main className="mx-auto max-w-[1000px] p-8">
+            <Fixture />
+          </main>
+        </NextDataContext.Provider>
+      </MemoryRouter>
+    </TranslateContext.Provider>
+  </Provider>,
 );

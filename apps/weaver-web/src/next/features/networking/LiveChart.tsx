@@ -21,10 +21,18 @@ function niceCeiling(value: number): number {
   if (value <= 0) {
     return 1;
   }
-  const unit = 1024 ** Math.min(Math.max(Math.floor(Math.log(value) / Math.log(1024)), 0), 4);
+  const unit =
+    1024 **
+    Math.min(Math.max(Math.floor(Math.log(value) / Math.log(1024)), 0), 4);
   const scaled = value / unit;
   const power = 10 ** Math.floor(Math.log10(scaled));
-  return ([1, 1.5, 2, 2.5, 3, 4, 5, 6, 8, 10].find((step) => step * power >= scaled) ?? 10) * power * unit;
+  return (
+    ([1, 1.5, 2, 2.5, 3, 4, 5, 6, 8, 10].find(
+      (step) => step * power >= scaled,
+    ) ?? 10) *
+    power *
+    unit
+  );
 }
 
 /** How long the chart takes to move on to a newly closed bin; the polls arrive about a second apart. */
@@ -55,7 +63,10 @@ function useGlide(target: number, paint: (shown: number) => void) {
   });
   useEffect(() => {
     const from = current.current;
-    if (target <= from || window.matchMedia?.("(prefers-reduced-motion: reduce)").matches) {
+    if (
+      target <= from ||
+      window.matchMedia?.("(prefers-reduced-motion: reduce)").matches
+    ) {
       current.current = target;
       painter.current(target);
       return;
@@ -102,16 +113,26 @@ export function LiveChart({
     if (!element) {
       return;
     }
-    const observer = new ResizeObserver(([entry]) => setWidth(Math.round(entry?.contentRect.width ?? 0)));
+    const observer = new ResizeObserver(([entry]) =>
+      setWidth(Math.round(entry?.contentRect.width ?? 0)),
+    );
     observer.observe(element);
     return () => observer.disconnect();
   }, []);
 
   const latest = points.at(-1);
   const end = latest?.at ?? 0;
-  const ceiling = niceCeiling(Math.max(0, ...points.filter((point) => point.at > end - WINDOW_MS * 1.5).map((point) => point.rate)));
+  const ceiling = niceCeiling(
+    Math.max(
+      0,
+      ...points
+        .filter((point) => point.at > end - WINDOW_MS * 1.5)
+        .map((point) => point.rate),
+    ),
+  );
   const scale = width / WINDOW_MS;
-  const y = (rate: number) => HEIGHT - (Math.min(rate, ceiling) / ceiling) * (HEIGHT - HEAD);
+  const y = (rate: number) =>
+    HEIGHT - (Math.min(rate, ceiling) / ceiling) * (HEIGHT - HEAD);
   const reveal = useRef<SVGRectElement>(null);
   const slide = useRef<SVGGElement>(null);
   const area = useRef<SVGPolygonElement>(null);
@@ -122,9 +143,14 @@ export function LiveChart({
     const shift = Math.min(0, width - shown * scale);
     const reach = shown * scale + shift;
     const vertices = [{ at: 0, rate: points[0]?.rate ?? 0 }, ...points]
-      .filter((point, index, all) => (all[index + 1]?.at ?? Infinity) >= shown - WINDOW_MS - 2000)
+      .filter(
+        (point, index, all) =>
+          (all[index + 1]?.at ?? Infinity) >= shown - WINDOW_MS - 2000,
+      )
       .map((point) => ({ x: point.at * scale, y: y(point.rate) }));
-    const line = vertices.map((point) => `${point.x.toFixed(1)},${point.y.toFixed(1)}`);
+    const line = vertices.map(
+      (point) => `${point.x.toFixed(1)},${point.y.toFixed(1)}`,
+    );
     const first = line[0]?.split(",")[0] ?? "0";
     // Where the line stands at the shown moment, between the two corners either side of it.
     const at = shown * scale;
@@ -133,17 +159,31 @@ export function LiveChart({
     const next = vertices[after] ?? vertices.at(-1);
     const dot =
       before && next && next.x > before.x
-        ? before.y + ((next.y - before.y) * (at - before.x)) / (next.x - before.x)
+        ? before.y +
+          ((next.y - before.y) * (at - before.x)) / (next.x - before.x)
         : (next?.y ?? HEIGHT);
     place(reveal.current, "x", String(reach - width));
     place(slide.current, "transform", `translate(${shift.toFixed(1)} 0)`);
-    place(area.current, "points", `${first},${HEIGHT} ${line.join(" ")} ${(end * scale).toFixed(1)},${HEIGHT}`);
+    place(
+      area.current,
+      "points",
+      `${first},${HEIGHT} ${line.join(" ")} ${(end * scale).toFixed(1)},${HEIGHT}`,
+    );
     place(trace.current, "points", line.join(" "));
-    place(lead.current, "transform", `translate(${reach.toFixed(1)} ${dot.toFixed(1)})`);
+    place(
+      lead.current,
+      "transform",
+      `translate(${reach.toFixed(1)} ${dot.toFixed(1)})`,
+    );
   });
 
   return (
-    <div ref={box} className="relative h-[132px] w-full min-w-0" role="img" aria-label={label}>
+    <div
+      ref={box}
+      className="relative h-[132px] w-full min-w-0"
+      role="img"
+      aria-label={label}
+    >
       {width > 0 ? (
         <svg width={width} height={HEIGHT} className="block overflow-visible">
           <defs>
@@ -153,24 +193,58 @@ export function LiveChart({
             </linearGradient>
             <clipPath id={clip}>
               {/* What has arrived so far, revealed as it arrives. */}
-              <rect ref={reveal} y={-HEAD} width={width} height={HEIGHT + 2 * HEAD} />
+              <rect
+                ref={reveal}
+                y={-HEAD}
+                width={width}
+                height={HEIGHT + 2 * HEAD}
+              />
             </clipPath>
           </defs>
-          <line x1={0} x2={width} y1={HEIGHT - 0.5} y2={HEIGHT - 0.5} className="stroke-wv-hairline" />
-          <line x1={0} x2={width} y1={HEAD} y2={HEAD} strokeDasharray="2 4" className="stroke-wv-hairline" />
-          <text x={0} y={HEAD - 6} className="fill-wv-muted font-wv-mono text-[10.5px]">
+          <line
+            x1={0}
+            x2={width}
+            y1={HEIGHT - 0.5}
+            y2={HEIGHT - 0.5}
+            className="stroke-wv-hairline"
+          />
+          <line
+            x1={0}
+            x2={width}
+            y1={HEAD}
+            y2={HEAD}
+            strokeDasharray="2 4"
+            className="stroke-wv-hairline"
+          />
+          <text
+            x={0}
+            y={HEAD - 6}
+            className="fill-wv-muted font-wv-mono text-[10.5px]"
+          >
             {formatRate(ceiling)}
           </text>
           {points.length ? (
             <g clipPath={`url(#${clip})`}>
               <g ref={slide}>
                 <polygon ref={area} fill={`url(#${fill})`} />
-                <polyline ref={trace} fill="none" stroke={color} strokeWidth={2} strokeLinejoin="round" strokeLinecap="round" />
+                <polyline
+                  ref={trace}
+                  fill="none"
+                  stroke={color}
+                  strokeWidth={2}
+                  strokeLinejoin="round"
+                  strokeLinecap="round"
+                />
               </g>
             </g>
           ) : null}
           <g ref={lead} className={cn(!latest && "opacity-0")}>
-            <circle r={8} fill={color} opacity={0.25} className="origin-center [transform-box:fill-box] motion-safe:animate-ping" />
+            <circle
+              r={8}
+              fill={color}
+              opacity={0.25}
+              className="origin-center [transform-box:fill-box] motion-safe:animate-ping"
+            />
             <circle r={3.5} fill={color} />
           </g>
         </svg>

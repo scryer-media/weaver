@@ -6,7 +6,11 @@ import { useClient } from "urql";
 import { ROUTE_NAMES_QUERY } from "@/graphql/dns";
 import { useTranslate } from "@/lib/context/translate-context";
 import { OUTBOUND_CONSUMER, TORRENT_DEFAULT_CONSUMER } from "@/lib/networking";
-import { refusalMessage, refusalNamesSomething, type FailedRequest } from "@/lib/refusal";
+import {
+  refusalMessage,
+  refusalNamesSomething,
+  type FailedRequest,
+} from "@/lib/refusal";
 import { consumerName } from "./data";
 
 type RouteNames = {
@@ -27,19 +31,37 @@ export function useNamedRefusal(): (failed: FailedRequest) => Promise<string> {
   return useCallback(
     async (failed: FailedRequest) => {
       if (!refusalNamesSomething(failed)) return refusalMessage(t, failed);
-      const { data: names } = await client.query<RouteNames>(ROUTE_NAMES_QUERY, {}, { requestPolicy: "network-only" }).toPromise();
+      const { data: names } = await client
+        .query<RouteNames>(
+          ROUTE_NAMES_QUERY,
+          {},
+          { requestPolicy: "network-only" },
+        )
+        .toPromise();
       const routes = new Map<string, string>([
-        ...(names?.servers ?? []).map((server) => [`server:${server.id}`, server.host] as const),
-        ...(names?.rssFeeds ?? []).map((feed) => [`rss:${feed.id}`, feed.name] as const),
-        ...(names?.networkFlow?.consumers ?? []).map((consumer) => [consumer.key, consumer.name] as const),
+        ...(names?.servers ?? []).map(
+          (server) => [`server:${server.id}`, server.host] as const,
+        ),
+        ...(names?.rssFeeds ?? []).map(
+          (feed) => [`rss:${feed.id}`, feed.name] as const,
+        ),
+        ...(names?.networkFlow?.consumers ?? []).map(
+          (consumer) => [consumer.key, consumer.name] as const,
+        ),
       ]);
-      const proxies = new Map((names?.proxyProfiles ?? []).map((proxy) => [proxy.id, proxy.name] as const));
+      const proxies = new Map(
+        (names?.proxyProfiles ?? []).map(
+          (proxy) => [proxy.id, proxy.name] as const,
+        ),
+      );
       return refusalMessage(t, failed, {
         route: (key) => {
           const name = routes.get(key);
           if (name !== undefined) return consumerName(t, key, name);
           // Default outbound and the torrent default are named by key; any other route with no name is gone.
-          return key === OUTBOUND_CONSUMER || key === TORRENT_DEFAULT_CONSUMER ? consumerName(t, key, key) : t("next.networking.deletedRoute");
+          return key === OUTBOUND_CONSUMER || key === TORRENT_DEFAULT_CONSUMER
+            ? consumerName(t, key, key)
+            : t("next.networking.deletedRoute");
         },
         proxy: (id) => proxies.get(id),
       });

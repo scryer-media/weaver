@@ -45,7 +45,12 @@ test("a running pool leads with the state word and keeps the counts", () => {
 
 test("an idle pool says so rather than showing a zero", () => {
   const label = providerActivityLabel(
-    provider({ activity: "idle", connectionsOpen: 0, connectionsBusy: 0, connectionsActive: 0 }),
+    provider({
+      activity: "idle",
+      connectionsOpen: 0,
+      connectionsBusy: 0,
+      connectionsActive: 0,
+    }),
     t,
     NOW,
   );
@@ -89,10 +94,17 @@ test("a cooldown names the errors behind it and when it lifts", () => {
     NOW,
   );
   assert.equal(withDeadline.word, "cooling");
-  assert.equal(withDeadline.cause, "paused after repeated errors, resuming in 45s");
+  assert.equal(
+    withDeadline.cause,
+    "paused after repeated errors, resuming in 45s",
+  );
   assert.equal(withDeadline.tone, "warn");
 
-  const withoutDeadline = providerActivityLabel(provider({ activity: "cooling_down" }), t, NOW);
+  const withoutDeadline = providerActivityLabel(
+    provider({ activity: "cooling_down" }),
+    t,
+    NOW,
+  );
   assert.equal(withoutDeadline.cause, "paused after repeated errors");
 });
 
@@ -107,7 +119,11 @@ test("degraded and disabled each carry their own cause", () => {
     (({ word, cause, tone }) => ({ word, cause, tone }))(
       providerActivityLabel(provider({ activity: "disabled" }), t, NOW),
     ),
-    { word: "disabled", cause: "paused after login or repeated failures", tone: "error" },
+    {
+      word: "disabled",
+      cause: "paused after login or repeated failures",
+      tone: "error",
+    },
   );
 });
 
@@ -118,7 +134,10 @@ test("a quarantined server counts down to its retry like any other holdoff", () 
     NOW,
   );
   assert.equal(quarantined.word, "disabled");
-  assert.equal(quarantined.cause, "paused after login or repeated failures, retrying in 45s");
+  assert.equal(
+    quarantined.cause,
+    "paused after login or repeated failures, retrying in 45s",
+  );
   assert.equal(quarantined.tone, "error");
 });
 
@@ -135,12 +154,19 @@ test("held-open connections read as preparing, with the repair fetch as the caus
 });
 
 test("an activity the daemon has not taught the rail falls back to idle", () => {
-  assert.equal(providerActivityLabel(provider({ activity: "" }), t, NOW).word, "idle");
+  assert.equal(
+    providerActivityLabel(provider({ activity: "" }), t, NOW).word,
+    "idle",
+  );
 });
 
 test("a live maximum of zero falls back to the configured one", () => {
   const label = providerActivityLabel(
-    provider({ activity: "idle", connectionsMax: 0, connectionsConfigured: 20 }),
+    provider({
+      activity: "idle",
+      connectionsMax: 0,
+      connectionsConfigured: 20,
+    }),
     t,
     NOW,
   );

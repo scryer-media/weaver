@@ -18,11 +18,7 @@ import { formatCount } from "./format.ts";
 
 /** What the request answered for one id, before any disk work. */
 export type ArchiveHistoryAcceptOutcome =
-  | "ACCEPTED"
-  | "NOT_FOUND"
-  | "BUSY"
-  | "NOT_FINISHED"
-  | "ALREADY_ARCHIVED";
+  "ACCEPTED" | "NOT_FOUND" | "BUSY" | "NOT_FINISHED" | "ALREADY_ARCHIVED";
 
 export interface ArchiveHistoryAcceptResult {
   id: number;
@@ -31,12 +27,7 @@ export interface ArchiveHistoryAcceptResult {
 
 /** How an archive ended, on a failed ARCHIVE operation. */
 export type ArchiveHistoryOutcome =
-  | "ARCHIVED"
-  | "ALREADY_GONE"
-  | "NOT_MANAGED"
-  | "BUSY"
-  | "NOT_FOUND"
-  | "FAILED";
+  "ARCHIVED" | "ALREADY_GONE" | "NOT_MANAGED" | "BUSY" | "NOT_FOUND" | "FAILED";
 
 /** The history operation an entry waits on, or the last one that failed for it. */
 export interface HistoryRowOperation {
@@ -67,7 +58,12 @@ export interface HistoryRowState {
  * there is none.
  */
 export function rowOperationKind(
-  operation: Pick<HistoryRowOperation, "state"> & { action?: HistoryRowOperation["action"] } | null | undefined,
+  operation:
+    | (Pick<HistoryRowOperation, "state"> & {
+        action?: HistoryRowOperation["action"];
+      })
+    | null
+    | undefined,
 ): "deleting" | "archiving" | "archiveFailed" | null {
   if (!operation) {
     return null;
@@ -98,8 +94,13 @@ export function rowDeletes(row: HistoryRowState): boolean {
 }
 
 /** `Not archived · Failed: disk full`, for an archive that failed. */
-export function describeFailedArchive(t: Translate, operation: HistoryRowOperation): string {
-  const outcome = t(`next.historyArchive.outcome.${operation.archiveOutcome ?? "FAILED"}`);
+export function describeFailedArchive(
+  t: Translate,
+  operation: HistoryRowOperation,
+): string {
+  const outcome = t(
+    `next.historyArchive.outcome.${operation.archiveOutcome ?? "FAILED"}`,
+  );
   const message = operation.errorMessage?.trim();
   return `${t("next.historyArchive.failed")} · ${message ? `${outcome}: ${message}` : outcome}`;
 }
@@ -115,8 +116,7 @@ export function archiveHistoryChunks(ids: readonly number[]): number[][] {
 
 /** One call's answer: its results, or why it was refused whole. */
 export type ArchiveHistoryCall =
-  | { results: readonly ArchiveHistoryAcceptResult[] }
-  | { error: string };
+  { results: readonly ArchiveHistoryAcceptResult[] } | { error: string };
 
 export interface ArchiveHistoryRequest {
   results: ArchiveHistoryAcceptResult[];
@@ -164,24 +164,38 @@ export function describeArchiveHistory(
   results: readonly ArchiveHistoryAcceptResult[],
   requested: number = results.length,
 ): string {
-  const queued = results.filter((result) => result.outcome === "ACCEPTED").length;
-  const gone = results.filter((result) => result.outcome === "ALREADY_ARCHIVED").length;
+  const queued = results.filter(
+    (result) => result.outcome === "ACCEPTED",
+  ).length;
+  const gone = results.filter(
+    (result) => result.outcome === "ALREADY_ARCHIVED",
+  ).length;
   const refused = results.filter(
-    (result) => result.outcome !== "ACCEPTED" && result.outcome !== "ALREADY_ARCHIVED",
+    (result) =>
+      result.outcome !== "ACCEPTED" && result.outcome !== "ALREADY_ARCHIVED",
   );
   const unanswered = Math.max(0, requested - results.length);
   const alreadyGone =
-    gone > 0 ? countLabel(t, "next.historyArchive.alreadyArchived", gone, { count: formatCount(gone) }) : null;
+    gone > 0
+      ? countLabel(t, "next.historyArchive.alreadyArchived", gone, {
+          count: formatCount(gone),
+        })
+      : null;
   if (refused.length === 0 && unanswered === 0) {
     const done =
       queued > 0 || gone === 0
-        ? countLabel(t, "next.historyArchive.queued", queued, { count: formatCount(queued) })
+        ? countLabel(t, "next.historyArchive.queued", queued, {
+            count: formatCount(queued),
+          })
         : null;
     return [done, alreadyGone].filter((part) => part !== null).join(" · ");
   }
   const named = refused
     .slice(0, NAMED_FAILURES)
-    .map((result) => `#${result.id} ${t(`next.historyArchive.outcome.${result.outcome}`)}`);
+    .map(
+      (result) =>
+        `#${result.id} ${t(`next.historyArchive.outcome.${result.outcome}`)}`,
+    );
   const more = refused.length - named.length;
   return [
     t("next.historyArchive.queuedPartial", {
@@ -190,9 +204,13 @@ export function describeArchiveHistory(
     }),
     alreadyGone,
     ...named,
-    more > 0 ? t("next.historyArchive.more", { count: formatCount(more) }) : null,
+    more > 0
+      ? t("next.historyArchive.more", { count: formatCount(more) })
+      : null,
     unanswered > 0
-      ? countLabel(t, "next.historyArchive.unanswered", unanswered, { count: formatCount(unanswered) })
+      ? countLabel(t, "next.historyArchive.unanswered", unanswered, {
+          count: formatCount(unanswered),
+        })
       : null,
   ]
     .filter((part) => part !== null)

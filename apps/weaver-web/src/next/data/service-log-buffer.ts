@@ -74,7 +74,12 @@ export function parseLogLine(id: number, raw: string): LogLine {
   KV_RE.lastIndex = 0;
   let kv: RegExpExecArray | null;
   while ((kv = KV_RE.exec(body)) !== null) {
-    kvPairs.push({ key: kv[1]!, value: kv[2]!, start: kv.index, end: kv.index + kv[0].length });
+    kvPairs.push({
+      key: kv[1]!,
+      value: kv[2]!,
+      start: kv.index,
+      end: kv.index + kv[0].length,
+    });
   }
   return {
     id,
@@ -149,7 +154,9 @@ function readJson(source: string): JsonValue | null {
           }
         }
       }
-      return char === "[" ? { kind: "array", items } : { kind: "object", entries };
+      return char === "["
+        ? { kind: "array", items }
+        : { kind: "object", entries };
     }
     LITERAL_RE.lastIndex = at;
     const literal = LITERAL_RE.exec(source);
@@ -180,7 +187,9 @@ function writeJson(value: JsonValue, indent: string | null, depth = 0): string {
   if (parts.length === 0) return open + close;
   if (indent === null) return open + parts.join(",") + close;
   const inner = "\n" + indent.repeat(depth + 1);
-  return open + inner + parts.join("," + inner) + "\n" + indent.repeat(depth) + close;
+  return (
+    open + inner + parts.join("," + inner) + "\n" + indent.repeat(depth) + close
+  );
 }
 
 /** Whether the text line quotes `text`: empty, or holding a space, `"`, `=` or a control character. */
@@ -195,7 +204,8 @@ function quoted(text: string): boolean {
 
 /** Whether `text` is one string already quoted, every quote inside it escaped. */
 function debugQuoted(text: string): boolean {
-  if (text.length < 2 || !text.startsWith('"') || !text.endsWith('"')) return false;
+  if (text.length < 2 || !text.startsWith('"') || !text.endsWith('"'))
+    return false;
   let at = 1;
   while (at < text.length - 1) {
     if (text[at] === "\\") at += 2;
@@ -216,8 +226,13 @@ function textValue(value: JsonValue): string {
   return quoted(text) ? JSON.stringify(text) : text;
 }
 
-function entry(value: JsonValue | null | undefined, key: string): JsonValue | undefined {
-  return value?.kind === "object" ? value.entries.find(([name]) => name === key)?.[1] : undefined;
+function entry(
+  value: JsonValue | null | undefined,
+  key: string,
+): JsonValue | undefined {
+  return value?.kind === "object"
+    ? value.entries.find(([name]) => name === key)?.[1]
+    : undefined;
 }
 
 function text(value: JsonValue | undefined): string | null {
@@ -234,7 +249,12 @@ export function readLogLine(id: number, source: string): LogLine {
   const stamp = text(entry(record, "timestamp"));
   const levelName = text(entry(record, "level"));
   const target = text(entry(record, "target"));
-  if (record === null || stamp === null || levelName === null || target === null) {
+  if (
+    record === null ||
+    stamp === null ||
+    levelName === null ||
+    target === null
+  ) {
     return { ...parseLogLine(id, source), source };
   }
 
@@ -263,7 +283,12 @@ export function readLogLine(id: number, source: string): LogLine {
       message += value.kind === "string" ? value.text : writeJson(value, null);
     } else {
       const pair = `${key}=${textValue(value)}`;
-      kvPairs.push({ key, value: textValue(value), start: message.length, end: message.length + pair.length });
+      kvPairs.push({
+        key,
+        value: textValue(value),
+        start: message.length,
+        end: message.length + pair.length,
+      });
       message += pair;
     }
   }
@@ -273,7 +298,9 @@ export function readLogLine(id: number, source: string): LogLine {
     id,
     source,
     raw: `${head}${target}:${message === "" ? "" : " " + message}`,
-    level: (LOG_LEVELS as readonly string[]).includes(lower) ? (lower as LogLevel) : detectLevel(levelName),
+    level: (LOG_LEVELS as readonly string[]).includes(lower)
+      ? (lower as LogLevel)
+      : detectLevel(levelName),
     time: timeOf(stamp),
     target,
     message,
@@ -388,6 +415,11 @@ export function mergeSnapshot(
   }
 
   const changed =
-    lines.length !== buffered.length || lines.some((line, index) => line !== buffered[index]);
-  return { lines: changed ? lines : (buffered as LogLine[]), nextId: id, changed };
+    lines.length !== buffered.length ||
+    lines.some((line, index) => line !== buffered[index]);
+  return {
+    lines: changed ? lines : (buffered as LogLine[]),
+    nextId: id,
+    changed,
+  };
 }

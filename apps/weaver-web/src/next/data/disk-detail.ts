@@ -6,7 +6,10 @@ import type { Translate } from "@/lib/context/translate-context";
 import type { DiskWrite, JobData } from "@/lib/job-types";
 import { formatRate, formatSize } from "./format.ts";
 
-type DiskJob = Pick<JobData, "diskWrite" | "status" | "remainingBytes" | "totalBytes" | "downloadedBytes">;
+type DiskJob = Pick<
+  JobData,
+  "diskWrite" | "status" | "remainingBytes" | "totalBytes" | "downloadedBytes"
+>;
 
 /** Statuses that show their own work: the disk is named only while it is slow. */
 const WORKING = new Set(["VERIFYING", "REPAIRING", "EXTRACTING"]);
@@ -21,11 +24,15 @@ const FETCHING = new Set(["DOWNLOADING", "FETCHING_REPAIR_DATA"]);
  * status, and the disk only while its own writes wait on a slow one, as the
  * server lists it. Null otherwise.
  */
-export function shownDiskWrite(job: DiskJob): { write: DiskWrite; fetched: boolean } | null {
+export function shownDiskWrite(
+  job: DiskJob,
+): { write: DiskWrite; fetched: boolean } | null {
   const write = job.diskWrite;
   if (!write) return null;
-  if (WORKING.has(job.status)) return write.slow ? { write, fetched: false } : null;
-  const fetched = (job.remainingBytes ?? job.totalBytes - job.downloadedBytes) <= 0;
+  if (WORKING.has(job.status))
+    return write.slow ? { write, fetched: false } : null;
+  const fetched =
+    (job.remainingBytes ?? job.totalBytes - job.downloadedBytes) <= 0;
   if (fetched) return write.draining ? { write, fetched } : null;
   return write.slow && FETCHING.has(job.status) ? { write, fetched } : null;
 }
@@ -46,7 +53,11 @@ export function diskVolumeOf(
  * disk list carries the disk, the short form. Null when the row shows no disk
  * write.
  */
-export function diskDetail(t: Translate, job: DiskJob, volumes: readonly DiskVolume[]): string | null {
+export function diskDetail(
+  t: Translate,
+  job: DiskJob,
+  volumes: readonly DiskVolume[],
+): string | null {
   const shown = shownDiskWrite(job);
   if (!shown) return null;
   const { write, fetched } = shown;
@@ -58,7 +69,11 @@ export function diskDetail(t: Translate, job: DiskJob, volumes: readonly DiskVol
     return t("next.status.diskLeft", { left: waiting, volume });
   }
   return figures.writeRateBytesPerSec > 0
-    ? t("next.status.diskWriting", { waiting, volume, rate: formatRate(figures.writeRateBytesPerSec) })
+    ? t("next.status.diskWriting", {
+        waiting,
+        volume,
+        rate: formatRate(figures.writeRateBytesPerSec),
+      })
     : t("next.status.diskWaiting", { waiting, volume });
 }
 

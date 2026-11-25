@@ -42,7 +42,9 @@ export function LimitControl({
           step={0.1}
           precision={1}
           suffix={suffix}
-          testId={fieldId === undefined ? undefined : testIds.fieldValue(fieldId)}
+          testId={
+            fieldId === undefined ? undefined : testIds.fieldValue(fieldId)
+          }
           onChange={(next) => {
             const bytes = Math.round(Math.max(0, next) * unit);
             setLast(bytes);
@@ -87,7 +89,9 @@ export function SplitControl({
       {value !== null ? (
         <>
           {/* The share typed is usenet's; torrents take the rest, said after it. */}
-          <span className="font-wv-mono text-[11.5px] text-wv-secondary">{t("next.bandwidth.splitUsenet")}</span>
+          <span className="font-wv-mono text-[11.5px] text-wv-secondary">
+            {t("next.bandwidth.splitUsenet")}
+          </span>
           <NumberField
             label={t("next.bandwidth.splitUsenet")}
             value={value.usenetPct}

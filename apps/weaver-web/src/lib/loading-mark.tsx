@@ -21,10 +21,19 @@ import { cn } from "@/lib/utils";
  * `reveal` holds it back briefly before fading in, for a placeholder that most
  * loads replace before anyone would notice it.
  */
-export function LoadingMark({ className, reveal = false }: { className?: string; reveal?: boolean }) {
+export function LoadingMark({
+  className,
+  reveal = false,
+}: {
+  className?: string;
+  reveal?: boolean;
+}) {
   return (
     <picture className="contents">
-      <source media="(prefers-reduced-motion: reduce)" srcSet={loadingMarkStill} />
+      <source
+        media="(prefers-reduced-motion: reduce)"
+        srcSet={loadingMarkStill}
+      />
       <img
         src={loadingMark}
         width={304}
@@ -32,7 +41,11 @@ export function LoadingMark({ className, reveal = false }: { className?: string;
         alt=""
         aria-hidden="true"
         draggable={false}
-        className={cn("h-4 w-auto flex-none select-none", reveal && "animate-loading-reveal", className)}
+        className={cn(
+          "h-4 w-auto flex-none select-none",
+          reveal && "animate-loading-reveal",
+          className,
+        )}
       />
     </picture>
   );

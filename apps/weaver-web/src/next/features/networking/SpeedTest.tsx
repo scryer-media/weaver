@@ -27,7 +27,15 @@ import { cn } from "@/lib/utils";
 import { networkIds } from "@/next/testids";
 import { Eyebrow, MetricCell, MetricStrip } from "../../components/chrome";
 import { ConfirmDialog } from "../../components/ConfirmDialog";
-import { DangerButton, NumberField, PrimaryButton, SecondaryButton, Segmented, Select, TextField } from "../../components/controls";
+import {
+  DangerButton,
+  NumberField,
+  PrimaryButton,
+  SecondaryButton,
+  Segmented,
+  Select,
+  TextField,
+} from "../../components/controls";
 import { EM_DASH, splitBytes, splitSpeed } from "../../data/format";
 import { useNextDataSelector } from "../../data/next-data";
 import type { Consumer } from "./data";
@@ -57,9 +65,15 @@ const DECODE_COLOR = "#6aa7e8";
 const SAB_SIZES: SabTestSize[] = ["MB_100", "GB_1", "GB_10"];
 export const MAX_DURATION = 900;
 /** The job statuses that are fetching from a server, which a run pauses. */
-const FETCHING = new Set(["DOWNLOADING", "FETCHING_REPAIR_DATA", "FINALIZING_DOWNLOAD"]);
+const FETCHING = new Set([
+  "DOWNLOADING",
+  "FETCHING_REPAIR_DATA",
+  "FINALIZING_DOWNLOAD",
+]);
 
-export function defaultForm(consumer: Pick<Consumer, "kind" | "cap">): TestForm {
+export function defaultForm(
+  consumer: Pick<Consumer, "kind" | "cap">,
+): TestForm {
   return {
     kind: "BANDWIDTH",
     providerId: "cloudflare",
@@ -78,7 +92,8 @@ const rateLabel = (bytesPerSecond: number) => {
   const { value, unit } = splitSpeed(bytesPerSecond);
   return `${value} ${unit}`;
 };
-export const sabLabel = (t: Translate, size: SabTestSize) => t(`next.networking.speed.sab.${size}`);
+export const sabLabel = (t: Translate, size: SabTestSize) =>
+  t(`next.networking.speed.sab.${size}`);
 
 /** The host part of a URL, or null when it is not one yet. */
 export function urlHost(url: string): string | null {
@@ -95,9 +110,15 @@ export function useProviderServers(
   consumer: Pick<Consumer, "kind" | "id">,
   provider: BandwidthProvider | undefined,
 ): BandwidthProviderServer[] {
-  const [{ data }] = useQuery<{ bandwidthProviderServers: BandwidthProviderServer[] }>({
+  const [{ data }] = useQuery<{
+    bandwidthProviderServers: BandwidthProviderServer[];
+  }>({
     query: BANDWIDTH_PROVIDER_SERVERS_QUERY,
-    variables: { providerId: form.providerId, kind: consumer.kind, id: consumer.id },
+    variables: {
+      providerId: form.providerId,
+      kind: consumer.kind,
+      id: consumer.id,
+    },
     pause: form.kind !== "BANDWIDTH" || !provider?.needsServer,
   });
   return provider?.needsServer ? (data?.bandwidthProviderServers ?? []) : [];
@@ -121,16 +142,28 @@ export function formEndpoint(
         : form.nzb === "FILE"
           ? (form.nzbFile?.name ?? t("next.networking.speed.nzbFile"))
           : sabLabel(t, form.nzb);
-    return { title: consumer.name, detail: `${t("next.networking.speed.usenet")} · ${nzb}` };
+    return {
+      title: consumer.name,
+      detail: `${t("next.networking.speed.usenet")} · ${nzb}`,
+    };
   }
   if (!form.providerId) {
-    return { title: t("next.networking.speed.customUrl"), detail: urlHost(form.customUrl) ?? "https://" };
+    return {
+      title: t("next.networking.speed.customUrl"),
+      detail: urlHost(form.customUrl) ?? "https://",
+    };
   }
   if (provider?.needsServer) {
     const server = servers.find((candidate) => candidate.id === form.server);
-    return { title: provider.name, detail: server?.host ?? t("next.networking.speed.nearestServer") };
+    return {
+      title: provider.name,
+      detail: server?.host ?? t("next.networking.speed.nearestServer"),
+    };
   }
-  return { title: provider?.name ?? form.providerId, detail: provider?.host ?? t("next.networking.speed.bandwidth") };
+  return {
+    title: provider?.name ?? form.providerId,
+    detail: provider?.host ?? t("next.networking.speed.bandwidth"),
+  };
 }
 
 /** Why the form cannot be run as it stands, in one line, or null. */
@@ -145,20 +178,33 @@ export function formProblem(
   if (form.kind === "TORRENT" && !isTorrentConsumer(consumer.kind)) {
     return t("next.networking.speed.torrentNeedsTorrentRoute");
   }
-  if (form.kind === "BANDWIDTH" && !form.providerId && !/^https:\/\/\S+$/i.test(form.customUrl.trim())) {
+  if (
+    form.kind === "BANDWIDTH" &&
+    !form.providerId &&
+    !/^https:\/\/\S+$/i.test(form.customUrl.trim())
+  ) {
     return t("next.networking.speed.customUrlInvalid");
   }
-  if (form.kind === "USENET" && form.nzb === "URL" && !/^https?:\/\/\S+$/i.test(form.nzbUrl.trim())) {
+  if (
+    form.kind === "USENET" &&
+    form.nzb === "URL" &&
+    !/^https?:\/\/\S+$/i.test(form.nzbUrl.trim())
+  ) {
     return t("next.networking.speed.nzbUrlInvalid");
   }
-  if (form.kind === "USENET" && form.nzb === "FILE" && !isNzbFile(form.nzbFile)) {
+  if (
+    form.kind === "USENET" &&
+    form.nzb === "FILE" &&
+    !isNzbFile(form.nzbFile)
+  ) {
     return t("next.networking.speed.nzbFileMissing");
   }
   return null;
 }
 
 /** Only a single `.nzb` file is taken: no archives of them, and no other kind of file. */
-const isNzbFile = (file: File | null): file is File => file !== null && /\.nzb$/i.test(file.name);
+const isNzbFile = (file: File | null): file is File =>
+  file !== null && /\.nzb$/i.test(file.name);
 
 /** The request a form makes, for a consumer's saved route. */
 export function speedTestInput(
@@ -176,11 +222,21 @@ export function speedTestInput(
     // The daemon picks the download, the connections and when to stop.
     input.bandwidth = {
       ...(form.providerId
-        ? { providerId: form.providerId, ...(provider?.needsServer && form.server ? { server: form.server } : {}) }
+        ? {
+            providerId: form.providerId,
+            ...(provider?.needsServer && form.server
+              ? { server: form.server }
+              : {}),
+          }
         : { customUrl: form.customUrl.trim() }),
     };
   } else if (form.kind === "TORRENT") {
-    input.torrent = { maxDurationSeconds: Math.max(1, Math.min(MAX_DURATION, Math.round(form.torrentDuration))) };
+    input.torrent = {
+      maxDurationSeconds: Math.max(
+        1,
+        Math.min(MAX_DURATION, Math.round(form.torrentDuration)),
+      ),
+    };
   } else {
     input.usenet = {
       ...(form.nzb === "URL"
@@ -189,7 +245,10 @@ export function speedTestInput(
           ? { nzbUpload: form.nzbFile }
           : { sabSize: form.nzb }),
       connections: form.connections,
-      maxDurationSeconds: Math.max(1, Math.min(MAX_DURATION, Math.round(form.maxDuration))),
+      maxDurationSeconds: Math.max(
+        1,
+        Math.min(MAX_DURATION, Math.round(form.maxDuration)),
+      ),
     };
   }
   return input;
@@ -197,7 +256,10 @@ export function speedTestInput(
 
 /** Bandwidth providers and the runs the daemon still holds, newest first. */
 export function useSpeedTestData() {
-  const [{ data, error }, refresh] = useQuery<{ bandwidthProviders: BandwidthProvider[]; speedTestRuns: SpeedTestRun[] }>({
+  const [{ data, error }, refresh] = useQuery<{
+    bandwidthProviders: BandwidthProvider[];
+    speedTestRuns: SpeedTestRun[];
+  }>({
     query: SPEED_TEST_QUERY,
     requestPolicy: "cache-and-network",
   });
@@ -220,14 +282,20 @@ async function startSpeedTest(
   started: (run: SpeedTestRun) => void,
 ): Promise<string | null> {
   try {
-    const result = await client.mutation<{ startSpeedTest: SpeedTestRun }>(START_SPEED_TEST, { input }).toPromise();
+    const result = await client
+      .mutation<{ startSpeedTest: SpeedTestRun }>(START_SPEED_TEST, { input })
+      .toPromise();
     if (result.error || !result.data) {
-      return result.error ? refusalMessage(t, result.error) : t("next.networking.requestFailed");
+      return result.error
+        ? refusalMessage(t, result.error)
+        : t("next.networking.requestFailed");
     }
     started(result.data.startSpeedTest);
     return null;
   } catch (caught) {
-    return caught instanceof Error ? caught.message : t("next.networking.requestFailed");
+    return caught instanceof Error
+      ? caught.message
+      : t("next.networking.requestFailed");
   }
 }
 
@@ -247,8 +315,10 @@ export function useSpeedTestRun(onFinished: () => void) {
   // Only the answer is read, so a queue that changes without changing it draws nothing.
   const downloading = useNextDataSelector(
     (data) =>
-      !data.isPaused
-      && data.queue.stateCounts.some((entry) => entry.count > 0 && FETCHING.has(entry.state)),
+      !data.isPaused &&
+      data.queue.stateCounts.some(
+        (entry) => entry.count > 0 && FETCHING.has(entry.state),
+      ),
   );
   const runningId = run?.status === "RUNNING" ? run.id : null;
   // The poll outlives renders, so it reads the latest callback rather than restarting for each.
@@ -264,7 +334,11 @@ export function useSpeedTestRun(onFinished: () => void) {
     let live = true;
     const timer = setInterval(() => {
       void client
-        .query<{ speedTestRun: SpeedTestRun | null }>(SPEED_TEST_RUN_QUERY, { id: runningId }, { requestPolicy: "network-only" })
+        .query<{ speedTestRun: SpeedTestRun | null }>(
+          SPEED_TEST_RUN_QUERY,
+          { id: runningId },
+          { requestPolicy: "network-only" },
+        )
         .toPromise()
         .then((result) => {
           const next = result.data?.speedTestRun;
@@ -299,7 +373,9 @@ export function useSpeedTestRun(onFinished: () => void) {
     if (!run) {
       return;
     }
-    const result = await client.mutation<{ cancelSpeedTest: boolean }>(CANCEL_SPEED_TEST, { id: run.id }).toPromise();
+    const result = await client
+      .mutation<{ cancelSpeedTest: boolean }>(CANCEL_SPEED_TEST, { id: run.id })
+      .toPromise();
     if (result.error) {
       setRefusal(refusalMessage(t, result.error));
       return;
@@ -307,7 +383,11 @@ export function useSpeedTestRun(onFinished: () => void) {
     if (result.data?.cancelSpeedTest === false) {
       // It had already stopped: read where it ended up.
       const latest = await client
-        .query<{ speedTestRun: SpeedTestRun | null }>(SPEED_TEST_RUN_QUERY, { id: run.id }, { requestPolicy: "network-only" })
+        .query<{ speedTestRun: SpeedTestRun | null }>(
+          SPEED_TEST_RUN_QUERY,
+          { id: run.id },
+          { requestPolicy: "network-only" },
+        )
         .toPromise();
       if (latest.data?.speedTestRun) {
         setRun(latest.data.speedTestRun);
@@ -360,7 +440,9 @@ export function TestControls({
 }) {
   const t = useTranslate();
   const set = (patch: Partial<TestForm>) => onChange({ ...form, ...patch });
-  const provider = providers.find((candidate) => candidate.id === form.providerId);
+  const provider = providers.find(
+    (candidate) => candidate.id === form.providerId,
+  );
   const servers = useProviderServers(form, consumer, provider);
   const fileRef = useRef<HTMLInputElement>(null);
 
@@ -374,9 +456,23 @@ export function TestControls({
           onChange={(kind) => set({ kind })}
           className="self-start"
           options={[
-            { value: "BANDWIDTH" as const, label: t("next.networking.speed.bandwidth") },
-            { value: "USENET" as const, label: t("next.networking.speed.usenet"), disabled: consumer.kind !== "SERVER" },
-            ...(isTorrentConsumer(consumer.kind) ? [{ value: "TORRENT" as const, label: t("next.networking.speed.torrent") }] : []),
+            {
+              value: "BANDWIDTH" as const,
+              label: t("next.networking.speed.bandwidth"),
+            },
+            {
+              value: "USENET" as const,
+              label: t("next.networking.speed.usenet"),
+              disabled: consumer.kind !== "SERVER",
+            },
+            ...(isTorrentConsumer(consumer.kind)
+              ? [
+                  {
+                    value: "TORRENT" as const,
+                    label: t("next.networking.speed.torrent"),
+                  },
+                ]
+              : []),
           ]}
         />
       </ControlLabel>
@@ -390,7 +486,10 @@ export function TestControls({
                 value={form.providerId}
                 onChange={(providerId) => set({ providerId, server: "" })}
                 options={[
-                  ...providers.map((candidate) => ({ value: candidate.id, label: candidate.name })),
+                  ...providers.map((candidate) => ({
+                    value: candidate.id,
+                    label: candidate.name,
+                  })),
                   { value: "", label: t("next.networking.speed.customUrl") },
                 ]}
               />
@@ -403,17 +502,25 @@ export function TestControls({
                   value={form.server}
                   onChange={(server) => set({ server })}
                   options={[
-                    { value: "", label: t("next.networking.speed.nearestServer") },
+                    {
+                      value: "",
+                      label: t("next.networking.speed.nearestServer"),
+                    },
                     ...servers.map((server) => ({
                       value: server.id,
-                      label: server.location ? `${server.name} · ${server.location}` : server.name,
+                      label: server.location
+                        ? `${server.name} · ${server.location}`
+                        : server.name,
                     })),
                   ]}
                 />
               </ControlLabel>
             ) : null}
             {form.providerId ? null : (
-              <ControlLabel label={t("next.networking.speed.url")} className="min-w-0 flex-[0_1_480px]">
+              <ControlLabel
+                label={t("next.networking.speed.url")}
+                className="min-w-0 flex-[0_1_480px]"
+              >
                 <TextField
                   label={t("next.networking.speed.url")}
                   testId={networkIds.speedCustomUrl}
@@ -447,14 +554,26 @@ export function TestControls({
                 onChange={(nzb) => set({ nzb })}
                 className="min-w-[120px]"
                 options={[
-                  ...SAB_SIZES.map((size) => ({ value: size, label: sabLabel(t, size) })),
-                  { value: "URL" as const, label: t("next.networking.speed.url") },
-                  { value: "FILE" as const, label: t("next.networking.speed.file") },
+                  ...SAB_SIZES.map((size) => ({
+                    value: size,
+                    label: sabLabel(t, size),
+                  })),
+                  {
+                    value: "URL" as const,
+                    label: t("next.networking.speed.url"),
+                  },
+                  {
+                    value: "FILE" as const,
+                    label: t("next.networking.speed.file"),
+                  },
                 ]}
               />
             </ControlLabel>
             {form.nzb === "FILE" ? (
-              <ControlLabel label={t("next.networking.speed.nzbFile")} className="min-w-0 max-w-[480px]">
+              <ControlLabel
+                label={t("next.networking.speed.nzbFile")}
+                className="min-w-0 max-w-[480px]"
+              >
                 <div className="flex h-[34px] min-w-0 items-center gap-3">
                   <input
                     ref={fileRef}
@@ -471,11 +590,17 @@ export function TestControls({
                       }
                     }}
                   />
-                  <SecondaryButton icon="chooseFile" onClick={() => fileRef.current?.click()}>
+                  <SecondaryButton
+                    icon="chooseFile"
+                    onClick={() => fileRef.current?.click()}
+                  >
                     {t("next.networking.speed.chooseFile")}
                   </SecondaryButton>
                   {form.nzbFile ? (
-                    <span className="min-w-0 truncate font-wv-mono text-[12px] text-wv-fg" title={form.nzbFile.name}>
+                    <span
+                      className="min-w-0 truncate font-wv-mono text-[12px] text-wv-fg"
+                      title={form.nzbFile.name}
+                    >
                       {form.nzbFile.name}
                     </span>
                   ) : null}
@@ -483,7 +608,10 @@ export function TestControls({
               </ControlLabel>
             ) : null}
             {form.nzb === "URL" ? (
-              <ControlLabel label={t("next.networking.speed.nzbUrl")} className="min-w-0 flex-[0_1_480px]">
+              <ControlLabel
+                label={t("next.networking.speed.nzbUrl")}
+                className="min-w-0 flex-[0_1_480px]"
+              >
                 <TextField
                   label={t("next.networking.speed.nzbUrl")}
                   testId={networkIds.speedNzbUrl}
@@ -524,30 +652,45 @@ export function TestControls({
 }
 
 /** When each bin closed, oldest first: every leg is sampled on the same tick. */
-const binEnds = (run: SpeedTestRun) => [...new Set((run.result?.samples ?? []).map((sample) => sample.atMs))].sort((a, b) => a - b);
+const binEnds = (run: SpeedTestRun) =>
+  [...new Set((run.result?.samples ?? []).map((sample) => sample.atMs))].sort(
+    (a, b) => a - b,
+  );
 
 /**
  * The rate over the newest bin, in all and per leg: the rate right now. A bin
  * spans the time since the one before it closed, as the daemon rates it.
  */
-export function lastSecond(run: SpeedTestRun): { total: number; legs: Map<number, number> } {
+export function lastSecond(run: SpeedTestRun): {
+  total: number;
+  legs: Map<number, number>;
+} {
   const ends = binEnds(run);
   const newest = ends.at(-1);
   const width = Math.max(1, (newest ?? 0) - (ends.at(-2) ?? 0));
   const legs = new Map<number, number>();
   for (const sample of run.result?.samples ?? []) {
     if (sample.atMs === newest) {
-      legs.set(sample.leg, (legs.get(sample.leg) ?? 0) + (sample.bytes * 1000) / width);
+      legs.set(
+        sample.leg,
+        (legs.get(sample.leg) ?? 0) + (sample.bytes * 1000) / width,
+      );
     }
   }
-  return { total: [...legs.values()].reduce((sum, rate) => sum + rate, 0), legs };
+  return {
+    total: [...legs.values()].reduce((sum, rate) => sum + rate, 0),
+    legs,
+  };
 }
 
 /**
  * A run's rate bin by bin over every leg: of the bytes off the wire, or of
  * what they decoded to. Empty until the run measures.
  */
-export function rateSeries(run: SpeedTestRun, field: "bytes" | "decodedBytes" = "bytes"): RatePoint[] {
+export function rateSeries(
+  run: SpeedTestRun,
+  field: "bytes" | "decodedBytes" = "bytes",
+): RatePoint[] {
   const bins = new Map<number, number>();
   for (const sample of run.result?.samples ?? []) {
     bins.set(sample.atMs, (bins.get(sample.atMs) ?? 0) + sample[field]);
@@ -561,10 +704,19 @@ export function rateSeries(run: SpeedTestRun, field: "bytes" | "decodedBytes" = 
 }
 
 /** The word a running test's phase starts with, as the daemon reports it: "draining 3" is "draining". */
-const phaseKey = (phase: string | null) => phase?.trim().split(/\s+/)[0]?.toLowerCase() || "running";
+const phaseKey = (phase: string | null) =>
+  phase?.trim().split(/\s+/)[0]?.toLowerCase() || "running";
 
 /** What a running test reports doing, in the order it does it. */
-const PHASES = ["preparing", "pausing", "draining", "leasing", "measuring", "uploading", "releasing"];
+const PHASES = [
+  "preparing",
+  "pausing",
+  "draining",
+  "leasing",
+  "measuring",
+  "uploading",
+  "releasing",
+];
 
 /** What the gate is doing, in words: pausing downloads, waiting for what is in flight, or measuring. */
 export function phaseLabel(t: Translate, phase: string | null): string {
@@ -573,7 +725,9 @@ export function phaseLabel(t: Translate, phase: string | null): string {
   }
   const draining = /^draining\s+(\d+)$/i.exec(phase.trim());
   if (draining) {
-    return t("next.networking.speed.phase.draining", { count: Number(draining[1]) });
+    return t("next.networking.speed.phase.draining", {
+      count: Number(draining[1]),
+    });
   }
   const word = phase.trim().toLowerCase();
   if (PHASES.includes(word)) {
@@ -583,19 +737,41 @@ export function phaseLabel(t: Translate, phase: string | null): string {
 }
 
 /** One rate a running test follows: the figure now, large, over a chart chasing it. */
-function LiveFigure({ label, points, color, className }: { label: string; points: RatePoint[]; color?: string; className?: string }) {
+function LiveFigure({
+  label,
+  points,
+  color,
+  className,
+}: {
+  label: string;
+  points: RatePoint[];
+  color?: string;
+  className?: string;
+}) {
   const latest = points.at(-1);
   const split = latest ? splitSpeed(latest.rate) : null;
   return (
-    <div className={cn("flex min-w-0 flex-col gap-4 px-4 pt-5 pb-4 sm:px-6", className)}>
+    <div
+      className={cn(
+        "flex min-w-0 flex-col gap-4 px-4 pt-5 pb-4 sm:px-6",
+        className,
+      )}
+    >
       <Eyebrow tone="rail">{label}</Eyebrow>
       <div className="flex items-baseline gap-2 whitespace-nowrap">
         <span className="font-semibold leading-none tracking-[-0.03em] text-wv-fg tabular-nums text-[60px] sm:text-[76px]">
           {split?.value ?? EM_DASH}
         </span>
-        {split ? <span className="text-[18px] text-wv-muted">{split.unit}</span> : null}
+        {split ? (
+          <span className="text-[18px] text-wv-muted">{split.unit}</span>
+        ) : null}
       </div>
-      <LiveChart label={label} points={points} color={color} formatRate={rateLabel} />
+      <LiveChart
+        label={label}
+        points={points}
+        color={color}
+        formatRate={rateLabel}
+      />
     </div>
   );
 }
@@ -605,25 +781,47 @@ function LiveFigure({ label, points, color, className }: { label: string; points
  * figure over a chart chasing it, then what it has moved and each leg's rate.
  * A Usenet test charts what it decodes beside what it downloads.
  */
-export function RunProgress({ run, onCancel }: { run: SpeedTestRun; onCancel: () => void }) {
+export function RunProgress({
+  run,
+  onCancel,
+}: {
+  run: SpeedTestRun;
+  onCancel: () => void;
+}) {
   const t = useTranslate();
   const usenet = run.kind === "USENET";
   const now = lastSecond(run);
   const bytes = splitBytes(run.result?.bytes ?? 0);
   const decoded = splitBytes(run.result?.usenet?.decodedBytes ?? 0);
   return (
-    <section aria-label={t("next.networking.speed.progress")} data-testid={networkIds.speedProgress} className="flex flex-col border-b border-wv-hairline">
+    <section
+      aria-label={t("next.networking.speed.progress")}
+      data-testid={networkIds.speedProgress}
+      className="flex flex-col border-b border-wv-hairline"
+    >
       <div className="flex flex-wrap items-center justify-between gap-3 border-b border-wv-hairline px-4 py-3 sm:px-6">
         <span className="flex min-w-0 items-baseline gap-3">
           <Eyebrow tone="rail">{t("next.networking.speed.gate")}</Eyebrow>
-          <span data-testid={networkIds.speedPhase(phaseKey(run.phase))} className="truncate text-[13px] text-wv-fg">{phaseLabel(t, run.phase)}</span>
+          <span
+            data-testid={networkIds.speedPhase(phaseKey(run.phase))}
+            className="truncate text-[13px] text-wv-fg"
+          >
+            {phaseLabel(t, run.phase)}
+          </span>
         </span>
-        <DangerButton icon="close" onClick={onCancel} testId={networkIds.speedCancel}>
+        <DangerButton
+          icon="close"
+          onClick={onCancel}
+          testId={networkIds.speedCancel}
+        >
           {t("next.networking.speed.cancel")}
         </DangerButton>
       </div>
       <div className={cn("grid min-w-0", usenet && "lg:grid-cols-2")}>
-        <LiveFigure label={t("next.networking.speed.speed")} points={rateSeries(run)} />
+        <LiveFigure
+          label={t("next.networking.speed.speed")}
+          points={rateSeries(run)}
+        />
         {usenet ? (
           <LiveFigure
             label={t("next.networking.speed.decode")}
@@ -634,15 +832,31 @@ export function RunProgress({ run, onCancel }: { run: SpeedTestRun; onCancel: ()
         ) : null}
       </div>
       <MetricStrip min={132}>
-        {usenet ? <MetricCell variant="stat" eyebrow={t("next.networking.speed.downloaded")} value={bytes.value} unit={bytes.unit} /> : null}
-        {usenet ? <MetricCell variant="stat" eyebrow={t("next.networking.speed.decoded")} value={decoded.value} unit={decoded.unit} /> : null}
+        {usenet ? (
+          <MetricCell
+            variant="stat"
+            eyebrow={t("next.networking.speed.downloaded")}
+            value={bytes.value}
+            unit={bytes.unit}
+          />
+        ) : null}
+        {usenet ? (
+          <MetricCell
+            variant="stat"
+            eyebrow={t("next.networking.speed.decoded")}
+            value={decoded.value}
+            unit={decoded.unit}
+          />
+        ) : null}
         {run.tested.legs
           .filter((leg) => !leg.down)
           .map((leg) => (
             <MetricCell
               key={leg.position}
               variant="stat"
-              eyebrow={t("next.networking.speed.legRate", { position: leg.position + 1 })}
+              eyebrow={t("next.networking.speed.legRate", {
+                position: leg.position + 1,
+              })}
               value={rateLabel(now.legs.get(leg.position) ?? 0)}
               valueClassName="text-wv-fg text-[15px]"
             />
@@ -658,8 +872,13 @@ export type RunStat = "average" | "peak" | "downloaded" | "decoded";
 export type BetterStats = Partial<Record<RunStat, string>>;
 
 /** Where `run` beat `other`: each figure both report that came out higher, and by how much. */
-export function betterStats(run: SpeedTestRun, other: SpeedTestRun): BetterStats {
-  const figures = (candidate: SpeedTestRun): Record<RunStat, number | undefined> => {
+export function betterStats(
+  run: SpeedTestRun,
+  other: SpeedTestRun,
+): BetterStats {
+  const figures = (
+    candidate: SpeedTestRun,
+  ): Record<RunStat, number | undefined> => {
     const result = candidate.result;
     return {
       average: result?.averageBps,
@@ -678,14 +897,25 @@ export function betterStats(run: SpeedTestRun, other: SpeedTestRun): BetterStats
       continue;
     }
     const margin = against > 0 ? ((mine - against) / against) * 100 : null;
-    better[stat] = margin === null ? "" : `+${margin >= 10 ? Math.round(margin) : margin.toFixed(1)}%`;
+    better[stat] =
+      margin === null
+        ? ""
+        : `+${margin >= 10 ? Math.round(margin) : margin.toFixed(1)}%`;
   }
   return better;
 }
 
 /** Why a run failed, in our words for its code; the daemon's own for a code we have none for. */
-const failureMessage = (t: Translate, failure: NonNullable<SpeedTestRun["failure"]>) =>
-  codedSentence(t, `next.networking.speed.failure.${failure.code}`, failure.params, failure.message);
+const failureMessage = (
+  t: Translate,
+  failure: NonNullable<SpeedTestRun["failure"]>,
+) =>
+  codedSentence(
+    t,
+    `next.networking.speed.failure.${failure.code}`,
+    failure.params,
+    failure.message,
+  );
 
 /**
  * What a finished run measured: its average with its peak beside it, large,
@@ -694,41 +924,79 @@ const failureMessage = (t: Translate, failure: NonNullable<SpeedTestRun["failure
  * the first. Set against another run, each figure it beat is marked, with the
  * margin it beat it by.
  */
-export function RunResult({ run, better = {} }: { run: SpeedTestRun; better?: BetterStats }) {
+export function RunResult({
+  run,
+  better = {},
+}: {
+  run: SpeedTestRun;
+  better?: BetterStats;
+}) {
   const t = useTranslate();
   const result = run.result;
   const failed = run.status === "FAILED" || run.status === "CANCELLED";
   const figure = (stat: RunStat, split: { value: string; unit: string }) => ({
     value: split.value,
     unit: split.unit,
-    valueClassName: better[stat] !== undefined ? "text-wv-accent" : "text-wv-fg",
+    valueClassName:
+      better[stat] !== undefined ? "text-wv-accent" : "text-wv-fg",
     ...(better[stat] !== undefined
       ? {
           note: better[stat] || undefined,
-          children: <span aria-hidden="true" className="absolute inset-x-0 top-0 h-[3px] bg-wv-accent" />,
+          children: (
+            <span
+              aria-hidden="true"
+              className="absolute inset-x-0 top-0 h-[3px] bg-wv-accent"
+            />
+          ),
         }
       : {}),
   });
   return (
-    <section aria-label={t("next.networking.speed.result")} data-testid={networkIds.speedResult} className="flex flex-col border-b border-wv-hairline">
+    <section
+      aria-label={t("next.networking.speed.result")}
+      data-testid={networkIds.speedResult}
+      className="flex flex-col border-b border-wv-hairline"
+    >
       {failed ? (
-        <p role={run.status === "FAILED" ? "alert" : "status"} data-testid={networkIds.speedOutcome(run.status)} title={run.failure?.message} className="px-4 py-3 text-[12.5px] text-wv-error-text sm:px-6">
-          {run.failure ? `${t(`next.networking.speed.status.${run.status}`)} · ${failureMessage(t, run.failure)}` : t(`next.networking.speed.status.${run.status}`)}
+        <p
+          role={run.status === "FAILED" ? "alert" : "status"}
+          data-testid={networkIds.speedOutcome(run.status)}
+          title={run.failure?.message}
+          className="px-4 py-3 text-[12.5px] text-wv-error-text sm:px-6"
+        >
+          {run.failure
+            ? `${t(`next.networking.speed.status.${run.status}`)} · ${failureMessage(t, run.failure)}`
+            : t(`next.networking.speed.status.${run.status}`)}
         </p>
       ) : null}
       {result ? (
         <>
           <MetricStrip min={200}>
-            <MetricCell variant="hero" eyebrow={t("next.networking.speed.average")} {...figure("average", splitSpeed(result.averageBps))} />
-            <MetricCell variant="hero" eyebrow={t("next.networking.speed.peak")} {...figure("peak", splitSpeed(result.peakBps))} />
+            <MetricCell
+              variant="hero"
+              eyebrow={t("next.networking.speed.average")}
+              {...figure("average", splitSpeed(result.averageBps))}
+            />
+            <MetricCell
+              variant="hero"
+              eyebrow={t("next.networking.speed.peak")}
+              {...figure("peak", splitSpeed(result.peakBps))}
+            />
           </MetricStrip>
           {run.kind === "USENET" ? (
             <MetricStrip min={140}>
-              <MetricCell variant="stat" eyebrow={t("next.networking.speed.downloaded")} {...figure("downloaded", splitBytes(result.bytes))} />
+              <MetricCell
+                variant="stat"
+                eyebrow={t("next.networking.speed.downloaded")}
+                {...figure("downloaded", splitBytes(result.bytes))}
+              />
               <MetricCell
                 variant="stat"
                 eyebrow={t("next.networking.speed.decoded")}
-                {...figure("decoded", splitBytes(result.usenet?.decodedBytes ?? 0))}
+                {...figure(
+                  "decoded",
+                  splitBytes(result.usenet?.decodedBytes ?? 0),
+                )}
               />
             </MetricStrip>
           ) : null}
@@ -751,7 +1019,12 @@ function UploadResult({ upload }: { upload: SpeedTestUpload }) {
   return (
     <MetricStrip min={140}>
       {http === null ? null : http.outcome === "MEASURED" ? (
-        <MetricCell variant="stat" eyebrow={t("next.networking.speed.upload")} {...rate(http.bps)} note={splitBytesLabel(http.bytes)} />
+        <MetricCell
+          variant="stat"
+          eyebrow={t("next.networking.speed.upload")}
+          {...rate(http.bps)}
+          note={splitBytesLabel(http.bytes)}
+        />
       ) : (
         <MetricCell
           variant="stat"
@@ -760,7 +1033,9 @@ function UploadResult({ upload }: { upload: SpeedTestUpload }) {
           note={
             http.outcome === "FAILED" && http.failure
               ? failureMessage(t, http.failure)
-              : t(`next.networking.speed.uploadOutcome.${http.outcome}`, { provider: http.provider ?? "" })
+              : t(`next.networking.speed.uploadOutcome.${http.outcome}`, {
+                  provider: http.provider ?? "",
+                })
           }
         />
       )}
@@ -776,7 +1051,11 @@ function UploadResult({ upload }: { upload: SpeedTestUpload }) {
             variant="stat"
             eyebrow={t("next.networking.speed.uploadPeers")}
             value={EM_DASH}
-            note={peers.outcome === "FAILED" && peers.error ? peers.error : t(`next.networking.speed.uploadOutcome.${peers.outcome}`)}
+            note={
+              peers.outcome === "FAILED" && peers.error
+                ? peers.error
+                : t(`next.networking.speed.uploadOutcome.${peers.outcome}`)
+            }
           />
         )
       ) : null}
@@ -811,7 +1090,9 @@ export function SpeedTestRunner({
 }) {
   const t = useTranslate();
   const { run, start, cancel, busy, refusal } = speedTest;
-  const provider = providers.find((candidate) => candidate.id === form.providerId);
+  const provider = providers.find(
+    (candidate) => candidate.id === form.providerId,
+  );
   const problem = formProblem(t, form, consumer);
   const running = run?.status === "RUNNING";
   return (
@@ -821,18 +1102,26 @@ export function SpeedTestRunner({
           icon="go"
           testId={networkIds.speedRun}
           disabled={busy || running || problem !== null}
-          onClick={() => start(speedTestInput(consumer, overrides, form, provider))}
+          onClick={() =>
+            start(speedTestInput(consumer, overrides, form, provider))
+          }
         >
           {t("next.networking.speed.run")}
         </PrimaryButton>
         {extra}
         {problem || refusal ? (
-          <span role="alert" data-testid={networkIds.speedRefusal} className="min-w-0 text-[12.5px] text-wv-error-text">
+          <span
+            role="alert"
+            data-testid={networkIds.speedRefusal}
+            className="min-w-0 text-[12.5px] text-wv-error-text"
+          >
             {refusal ?? problem}
           </span>
         ) : null}
       </div>
-      {run && running ? <RunProgress run={run} onCancel={() => void cancel()} /> : null}
+      {run && running ? (
+        <RunProgress run={run} onCancel={() => void cancel()} />
+      ) : null}
       {run && !running ? <RunResult run={run} /> : null}
     </div>
   );

@@ -1,0 +1,3 @@
+# The Secret weaver-database holds database-url: postgres://...
+database:
+  existingSecret: weaver-database

@@ -19,7 +19,10 @@ interface UseReconnectPollingResult {
   isPolling: boolean;
 }
 
-export function useReconnectPolling<Data, Variables extends AnyVariables = AnyVariables>({
+export function useReconnectPolling<
+  Data,
+  Variables extends AnyVariables = AnyVariables,
+>({
   enabled,
   query,
   variables,

@@ -20,17 +20,75 @@ export const DNS_QUERY = gql`
   }
 `;
 /** What a route's DNS select offers, and what its in-form check needs. */
-export const DNS_PROFILE_CHOICES_QUERY = gql`query DnsProfileChoices { dnsProfiles(kind: ROUTE) { id name who trust systemFallback } }`;
+export const DNS_PROFILE_CHOICES_QUERY = gql`
+  query DnsProfileChoices {
+    dnsProfiles(kind: ROUTE) {
+      id
+      name
+      who
+      trust
+      systemFallback
+    }
+  }
+`;
 /** What the network flow draws of DNS: each route profile's lookups, and the servers on the lists they ask. */
 export const FLOW_DNS_QUERY = gql`query FlowDns { dnsServerLists { id name servers { ${SERVER_FIELDS} } } dnsProfiles(kind: ROUTE) { id name who transit trust serverListId systemFallback } }`;
 /** What a proxy's "Find this proxy with" select and its "Found with" line show. */
-export const DNS_PROFILE_NAMES_QUERY = gql`query DnsProfileNames { dnsProfiles(kind: PROXY_NAME) { id name } }`;
-export const SAVE_DNS_SERVER_LIST = gql`mutation SaveDnsServerList($input:DnsServerListInput!) { saveDnsServerList(input:$input) { id } }`;
-export const DELETE_DNS_SERVER_LIST = gql`mutation DeleteDnsServerList($id:Int!) { deleteDnsServerList(id:$id) }`;
-export const SAVE_DNS_PROFILE = gql`mutation SaveDnsProfile($input:DnsProfileInput!) { saveDnsProfile(input:$input) { id } }`;
-export const DELETE_DNS_PROFILE = gql`mutation DeleteDnsProfile($id:Int!) { deleteDnsProfile(id:$id) }`;
+export const DNS_PROFILE_NAMES_QUERY = gql`
+  query DnsProfileNames {
+    dnsProfiles(kind: PROXY_NAME) {
+      id
+      name
+    }
+  }
+`;
+export const SAVE_DNS_SERVER_LIST = gql`
+  mutation SaveDnsServerList($input: DnsServerListInput!) {
+    saveDnsServerList(input: $input) {
+      id
+    }
+  }
+`;
+export const DELETE_DNS_SERVER_LIST = gql`
+  mutation DeleteDnsServerList($id: Int!) {
+    deleteDnsServerList(id: $id)
+  }
+`;
+export const SAVE_DNS_PROFILE = gql`
+  mutation SaveDnsProfile($input: DnsProfileInput!) {
+    saveDnsProfile(input: $input) {
+      id
+    }
+  }
+`;
+export const DELETE_DNS_PROFILE = gql`
+  mutation DeleteDnsProfile($id: Int!) {
+    deleteDnsProfile(id: $id)
+  }
+`;
 /** The names of the routes and proxies a refusal names by key and id: the flow's consumers, or the servers and feeds before it has any. */
-export const ROUTE_NAMES_QUERY = gql`query RouteNames { networkFlow { consumers { key name } } servers { id host } rssFeeds { id name } proxyProfiles { id name } }`;
+export const ROUTE_NAMES_QUERY = gql`
+  query RouteNames {
+    networkFlow {
+      consumers {
+        key
+        name
+      }
+    }
+    servers {
+      id
+      host
+    }
+    rssFeeds {
+      id
+      name
+    }
+    proxyProfiles {
+      id
+      name
+    }
+  }
+`;
 /** What each server supports, probed through a drafted route. Nothing is saved. */
 export const TEST_DNS_SERVERS = gql`mutation TestDnsServers($route:RouteInput!,$servers:[DnsServerInput!]!) {
   testDnsServers(route:$route,servers:$servers) {

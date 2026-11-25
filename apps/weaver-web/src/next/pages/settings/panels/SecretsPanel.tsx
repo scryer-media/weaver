@@ -9,7 +9,11 @@ import { settingsIds } from "@/next/testids";
 import { Cell } from "../../../components/rows";
 import { formatDate } from "../../../data/format";
 import { sortedSecrets, usedByText, type Secret } from "../../../data/secrets";
-import { SettingsBlocks, usePanelStatus, type SettingsBlock } from "../framework";
+import {
+  SettingsBlocks,
+  usePanelStatus,
+  type SettingsBlock,
+} from "../framework";
 import { SecretEditor, type SecretEditorTarget } from "./SecretEditor";
 
 /**
@@ -19,14 +23,21 @@ import { SecretEditor, type SecretEditorTarget } from "./SecretEditor";
  */
 export function SecretsPanel() {
   const t = useTranslate();
-  const [{ data, fetching, error }, reexecute] = useQuery<{ secrets: Secret[] }>({ query: SECRETS_QUERY });
+  const [{ data, fetching, error }, reexecute] = useQuery<{
+    secrets: Secret[];
+  }>({ query: SECRETS_QUERY });
   const [target, setTarget] = useState<SecretEditorTarget | null>(null);
   const [status, setStatus] = useState<string | null>(null);
   // A list that could not be read says why in the status bar, as the other script screens do.
-  const failure = error ? (error.graphQLErrors[0]?.message ?? error.message) : null;
+  const failure = error
+    ? (error.graphQLErrors[0]?.message ?? error.message)
+    : null;
   usePanelStatus(failure ?? status, failure !== null);
 
-  const secrets = useMemo(() => sortedSecrets(data?.secrets ?? []), [data?.secrets]);
+  const secrets = useMemo(
+    () => sortedSecrets(data?.secrets ?? []),
+    [data?.secrets],
+  );
   const refresh = () => reexecute({ requestPolicy: "network-only" });
 
   const blocks: SettingsBlock[] = [
@@ -36,9 +47,16 @@ export function SecretsPanel() {
       title: t("next.settings.panel.secrets"),
       note: t("next.secrets.note"),
       columns: "minmax(0, 1fr) minmax(0, 1.4fr) minmax(0, 0.8fr)",
-      headers: [t("next.secrets.name"), t("next.secrets.usedBy"), t("next.secrets.updated")],
+      headers: [
+        t("next.secrets.name"),
+        t("next.secrets.usedBy"),
+        t("next.secrets.updated"),
+      ],
       empty: t("next.secrets.empty"),
-      add: { label: t("next.secrets.add"), onClick: () => setTarget({ mode: "new" }) },
+      add: {
+        label: t("next.secrets.add"),
+        onClick: () => setTarget({ mode: "new" }),
+      },
       onRowClick: (id) => {
         const secret = secrets.find((entry) => entry.id === id);
         if (secret) {
@@ -54,9 +72,13 @@ export function SecretsPanel() {
           </Cell>,
           <Cell
             key="usedBy"
-            className={secret.usedBy.length > 0 ? "text-wv-secondary" : "text-wv-muted"}
+            className={
+              secret.usedBy.length > 0 ? "text-wv-secondary" : "text-wv-muted"
+            }
             title={usedByText(secret) || undefined}
-            testId={settingsIds.secretUsage(secret.usedBy.length > 0 ? "used" : "unused")}
+            testId={settingsIds.secretUsage(
+              secret.usedBy.length > 0 ? "used" : "unused",
+            )}
           >
             {usedByText(secret) || t("next.secrets.unused")}
           </Cell>,
@@ -78,7 +100,14 @@ export function SecretsPanel() {
           target={target}
           onSaved={(secret) => {
             setTarget(null);
-            setStatus(t(target.mode === "edit" ? "next.secrets.saved" : "next.secrets.created", { name: secret.name }));
+            setStatus(
+              t(
+                target.mode === "edit"
+                  ? "next.secrets.saved"
+                  : "next.secrets.created",
+                { name: secret.name },
+              ),
+            );
             refresh();
           }}
           onDeleted={(secret) => {

@@ -85,7 +85,8 @@ export const nextZh: LocaleDictionary = {
   "next.errorPage.goBack": "返回",
   "next.errorPage.retry": "重试",
   "next.errorPage.checking": "正在检查…",
-  "next.errorPage.unreachable": "Weaver 没有响应。一旦它恢复响应，此页面会自动打开它。",
+  "next.errorPage.unreachable":
+    "Weaver 没有响应。一旦它恢复响应，此页面会自动打开它。",
   "next.errorPage.details": "技术详情",
 
   // Shared components
@@ -160,7 +161,8 @@ export const nextZh: LocaleDictionary = {
   "next.downloads.shown": "显示 {{total}} 个下载中的 {{shown}} 个",
   "next.downloads.loadingBody": "正在获取队列。",
   "next.downloads.emptyTitle": "没有活动的下载",
-  "next.downloads.emptyBody": "添加一个 NZB 或种子，或将其拖放到此列表的任意位置。",
+  "next.downloads.emptyBody":
+    "添加一个 NZB 或种子，或将其拖放到此列表的任意位置。",
   "next.downloads.emptyBodyNzb": "添加一个 NZB，或将其拖放到此列表的任意位置。",
   "next.downloads.noMatchTitle": "没有符合此视图的内容",
   "next.downloads.noMatchBody": "清除搜索或选择其他筛选条件。",
@@ -174,19 +176,24 @@ export const nextZh: LocaleDictionary = {
   "next.downloads.keepDownloading": "继续下载",
   "next.downloads.bulk.paused.one": "已暂停 1 个下载",
   "next.downloads.bulk.paused.other": "已暂停 {{count}} 个下载",
-  "next.downloads.bulk.pausedPartial": "已暂停 {{total}} 个中的 {{done}} 个 — {{refused}} 个被拒绝",
+  "next.downloads.bulk.pausedPartial":
+    "已暂停 {{total}} 个中的 {{done}} 个 — {{refused}} 个被拒绝",
   "next.downloads.bulk.resumed.one": "已恢复 1 个下载",
   "next.downloads.bulk.resumed.other": "已恢复 {{count}} 个下载",
-  "next.downloads.bulk.resumedPartial": "已恢复 {{total}} 个中的 {{done}} 个 — {{refused}} 个被拒绝",
+  "next.downloads.bulk.resumedPartial":
+    "已恢复 {{total}} 个中的 {{done}} 个 — {{refused}} 个被拒绝",
   "next.downloads.bulk.priority.one": "已为 1 个下载设置优先级",
   "next.downloads.bulk.priority.other": "已为 {{count}} 个下载设置优先级",
-  "next.downloads.bulk.priorityPartial": "已为 {{total}} 个中的 {{done}} 个设置优先级 — {{refused}} 个被拒绝",
+  "next.downloads.bulk.priorityPartial":
+    "已为 {{total}} 个中的 {{done}} 个设置优先级 — {{refused}} 个被拒绝",
   "next.downloads.bulk.category.one": "已为 1 个下载设置分类",
   "next.downloads.bulk.category.other": "已为 {{count}} 个下载设置分类",
-  "next.downloads.bulk.categoryPartial": "已为 {{total}} 个中的 {{done}} 个设置分类 — {{refused}} 个被拒绝",
+  "next.downloads.bulk.categoryPartial":
+    "已为 {{total}} 个中的 {{done}} 个设置分类 — {{refused}} 个被拒绝",
   "next.downloads.bulk.cancelled.one": "已取消 1 个下载",
   "next.downloads.bulk.cancelled.other": "已取消 {{count}} 个下载",
-  "next.downloads.bulk.cancelledPartial": "已取消 {{total}} 个中的 {{done}} 个 — {{refused}} 个被拒绝",
+  "next.downloads.bulk.cancelledPartial":
+    "已取消 {{total}} 个中的 {{done}} 个 — {{refused}} 个被拒绝",
   "next.downloads.bulk.failed": "所选下载未被更改 — {{message}}",
   "next.inspector.selected": "已选下载",
   "next.inspector.openDetail": "打开任务详情",
@@ -303,10 +310,12 @@ export const nextZh: LocaleDictionary = {
   "next.completed.sortMenu": "排序已完成项",
   "next.completed.bulk.requeued.one": "已重新排队 {{count}} 项",
   "next.completed.bulk.requeued.other": "已重新排队 {{count}} 项",
-  "next.completed.bulk.requeuedPartial": "已重新排队 {{done}}/{{total}} 项 — {{refused}} 项被拒绝",
+  "next.completed.bulk.requeuedPartial":
+    "已重新排队 {{done}}/{{total}} 项 — {{refused}} 项被拒绝",
   "next.completed.bulk.rerun.one": "已为 {{count}} 项重新运行脚本",
   "next.completed.bulk.rerun.other": "已为 {{count}} 项重新运行脚本",
-  "next.completed.bulk.rerunPartial": "已为 {{done}}/{{total}} 项重新运行脚本 — {{refused}} 项被拒绝",
+  "next.completed.bulk.rerunPartial":
+    "已为 {{done}}/{{total}} 项重新运行脚本 — {{refused}} 项被拒绝",
   "next.completed.redownload": "重新下载",
   "next.completed.rerunScripts": "重新运行脚本",
   "next.completed.exported.one": "已导出本页 — {{count}} 项",
@@ -353,7 +362,8 @@ export const nextZh: LocaleDictionary = {
   "next.download.recovery": "恢复",
   "next.download.recoveryShown": "显示 {{shown}} / {{count}}",
   "next.download.setsShown": "显示 {{shown}} / {{count}} 组",
-  "next.download.recoverySet": "{{blocks}} 块 · 损坏 {{damaged}} · 修复 {{repaired}}",
+  "next.download.recoverySet":
+    "{{blocks}} 块 · 损坏 {{damaged}} · 修复 {{repaired}}",
   "next.download.files": "文件",
   "next.download.articles": "文章",
   "next.download.missing": "缺失",
@@ -410,10 +420,12 @@ export const nextZh: LocaleDictionary = {
   "next.completed.dayTotal": "已完成 {{size}}",
   "next.completed.deleting": "正在删除",
   "next.completed.took": "耗时 {{span}}",
-  "next.completed.deleteBody": "“删除，保留文件”会移除条目并保留磁盘上的文件。“删除”也会删除已下载的文件。两者都在后台运行；条目会锁定并留在这里，直到删除完成。",
+  "next.completed.deleteBody":
+    "“删除，保留文件”会移除条目并保留磁盘上的文件。“删除”也会删除已下载的文件。两者都在后台运行；条目会锁定并留在这里，直到删除完成。",
   "next.job.title": "任务",
   "next.job.missingTitle": "没有该任务",
-  "next.job.missingBody": "它已从历史记录中删除，或者链接指向 weaver 中不存在的 id。",
+  "next.job.missingBody":
+    "它已从历史记录中删除，或者链接指向 weaver 中不存在的 id。",
   "next.job.backToHistory": "返回历史",
   "next.job.loadingBody": "正在获取该任务的状态。",
   "next.job.outcomeFailed": "失败 — 不完整，未移动任何内容",
@@ -497,7 +509,8 @@ export const nextZh: LocaleDictionary = {
   "next.analyzer.noteNzb": "检查 NZB 而不将其加入队列",
   "next.analyzer.source": "NZB、种子或磁力链接",
   "next.analyzer.sourceNzb": "NZB",
-  "next.analyzer.dropZone": "将 .nzb、.nzb.gz 或 .torrent 拖放到此处，或点击选择",
+  "next.analyzer.dropZone":
+    "将 .nzb、.nzb.gz 或 .torrent 拖放到此处，或点击选择",
   "next.analyzer.dropZoneNzb": "将 .nzb 或 .nzb.gz 拖放到此处，或点击选择",
   "next.analyzer.magnet": "磁力链接",
   "next.analyzer.analyze": "分析",
@@ -506,8 +519,10 @@ export const nextZh: LocaleDictionary = {
   "next.analyzer.magnetFailed": "无法分析该磁力链接。",
   "next.analyzer.tooLarge": "文件超过 {{size}}。",
   "next.analyzer.emptyTitle": "尚未分析任何内容",
-  "next.analyzer.emptyBody": "报告列出结构、Tracker 和警示信号，不含名称、路径、组、消息 ID 或 passkey，因此可以公开粘贴。",
-  "next.analyzer.emptyBodyNzb": "报告列出结构和警示信号，不含名称、路径、组或消息 ID，因此可以公开粘贴。",
+  "next.analyzer.emptyBody":
+    "报告列出结构、Tracker 和警示信号，不含名称、路径、组、消息 ID 或 passkey，因此可以公开粘贴。",
+  "next.analyzer.emptyBodyNzb":
+    "报告列出结构和警示信号，不含名称、路径、组或消息 ID，因此可以公开粘贴。",
   "next.analyzer.report": "报告",
   "next.job.download": "下载",
   "next.job.downloadFileTitle": "下载 {{name}}",
@@ -540,7 +555,8 @@ export const nextZh: LocaleDictionary = {
   "next.job.originalTitle": "原始 NZB 标题",
   "next.job.originalTorrentName": "原始种子名称",
   "next.job.providersUsed": "使用的提供商",
-  "next.job.providersEmpty": "该任务没有记录 — 要么尚未收到数据，要么在 weaver 开始按提供商统计前就已完成。",
+  "next.job.providersEmpty":
+    "该任务没有记录 — 要么尚未收到数据，要么在 weaver 开始按提供商统计前就已完成。",
   "next.job.serverId": "服务器 {{id}}",
   "next.job.articles.one": "{{count}} 篇文章",
   "next.job.articles.other": "{{count}} 篇文章",
@@ -555,7 +571,8 @@ export const nextZh: LocaleDictionary = {
   "next.job.deleteBody": "条目会从历史记录中移除，文件保留在磁盘上。",
   "next.job.cancelTitle": "取消下载",
   "next.job.cancelBody": "下载会停止并离开队列。部分数据会照常清理。",
-  "next.job.forgetBody": "weaver 将不再把此发布识别为已见内容的重复项。以后再次获取同一发布时会视为新内容。",
+  "next.job.forgetBody":
+    "weaver 将不再把此发布识别为已见内容的重复项。以后再次获取同一发布时会视为新内容。",
   "next.common.yes": "是",
   "next.common.no": "否",
   "next.monitoring.note": "流水线压力、服务商、失败",
@@ -689,9 +706,11 @@ export const nextZh: LocaleDictionary = {
   "next.settings.panel.scriptJobs": "作业",
   "next.settings.panel.secrets": "机密",
   "next.secrets.secret": "机密",
-  "next.secrets.note": "值以其名称加密保存，之后不会再显示。脚本输入按名称关联机密，因此在这里修改会作用于所有关联它的作业。",
+  "next.secrets.note":
+    "值以其名称加密保存，之后不会再显示。脚本输入按名称关联机密，因此在这里修改会作用于所有关联它的作业。",
   "next.secrets.name": "名称",
-  "next.secrets.nameHelp": "脚本输入选择此机密时使用的名称。不区分大小写，必须唯一。",
+  "next.secrets.nameHelp":
+    "脚本输入选择此机密时使用的名称。不区分大小写，必须唯一。",
   "next.secrets.nameInvalid": "请为机密指定不超过 128 字节的名称。",
   "next.secrets.value": "值",
   "next.secrets.valueHelp": "加密保存。保存后不会再显示。",
@@ -741,15 +760,19 @@ export const nextZh: LocaleDictionary = {
   "next.general.duplicate.strictActive": "相同发布,已存在",
   "next.general.duplicate.strictActiveHelp": "正在下载或已成功完成的相同 NZB。",
   "next.general.duplicate.strictFailed": "相同发布,之前失败",
-  "next.general.duplicate.strictFailedHelp": "之前的尝试失败或被取消的相同 NZB。",
+  "next.general.duplicate.strictFailedHelp":
+    "之前的尝试失败或被取消的相同 NZB。",
   "next.general.duplicate.layoutActive": "相同文章结构,已存在",
-  "next.general.duplicate.layoutActiveHelp": "与进行中或已完成任务发布相同文章的另一个 NZB。",
+  "next.general.duplicate.layoutActiveHelp":
+    "与进行中或已完成任务发布相同文章的另一个 NZB。",
   "next.general.duplicate.layoutFailed": "相同文章结构,之前失败",
-  "next.general.duplicate.layoutFailedHelp": "与失败尝试发布相同文章的另一个 NZB。",
+  "next.general.duplicate.layoutFailedHelp":
+    "与失败尝试发布相同文章的另一个 NZB。",
   "next.general.duplicate.articleSet": "重叠的文章集合",
   "next.general.duplicate.articleSetHelp": "与 weaver 已见过的内容部分重叠。",
   "next.general.duplicate.normalizedName": "相同的规范化名称",
-  "next.general.duplicate.normalizedNameHelp": "去除大小写、空格和标签后名称一致的发布。",
+  "next.general.duplicate.normalizedNameHelp":
+    "去除大小写、空格和标签后名称一致的发布。",
   "next.general.language": "语言",
   "next.general.languageHelp": "仅对此浏览器生效。",
   "next.general.interface": "界面",
@@ -767,13 +790,16 @@ export const nextZh: LocaleDictionary = {
   "next.general.attempts": "次",
   "next.general.propagationDelay": "传播延迟",
   "next.general.maxConcurrentNzbs": "最大并发 NZB 数",
-  "next.general.maxConcurrentNzbsHelp": "限制从开始到修复、解压和最终完成的 Usenet NZB 数量。所有服务商共用此限制。",
+  "next.general.maxConcurrentNzbsHelp":
+    "限制从开始到修复、解压和最终完成的 Usenet NZB 数量。所有服务商共用此限制。",
   "next.status.wait.nzb_slot": "正在等待 NZB 名额",
   "next.status.wait.disk_space": "磁盘空间不足",
-  "next.status.wait.disk_space_need": "磁盘空间不足：需要 {{need}}，可用 {{free}}",
+  "next.status.wait.disk_space_need":
+    "磁盘空间不足：需要 {{need}}，可用 {{free}}",
   "next.status.wait.disk_space_unread": "等待磁盘读数：需要 {{need}}",
   "next.status.wait.disk_too_small": "磁盘太小",
-  "next.status.wait.disk_too_small_need": "磁盘太小：需要 {{need}}，最多容纳 {{most}}",
+  "next.status.wait.disk_too_small_need":
+    "磁盘太小：需要 {{need}}，最多容纳 {{most}}",
   "next.status.wait.disk_full": "磁盘已满：仅做种",
   "next.status.wait.goal_met": "已达到做种目标",
   "next.status.wait.fetch_trackers": "正在向 Tracker 请求节点",
@@ -781,17 +807,21 @@ export const nextZh: LocaleDictionary = {
   "next.status.wait.fetch_waiting": "Tracker 未提供节点",
   "next.status.wait.login_refused": "等待中：登录被 {{server}} 拒绝",
   "next.status.diskShort": "正在写入磁盘",
-  "next.status.diskWriting": "正在写入磁盘 · {{volume}} 上 {{waiting}} 等待中 · {{rate}}",
+  "next.status.diskWriting":
+    "正在写入磁盘 · {{volume}} 上 {{waiting}} 等待中 · {{rate}}",
   "next.status.diskWaiting": "正在写入磁盘 · {{volume}} 上 {{waiting}} 等待中",
   "next.status.diskLeft": "正在写入磁盘：{{volume}} 上剩余 {{left}} 待写入",
   "next.attention.slowDisk": "目标磁盘较慢：写入速度 {{rate}}",
   "next.attention.slowDiskUnmeasured": "目标磁盘较慢",
-  "next.general.propagationDelayHelp": "新 NZB 开始前先等待这么久,确保所有文章都已到达服务器。",
+  "next.general.propagationDelayHelp":
+    "新 NZB 开始前先等待这么久,确保所有文章都已到达服务器。",
   "next.general.seconds": "秒",
   "next.general.srrdb": "SRRDB 发布查询",
-  "next.general.srrdbHelp": "对于混淆的归档成员,只将其 CRC32 校验和发送到公共 SRRDB 索引,以恢复发布名称。",
+  "next.general.srrdbHelp":
+    "对于混淆的归档成员,只将其 CRC32 校验和发送到公共 SRRDB 索引,以恢复发布名称。",
   "next.general.unacceptableExtensions": "不接受的扩展名",
-  "next.general.unacceptableExtensionsHelp": "以逗号分隔。包含其中任一扩展名的已完成下载如何处理，由下方的处理方式决定。",
+  "next.general.unacceptableExtensionsHelp":
+    "以逗号分隔。包含其中任一扩展名的已完成下载如何处理，由下方的处理方式决定。",
   "next.general.unwantedExtensionAction": "不接受扩展名的处理方式",
   "next.general.unwantedExtensionActionHelp":
     "列表中的文件绝不会作为压缩包打开。“使任务失败”会拒绝该下载；“只删除不需要的文件”会删除这些文件，并将其余文件作为部分完成交付。",
@@ -807,23 +837,29 @@ export const nextZh: LocaleDictionary = {
   "next.general.storage": "存储",
   "next.general.dataDirHelp": "在服务启动时确定;数据库和默认文件夹都在这里。",
   "next.general.workingDir": "工作目录",
-  "next.general.workingDirHelp": "后处理之前组装下载内容的位置。留空则使用数据目录。",
+  "next.general.workingDirHelp":
+    "后处理之前组装下载内容的位置。留空则使用数据目录。",
   "next.general.completeDir": "完成目录",
-  "next.general.completeDirHelp": "未单独指定目标的分类会在其中获得自己的文件夹。",
+  "next.general.completeDirHelp":
+    "未单独指定目标的分类会在其中获得自己的文件夹。",
   "next.general.cleanup": "解压后清理",
   "next.general.cleanupHelp": "发布成功解压后,删除压缩包和修复文件。",
   "next.general.deleteFailedJobFiles": "维护时删除失败任务的不完整文件",
   "next.general.historyRetentionDays": "历史保留天数",
-  "next.general.historyRetentionDaysHelp": "更早的条目会离开历史，其文件仍留在磁盘上。0 表示永久保留历史。",
+  "next.general.historyRetentionDaysHelp":
+    "更早的条目会离开历史，其文件仍留在磁盘上。0 表示永久保留历史。",
   "next.general.days": "天",
   "next.historyArchive.action": "封存",
   "next.historyArchive.title": "封存",
-  "next.historyArchive.body": "封存会从磁盘删除这些条目的已下载文件。条目及其 NZB 以已封存状态保留在历史中。只处理 Weaver 创建的文件夹。此操作无法撤销。",
-  "next.historyArchive.jobBody": "封存会从磁盘删除此条目的已下载文件。条目及其 NZB 以已封存状态保留在历史中。只处理 Weaver 创建的文件夹。此操作无法撤销。",
+  "next.historyArchive.body":
+    "封存会从磁盘删除这些条目的已下载文件。条目及其 NZB 以已封存状态保留在历史中。只处理 Weaver 创建的文件夹。此操作无法撤销。",
+  "next.historyArchive.jobBody":
+    "封存会从磁盘删除此条目的已下载文件。条目及其 NZB 以已封存状态保留在历史中。只处理 Weaver 创建的文件夹。此操作无法撤销。",
   "next.historyArchive.mark": "已封存",
   "next.historyArchive.queued.one": "已将 {{count}} 个条目加入封存队列",
   "next.historyArchive.queued.other": "已将 {{count}} 个条目加入封存队列",
-  "next.historyArchive.queuedPartial": "已将 {{total}} 个中的 {{done}} 个加入封存队列",
+  "next.historyArchive.queuedPartial":
+    "已将 {{total}} 个中的 {{done}} 个加入封存队列",
   "next.historyArchive.pending": "正在封存",
   "next.historyArchive.failed": "未封存",
   "next.historyArchive.notAccepted": "无法封存。",
@@ -904,20 +940,25 @@ export const nextZh: LocaleDictionary = {
   "next.categories.completedFolder": "完成文件夹",
   "next.categories.namePlaceholder": "<名称>",
   "next.categories.aliasesHelp": "索引器可能改用的名称,以逗号分隔。",
-  "next.categories.removeBody": "已归入 {{name}} 的下载保留其文件夹;新的下载改为存放到完成文件夹。",
+  "next.categories.removeBody":
+    "已归入 {{name}} 的下载保留其文件夹;新的下载改为存放到完成文件夹。",
   "next.watchFolder.polling": "轮询",
   "next.watchFolder.live": "实时",
   "next.watchFolder.folderRequired": "开启监视前请先选择文件夹。",
   "next.watchFolder.saveFailed": "无法保存监视文件夹。",
   "next.watchFolder.watching": "监视方式",
-  "next.watchFolder.watchingHelp": "实时使用文件系统事件;轮询按定时重新读取文件夹。网络共享通常需要轮询。",
+  "next.watchFolder.watchingHelp":
+    "实时使用文件系统事件;轮询按定时重新读取文件夹。网络共享通常需要轮询。",
   "next.watchFolder.folder": "文件夹",
-  "next.watchFolder.folderHelp": "放入这里的每个 .nzb 都会加入队列,然后被移到一旁。",
+  "next.watchFolder.folderHelp":
+    "放入这里的每个 .nzb 都会加入队列,然后被移到一旁。",
   "next.watchFolder.pollInterval": "轮询间隔",
   "next.watchFolder.settleTime": "稳定等待时间",
-  "next.watchFolder.settleTimeHelp": "文件停止变化后等待这么久再读取,避免把写到一半的 NZB 加入队列。",
+  "next.watchFolder.settleTimeHelp":
+    "文件停止变化后等待这么久再读取,避免把写到一半的 NZB 加入队列。",
   "next.watchFolder.categoryFromSubfolder": "按子文件夹分类",
-  "next.watchFolder.categoryFromSubfolderHelp": "`watch/tv` 中的文件会以 `tv` 分类加入队列。",
+  "next.watchFolder.categoryFromSubfolderHelp":
+    "`watch/tv` 中的文件会以 `tv` 分类加入队列。",
   "next.watchFolder.pauseScanning": "暂停扫描",
   "next.watchFolder.lastScan": "上次扫描",
   "next.watchFolder.lastScanNote": "找到 {{found}} 个,已加入队列 {{queued}} 个",
@@ -927,11 +968,15 @@ export const nextZh: LocaleDictionary = {
   "next.watchFolder.scanning": "正在扫描…",
   "next.watchFolder.scanNow": "立即扫描",
   "next.proxies.needsPrivateKey": "WireGuard 需要私钥。",
-  "next.proxies.malformedPrivateKey": "私钥看起来不是 WireGuard 密钥:应为 32 字节的 base64,与 wg genkey 的输出完全一致。",
-  "next.proxies.malformedPeerKey": "对端公钥看起来不是 WireGuard 密钥:应为 32 字节的 base64,与 wg genkey 的输出完全一致。",
-  "next.proxies.malformedPresharedKey": "预共享密钥看起来不是 WireGuard 密钥:应为 32 字节的 base64,与 wg genkey 的输出完全一致。",
+  "next.proxies.malformedPrivateKey":
+    "私钥看起来不是 WireGuard 密钥:应为 32 字节的 base64,与 wg genkey 的输出完全一致。",
+  "next.proxies.malformedPeerKey":
+    "对端公钥看起来不是 WireGuard 密钥:应为 32 字节的 base64,与 wg genkey 的输出完全一致。",
+  "next.proxies.malformedPresharedKey":
+    "预共享密钥看起来不是 WireGuard 密钥:应为 32 字节的 base64,与 wg genkey 的输出完全一致。",
   "next.proxies.needsPeerKey": "WireGuard 需要对端的公钥。",
-  "next.proxies.needsAddress": "WireGuard 至少需要一个接口地址,例如 10.6.0.2/32。",
+  "next.proxies.needsAddress":
+    "WireGuard 至少需要一个接口地址,例如 10.6.0.2/32。",
   "next.proxies.configTooLarge": "该配置超过 64 KiB。",
   "next.proxies.configNotWireguard": "这看起来不是 WireGuard 配置。",
   "next.proxies.configFilled": "已根据配置填写表单。",
@@ -971,19 +1016,25 @@ export const nextZh: LocaleDictionary = {
   "next.dns.trust.VALIDATE": "DNSSEC 开",
   "next.dns.tooMany": "最多保留 {{count}} 个 DNS 服务器。",
   "next.dns.orderHelp": "按此顺序从上到下询问服务器，最多 {{count}} 个。",
-  "next.dns.badAddress": "DNS 服务器 {{number}} 需要一个 IP 地址，端口仅在不是默认端口时填写。",
-  "next.dns.badUrl": "DNS 服务器 {{number}} 需要包含主机和路径的 https:// 地址，例如 https://cloudflare-dns.com/dns-query。",
-  "next.dns.dohNeedsAddress": "DNS 服务器 {{number}}：请填写访问此主机所用的 IP 地址。",
+  "next.dns.badAddress":
+    "DNS 服务器 {{number}} 需要一个 IP 地址，端口仅在不是默认端口时填写。",
+  "next.dns.badUrl":
+    "DNS 服务器 {{number}} 需要包含主机和路径的 https:// 地址，例如 https://cloudflare-dns.com/dns-query。",
+  "next.dns.dohNeedsAddress":
+    "DNS 服务器 {{number}}：请填写访问此主机所用的 IP 地址。",
   "next.dns.badTlsName": "DNS 服务器 {{number}} 的 TLS 名称不是有效的主机名。",
   "next.dns.title": "DNS",
-  "next.dns.note": "已保存的 DNS 服务器列表和配置文件。代理名称配置文件用于查找地址为名称的代理，在代理的编辑器中选择。每条路由遵循在其编辑器中选择的一个路由配置文件。更改从下一次查询起生效。",
+  "next.dns.note":
+    "已保存的 DNS 服务器列表和配置文件。代理名称配置文件用于查找地址为名称的代理，在代理的编辑器中选择。每条路由遵循在其编辑器中选择的一个路由配置文件。更改从下一次查询起生效。",
   "next.dns.who.SYSTEM": "系统",
   "next.dns.who.WEAVER": "Weaver",
   "next.dns.who.HOST": "主机",
-  "next.dns.nameWhoHelp.SYSTEM": "由主机查找此代理。在链中，由承载它的代理查找。",
+  "next.dns.nameWhoHelp.SYSTEM":
+    "由主机查找此代理。在链中，由承载它的代理查找。",
   "next.dns.profiles.hostName": "主机",
   "next.dns.whoHelp.SYSTEM": "由主机自己的解析器应答，与任何程序一样。",
-  "next.dns.whoHelp.PROXY": "SOCKS5、HTTP 和 SSH 代理直接收到名称。WireGuard 代理自带的 DNS 服务器通过隧道查询。",
+  "next.dns.whoHelp.PROXY":
+    "SOCKS5、HTTP 和 SSH 代理直接收到名称。WireGuard 代理自带的 DNS 服务器通过隧道查询。",
   "next.dns.whoHelp.WEAVER": "Weaver 按顺序查询已保存列表中的服务器。",
   "next.dns.list": "服务器列表",
   "next.dns.listChoose": "选择列表",
@@ -992,13 +1043,18 @@ export const nextZh: LocaleDictionary = {
   "next.dns.transit": "传输路径",
   "next.dns.transit.EGRESS": "经由出口",
   "next.dns.transit.PROXY": "经由代理",
-  "next.dns.transitHelp": "经由代理时，通过该分支当前代理的最后一跳查询。没有代理的分支或梯级从其出口查询。",
+  "next.dns.transitHelp":
+    "经由代理时，通过该分支当前代理的最后一跳查询。没有代理的分支或梯级从其出口查询。",
   "next.dns.systemFallback": "在没有代理的分支上询问系统",
-  "next.dns.systemFallbackHelp": "关闭：含有直连分支或直连回退的路由无法使用此配置文件。",
+  "next.dns.systemFallbackHelp":
+    "关闭：含有直连分支或直连回退的路由无法使用此配置文件。",
   "next.dns.systemFallbackOn": "不使用代理时使用系统",
-  "next.dns.routeNeedsWireGuard": "此处只能验证 WireGuard 代理的应答，因此此路由的每个分支都必须以 WireGuard 代理结束，不能有直连分支或直连回退。",
-  "next.dns.routeNeedsProxy": "此路由有直连分支或直连回退，代理无法在那里应答 DNS。请为它配上代理，或在配置中打开“在没有代理的分支上询问系统”。",
-  "next.dns.routeNeedsTunnelDns": "此处由代理应答 DNS，但这些 WireGuard 代理没有为其隧道列出 DNS 服务器：{{proxies}}。请为每个代理添加隧道的 DNS 服务器。",
+  "next.dns.routeNeedsWireGuard":
+    "此处只能验证 WireGuard 代理的应答，因此此路由的每个分支都必须以 WireGuard 代理结束，不能有直连分支或直连回退。",
+  "next.dns.routeNeedsProxy":
+    "此路由有直连分支或直连回退，代理无法在那里应答 DNS。请为它配上代理，或在配置中打开“在没有代理的分支上询问系统”。",
+  "next.dns.routeNeedsTunnelDns":
+    "此处由代理应答 DNS，但这些 WireGuard 代理没有为其隧道列出 DNS 服务器：{{proxies}}。请为每个代理添加隧道的 DNS 服务器。",
   "next.dns.wireShort.PLAIN": "明文",
   "next.dns.wireShort.TLS": "TLS",
   "next.dns.wireShort.HTTPS": "HTTPS",
@@ -1014,7 +1070,8 @@ export const nextZh: LocaleDictionary = {
   "next.dns.lists.section": "服务器列表",
   "next.dns.lists.save": "保存列表",
   "next.dns.lists.delete": "删除列表",
-  "next.dns.lists.deleteBody": "删除服务器列表 {{name}}？仍被配置文件使用的列表无法删除。",
+  "next.dns.lists.deleteBody":
+    "删除服务器列表 {{name}}？仍被配置文件使用的列表无法删除。",
   "next.dns.lists.nameRequired": "请为列表命名。",
   "next.dns.lists.serverCount.one": "{{count}} 个服务器",
   "next.dns.lists.serverCount.other": "{{count}} 个服务器",
@@ -1031,15 +1088,20 @@ export const nextZh: LocaleDictionary = {
   "next.dns.profiles.section": "配置文件",
   "next.dns.profiles.save": "保存配置文件",
   "next.dns.profiles.delete": "删除配置文件",
-  "next.dns.profiles.deleteBody": "删除 DNS 配置文件 {{name}}？仍有路由遵循的配置文件无法删除。",
+  "next.dns.profiles.deleteBody":
+    "删除 DNS 配置文件 {{name}}？仍有路由遵循的配置文件无法删除。",
   "next.dns.profiles.nameRequired": "请为配置文件命名。",
   "next.dns.profiles.builtIn": "内置",
-  "next.dns.nameWhoHelp.WEAVER": "Weaver 从出口按顺序查询已保存列表中的服务器。",
-  "next.dns.nameProfiles.deleteBody": "删除 DNS 配置文件 {{name}}？仍被代理使用的配置文件无法删除。",
+  "next.dns.nameWhoHelp.WEAVER":
+    "Weaver 从出口按顺序查询已保存列表中的服务器。",
+  "next.dns.nameProfiles.deleteBody":
+    "删除 DNS 配置文件 {{name}}？仍被代理使用的配置文件无法删除。",
   "next.dns.nameProfiles.add": "添加代理名称配置文件",
   "next.dns.nameProfiles.title": "代理名称配置文件",
-  "next.dns.profiles.inUseByBoth": "这些路由仍在使用此配置：{{routes}}。这些代理仍用它查找地址：{{proxies}}。请先为它们选择其他配置。",
-  "next.dns.profiles.inUseByProxies": "这些代理仍用此配置文件查找地址：{{proxies}}。请先为它们选择其他配置。",
+  "next.dns.profiles.inUseByBoth":
+    "这些路由仍在使用此配置：{{routes}}。这些代理仍用它查找地址：{{proxies}}。请先为它们选择其他配置。",
+  "next.dns.profiles.inUseByProxies":
+    "这些代理仍用此配置文件查找地址：{{proxies}}。请先为它们选择其他配置。",
   "next.dns.profiles.proxyCount.other": "{{count}} 个代理",
   "next.dns.profiles.proxyCount.one": "{{count}} 个代理",
   "next.dns.profiles.proxies": "代理",
@@ -1054,7 +1116,8 @@ export const nextZh: LocaleDictionary = {
   "next.dns.test.ownWire": "本行使用的协议",
   "next.dns.test.signaturesValidated": "签名已验证",
   "next.proxies.tunnelDns": "DNS 服务器",
-  "next.proxies.tunnelDnsHelp": "隧道自己的 DNS 服务器，每行一个 IP 地址。当路由的 DNS 配置文件由代理应答时，由它们应答。",
+  "next.proxies.tunnelDnsHelp":
+    "隧道自己的 DNS 服务器，每行一个 IP 地址。当路由的 DNS 配置文件由代理应答时，由它们应答。",
   "next.proxies.tunnelDnsBad": "隧道 DNS 服务器必须是 IP 地址。",
   "next.proxies.dnsProfileNumber": "DNS 配置文件 #{{id}}",
   "next.proxies.dnsProfileDetail": "通过 {{name}} 查找",
@@ -1092,9 +1155,11 @@ export const nextZh: LocaleDictionary = {
   "next.proxies.configBadKey": "{{key}} 不是 WireGuard 密钥。",
   "next.proxies.configBadEndpoint": "Endpoint 不是 host:port 格式。",
   "next.proxies.configBadNumber": "{{key}} 不是数字。",
-  "next.proxies.removeBody": "经由此代理的连接会改走下一条路由;若允许直连,则改为直连。",
+  "next.proxies.removeBody":
+    "经由此代理的连接会改走下一条路由;若允许直连,则改为直连。",
   "next.proxies.forgetKey": "忘记密钥",
-  "next.proxies.forgetBody": "下次连接将信任主机出示的任何密钥。只有在确定主机已重建时才这样做。",
+  "next.proxies.forgetBody":
+    "下次连接将信任主机出示的任何密钥。只有在确定主机已重建时才这样做。",
   "next.security.mode.required": "所有浏览器都需要登录",
   "next.security.mode.exceptTrusted": "需要登录,受信任网络除外",
   "next.security.mode.noLogin": "无需登录(仅限本机)",
@@ -1102,28 +1167,34 @@ export const nextZh: LocaleDictionary = {
   "next.security.scope.control": "控制队列",
   "next.security.scope.admin": "完全管理",
   "next.security.listenSaved": "监听地址已保存 — 重启 weaver 后生效",
-  "next.security.listenCleared": "监听地址已清除 — weaver 下次重启后将只允许本机访问",
+  "next.security.listenCleared":
+    "监听地址已清除 — weaver 下次重启后将只允许本机访问",
   "next.security.policyApplied": "访问策略已应用",
   "next.security.passwordsMismatch": "两次输入的密码不一致。",
   "next.security.credentialsRequired": "用户名和密码都必须填写。",
   "next.security.keyNameRequired": "请用将要使用该密钥的对象为它命名。",
   "next.security.keyCreateFailed": "无法创建密钥。",
   "next.security.listenAddress": "监听地址",
-  "next.security.listenHelp": "Weaver 默认在 127.0.0.1 上响应,只有本机可以访问。使用 0.0.0.0 可监听所有接口。下次重启后生效。",
-  "next.security.listenPinnedHelp": "由 weaver 环境中的 {{variable}} 固定;请改在部署配置中修改。",
+  "next.security.listenHelp":
+    "Weaver 默认在 127.0.0.1 上响应,只有本机可以访问。使用 0.0.0.0 可监听所有接口。下次重启后生效。",
+  "next.security.listenPinnedHelp":
+    "由 weaver 环境中的 {{variable}} 固定;请改在部署配置中修改。",
   "next.security.listenPlaceholder": "{{address}}(默认)",
   "next.security.browserAccess": "浏览器访问",
   "next.security.accessPinnedHelp": "由 weaver 环境中的 {{variable}} 管理。",
   "next.security.accessHelp": "哪些人无需登录即可使用网页界面。",
   "next.security.trustedNetworks": "受信任网络",
-  "next.security.trustedNetworksHelp": "每行一个 CIDR。这些范围内的浏览器无需登录。",
+  "next.security.trustedNetworksHelp":
+    "每行一个 CIDR。这些范围内的浏览器无需登录。",
   "next.security.mcpEnabled": "允许 MCP 服务器",
-  "next.security.mcpEnabledHelp": "允许持有 API 密钥的代理通过 /mcp 运行操作员技能的操作。",
+  "next.security.mcpEnabledHelp":
+    "允许持有 API 密钥的代理通过 /mcp 运行操作员技能的操作。",
   "next.security.signIn": "登录",
   "next.security.signedInAs": "已登录为 {{name}}",
   "next.security.notConfigured": "未配置",
   "next.security.requireLogin": "要求登录",
-  "next.security.requireLoginOffHelp": "任何能访问 weaver 的人都拥有完全管理权限。",
+  "next.security.requireLoginOffHelp":
+    "任何能访问 weaver 的人都拥有完全管理权限。",
   "next.security.changePassword": "修改密码",
   "next.security.turnOff": "关闭",
   "next.security.setUpLogin": "设置登录",
@@ -1134,11 +1205,13 @@ export const nextZh: LocaleDictionary = {
   "next.security.scope": "权限范围",
   "next.security.created": "创建时间",
   "next.security.lastUsed": "上次使用",
-  "next.security.keysEmpty": "没有 API 密钥。Sonarr、Radarr 和 NZBGet 兼容接口各需要一个。",
+  "next.security.keysEmpty":
+    "没有 API 密钥。Sonarr、Radarr 和 NZBGet 兼容接口各需要一个。",
   "next.security.addKey": "添加 API 密钥",
   "next.security.never": "从未",
   "next.security.revoke": "撤销",
-  "next.security.exposedWarning": "在未配置登录的情况下,下次重启后 Weaver 将可以从本机以外访问。",
+  "next.security.exposedWarning":
+    "在未配置登录的情况下,下次重启后 Weaver 将可以从本机以外访问。",
   "next.security.appliesImmediately": "立即生效",
   "next.security.turnOnLogin": "开启登录",
   "next.security.administrator": "管理员",
@@ -1152,17 +1225,20 @@ export const nextZh: LocaleDictionary = {
   "next.security.newKeyNote": "只会显示一次",
   "next.security.createKey": "创建密钥",
   "next.security.key": "密钥",
-  "next.security.scopeHelp": "只读可查看队列;控制可添加和移除任务;管理可修改设置。",
+  "next.security.scopeHelp":
+    "只读可查看队列;控制可添加和移除任务;管理可修改设置。",
   "next.security.keyCreated": "API 密钥已创建",
   "next.security.copied": "已复制",
   "next.security.copyFailed": "无法复制，请按 Ctrl+C 或 ⌘C",
   "next.security.copyKey": "复制密钥",
   "next.security.done": "完成",
-  "next.security.copyNow": "请立即复制。Weaver 只保存它的哈希值,因此无法再次显示。",
+  "next.security.copyNow":
+    "请立即复制。Weaver 只保存它的哈希值,因此无法再次显示。",
   "next.security.apiKey": "API 密钥",
   "next.security.turnOffTitle": "关闭登录",
   "next.security.turnOffLogin": "关闭登录",
-  "next.security.turnOffBody": "任何能访问 weaver 的人都将无需登录即拥有完全管理权限。",
+  "next.security.turnOffBody":
+    "任何能访问 weaver 的人都将无需登录即拥有完全管理权限。",
   "next.security.revokeTitle": "撤销 API 密钥",
   "next.security.revokeKey": "撤销密钥",
   "next.security.revokeBody": "仍在使用 {{name}} 的一切都会立即停止工作。",
@@ -1178,38 +1254,50 @@ export const nextZh: LocaleDictionary = {
   "next.security.passwordHelp": "更改密码会注销所有会话。",
   "next.security.signOutEverywhere": "在所有位置注销",
   "next.security.signOutEverywhereTitle": "注销所有浏览器",
-  "next.security.signOutEverywhereBody": "所有登录到 weaver 的浏览器（包括当前浏览器）都会被注销，需要重新登录。API 密钥仍可继续使用。",
+  "next.security.signOutEverywhereBody":
+    "所有登录到 weaver 的浏览器（包括当前浏览器）都会被注销，需要重新登录。API 密钥仍可继续使用。",
   "next.security.signOutEverywhereFailed": "Weaver 无法注销其他会话。请重试。",
   "next.security.listeningNow": "当前监听",
-  "next.security.listenPending": "Weaver 仍在此地址上监听；已保存的地址将在下次重启时生效。",
+  "next.security.listenPending":
+    "Weaver 仍在此地址上监听；已保存的地址将在下次重启时生效。",
   "next.security.rememberedNetworks": "允许记住登录的网络",
-  "next.security.rememberedNetworksHelp": "这些网段内的浏览器登录时可以使用“记住我”。每行一个 CIDR；留空则允许任何客户端。",
+  "next.security.rememberedNetworksHelp":
+    "这些网段内的浏览器登录时可以使用“记住我”。每行一个 CIDR；留空则允许任何客户端。",
   "next.security.trustedProxies": "受信任的代理",
-  "next.security.trustedProxiesHelp": "只信任来自这些地址或 CIDR 的转发标头。只填写你自己部署的代理。",
+  "next.security.trustedProxiesHelp":
+    "只信任来自这些地址或 CIDR 的转发标头。只填写你自己部署的代理。",
   "next.security.thisBrowser": "当前浏览器",
-  "next.security.connectionHelp": "连接的对端地址，以及 weaver 据此解析出的客户端地址。",
+  "next.security.connectionHelp":
+    "连接的对端地址，以及 weaver 据此解析出的客户端地址。",
   "next.security.headersIgnored": "已忽略转发标头。",
   "next.security.unknown": "未知",
   "next.security.draft": "草稿",
   "next.security.draftHelp": "未保存更改的解析结果，输入时由 weaver 检查。",
-  "next.security.draftResolves": "记住登录的来源：{{networks}}；受信任的代理：{{proxies}}。",
+  "next.security.draftResolves":
+    "记住登录的来源：{{networks}}；受信任的代理：{{proxies}}。",
   "next.security.anyClient": "任何客户端",
   "next.security.draftRestart": "监听地址将在下次重启时生效。",
   "next.security.draftLocksOut": "当前浏览器将无法再保持记住的登录。",
-  "next.security.policyInvalid": "已保存的记住登录网络无效，因此 weaver 正在拒绝所有记住的登录。请在下方更正。",
-  "next.security.networkSaved": "网络访问已保存。监听地址的更改将在下次重启时生效。",
+  "next.security.policyInvalid":
+    "已保存的记住登录网络无效，因此 weaver 正在拒绝所有记住的登录。请在下方更正。",
+  "next.security.networkSaved":
+    "网络访问已保存。监听地址的更改将在下次重启时生效。",
   "next.security.lockoutTitle": "当前浏览器将失去“记住我”",
-  "next.security.lockoutBody": "当前浏览器不在你要保存的网络范围内。如果它是用“记住我”登录的，将需要重新登录。",
+  "next.security.lockoutBody":
+    "当前浏览器不在你要保存的网络范围内。如果它是用“记住我”登录的，将需要重新登录。",
   "next.security.lockoutConfirm": "仍然保存",
   "next.backup.requestFailed": "请求失败,状态码 {{status}}",
   "next.backup.building": "正在生成归档…",
   "next.backup.savedFile": "已保存 {{name}}",
   "next.backup.reading": "正在读取归档…",
-  "next.backup.readNeedsRemaps": "归档已读取。请为下方分类指定本机上的目标位置。",
+  "next.backup.readNeedsRemaps":
+    "归档已读取。请为下方分类指定本机上的目标位置。",
   "next.backup.readDone": "归档已读取。",
   "next.backup.staging": "正在准备恢复…",
-  "next.backup.staged.one": "恢复已准备 · 历史中有 {{count}} 个下载 · 重启 weaver 后生效",
-  "next.backup.staged.other": "恢复已准备 · 历史中有 {{count}} 个下载 · 重启 weaver 后生效",
+  "next.backup.staged.one":
+    "恢复已准备 · 历史中有 {{count}} 个下载 · 重启 weaver 后生效",
+  "next.backup.staged.other":
+    "恢复已准备 · 历史中有 {{count}} 个下载 · 重启 weaver 后生效",
   "next.backup.restored.one": "已从历史恢复 {{count}} 个下载",
   "next.backup.restored.other": "已从历史恢复 {{count}} 个下载",
   "next.backup.theDataDirectory": "数据目录",
@@ -1222,13 +1310,15 @@ export const nextZh: LocaleDictionary = {
   "next.backup.intermediateDir": "中间目录",
   "next.backup.blankUses": "留空则使用 {{path}}。",
   "next.backup.readTheArchive": "读取归档",
-  "next.backup.readTheArchiveHelp": "Weaver 会先检查归档,并在执行前报告恢复会产生的变化。",
+  "next.backup.readTheArchiveHelp":
+    "Weaver 会先检查归档,并在执行前报告恢复会产生的变化。",
   "next.backup.checking": "检查中…",
   "next.backup.restoreAvailable": "可以恢复",
   "next.backup.restoreUnavailable": "无法恢复",
   "next.backup.readArchive": "读取归档",
   "next.backup.restore": "恢复",
-  "next.backup.restoreHelp": "用归档中的内容替换本机的设置、服务商、分类和历史。",
+  "next.backup.restoreHelp":
+    "用归档中的内容替换本机的设置、服务商、分类和历史。",
   "next.backup.restoreFromArchive": "从归档恢复",
   "next.backup.exportNote": "设置、服务商、分类、计划和历史",
   "next.backup.passwordHelp": "归档将用此密码加密。Weaver 无法替你找回。",
@@ -1249,7 +1339,8 @@ export const nextZh: LocaleDictionary = {
   "next.backup.sourceDataDir": "源数据目录",
   "next.backup.sourceCompleteDir": "源完成目录",
   "next.backup.sourceIntermediateDir": "源中间目录",
-  "next.backup.keyIncompatible": "此归档的加密密钥无法导入已配置的密钥存储,因此无法在此恢复。",
+  "next.backup.keyIncompatible":
+    "此归档的加密密钥无法导入已配置的密钥存储,因此无法在此恢复。",
   "next.backup.categoryDestinations": "分类目标位置",
   "next.backup.categoryDestinationsNote": "这些文件夹在本机上不存在",
   "next.backup.was": "原位置",
@@ -1257,23 +1348,27 @@ export const nextZh: LocaleDictionary = {
   "next.backup.destinationFor": "{{name}} 的目标位置",
   "next.backup.download": "下载备份",
   "next.backup.stageRestore": "准备恢复",
-  "next.backup.restoreBody": "weaver 所知的一切 — 服务商、分类、计划、历史 — 都会被归档内容替换。恢复内容会先另行写入,并在服务下次启动时应用。",
+  "next.backup.restoreBody":
+    "weaver 所知的一切 — 服务商、分类、计划、历史 — 都会被归档内容替换。恢复内容会先另行写入,并在服务下次启动时应用。",
   "next.postProcessing.directorySaved": "已保存脚本目录 · 所有脚本作业均已关闭",
   "next.postProcessing.required": "必填。",
   "next.postProcessing.defaultValue": "默认值：{{value}}。",
   "next.postProcessing.execution": "执行",
   "next.postProcessing.strictOn": "严格安全已开启",
   "next.postProcessing.runScripts": "运行脚本",
-  "next.postProcessing.runScriptsHelp": "关闭后，weaver 会发现脚本，但不会执行任何脚本。",
+  "next.postProcessing.runScriptsHelp":
+    "关闭后，weaver 会发现脚本，但不会执行任何脚本。",
   "next.postProcessing.concurrency": "并发脚本数",
-  "next.postProcessing.concurrencyHelp": "所有下载和事件合计可同时运行的脚本数量。同一下载的脚本仍按顺序依次运行。",
+  "next.postProcessing.concurrencyHelp":
+    "所有下载和事件合计可同时运行的脚本数量。同一下载的脚本仍按顺序依次运行。",
   "next.postProcessing.grace": "终止宽限时间",
   "next.postProcessing.interpreters": "解释器",
   "next.postProcessing.interpretersNote": "留空则使用守护进程 PATH 中的程序",
   "next.postProcessing.directory": "脚本目录",
   "next.postProcessing.directoryNote": "从守护进程自身的文件系统读取",
   "next.postProcessing.directoryLabel": "目录",
-  "next.postProcessing.directoryHelp": "在此处发现脚本。Weaver 从不上传、编辑或删除它们。",
+  "next.postProcessing.directoryHelp":
+    "在此处发现脚本。Weaver 从不上传、编辑或删除它们。",
   "next.postProcessing.change": "更改",
   "next.postProcessing.script": "脚本",
   "next.postProcessing.timeout": "超时",
@@ -1285,30 +1380,39 @@ export const nextZh: LocaleDictionary = {
   "next.postProcessing.moveUp": "上移",
   "next.postProcessing.moveDown": "下移",
   "next.postProcessing.adapter": "适配器",
-  "next.postProcessing.discoveredEmpty": "没有找到脚本。把脚本放进脚本目录，然后刷新。",
+  "next.postProcessing.discoveredEmpty":
+    "没有找到脚本。把脚本放进脚本目录，然后刷新。",
   "next.postProcessing.problems": "无法读取的脚本",
   "next.postProcessing.changeDirTitle": "更改脚本目录",
   "next.postProcessing.changeDirConfirm": "更改目录",
-  "next.postProcessing.changeDirBody": "所有脚本作业都会被关闭，因为新目录中的同名文件未必是原先接入的脚本。其中保存的内容全部保留。不会改动磁盘上的任何文件。",
+  "next.postProcessing.changeDirBody":
+    "所有脚本作业都会被关闭，因为新目录中的同名文件未必是原先接入的脚本。其中保存的内容全部保留。不会改动磁盘上的任何文件。",
   "next.postProcessing.events": "事件脚本与输出保留",
   "next.postProcessing.eventsNote": "同一下载的队列事件一次只运行一个",
   "next.postProcessing.eventTimeout": "默认事件超时",
-  "next.postProcessing.eventTimeoutHelp": "当队列、扫描、计划或订阅源脚本作业没有自己的超时时使用。",
+  "next.postProcessing.eventTimeoutHelp":
+    "当队列、扫描、计划或订阅源脚本作业没有自己的超时时使用。",
   "next.postProcessing.fileEventInterval": "文件事件间隔",
-  "next.postProcessing.fileEventIntervalHelp": "同一下载的文件事件之间的最短时间。0 表示不限制，-1 表示关闭。直接存储的下载可能没有可供脚本检查的压缩文件。",
+  "next.postProcessing.fileEventIntervalHelp":
+    "同一下载的文件事件之间的最短时间。0 表示不限制，-1 表示关闭。直接存储的下载可能没有可供脚本检查的压缩文件。",
   "next.postProcessing.outputRuns": "每个下载保留的运行次数",
-  "next.postProcessing.outputRunsHelp": "为每个下载以及每次扫描、每个计划或每个订阅源保留的最新运行次数。",
+  "next.postProcessing.outputRunsHelp":
+    "为每个下载以及每次扫描、每个计划或每个订阅源保留的最新运行次数。",
   "next.postProcessing.outputFailedRuns": "保留失败的运行",
-  "next.postProcessing.outputFailedRunsHelp": "每个下载超出该数量后仍保留的失败运行次数，便于查看失败原因。",
-  "next.postProcessing.outputLoweringDeletes": "调低此值后，保存时会立即删除每个下载的较早运行记录。",
+  "next.postProcessing.outputFailedRunsHelp":
+    "每个下载超出该数量后仍保留的失败运行次数，便于查看失败原因。",
+  "next.postProcessing.outputLoweringDeletes":
+    "调低此值后，保存时会立即删除每个下载的较早运行记录。",
   "next.postProcessing.outputTruncatedChip": "已截断",
   "next.postProcessing.kindPostProcessing": "后处理",
   "next.postProcessing.kindQueue": "队列",
   "next.postProcessing.kindScan": "扫描",
   "next.postProcessing.kindFeed": "订阅源",
   "next.postProcessing.instances": "作业",
-  "next.postProcessing.instancesNote": "适用于所有分类的作业先于分类自己的作业运行",
-  "next.postProcessing.instancesNoteOnlyWithout": "适用于所有分类的作业仅在分类没有自己的作业时运行",
+  "next.postProcessing.instancesNote":
+    "适用于所有分类的作业先于分类自己的作业运行",
+  "next.postProcessing.instancesNoteOnlyWithout":
+    "适用于所有分类的作业仅在分类没有自己的作业时运行",
   "next.postProcessing.noInstances": "还没有作业。",
   "next.postProcessing.createInstance": "添加作业",
   "next.postProcessing.chooseScript": "选择脚本",
@@ -1318,7 +1422,8 @@ export const nextZh: LocaleDictionary = {
   "next.postProcessing.inputs": "输入项",
   "next.postProcessing.noInputs": "此作业没有输入项。",
   "next.postProcessing.secret": "机密",
-  "next.postProcessing.secretLinkHelp": "在 设置 · 脚本 · 机密 中关联。脚本运行时会获得其值，此处永不显示。",
+  "next.postProcessing.secretLinkHelp":
+    "在 设置 · 脚本 · 机密 中关联。脚本运行时会获得其值，此处永不显示。",
   "next.postProcessing.chooseSecret": "选择机密",
   "next.postProcessing.noSecret": "无机密",
   "next.postProcessing.createSecret": "新建机密…",
@@ -1330,42 +1435,54 @@ export const nextZh: LocaleDictionary = {
   "next.postProcessing.newInputIsSecret": "新输入是密钥",
   "next.postProcessing.ownSecretSaved": "已保存。输入即替换",
   "next.postProcessing.addInput": "添加输入项",
-  "next.postProcessing.inputNameInvalid": "请使用字母、数字、- 和 _，并以字母开头。可用点号连接多个这样的部分。",
+  "next.postProcessing.inputNameInvalid":
+    "请使用字母、数字、- 和 _，并以字母开头。可用点号连接多个这样的部分。",
   "next.postProcessing.inputNameTaken": "此作业已有同名输入项。",
   "next.postProcessing.runPolicy": "如何运行",
   "next.postProcessing.categories": "分类",
-  "next.postProcessing.categoriesHelp": "仅对这些分类的下载运行。未选择任何分类时，对所有分类运行。",
+  "next.postProcessing.categoriesHelp":
+    "仅对这些分类的下载运行。未选择任何分类时，对所有分类运行。",
   "next.postProcessing.everyCategory": "所有分类",
   "next.postProcessing.noCategories": "未定义任何分类",
   "next.postProcessing.runTimes": "运行时间",
-  "next.postProcessing.runTimeNeeded": "请为此作业指定运行时间，或开启启动时运行。",
-  "next.postProcessing.runTimeInvalid": "{{time}} 不是时间。请使用 HH:MM，或用 *:MM 表示每小时。",
-  "next.postProcessing.runModeHelp": "阻塞会等待脚本结束后再继续。即发即忘只负责启动，不等待其结束。",
-  "next.postProcessing.timeoutHelp": "0 表示使用默认值：后处理脚本为一天，其他为默认事件超时。最长 7 天。",
+  "next.postProcessing.runTimeNeeded":
+    "请为此作业指定运行时间，或开启启动时运行。",
+  "next.postProcessing.runTimeInvalid":
+    "{{time}} 不是时间。请使用 HH:MM，或用 *:MM 表示每小时。",
+  "next.postProcessing.runModeHelp":
+    "阻塞会等待脚本结束后再继续。即发即忘只负责启动，不等待其结束。",
+  "next.postProcessing.timeoutHelp":
+    "0 表示使用默认值：后处理脚本为一天，其他为默认事件超时。最长 7 天。",
   "next.postProcessing.timeoutDefault": "默认",
   "next.postProcessing.enabledFor": "启用 {{name}}",
   "next.postProcessing.headerDrift": "输入项与脚本头部不一致",
-  "next.postProcessing.headerDriftBody": "此作业的输入项已与脚本头部声明的内容不一致。从头部重新应用可使其一致，已保存的值会保留。",
+  "next.postProcessing.headerDriftBody":
+    "此作业的输入项已与脚本头部声明的内容不一致。从头部重新应用可使其一致，已保存的值会保留。",
   "next.postProcessing.reapply": "从头部重新应用",
-  "next.postProcessing.reapplyBody": "已保存的值会保留，新输入项以默认值加入，头部不再声明的输入项会被移除。触发方式不变。",
+  "next.postProcessing.reapplyBody":
+    "已保存的值会保留，新输入项以默认值加入，头部不再声明的输入项会被移除。触发方式不变。",
   "next.postProcessing.reapplied": "已从头部重新应用 {{name}}",
   "next.postProcessing.setUpFromHeader": "按头部设置作业",
-  "next.postProcessing.setUpFromHeaderHelp": "为脚本头部声明且尚无作业的每种触发方式创建一个作业。",
+  "next.postProcessing.setUpFromHeaderHelp":
+    "为脚本头部声明且尚无作业的每种触发方式创建一个作业。",
   "next.postProcessing.setUpDone.one": "已为 {{name}} 创建 {{count}} 个作业",
   "next.postProcessing.setUpDone.other": "已为 {{name}} 创建 {{count}} 个作业",
   "next.postProcessing.instanceCreated": "已创建 {{name}}",
   "next.postProcessing.instanceSaved": "已保存 {{name}}",
   "next.postProcessing.instanceDeleted": "已删除 {{name}}",
   "next.postProcessing.deleteTitle": "删除作业",
-  "next.postProcessing.deleteBody": "作业会被移除，它在各订阅源中的位置也会一并移除。脚本文件不受影响。",
+  "next.postProcessing.deleteBody":
+    "作业会被移除，它在各订阅源中的位置也会一并移除。脚本文件不受影响。",
   "next.postProcessing.feedGroupNote": "在其所附加的订阅源上运行",
   "next.postProcessing.globalScriptsRun": "全局脚本运行时机",
-  "next.postProcessing.globalScriptsRunHelp": "全局脚本是没有自己分类的作业，先于分类自己的脚本运行。此项决定当下载的分类有自己的脚本时，全局脚本是否也运行。",
+  "next.postProcessing.globalScriptsRunHelp":
+    "全局脚本是没有自己分类的作业，先于分类自己的脚本运行。此项决定当下载的分类有自己的脚本时，全局脚本是否也运行。",
   "next.postProcessing.globalAlways": "对每个下载运行",
   "next.postProcessing.globalOnlyWithout": "仅当分类没有脚本时",
   "next.postProcessing.test": "测试",
   "next.postProcessing.testTitle": "测试 {{name}}",
-  "next.postProcessing.testNote": "按已保存的内容，用虚构的输入运行一次作业。脚本请求的任何操作都不会生效。",
+  "next.postProcessing.testNote":
+    "按已保存的内容，用虚构的输入运行一次作业。脚本请求的任何操作都不会生效。",
   "next.postProcessing.testStarting": "正在启动测试…",
   "next.postProcessing.testRunning": "运行中",
   "next.postProcessing.testGone": "守护进程已不再保留这次测试运行。",
@@ -1377,7 +1494,8 @@ export const nextZh: LocaleDictionary = {
   "next.postProcessing.testLogEmpty": "脚本没有输出任何内容。",
   "next.postProcessing.testCommands": "脚本请求的操作",
   "next.postProcessing.testCommandsNote": "均未生效",
-  "next.postProcessing.testCommandsTruncated": "脚本请求的操作多于此处显示的内容。",
+  "next.postProcessing.testCommandsTruncated":
+    "脚本请求的操作多于此处显示的内容。",
   "next.postProcessing.testAgain": "再次运行",
   "next.postProcessing.cancelTest": "取消测试",
   "next.scriptRuns.note": "最新优先",
@@ -1422,12 +1540,16 @@ export const nextZh: LocaleDictionary = {
   "next.providers.username": "用户名",
   "next.providers.password": "密码",
   "next.providers.passwordKeep": "留空以保留已保存的密码。",
-  "next.providers.connectionsHelp": "weaver 可同时打开的连接数。切勿超过套餐允许的数量。",
+  "next.providers.connectionsHelp":
+    "weaver 可同时打开的连接数。切勿超过套餐允许的数量。",
   "next.providers.enabled": "启用",
-  "next.providers.killSwitchHelp": "以停用状态保存此服务商，不做连接测试，且不允许任何流量外出。在“网络”中设置路由后，再在此处启用。",
+  "next.providers.killSwitchHelp":
+    "以停用状态保存此服务商，不做连接测试，且不允许任何流量外出。在“网络”中设置路由后，再在此处启用。",
   "next.providers.priority": "优先级",
-  "next.providers.priorityHelp": "数值越小优先级越高，相同数值的服务商共同提供带宽。仅当前面的组无法提供该文章时才使用后面的组；连接繁忙不会触发回退。",
-  "next.providers.backfillServerHelp": "仅补全主服务器没有的文章。主服务器宕机或拒绝其凭据时绝不使用。",
+  "next.providers.priorityHelp":
+    "数值越小优先级越高，相同数值的服务商共同提供带宽。仅当前面的组无法提供该文章时才使用后面的组；连接繁忙不会触发回退。",
+  "next.providers.backfillServerHelp":
+    "仅补全主服务器没有的文章。主服务器宕机或拒绝其凭据时绝不使用。",
   "next.providers.retention": "保留期",
   "next.providers.days": "天",
   "next.providers.unlimitedSpeed": "不限速",
@@ -1443,9 +1565,11 @@ export const nextZh: LocaleDictionary = {
   "next.providers.test": "测试连接",
   "next.providers.loading": "正在加载服务商…",
   "next.providers.pipelining": "流水线",
-  "next.providers.certMismatch": "此服务器的证书指向其他主机名。只有在确定这是你的服务商服务器时才信任它。",
+  "next.providers.certMismatch":
+    "此服务器的证书指向其他主机名。只有在确定这是你的服务商服务器时才信任它。",
   "next.providers.trustCert": "信任此证书",
-  "next.providers.removeBody": "Weaver 将停止使用 {{host}}。进行中的下载会转到其余服务商。",
+  "next.providers.removeBody":
+    "Weaver 将停止使用 {{host}}。进行中的下载会转到其余服务商。",
   "next.providers.thisProvider": "此服务商",
   "next.providers.quotaWindow": "配额周期",
   "next.providers.usedSoFar": "目前已用：{{size}}。",
@@ -1511,16 +1635,19 @@ export const nextZh: LocaleDictionary = {
   "next.rss.clearHistory": "清除历史",
   "next.rss.urlHelp": "索引器的 RSS 或 Newznab 搜索，包含其 API 密钥。",
   "next.rss.enabled": "启用",
-  "next.rss.killSwitchHelp": "以停用状态保存此订阅源，且不允许任何流量外出。在“网络”中设置路由后，再在此处启用。",
+  "next.rss.killSwitchHelp":
+    "以停用状态保存此订阅源，且不允许任何流量外出。在“网络”中设置路由后，再在此处启用。",
   "next.rss.pollInterval": "拉取间隔",
   "next.rss.defaultCategory": "默认分类",
   "next.rss.defaultCategoryHelp": "没有规则覆盖时，已接受条目归入的分类。",
   "next.rss.feedScripts": "订阅源脚本",
-  "next.rss.feedScriptsHelp": "此订阅源按此顺序运行的订阅源作业。为空时，不会对其运行任何脚本。",
+  "next.rss.feedScriptsHelp":
+    "此订阅源按此顺序运行的订阅源作业。为空时，不会对其运行任何脚本。",
   "next.rss.attachScript": "附加订阅源作业",
   "next.rss.noFeedInstances": "还没有订阅源作业。请在“脚本”中创建。",
   "next.rss.defaultMetadata": "默认元数据",
-  "next.rss.defaultMetadataHelp": "每行一个 键 = 值，附加到此订阅源加入队列的每个条目。",
+  "next.rss.defaultMetadataHelp":
+    "每行一个 键 = 值，附加到此订阅源加入队列的每个条目。",
   "next.rss.credentials": "凭据",
   "next.rss.credentialsNote": "可选 · 以只写方式保存",
   "next.rss.username": "用户名",
@@ -1530,7 +1657,8 @@ export const nextZh: LocaleDictionary = {
   "next.rss.orderHelp": "数字小的先尝试。",
   "next.rss.titleMatchesHelp": "正则表达式。留空匹配所有标题。",
   "next.rss.feedCategories": "订阅源分类",
-  "next.rss.feedCategoriesHelp": "以逗号分隔的分类，与索引器的标注一致。留空匹配任意分类。",
+  "next.rss.feedCategoriesHelp":
+    "以逗号分隔的分类，与索引器的标注一致。留空匹配任意分类。",
   "next.rss.minSize": "最小大小",
   "next.rss.maxSize": "最大大小",
   "next.rss.fileInto": "归入",
@@ -1543,20 +1671,25 @@ export const nextZh: LocaleDictionary = {
   "next.rss.editRule": "编辑规则",
   "next.rss.rule": "规则",
   "next.rss.removeRule": "移除规则",
-  "next.rss.removeFeedBody": "它的规则及记住的所有条目都会一并移除。已加入队列的下载不受影响。",
+  "next.rss.removeFeedBody":
+    "它的规则及记住的所有条目都会一并移除。已加入队列的下载不受影响。",
   "next.rss.removeRuleBody": "原由此规则决定的条目会交给后面的规则。",
   "next.rss.clearSeenTitle": "清除见过的历史",
   "next.rss.forgetItemTitle": "忘记此条目",
   "next.rss.items.one": "{{count}} 个条目",
   "next.rss.items.other": "{{count}} 个条目",
   "next.rss.forgetItem": "忘记条目",
-  "next.rss.clearSeenBody": "每个订阅源在下次拉取时都可能再次将其报告的任何内容加入队列。",
-  "next.rss.forgetItemBody": "下次报告此条目的拉取会将其视为新条目，并可能再次加入队列。",
+  "next.rss.clearSeenBody":
+    "每个订阅源在下次拉取时都可能再次将其报告的任何内容加入队列。",
+  "next.rss.forgetItemBody":
+    "下次报告此条目的拉取会将其视为新条目，并可能再次加入队列。",
   "next.proxies.clearStored": "清除",
   "next.proxies.keepStored": "保留",
   "next.proxies.clearedPlaceholder": "保存时移除",
-  "next.proxies.storedCleared": "保存后将移除已存储的值。如需替换，请改为输入新值。",
-  "next.proxies.typeLocked": "配置文件的类型不可更改。如需使用其他类型，请添加新的配置文件。",
+  "next.proxies.storedCleared":
+    "保存后将移除已存储的值。如需替换，请改为输入新值。",
+  "next.proxies.typeLocked":
+    "配置文件的类型不可更改。如需使用其他类型，请添加新的配置文件。",
   "next.routing.full": "一条路由最多包含 {{count}} 个代理。",
   "next.inspector.removeFailed": "无法移除此下载。",
   "next.schedules.pauseWatchFolder": "暂停扫描监视文件夹",
@@ -1589,7 +1722,8 @@ export const nextZh: LocaleDictionary = {
   "next.schedules.splitTo": "带宽分配：Usenet {{usenet}}%，种子 {{torrent}}%",
   "next.schedules.splitLifted": "带宽分配：解除",
   "next.schedules.profile": "硬件配置",
-  "next.schedules.profileHelp": "在下一条配置规则执行前一直有效。只显示本机能够运行的配置。",
+  "next.schedules.profileHelp":
+    "在下一条配置规则执行前一直有效。只显示本机能够运行的配置。",
   "next.system.kernels": "计算内核",
   "next.system.kernelsNote": "最快的在前 · 高亮为正在使用",
   "next.system.kernelLadder": "此库可选择的内核，最快的在前",
@@ -1612,13 +1746,16 @@ export const nextZh: LocaleDictionary = {
   "next.login.failed": "无法登录：{{error}}",
   "next.login.unreachable": "Weaver 没有响应。请确认它正在运行，然后重试。",
   "next.login.forgot": "忘记密码？",
-  "next.login.resetHelp": "停止 Weaver，然后使用登录重置和新的引导凭据重新启动。密码文件比环境变量中的密码更安全。",
+  "next.login.resetHelp":
+    "停止 Weaver，然后使用登录重置和新的引导凭据重新启动。密码文件比环境变量中的密码更安全。",
   "next.login.docker": "Docker",
   "next.login.bareMetal": "直接安装",
-  "next.login.trustedNetworks": "也可以在 {{variable}} 中列出受信任的网络，让这些网络中的浏览器无需登录即可以管理员身份访问。",
+  "next.login.trustedNetworks":
+    "也可以在 {{variable}} 中列出受信任的网络，让这些网络中的浏览器无需登录即可以管理员身份访问。",
   "next.job.deleteSaveFiles": "删除，保留文件",
   "next.job.deleteAllTitle": "连同所有文件删除",
-  "next.job.deleteAllBody": "该条目将从历史中移除，其下载的文件也会从磁盘删除。此操作在后台进行，无法撤销。",
+  "next.job.deleteAllBody":
+    "该条目将从历史中移除，其下载的文件也会从磁盘删除。此操作在后台进行，无法撤销。",
   // First-run setup
   "next.firstRun.title": "欢迎使用 Weaver",
   "next.firstRun.step": "第 {{step}} 步，共 {{total}} 步",
@@ -1631,15 +1768,19 @@ export const nextZh: LocaleDictionary = {
   "next.firstRun.continue": "继续",
   "next.firstRun.saving": "正在保存…",
   "next.firstRun.provider.title": "连接你的 Usenet 服务商",
-  "next.firstRun.provider.body": "Weaver 从服务商的新闻服务器下载。服务器地址、端口和登录信息可以在服务商的欢迎邮件或账户页面中找到。",
+  "next.firstRun.provider.body":
+    "Weaver 从服务商的新闻服务器下载。服务器地址、端口和登录信息可以在服务商的欢迎邮件或账户页面中找到。",
   "next.firstRun.provider.tls": "加密连接 (TLS)",
-  "next.firstRun.provider.tlsHint": "几乎所有服务商都支持。通常使用 TLS 时端口为 563，不使用时为 119。",
+  "next.firstRun.provider.tlsHint":
+    "几乎所有服务商都支持。通常使用 TLS 时端口为 563，不使用时为 119。",
   "next.providers.certFingerprint": "SHA-256 指纹：{{fingerprint}}",
-  "next.providers.certIssuedFor": "此服务器的证书不适用于 {{host}}，它签发给 {{names}}。只有在确定这是你的服务商服务器时才信任它。",
+  "next.providers.certIssuedFor":
+    "此服务器的证书不适用于 {{host}}，它签发给 {{names}}。只有在确定这是你的服务商服务器时才信任它。",
   "next.providers.certNames": "签发给 {{names}}",
   "next.providers.certificateTrusted": "已为此服务商信任该证书。",
   "next.providers.trustTitle": "信任此证书？",
-  "next.providers.trustBody": "Weaver 仍会校验证书的其他所有内容。只有在主机名不匹配时才接受这张证书本身，任何其他指向不同主机的证书仍会被拒绝。",
+  "next.providers.trustBody":
+    "Weaver 仍会校验证书的其他所有内容。只有在主机名不匹配时才接受这张证书本身，任何其他指向不同主机的证书仍会被拒绝。",
   "next.providers.trustConfirm": "信任证书",
   "next.providers.forgetCertificate": "忘记证书",
   "next.firstRun.provider.save": "保存服务商",
@@ -1650,11 +1791,13 @@ export const nextZh: LocaleDictionary = {
   "next.firstRun.folders.title": "设置文件夹",
   "next.firstRun.folders.saveFailed": "无法保存文件夹：{{message}}",
   "next.firstRun.categories.title": "类别",
-  "next.firstRun.categories.body": "类别会为其下载提供专用文件夹。向 Weaver 发送下载的应用通常会指定一个类别，例如 tv 或 movies。",
+  "next.firstRun.categories.body":
+    "类别会为其下载提供专用文件夹。向 Weaver 发送下载的应用通常会指定一个类别，例如 tv 或 movies。",
   "next.firstRun.categories.remove": "删除 {{name}}",
   "next.firstRun.categories.saveFailed": "无法保存类别：{{message}}",
   "next.firstRun.done.title": "一切就绪",
-  "next.firstRun.done.body": "添加一个 NZB 即可开始第一次下载。这里的所有设置之后都可以在“设置”中更改。",
+  "next.firstRun.done.body":
+    "添加一个 NZB 即可开始第一次下载。这里的所有设置之后都可以在“设置”中更改。",
   "next.firstRun.done.providers": "服务商",
   "next.firstRun.done.noProvider": "还没有。下载前请在“设置”中添加。",
   "next.firstRun.done.categoriesNone": "无",
@@ -1662,40 +1805,56 @@ export const nextZh: LocaleDictionary = {
   "next.firstRun.finishFailed": "无法完成设置：{{message}}",
   "next.performance.title": "性能",
   "next.performance.profile": "硬件配置",
-  "next.performance.body": "选择 Weaver 可以在多大程度上占用这台机器。本机无法运行的配置不会显示。",
+  "next.performance.body":
+    "选择 Weaver 可以在多大程度上占用这台机器。本机无法运行的配置不会显示。",
   "next.performance.efficient": "节能",
   "next.performance.balanced": "均衡",
   "next.performance.performance": "性能",
-  "next.performance.efficientBody": "占用最小。适合小型主板，以及与其他任务共用的机器。",
+  "next.performance.efficientBody":
+    "占用最小。适合小型主板，以及与其他任务共用的机器。",
   "next.performance.balancedBody": "台式机或家庭服务器的日常选择。",
-  "next.performance.performanceBody": "上限最宽。适合内存和核心充裕的大型机器。",
+  "next.performance.performanceBody":
+    "上限最宽。适合内存和核心充裕的大型机器。",
   "next.performance.recommendedTag": "推荐",
   "next.performance.factDecodeMemory": "7z 解码内存 {{size}}",
   "next.performance.factThreads": "线程：解码 {{decode}} · 解压 {{extract}}",
   "next.performance.factDownloads": "最多同时下载 {{count}} 个",
   "next.performance.detected": "本机推荐：{{memory}} 内存，{{cores}} 个核心。",
-  "next.performance.timing": "更改会应用于下一个开始的下载或解压；正在进行的任务按开始时的设置完成。",
+  "next.performance.timing":
+    "更改会应用于下一个开始的下载或解压；正在进行的任务按开始时的设置完成。",
   "next.performance.notConfirmed": "正在运行推荐配置，尚未确认。",
-  "next.performance.scheduled": "当前由计划启用了{{profile}}配置；没有计划规则生效时，使用你选择的配置。",
+  "next.performance.scheduled":
+    "当前由计划启用了{{profile}}配置；没有计划规则生效时，使用你选择的配置。",
   "next.performance.saveFailed": "无法保存配置：{{message}}",
   "next.securityNotice.title": "新的访问模型可用",
-  "next.securityNotice.intro": "此安装仍在使用 0.12.0 之前的访问设置，因此谁能进入并没有变化。Weaver 现在有一个更简单的模型，你可以在准备好时迁移过去。",
+  "next.securityNotice.intro":
+    "此安装仍在使用 0.12.0 之前的访问设置，因此谁能进入并没有变化。Weaver 现在有一个更简单的模型，你可以在准备好时迁移过去。",
   "next.securityNotice.changesTitle": "在新模型中",
-  "next.securityNotice.changeSignIn": "每个浏览器都要登录。以前无需登录即可进入的网络，现在只决定浏览器可以在哪里被记住。",
+  "next.securityNotice.changeSignIn":
+    "每个浏览器都要登录。以前无需登录即可进入的网络，现在只决定浏览器可以在哪里被记住。",
   "next.securityNotice.changeProxies": "受信任的代理在 设置 → 安全 中设置。",
-  "next.securityNotice.changeHosts": "任何主机名都无需列入 WEAVER_HTTP_ALLOWED_HOSTS 即可使用。",
+  "next.securityNotice.changeHosts":
+    "任何主机名都无需列入 WEAVER_HTTP_ALLOWED_HOSTS 即可使用。",
   "next.securityNotice.stepsTitle": "迁移此安装",
-  "next.securityNotice.container": "将此变量添加到容器的环境中。在 Docker Compose 中：",
-  "next.securityNotice.containerAfter": "然后用 docker compose up -d 重新创建容器。在 Unraid 上，在容器模板中将 Access Mode 设为 authenticated。",
+  "next.securityNotice.container":
+    "将此变量添加到容器的环境中。在 Docker Compose 中：",
+  "next.securityNotice.containerAfter":
+    "然后用 docker compose up -d 重新创建容器。在 Unraid 上，在容器模板中将 Access Mode 设为 authenticated。",
   "next.securityNotice.windows": "在 PowerShell 中运行：",
-  "next.securityNotice.windowsAfter": "然后在托盘图标中选择“Exit”，再从开始菜单重新启动 Weaver。",
+  "next.securityNotice.windowsAfter":
+    "然后在托盘图标中选择“Exit”，再从开始菜单重新启动 Weaver。",
   "next.securityNotice.macos": "在终端中运行：",
-  "next.securityNotice.macosAfter": "然后在菜单栏图标中选择“Quit Weaver”，再重新打开 Weaver。如果使用 Homebrew，请改为运行 brew services restart weaver-usenet。",
-  "next.securityNotice.linux": "将这一行添加到 Weaver systemd 单元的 [Service] 部分，或在启动 Weaver 的地方设置该变量：",
+  "next.securityNotice.macosAfter":
+    "然后在菜单栏图标中选择“Quit Weaver”，再重新打开 Weaver。如果使用 Homebrew，请改为运行 brew services restart weaver-usenet。",
+  "next.securityNotice.linux":
+    "将这一行添加到 Weaver systemd 单元的 [Service] 部分，或在启动 Weaver 的地方设置该变量：",
   "next.securityNotice.linuxAfter": "然后重启 Weaver。",
-  "next.securityNotice.other": "在启动 Weaver 的地方设置环境变量 WEAVER_ACCESS_MODE=authenticated，然后重启 Weaver。",
-  "next.securityNotice.keepsLogin": "你的登录和 API 密钥会保留，每个浏览器都需要重新登录。从那次启动起，迁移是永久的。",
-  "next.securityNotice.createsLogin": "此安装没有登录，因此重启后 Weaver 会打开设置来创建一个。",
+  "next.securityNotice.other":
+    "在启动 Weaver 的地方设置环境变量 WEAVER_ACCESS_MODE=authenticated，然后重启 Weaver。",
+  "next.securityNotice.keepsLogin":
+    "你的登录和 API 密钥会保留，每个浏览器都需要重新登录。从那次启动起，迁移是永久的。",
+  "next.securityNotice.createsLogin":
+    "此安装没有登录，因此重启后 Weaver 会打开设置来创建一个。",
   "next.securityNotice.guide": "阅读指南",
   "next.securityNotice.dismiss": "知道了",
   "next.securityNotice.dismissFailed": "无法保存：{{message}}",
@@ -1709,7 +1868,8 @@ export const nextZh: LocaleDictionary = {
   "next.schedules.trackQuota": "配额计量",
   "next.schedules.trackServers": "服务器",
   "next.schedules.trackOneShot": "单次操作",
-  "next.schedules.scriptTimeHelp": "本地时间。HH:MM，或用 *:MM 表示每小时；多个时间以逗号分隔。",
+  "next.schedules.scriptTimeHelp":
+    "本地时间。HH:MM，或用 *:MM 表示每小时；多个时间以逗号分隔。",
   "next.schedules.runAtStartup": "启动时也运行",
   "next.schedules.trackNote": "本地时间 · 持续到本组的下一条规则",
   "next.schedules.oneShotNote": "本地时间 · 每次到点运行一次",
@@ -1725,19 +1885,26 @@ export const nextZh: LocaleDictionary = {
   "next.schedules.pruneCancelled": "已取消",
   "next.schedules.deleteFiles": "同时删除文件",
   "next.schedules.oneShotHelp": "停机期间错过的执行会跳过。",
-  "next.schedules.multipleTimesHelp": "可选，以逗号分隔。这些时间将替代上面的单个时间。",
-  "next.schedules.pauseAllHelp": "暂停下载、文件夹扫描和 RSS。恢复会结束此暂停。后处理继续运行。",
-  "next.schedules.postHelp": "正在运行的工作会完成；新的校验、修复、解压、移动和脚本会等待恢复。",
-  "next.schedules.serverHelp": "保存启用状态而不测试连接，并重新加载所有服务器的连接。",
-  "next.schedules.quotaHelp": "未计量的流量保留在统计中，但永远不计入配额。已配置的上限保持不变。",
+  "next.schedules.multipleTimesHelp":
+    "可选，以逗号分隔。这些时间将替代上面的单个时间。",
+  "next.schedules.pauseAllHelp":
+    "暂停下载、文件夹扫描和 RSS。恢复会结束此暂停。后处理继续运行。",
+  "next.schedules.postHelp":
+    "正在运行的工作会完成；新的校验、修复、解压、移动和脚本会等待恢复。",
+  "next.schedules.serverHelp":
+    "保存启用状态而不测试连接，并重新加载所有服务器的连接。",
+  "next.schedules.quotaHelp":
+    "未计量的流量保留在统计中，但永远不计入配额。已配置的上限保持不变。",
   "next.schedules.pruneWarning": "清理已完成历史会移除重复保护。",
   "next.schedules.pruneFilesWarning": "删除已完成文件也会删除输出文件夹。",
   "next.backup.storage": "备份存储",
   "next.backup.customPath": "自定义备份路径",
   "next.backup.saveStorage": "保存路径",
   "next.backup.automatic": "自动备份",
-  "next.backup.retention": "保留当前版本的三个备份和上一版本的一个备份。手动备份将保留到主动删除。",
-  "next.backup.verifyAccountPassword": "请确认您的账户密码以继续。这是登录密码，而不是存档加密密钥。",
+  "next.backup.retention":
+    "保留当前版本的三个备份和上一版本的一个备份。手动备份将保留到主动删除。",
+  "next.backup.verifyAccountPassword":
+    "请确认您的账户密码以继续。这是登录密码，而不是存档加密密钥。",
   "next.backup.autoEnabled": "启用自动备份",
   "next.backup.dailyTime": "每日时间（本地）",
   "next.backup.autoKey": "自动备份密钥",
@@ -1769,7 +1936,8 @@ export const nextZh: LocaleDictionary = {
   "next.networking.loadFailed": "无法加载网络设置",
   "next.networking.retry": "重试",
   "next.networking.loading": "正在读取出口接口、代理和路由。",
-  "next.networking.bridgeNotice": "容器桥接网络只暴露容器内的接口。请使用主机网络，或连接多个容器网络以选择独立线路。",
+  "next.networking.bridgeNotice":
+    "容器桥接网络只暴露容器内的接口。请使用主机网络，或连接多个容器网络以选择独立线路。",
   "next.networking.liveUnavailable": "实时更新不可用。正在显示最后收到的状态。",
   "next.networking.close": "关闭",
   "next.networking.enabled": "已启用",
@@ -1800,23 +1968,29 @@ export const nextZh: LocaleDictionary = {
   "next.networking.binding.interface": "网络接口",
   "next.networking.binding.sourceAddress": "源地址",
   "next.refusal.EGRESS_NAME_LENGTH": "出口名称需要 1 到 128 个字符。",
-  "next.refusal.EGRESS_SYSTEM_IMMUTABLE": "System 出口不能重命名、重新绑定或停用。",
-  "next.refusal.EGRESS_SYSTEM_BINDING_RESERVED": "只有 System 出口可以使用 System 绑定。",
+  "next.refusal.EGRESS_SYSTEM_IMMUTABLE":
+    "System 出口不能重命名、重新绑定或停用。",
+  "next.refusal.EGRESS_SYSTEM_BINDING_RESERVED":
+    "只有 System 出口可以使用 System 绑定。",
   "next.refusal.EGRESS_INTERFACE_NAME_INVALID": "请输入有效的接口名称。",
   "next.refusal.EGRESS_INTERFACE_NAME_REQUIRED": "请输入接口名称。",
-  "next.refusal.EGRESS_INTERFACE_BINDING_UNSUPPORTED": "Windows 无法绑定到接口，请使用源地址。",
+  "next.refusal.EGRESS_INTERFACE_BINDING_UNSUPPORTED":
+    "Windows 无法绑定到接口，请使用源地址。",
   "next.refusal.EGRESS_SOURCE_ADDRESS_REQUIRED": "请输入源地址。",
   "next.refusal.EGRESS_SOURCE_ADDRESS_INVALID": "源地址不是有效的 IP 地址。",
-  "next.refusal.EGRESS_SOURCE_ADDRESS_NOT_UNICAST": "源地址必须是单个主机的地址。",
+  "next.refusal.EGRESS_SOURCE_ADDRESS_NOT_UNICAST":
+    "源地址必须是单个主机的地址。",
   "next.refusal.EGRESS_QUOTA_LIMIT_TOO_LARGE": "配额上限过大。",
   "next.refusal.EGRESS_QUOTA_SOFT_ABOVE_HARD": "上传软配额不能高于硬配额。",
   "next.refusal.BANDWIDTH_LIMIT_TOO_LARGE": "速度上限过大。",
-  "next.refusal.BANDWIDTH_SPLIT_RANGE": "带宽分配给 Usenet 的比例为 1% 到 99%。",
+  "next.refusal.BANDWIDTH_SPLIT_RANGE":
+    "带宽分配给 Usenet 的比例为 1% 到 99%。",
   "next.refusal.TORRENT_ROUTE_LEGS": "种子路由只有一个分支。",
   "next.refusal.TORRENT_ROUTE_DIRECT_FALLBACK": "种子路由不能回退为直连。",
   "next.refusal.TORRENT_ROUTE_RUNGS": "种子路由只有一级。",
   "next.refusal.EGRESS_QUOTA_RESET_TIME_RANGE": "配额重置时间超出范围。",
-  "next.refusal.EGRESS_QUOTA_RESET_DAY_RANGE": "每月重置日必须在 1 到 31 之间。",
+  "next.refusal.EGRESS_QUOTA_RESET_DAY_RANGE":
+    "每月重置日必须在 1 到 31 之间。",
   "next.refusal.EGRESS_SPEED_LIMIT_TOO_LARGE": "速度限制过大。",
   "next.refusal.EGRESS_NOT_FOUND": "此出口已不存在。",
   "next.refusal.EGRESS_SYSTEM_UNDELETABLE": "System 出口不能删除。",
@@ -1825,11 +1999,14 @@ export const nextZh: LocaleDictionary = {
   "next.refusal.POOL_MEMBER_COUNT": "代理池最多可包含 16 个代理。",
   "next.refusal.POOL_PROXY_REPEATED": "一个代理在代理池中只能出现一次。",
   "next.refusal.POOL_PROXY_MISSING": "此代理池中的某个代理已不存在。",
-  "next.refusal.POOL_MEMBER_KIND_MISMATCH": "代理池中的每个代理都必须与代理池类型相同。",
+  "next.refusal.POOL_MEMBER_KIND_MISMATCH":
+    "代理池中的每个代理都必须与代理池类型相同。",
   "next.refusal.POOL_NOT_FOUND": "此代理池已不存在。",
   "next.refusal.POOL_IN_USE": "仍有路由在使用此代理池。",
-  "next.refusal.POOL_EDIT_REPEATS_PROXY": "使用此代理池的路由已在使用其中一个代理。",
-  "next.refusal.POOL_IN_USE_EMPTY": "有路由在使用此代理池，因此它至少需要一个代理。",
+  "next.refusal.POOL_EDIT_REPEATS_PROXY":
+    "使用此代理池的路由已在使用其中一个代理。",
+  "next.refusal.POOL_IN_USE_EMPTY":
+    "有路由在使用此代理池，因此它至少需要一个代理。",
   "next.refusal.ROUTE_LEG_COUNT": "请使用 1 到 8 条分支。",
   "next.refusal.ROUTE_LEG_WEIGHT_RANGE": "每条分支的权重必须在 1 到 100 之间。",
   "next.refusal.ROUTE_LEG_WEIGHT_SUM": "分支权重合计必须为 100%。",
@@ -1840,55 +2017,82 @@ export const nextZh: LocaleDictionary = {
   "next.refusal.ROUTE_POOL_MISSING": "路由使用了已不存在的代理池。",
   "next.refusal.ROUTE_POOL_EMPTY": "路由使用了没有代理的代理池。",
   "next.refusal.ROUTE_PROXY_MISSING": "路由使用了已不存在的代理。",
-  "next.refusal.ROUTE_CHAIN_TRANSPORT": "WireGuard 和 HTTP/3 只能作为链的第一个代理；WireGuard 也可以接在 WireGuard 之后。",
-  "next.refusal.ROUTE_PROXY_REPEATED": "一个代理在代理阶梯中只能出现一次，代理池和链也计算在内。",
+  "next.refusal.ROUTE_CHAIN_TRANSPORT":
+    "WireGuard 和 HTTP/3 只能作为链的第一个代理；WireGuard 也可以接在 WireGuard 之后。",
+  "next.refusal.ROUTE_PROXY_REPEATED":
+    "一个代理在代理阶梯中只能出现一次，代理池和链也计算在内。",
   "next.refusal.ROUTE_PROXY_COUNT": "一条路由最多使用八个代理。",
   "next.refusal.ROUTE_HAS_ADVANCED_LEGS": "请在“网络”中编辑此路由。",
   "next.refusal.ROUTE_CONSUMER_NOT_FOUND": "此路由已不存在。",
-  "next.refusal.WIREGUARD_PROXY_PATH_CONFLICT": "一个 WireGuard 代理只能经由一条路径到达出口。",
-  "next.refusal.WIREGUARD_INSTANCE_LIMIT": "这些路由需要 {{required}} 个 WireGuard 实例；此主机允许 {{limit}} 个。",
+  "next.refusal.WIREGUARD_PROXY_PATH_CONFLICT":
+    "一个 WireGuard 代理只能经由一条路径到达出口。",
+  "next.refusal.WIREGUARD_INSTANCE_LIMIT":
+    "这些路由需要 {{required}} 个 WireGuard 实例；此主机允许 {{limit}} 个。",
   "next.refusal.PROXY_NAME_LENGTH": "代理名称需要 1 到 128 个字符。",
   "next.refusal.PROXY_ENDPOINT_INVALID": "请输入有效的主机和端口。",
   "next.refusal.PROXY_TIMEOUT_RANGE": "超时必须在 1 到 300 秒之间。",
-  "next.refusal.PROXY_ADDRESS_COUNT": "WireGuard 代理最多可有 {{limit}} 个隧道地址。",
+  "next.refusal.PROXY_ADDRESS_COUNT":
+    "WireGuard 代理最多可有 {{limit}} 个隧道地址。",
   "next.refusal.PROXY_DNS_SERVER_COUNT": "最多可列出 {{limit}} 个 DNS 服务器。",
   "next.refusal.PROXY_CREDENTIAL_TOO_LARGE": "凭据过大。",
   "next.refusal.PROXY_SSH_USERNAME_REQUIRED": "SSH 需要用户名。",
   "next.refusal.PROXY_SSH_KEY_REQUIRED": "SSH 需要 Ed25519 私钥。",
-  "next.refusal.PROXY_SSH_PASSWORD_UNSUPPORTED": "SSH 使用 Ed25519 私钥，而不是密码。",
-  "next.refusal.PROXY_SOCKS5_PASSWORD_NEEDS_USERNAME": "SOCKS5 密码需要用户名。",
-  "next.refusal.PROXY_SOCKS5_CREDENTIAL_LENGTH": "SOCKS5 凭据不能超过 255 字节。",
+  "next.refusal.PROXY_SSH_PASSWORD_UNSUPPORTED":
+    "SSH 使用 Ed25519 私钥，而不是密码。",
+  "next.refusal.PROXY_SOCKS5_PASSWORD_NEEDS_USERNAME":
+    "SOCKS5 密码需要用户名。",
+  "next.refusal.PROXY_SOCKS5_CREDENTIAL_LENGTH":
+    "SOCKS5 凭据不能超过 255 字节。",
   "next.refusal.PROXY_HTTP_USERNAME_COLON": "HTTP 代理用户名不能包含冒号。",
   "next.refusal.PROXY_HTTP3_PASSWORD_NEEDS_USERNAME": "HTTP/3 密码需要用户名。",
   "next.refusal.PROXY_DNS_SERVER_INVALID": "DNS 服务器必须是 IP 地址。",
-  "next.refusal.PROXY_DNS_SERVERS_REQUIRED": "由列出的服务器应答的 DNS 设置至少需要一个服务器。",
-  "next.refusal.PROXY_DNS_TLS_NAME_INVALID": "DNS 服务器的 TLS 名称必须是有效的主机名。",
-  "next.refusal.PROXY_DNS_URL_INVALID": "DNS over HTTPS 服务器需要包含 IP 地址和路径的 https URL。",
-  "next.refusal.PROXY_DNS_URL_HOSTNAME": "以主机名指定的 DNS over HTTPS 服务器还需要提供 IP 地址。",
-  "next.refusal.PROXY_DNS_PLAIN_AFTER_ENCRYPTED": "明文 DNS 服务器不能排在加密服务器之后。",
+  "next.refusal.PROXY_DNS_SERVERS_REQUIRED":
+    "由列出的服务器应答的 DNS 设置至少需要一个服务器。",
+  "next.refusal.PROXY_DNS_TLS_NAME_INVALID":
+    "DNS 服务器的 TLS 名称必须是有效的主机名。",
+  "next.refusal.PROXY_DNS_URL_INVALID":
+    "DNS over HTTPS 服务器需要包含 IP 地址和路径的 https URL。",
+  "next.refusal.PROXY_DNS_URL_HOSTNAME":
+    "以主机名指定的 DNS over HTTPS 服务器还需要提供 IP 地址。",
+  "next.refusal.PROXY_DNS_PLAIN_AFTER_ENCRYPTED":
+    "明文 DNS 服务器不能排在加密服务器之后。",
   "next.refusal.PROXY_DNS_SERVER_DUPLICATE": "一个 DNS 服务器只能列出一次。",
   "next.refusal.DNS_LIST_NAME_LENGTH": "服务器列表名称须为 1 到 128 个字符。",
   "next.refusal.DNS_LIST_NOT_FOUND": "该服务器列表已不存在。",
   "next.refusal.DNS_LIST_LIMIT_REACHED": "无法再添加服务器列表。",
-  "next.refusal.DNS_LIST_IN_USE": "以下 DNS 配置文件仍在使用此列表：{{profiles}}。",
-  "next.refusal.DNS_PROFILE_NAME_LENGTH": "DNS 配置文件名称须为 1 到 128 个字符。",
+  "next.refusal.DNS_LIST_IN_USE":
+    "以下 DNS 配置文件仍在使用此列表：{{profiles}}。",
+  "next.refusal.DNS_PROFILE_NAME_LENGTH":
+    "DNS 配置文件名称须为 1 到 128 个字符。",
   "next.refusal.DNS_PROFILE_NOT_FOUND": "该 DNS 配置文件已不存在。",
   "next.refusal.DNS_PROFILE_LIMIT_REACHED": "无法再添加 DNS 配置文件。",
-  "next.refusal.DNS_PROFILE_BUILT_IN": "System 配置文件为内置，无法更改或删除。",
-  "next.refusal.DNS_PROFILE_IN_USE": "这些路由仍在使用此配置：{{routes}}。请先为它们选择其他配置。",
-  "next.refusal.DNS_PROFILE_KIND": "路由遵循 System 或路由配置文件，代理通过 System 或代理名称配置文件查找。",
-  "next.refusal.DNS_PROFILE_PROXY_NAME_INVALID": "代理名称配置文件由系统应答，或由 Weaver 从出口查询列出的服务器应答。",
-  "next.refusal.DNS_PROFILE_KIND_IMMUTABLE": "配置文件保持创建时的类型。请改为新建另一类型的配置文件。",
-  "next.refusal.DNS_PROFILE_KIND_REQUIRED": "新配置文件需注明由路由还是代理选择。",
-  "next.refusal.DNS_PROFILE_LIST_REQUIRED": "由 Weaver 应答时，请选择服务器列表。",
-  "next.refusal.DNS_PROFILE_TRUST_INVALID": "系统的应答按原样使用；代理的应答按原样使用或在此验证。",
-  "next.refusal.DNS_PROFILE_NEEDS_PROXY": "这些路由有直连分支或直连回退，代理无法在那里应答 DNS：{{routes}}。请为每个路由配上代理，或在配置中打开“在没有代理的分支上询问系统”。",
-  "next.refusal.DNS_PROFILE_NEEDS_WIREGUARD": "此处只能验证 WireGuard 代理的应答，而这些路由有直连分支、直连回退或其他类型的代理：{{routes}}。",
-  "next.refusal.DNS_PROFILE_NEEDS_TUNNEL_DNS": "这些路由由代理应答 DNS：{{routes}}。它们所用的这些 WireGuard 代理没有为其隧道列出 DNS 服务器：{{proxies}}。请为每个代理添加隧道的 DNS 服务器，或选择其他配置。",
+  "next.refusal.DNS_PROFILE_BUILT_IN":
+    "System 配置文件为内置，无法更改或删除。",
+  "next.refusal.DNS_PROFILE_IN_USE":
+    "这些路由仍在使用此配置：{{routes}}。请先为它们选择其他配置。",
+  "next.refusal.DNS_PROFILE_KIND":
+    "路由遵循 System 或路由配置文件，代理通过 System 或代理名称配置文件查找。",
+  "next.refusal.DNS_PROFILE_PROXY_NAME_INVALID":
+    "代理名称配置文件由系统应答，或由 Weaver 从出口查询列出的服务器应答。",
+  "next.refusal.DNS_PROFILE_KIND_IMMUTABLE":
+    "配置文件保持创建时的类型。请改为新建另一类型的配置文件。",
+  "next.refusal.DNS_PROFILE_KIND_REQUIRED":
+    "新配置文件需注明由路由还是代理选择。",
+  "next.refusal.DNS_PROFILE_LIST_REQUIRED":
+    "由 Weaver 应答时，请选择服务器列表。",
+  "next.refusal.DNS_PROFILE_TRUST_INVALID":
+    "系统的应答按原样使用；代理的应答按原样使用或在此验证。",
+  "next.refusal.DNS_PROFILE_NEEDS_PROXY":
+    "这些路由有直连分支或直连回退，代理无法在那里应答 DNS：{{routes}}。请为每个路由配上代理，或在配置中打开“在没有代理的分支上询问系统”。",
+  "next.refusal.DNS_PROFILE_NEEDS_WIREGUARD":
+    "此处只能验证 WireGuard 代理的应答，而这些路由有直连分支、直连回退或其他类型的代理：{{routes}}。",
+  "next.refusal.DNS_PROFILE_NEEDS_TUNNEL_DNS":
+    "这些路由由代理应答 DNS：{{routes}}。它们所用的这些 WireGuard 代理没有为其隧道列出 DNS 服务器：{{proxies}}。请为每个代理添加隧道的 DNS 服务器，或选择其他配置。",
   "next.refusal.PROXY_KIND_IMMUTABLE": "代理类型不能更改，请添加新的代理。",
   "next.refusal.PROXY_LIMIT_REACHED": "最多可以有 128 个代理。",
   "next.refusal.PROXY_KIND_LOCKED_BY_POOL": "代理在代理池中时不能更改类型。",
-  "next.refusal.PROXY_REVISION_CHANGED": "此代理已在别处更改，请重新打开后再试。",
+  "next.refusal.PROXY_REVISION_CHANGED":
+    "此代理已在别处更改，请重新打开后再试。",
   "next.refusal.PROXY_NOT_FOUND": "此代理已不存在。",
   "next.refusal.PROXY_IN_POOL": "此代理在代理池中，请先将其从代理池移除。",
   "next.refusal.PROXY_IN_USE": "仍有路由在使用此代理。",
@@ -1896,15 +2100,19 @@ export const nextZh: LocaleDictionary = {
   "next.refusal.SPEED_TEST_ALREADY_RUNNING": "测速 {{runId}} 仍在运行。",
   "next.refusal.SPEED_TEST_QUEUE_BUSY": "上一次测速仍在释放队列。",
   "next.refusal.SPEED_TEST_USENET_NEEDS_SERVER": "RSS 源只能运行带宽测试。",
-  "next.refusal.SPEED_TEST_TORRENT_NEEDS_TORRENT_ROUTE": "只有种子路由才能运行种子测试。",
+  "next.refusal.SPEED_TEST_TORRENT_NEEDS_TORRENT_ROUTE":
+    "只有种子路由才能运行种子测试。",
   "next.refusal.SPEED_TEST_TORRENTS_OFF": "种子已关闭。",
   "next.refusal.SPEED_TEST_LEG_DOWN_ALL": "请至少保留一段在线。",
   "next.refusal.SPEED_TEST_QUOTA_BLOCKED": "{{name}} 已用完下载配额。",
-  "next.refusal.SPEED_TEST_LEASE_REFUSED": "{{name}} 无法借出连接：{{reason}}。",
+  "next.refusal.SPEED_TEST_LEASE_REFUSED":
+    "{{name}} 无法借出连接：{{reason}}。",
   "next.refusal.TEST_NEEDS_ROUTE": "测试需要一条可经由的路由。",
   "next.refusal.TEST_TARGET_REQUIRED": "请输入主机和端口以测试路由。",
-  "next.refusal.TEST_SUBJECT_IN_ROUTE": "路由使用了正在测试的代理。请将其移出路由。",
-  "next.refusal.TEST_PATH_COUNT": "一次测试最多尝试 {{limit}} 条路径。请减少级或代理池成员。",
+  "next.refusal.TEST_SUBJECT_IN_ROUTE":
+    "路由使用了正在测试的代理。请将其移出路由。",
+  "next.refusal.TEST_PATH_COUNT":
+    "一次测试最多尝试 {{limit}} 条路径。请减少级或代理池成员。",
   "next.networking.problem.legCount": "请使用 1 到 8 条分支。",
   "next.networking.problem.weights": "权重必须是整数百分比，且合计为 100%。",
   "next.networking.problem.rungCount": "代理阶梯需要 1 到 8 级。",
@@ -1945,16 +2153,25 @@ export const nextZh: LocaleDictionary = {
   "next.networking.flow.dnsProxyCard": "{{proxy}} · 其解析器",
   "next.networking.flow.dnsProxyNote": "Weaver 无从得知",
   "next.networking.flow.dnsListMissing": "服务器列表",
-  "next.networking.flow.dnsSaysHost": "{{profile}}：由主机解析器应答，不做任何校验。",
-  "next.networking.flow.dnsSaysFallback": "{{profile}}：此分支没有可交付名称的代理，因此由主机解析器应答。",
-  "next.networking.flow.dnsSaysList": "{{profile}}：Weaver 从 {{from}} 查询 {{list}}。",
-  "next.networking.flow.dnsSaysListThrough": "{{profile}}：Weaver 通过 {{proxy}} 查询 {{list}}。",
-  "next.networking.flow.dnsSaysTunnel": "{{profile}}：Weaver 通过 {{proxy}} 查询隧道的 DNS 服务器。",
-  "next.networking.flow.dnsSaysProxy": "{{profile}}：{{proxy}} 收到名称并自行解析，Weaver 无法查看或校验该解析。",
+  "next.networking.flow.dnsSaysHost":
+    "{{profile}}：由主机解析器应答，不做任何校验。",
+  "next.networking.flow.dnsSaysFallback":
+    "{{profile}}：此分支没有可交付名称的代理，因此由主机解析器应答。",
+  "next.networking.flow.dnsSaysList":
+    "{{profile}}：Weaver 从 {{from}} 查询 {{list}}。",
+  "next.networking.flow.dnsSaysListThrough":
+    "{{profile}}：Weaver 通过 {{proxy}} 查询 {{list}}。",
+  "next.networking.flow.dnsSaysTunnel":
+    "{{profile}}：Weaver 通过 {{proxy}} 查询隧道的 DNS 服务器。",
+  "next.networking.flow.dnsSaysProxy":
+    "{{profile}}：{{proxy}} 收到名称并自行解析，Weaver 无法查看或校验该解析。",
   "next.networking.flow.dnsSaysValidates": "Weaver 校验应答的 DNSSEC。",
-  "next.networking.flow.dnsRefusedNoProxy": "{{profile}} 将名称交给代理，而此分支没有代理，因此其连接会失败。",
-  "next.networking.flow.dnsRefusedNoTunnelDns": "{{profile}} 查询 {{proxy}} 的隧道 DNS，但它未列出服务器，因此此分支的连接会失败。",
-  "next.networking.flow.dnsRefusedValidate": "{{profile}} 校验 DNSSEC，而只有 WireGuard 隧道的解析可以校验，因此此分支的连接会失败。",
+  "next.networking.flow.dnsRefusedNoProxy":
+    "{{profile}} 将名称交给代理，而此分支没有代理，因此其连接会失败。",
+  "next.networking.flow.dnsRefusedNoTunnelDns":
+    "{{profile}} 查询 {{proxy}} 的隧道 DNS，但它未列出服务器，因此此分支的连接会失败。",
+  "next.networking.flow.dnsRefusedValidate":
+    "{{profile}} 校验 DNSSEC，而只有 WireGuard 隧道的解析可以校验，因此此分支的连接会失败。",
   "next.networking.flow.dnsEditProfile": "编辑 DNS 配置 {{profile}}",
   "next.networking.flow.dnsEditList": "编辑 DNS 服务器列表 {{list}}",
   "next.networking.flow.killSwitchNote": "无代理，直连已关闭",
@@ -1972,8 +2189,10 @@ export const nextZh: LocaleDictionary = {
   "next.networking.flow.noLegs": "添加服务器或订阅源以查看其路由。",
   "next.networking.flow.waiting": "等待实时采样",
   "next.networking.flow.emptyTitle": "暂无内容",
-  "next.networking.flow.emptyBody": "添加服务器或 RSS 订阅源以查看其连接从哪里出去。",
-  "next.networking.flow.detailConnectionsValue": "{{open}} 已打开 · {{opening}} 正在打开 · 目标 {{target}} · {{rate}}",
+  "next.networking.flow.emptyBody":
+    "添加服务器或 RSS 订阅源以查看其连接从哪里出去。",
+  "next.networking.flow.detailConnectionsValue":
+    "{{open}} 已打开 · {{opening}} 正在打开 · 目标 {{target}} · {{rate}}",
   "next.networking.flow.detailPin": "固定目标",
   "next.networking.flow.noSocket": "无打开的套接字",
   "next.networking.egress.title": "出口接口",
@@ -2006,23 +2225,28 @@ export const nextZh: LocaleDictionary = {
   "next.torrents.seeding": "做种",
   "next.torrents.connection": "连接",
   "next.torrents.enabled": "启用",
-  "next.torrents.windingDown": "种子已关闭。仍在运行的种子会继续直到完成；不会添加新种子。",
+  "next.torrents.windingDown":
+    "种子已关闭。仍在运行的种子会继续直到完成；不会添加新种子。",
   "next.torrents.offTitle": "关闭种子",
   "next.torrents.enableButton": "启用种子",
   "next.torrents.enableBody": "种子功能处于早期测试阶段，使用风险自负。",
-  "next.torrents.offBody": "仍有种子在运行。它们应如何结束？无论哪种方式都不会添加新种子。",
-  "next.torrents.offIdleBody": "没有正在运行的种子。种子功能现在关闭，不会添加新的种子。",
+  "next.torrents.offBody":
+    "仍有种子在运行。它们应如何结束？无论哪种方式都不会添加新种子。",
+  "next.torrents.offIdleBody":
+    "没有正在运行的种子。种子功能现在关闭，不会添加新的种子。",
   "next.torrents.offFinishDownloadsBox": "完成进行中的种子下载",
   "next.torrents.offFinishDownloadsOn": "仍在下载的种子先完成下载。",
   "next.torrents.offFinishDownloadsOff": "仍在下载的种子立即停止。",
   "next.torrents.offFinishSeedingBox": "完成进行中任务的做种",
   "next.torrents.offFinishSeedingOff": "正在做种的种子立即停止。",
   "next.torrents.offForceTitle": "取消所有种子",
-  "next.torrents.offForceBody": "这将强制取消所有种子，并可能在私有 Tracker 上造成 Hit and Run。",
+  "next.torrents.offForceBody":
+    "这将强制取消所有种子，并可能在私有 Tracker 上造成 Hit and Run。",
   "next.torrents.offStopNow": "立即停止所有种子活动",
   "next.torrents.offStopNowNote": "所有种子立即停止。",
   "next.torrents.stopNow": "立即停止",
-  "next.torrents.finishAllForced": "强制的 torrent，或没有做种上限的 torrent，会一直做种，直到“立即停止”。",
+  "next.torrents.finishAllForced":
+    "强制的 torrent，或没有做种上限的 torrent，会一直做种，直到“立即停止”。",
   "next.torrents.basePort": "基础端口",
   "next.torrents.announcePort": "通告端口",
   "next.torrents.upnp": "UPnP",
@@ -2038,13 +2262,17 @@ export const nextZh: LocaleDictionary = {
   "next.torrents.bittorrent": "BitTorrent",
   "next.torrents.advanced": "高级",
   "next.torrents.peerTcp": "TCP",
-  "next.torrents.peerTcpHelp": "通过 TCP 连接和接受对等端。TCP 与 uTP 至少保留一个开启。",
+  "next.torrents.peerTcpHelp":
+    "通过 TCP 连接和接受对等端。TCP 与 uTP 至少保留一个开启。",
   "next.torrents.peerUtp": "uTP",
-  "next.torrents.peerUtpHelp": "通过 uTP 连接和接受对等端。TCP 与 uTP 至少保留一个开启。",
+  "next.torrents.peerUtpHelp":
+    "通过 uTP 连接和接受对等端。TCP 与 uTP 至少保留一个开启。",
   "next.torrents.preferDownloading": "下载时优先",
-  "next.torrents.preferDownloadingHelp": "种子仍缺所需分块时，对每个对等端首先尝试的传输方式；失败则尝试另一种。",
+  "next.torrents.preferDownloadingHelp":
+    "种子仍缺所需分块时，对每个对等端首先尝试的传输方式；失败则尝试另一种。",
   "next.torrents.preferSeeding": "做种时优先",
-  "next.torrents.preferSeedingHelp": "种子拥有全部所需分块后，对每个对等端首先尝试的传输方式；失败则尝试另一种。",
+  "next.torrents.preferSeedingHelp":
+    "种子拥有全部所需分块后，对每个对等端首先尝试的传输方式；失败则尝试另一种。",
   "next.torrents.connectionsLimit": "全局连接数",
   "next.torrents.unchokeSlots": "上传槽位",
   "next.torrents.blocklistEnabled": "IP 过滤",
@@ -2064,18 +2292,22 @@ export const nextZh: LocaleDictionary = {
   "next.torrents.trackerRule": "Tracker 规则",
   "next.torrents.trackerRuleAdd": "添加规则",
   "next.torrents.trackerRuleNewNote": "新的 Tracker 规则",
-  "next.torrents.trackerRuleRemoveBody": "该 Tracker 的种子将改用其分类或全局的做种策略。",
+  "next.torrents.trackerRuleRemoveBody":
+    "该 Tracker 的种子将改用其分类或全局的做种策略。",
   "next.torrents.trackerRuleName": "名称",
   "next.torrents.trackerRuleHosts": "主机",
-  "next.torrents.trackerRuleHostsNote": "种子的任一 Tracker 位于已勾选的主机时，种子遵循此规则。更改对此后添加的种子生效，Weaver 重启后对所有种子生效。",
+  "next.torrents.trackerRuleHostsNote":
+    "种子的任一 Tracker 位于已勾选的主机时，种子遵循此规则。更改对此后添加的种子生效，Weaver 重启后对所有种子生效。",
   "next.torrents.trackerRuleHostUnder": "及其下的所有主机",
   "next.torrents.trackerRuleHostOnly": "仅此主机",
   "next.torrents.trackerRuleHostLocked": "由 {{name}} 的 Tracker 文件设定",
   "next.torrents.trackerRuleHostAdd": "添加",
   "next.torrents.trackerRuleHostsMore": "{{host}} +{{count}}",
   "next.torrents.trackerRuleHostsNone": "请至少添加一个主机。",
-  "next.torrents.trackerRuleFilePrivate": "私有种子：其列出的所有 Tracker 均已勾选。",
-  "next.torrents.trackerRuleFilePublic": "公开种子：仅勾选主 Tracker。请勾选规则还应涵盖的其他 Tracker。",
+  "next.torrents.trackerRuleFilePrivate":
+    "私有种子：其列出的所有 Tracker 均已勾选。",
+  "next.torrents.trackerRuleFilePublic":
+    "公开种子：仅勾选主 Tracker。请勾选规则还应涵盖的其他 Tracker。",
   "next.torrents.trackerRuleHostKnown": "已知",
   "next.torrents.trackerRuleHostCustom": "自定义",
   "next.torrents.trackerRuleHostFile": "种子文件",
@@ -2091,7 +2323,8 @@ export const nextZh: LocaleDictionary = {
   "next.torrents.trackerRulePrivate": "私有 Tracker",
   "next.torrents.trackerRulePublic": "公共 Tracker",
   "next.torrents.trackerRuleAdvanced": "高级设置",
-  "next.torrents.trackerRuleCovers": "适用于在已勾选主机上有 Tracker 的任何种子，并适用于该种子的所有 Tracker 和对等节点。",
+  "next.torrents.trackerRuleCovers":
+    "适用于在已勾选主机上有 Tracker 的任何种子，并适用于该种子的所有 Tracker 和对等节点。",
   "next.torrents.trackerRuleEffective": "实际生效: {{value}}",
   "next.torrents.trackerRuleGoalInherited": "来自全局做种设置",
   "next.torrents.trackerRuleRouteOwn": "在路由中编辑",
@@ -2209,7 +2442,8 @@ export const nextZh: LocaleDictionary = {
   "next.quota.trickle": "限速",
   "next.quota.stopped": "已停止",
   "next.monitoring.egressQuotas": "Egress 配额",
-  "next.monitoring.noEgressQuota": "没有 Egress 设置配额。可在 {{link}} 中设置。",
+  "next.monitoring.noEgressQuota":
+    "没有 Egress 设置配额。可在 {{link}} 中设置。",
   "next.schedules.speedGlobalUpload": "全局上传上限",
   "next.schedules.speedSet": "限制",
   "next.protocol.torrent": "种子",
@@ -2230,7 +2464,8 @@ export const nextZh: LocaleDictionary = {
   "next.torrent.unforced": "已取消强制",
   "next.torrent.recheck": "重新校验",
   "next.torrent.recheckBody": "从磁盘重新读取并校验每个分块。",
-  "next.torrent.filesMissingBody": "此种子的文件不在其文件夹中，因此无法继续。请将文件放回，或将种子移动到存放这些文件的文件夹。如需重新开始下载，请重新校验：磁盘上已有的数据会保留，其余部分会重新下载。",
+  "next.torrent.filesMissingBody":
+    "此种子的文件不在其文件夹中，因此无法继续。请将文件放回，或将种子移动到存放这些文件的文件夹。如需重新开始下载，请重新校验：磁盘上已有的数据会保留，其余部分会重新下载。",
   "next.torrent.rechecking": "正在重新校验",
   "next.torrent.move": "移动",
   "next.torrent.moved": "已移动",
@@ -2243,7 +2478,8 @@ export const nextZh: LocaleDictionary = {
   "next.torrent.transfer": "传输",
   "next.torrent.information": "信息",
   "next.torrent.timeActive": "活动时间",
-  "next.torrent.timeActiveSeeded": "{{active}}（做种 {{seeded}}，连续 {{run}}）",
+  "next.torrent.timeActiveSeeded":
+    "{{active}}（做种 {{seeded}}，连续 {{run}}）",
   "next.torrent.eta": "剩余时间",
   "next.torrent.connections": "连接",
   "next.torrent.connectionsValue": "{{count}}（最多 {{max}}）",
@@ -2291,7 +2527,8 @@ export const nextZh: LocaleDictionary = {
   "next.torrent.addTrackers": "添加 Tracker",
   "next.torrent.editTracker": "编辑 Tracker",
   "next.torrent.trackerUrls": "Tracker 网址列表",
-  "next.torrent.privateTrackerWarning": "此种子为私有种子。只添加其 Tracker 提供给你的 URL。",
+  "next.torrent.privateTrackerWarning":
+    "此种子为私有种子。只添加其 Tracker 提供给你的 URL。",
   "next.torrent.trackerUrl": "Tracker 网址",
   "next.torrent.trackerSource": "来源",
   "next.torrent.trackerStatus": "状态",
@@ -2322,7 +2559,8 @@ export const nextZh: LocaleDictionary = {
   "next.quota.remaining": "剩余 {{size}}",
   "next.networking.egress.quota": "配额",
   "next.networking.egress.enabled": "已启用",
-  "next.networking.egress.systemHelp": "系统出口始终开启，它就是操作系统自身的路由。",
+  "next.networking.egress.systemHelp":
+    "系统出口始终开启，它就是操作系统自身的路由。",
   "next.networking.egress.nameRequired": "请为出口命名。",
   "next.networking.egress.interfaceRequired": "请选择要绑定的接口。",
   "next.networking.egress.sourceRequired": "请输入要绑定的源地址。",
@@ -2344,7 +2582,8 @@ export const nextZh: LocaleDictionary = {
   "next.networking.testVia.resolvedSystem": "系统",
   "next.networking.testVia.resolvedProxy": "代理（{{name}}）",
   "next.networking.testVia.resolvedServers": "DNS {{servers}}（经由 {{name}}）",
-  "next.networking.testVia.resolvedWeaver": "Weaver：经由 {{name}} 的 DNS {{servers}}",
+  "next.networking.testVia.resolvedWeaver":
+    "Weaver：经由 {{name}} 的 DNS {{servers}}",
   "next.networking.testVia.cached": "已缓存",
   "next.networking.testVia.torrent": "测试种子",
   "next.networking.testVia.step.TORRENT": "种子",
@@ -2357,7 +2596,8 @@ export const nextZh: LocaleDictionary = {
   "next.networking.pools.title": "代理池",
   "next.networking.pools.count.one": "{{count}} 个代理池",
   "next.networking.pools.count.other": "{{count}} 个代理池",
-  "next.networking.pools.note": "代理池让同类型代理相互竞速，然后优先选用有传输记录的成员。WireGuard 在所有出口路径上最多允许 {{count}} 条隧道，每条预留 {{budget}} MiB。",
+  "next.networking.pools.note":
+    "代理池让同类型代理相互竞速，然后优先选用有传输记录的成员。WireGuard 在所有出口路径上最多允许 {{count}} 条隧道，每条预留 {{budget}} MiB。",
   "next.networking.pools.name": "名称",
   "next.networking.pools.type": "代理类型",
   "next.networking.pools.typeHelp": "所有成员均为此类型；更改后成员会被清空。",
@@ -2386,10 +2626,12 @@ export const nextZh: LocaleDictionary = {
   "next.networking.routes.rssFeed": "RSS 订阅源",
   "next.networking.routes.editorTitle": "{{name}} 的路由",
   "next.networking.routes.save": "保存路由",
-  "next.networking.route.intro": "将最多 {{count}} 个连接分配到独立路径上。权重变化时，进行中的传输会在原路径上完成。",
+  "next.networking.route.intro":
+    "将最多 {{count}} 个连接分配到独立路径上。权重变化时，进行中的传输会在原路径上完成。",
   "next.networking.route.distribution": "分支权重分配",
   "next.networking.route.legWeight": "分支 {{position}} 权重",
-  "next.networking.route.preview": "仅预览：已分配 {{assigned}}，搁置 {{parked}}。运行中的路由不变。",
+  "next.networking.route.preview":
+    "仅预览：已分配 {{assigned}}，搁置 {{parked}}。运行中的路由不变。",
   "next.networking.route.leg": "分支 {{position}}",
   "next.networking.route.live": "{{open}}/{{target}} 个连接 · {{source}}",
   "next.networking.route.noSource": "尚无源地址",
@@ -2452,7 +2694,8 @@ export const nextZh: LocaleDictionary = {
   "next.networking.speed.cancel": "取消测试",
   "next.networking.speed.upSwitch": "启用",
   "next.networking.speed.downSwitch": "停用",
-  "next.networking.speed.usenetNeedsServer": "RSS 源没有可测试的 Usenet 服务器。",
+  "next.networking.speed.usenetNeedsServer":
+    "RSS 源没有可测试的 Usenet 服务器。",
   "next.networking.speed.torrentNeedsTorrentRoute": "种子测试需要种子路由。",
   "next.networking.speed.customUrlInvalid": "请输入 HTTPS URL。",
   "next.networking.speed.nzbUrlInvalid": "请输入 NZB 的 http 或 https URL。",
@@ -2485,57 +2728,85 @@ export const nextZh: LocaleDictionary = {
   "next.networking.speed.status.COMPLETED": "已完成",
   "next.networking.speed.status.CANCELLED": "已取消",
   "next.networking.speed.status.FAILED": "失败",
-  "next.networking.speed.failure.RATE_LIMITED": "提供方当前正在限制你的 IP，请选择其他提供方。",
+  "next.networking.speed.failure.RATE_LIMITED":
+    "提供方当前正在限制你的 IP，请选择其他提供方。",
   "next.networking.speed.failure.HTTP_STATUS": "提供方返回了 HTTP {{status}}。",
-  "next.networking.speed.failure.TLS_VERIFICATION": "{{host}} 未通过 TLS 验证。",
+  "next.networking.speed.failure.TLS_VERIFICATION":
+    "{{host}} 未通过 TLS 验证。",
   "next.networking.speed.failure.UNRESOLVED": "无法解析 {{host}}。",
-  "next.networking.speed.failure.ADDRESS_NOT_ALLOWED": "{{host}} 解析到的地址不被允许。",
+  "next.networking.speed.failure.ADDRESS_NOT_ALLOWED":
+    "{{host}} 解析到的地址不被允许。",
   "next.networking.speed.failure.EGRESS_QUOTA_USED": "出口接口已用完下载配额。",
   "next.networking.speed.failure.NO_LEG_UP": "没有在线的段。",
-  "next.networking.speed.failure.LEASE_REFUSED": "{{name}} 无法借出连接：{{reason}}。",
+  "next.networking.speed.failure.LEASE_REFUSED":
+    "{{name}} 无法借出连接：{{reason}}。",
   "next.networking.speed.failure.SERVER_LEFT_POOL": "服务器已离开连接池。",
   "next.networking.speed.failure.STOPPED": "测速已停止。",
   "next.networking.speed.failure.STOPPED_UNEXPECTEDLY": "测速意外停止。",
   "next.networking.speed.failure.NO_BYTES": "未收到任何字节。",
-  "next.proxyFault.NAME_NOT_RESOLVED": "无法解析主机名。请检查拼写和 DNS 服务器。",
-  "next.proxyFault.CONNECTION_REFUSED": "连接被拒绝。请检查端口以及代理是否正在运行。",
-  "next.proxyFault.HOST_UNREACHABLE": "主机不可达。请检查地址以及到它的网络路径。",
+  "next.proxyFault.NAME_NOT_RESOLVED":
+    "无法解析主机名。请检查拼写和 DNS 服务器。",
+  "next.proxyFault.CONNECTION_REFUSED":
+    "连接被拒绝。请检查端口以及代理是否正在运行。",
+  "next.proxyFault.HOST_UNREACHABLE":
+    "主机不可达。请检查地址以及到它的网络路径。",
   "next.proxyFault.NETWORK_UNREACHABLE": "网络不可达。请检查本机的网络连接。",
-  "next.proxyFault.NO_ROUTE_VIA": "没有经由 {{via}} 的路由。请检查该接口的网络连接。",
-  "next.proxyFault.CONNECTION_CLOSED": "代理应答前连接已关闭。请检查代理类型和端口。",
-  "next.proxyFault.TIMED_OUT": "{{seconds}} 秒内没有应答。请检查地址、端口和防火墙。",
-  "next.proxyFault.UDP_TIMED_OUT": "{{seconds}} 秒内没有 UDP 应答。请检查地址、端口以及防火墙是否放行 UDP。",
-  "next.proxyFault.EGRESS_UNUSABLE": "无法使用出口接口。请检查它是否已启用并有地址。",
-  "next.proxyFault.NOT_A_PROXY": "服务器没有用 {{protocol}} 代理协议应答。请检查代理类型和端口。",
+  "next.proxyFault.NO_ROUTE_VIA":
+    "没有经由 {{via}} 的路由。请检查该接口的网络连接。",
+  "next.proxyFault.CONNECTION_CLOSED":
+    "代理应答前连接已关闭。请检查代理类型和端口。",
+  "next.proxyFault.TIMED_OUT":
+    "{{seconds}} 秒内没有应答。请检查地址、端口和防火墙。",
+  "next.proxyFault.UDP_TIMED_OUT":
+    "{{seconds}} 秒内没有 UDP 应答。请检查地址、端口以及防火墙是否放行 UDP。",
+  "next.proxyFault.EGRESS_UNUSABLE":
+    "无法使用出口接口。请检查它是否已启用并有地址。",
+  "next.proxyFault.NOT_A_PROXY":
+    "服务器没有用 {{protocol}} 代理协议应答。请检查代理类型和端口。",
   "next.proxyFault.AUTH_REQUIRED": "代理需要用户名和密码。",
   "next.proxyFault.AUTH_UNSUPPORTED": "代理不接受用户名和密码。请删除它们。",
   "next.proxyFault.CREDENTIALS_REJECTED": "代理拒绝了用户名或密码。",
-  "next.proxyFault.CREDENTIALS_INVALID": "SOCKS5 要求用户名为 1 到 255 字节，密码不超过 255 字节。",
-  "next.proxyFault.CLOSED_DURING_SIGN_IN": "代理在登录过程中关闭了连接。请检查用户名和密码。",
+  "next.proxyFault.CREDENTIALS_INVALID":
+    "SOCKS5 要求用户名为 1 到 255 字节，密码不超过 255 字节。",
+  "next.proxyFault.CLOSED_DURING_SIGN_IN":
+    "代理在登录过程中关闭了连接。请检查用户名和密码。",
   "next.proxyFault.CONNECT_REFUSED": "代理以 HTTP {{status}} 拒绝了连接。",
   "next.proxyFault.DESTINATION_REFUSED": "{{target}} 拒绝了连接。",
-  "next.proxyFault.DESTINATION_UNREACHABLE": "无法到达 {{target}}（{{reply}}）。",
+  "next.proxyFault.DESTINATION_UNREACHABLE":
+    "无法到达 {{target}}（{{reply}}）。",
   "next.proxyFault.DESTINATION_TIMED_OUT": "{{target}} 未及时应答。",
-  "next.proxyFault.DESTINATION_FORBIDDEN": "代理的规则不允许连接到 {{target}}。",
+  "next.proxyFault.DESTINATION_FORBIDDEN":
+    "代理的规则不允许连接到 {{target}}。",
   "next.proxyFault.SSH_KEY_MISSING": "SSH 需要 Ed25519 私钥。",
   "next.proxyFault.SSH_KEY_PASSPHRASE": "私钥受口令保护。请输入其口令。",
-  "next.proxyFault.SSH_KEY_NOT_ED25519": "私钥不是 Ed25519 密钥。请用 ssh-keygen -t ed25519 生成一个。",
-  "next.proxyFault.SSH_KEY_UNREADABLE": "无法读取私钥。请粘贴完整的密钥，包括 BEGIN 和 END 行。",
-  "next.proxyFault.SSH_HOST_KEY_CHANGED": "服务器的主机密钥已更改。请核实服务器，然后忘记旧的主机密钥。",
-  "next.proxyFault.SSH_KEY_REJECTED": "服务器没有接受 {{username}} 的私钥。请检查其 authorized_keys。",
+  "next.proxyFault.SSH_KEY_NOT_ED25519":
+    "私钥不是 Ed25519 密钥。请用 ssh-keygen -t ed25519 生成一个。",
+  "next.proxyFault.SSH_KEY_UNREADABLE":
+    "无法读取私钥。请粘贴完整的密钥，包括 BEGIN 和 END 行。",
+  "next.proxyFault.SSH_HOST_KEY_CHANGED":
+    "服务器的主机密钥已更改。请核实服务器，然后忘记旧的主机密钥。",
+  "next.proxyFault.SSH_KEY_REJECTED":
+    "服务器没有接受 {{username}} 的私钥。请检查其 authorized_keys。",
   "next.proxyFault.SSH_HANDSHAKE_FAILED": "SSH 握手失败：{{detail}}",
-  "next.proxyFault.SSH_FORWARDING_REFUSED": "SSH 服务器拒绝转发到 {{target}}。请为此用户允许 TCP 转发。",
-  "next.proxyFault.WIREGUARD_KEY_INVALID": "某个 WireGuard 密钥无效。请按 wg 输出的原样粘贴每个密钥。",
-  "next.proxyFault.WIREGUARD_PEER_IS_SELF": "对端公钥是本隧道自己的公钥。请使用服务器的公钥。",
-  "next.proxyFault.WIREGUARD_NO_DNS": "隧道没有 DNS 服务器。请添加其配置中的 DNS 行，或使用 IP 地址。",
-  "next.proxyFault.WIREGUARD_NO_HANDSHAKE": "{{seconds}} 秒内没有握手。请检查端点，以及服务器的对端列表中是否有公钥 {{publicKey}}。",
+  "next.proxyFault.SSH_FORWARDING_REFUSED":
+    "SSH 服务器拒绝转发到 {{target}}。请为此用户允许 TCP 转发。",
+  "next.proxyFault.WIREGUARD_KEY_INVALID":
+    "某个 WireGuard 密钥无效。请按 wg 输出的原样粘贴每个密钥。",
+  "next.proxyFault.WIREGUARD_PEER_IS_SELF":
+    "对端公钥是本隧道自己的公钥。请使用服务器的公钥。",
+  "next.proxyFault.WIREGUARD_NO_DNS":
+    "隧道没有 DNS 服务器。请添加其配置中的 DNS 行，或使用 IP 地址。",
+  "next.proxyFault.WIREGUARD_NO_HANDSHAKE":
+    "{{seconds}} 秒内没有握手。请检查端点，以及服务器的对端列表中是否有公钥 {{publicKey}}。",
   "next.proxyFault.WIREGUARD_FAILED": "WireGuard 隧道无法启动：{{detail}}",
   "next.proxyFault.HTTP3_TLS": "与代理的 TLS 失败。请检查主机名和代理的证书。",
-  "next.proxyFault.HTTP3_HANDSHAKE_FAILED": "QUIC 握手失败。请检查端口以及代理是否提供 HTTP/3。",
+  "next.proxyFault.HTTP3_HANDSHAKE_FAILED":
+    "QUIC 握手失败。请检查端口以及代理是否提供 HTTP/3。",
   "next.proxyFault.HTTP3_FAILED": "到代理的 HTTP/3 失败：{{detail}}",
   "next.proxyFault.PROXY_UNAVAILABLE": "代理已停用或无法设置。",
   "next.proxyFault.STREAM_FAILED": "经由代理的连接在打开后失败。",
-  "next.proxyFault.TEST_NEEDS_DNS": "测试 HTTP/3 代理需要主机和端口，或它用于解析的 DNS 服务器。",
+  "next.proxyFault.TEST_NEEDS_DNS":
+    "测试 HTTP/3 代理需要主机和端口，或它用于解析的 DNS 服务器。",
   "next.proxyTest.CONNECTED": "已连接。",
   "next.proxyTest.FORWARDED": "已连接，并已通过代理转发。",
   "next.proxyTest.REACHABLE": "可访问。请指定主机和端口以检查转发。",
@@ -2602,7 +2873,8 @@ export const nextZh: LocaleDictionary = {
   "next.overview.jobs.other": "{{count}} 个任务 · 剩余 {{size}}",
   "next.overview.queueEmpty": "队列为空",
   "next.overview.finishedToday": "今日完成",
-  "next.overview.finished": "完成 {{complete}} · 部分 {{partial}} · 失败 {{failed}}",
+  "next.overview.finished":
+    "完成 {{complete}} · 部分 {{partial}} · 失败 {{failed}}",
   "next.overview.dataToday": "今日数据",
   "next.overview.dataPeriods": "本周 {{week}} · 本月 {{month}} · 全部 {{all}}",
   "next.overview.last30": "最近 30 天",
@@ -2669,13 +2941,15 @@ export const nextZh: LocaleDictionary = {
   "next.torrentDash.peersNote": "种子: {{seeds}} · 任务: {{torrents}}",
   "next.torrentDash.perDay": "每日",
   "next.torrentDash.trackers": "Tracker",
-  "next.torrentDash.trackersNote": "种子计入其 Tracker 规则；没有规则时计入其列出的每个 Tracker",
+  "next.torrentDash.trackersNote":
+    "种子计入其 Tracker 规则；没有规则时计入其列出的每个 Tracker",
   "next.torrentDash.tracker": "Tracker",
   "next.torrentDash.downloaded": "已下载",
   "next.torrentDash.uploaded": "已上传",
   "next.torrentDash.noTracker": "无 Tracker",
   "next.torrentDash.none": "没有种子",
-  "next.torrentDash.noneBody": "添加种子后，分享率、做种时间和 Tracker 会显示在这里。",
+  "next.torrentDash.noneBody":
+    "添加种子后，分享率、做种时间和 Tracker 会显示在这里。",
   "next.completed.since": "自 {{time}} 起",
   "next.completed.showAll": "显示全部",
 };
