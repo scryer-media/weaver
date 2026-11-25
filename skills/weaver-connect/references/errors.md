@@ -89,3 +89,41 @@ Other answers:
   not be read. Check `WEAVER_URL`.
 - **HTML instead of JSON**: `WEAVER_URL` points at a proxy page or the wrong
   base path.
+
+## MCP
+
+Refusals at `POST $WEAVER_URL/mcp` answer `{"code": "...", "error": "..."}`:
+
+| HTTP | `code` | Meaning | Do |
+|---|---|---|---|
+| 401 | `MCP_API_KEY_REQUIRED` | No key, or a browser session or local access instead of a key | Configure the key in the MCP client. |
+| 401 | `MCP_API_KEY_INVALID` | A key was sent and refused | Ask the operator for a new key. No retry. |
+| 403 | `MCP_ORIGIN_NOT_ALLOWED` | A browser page on another origin made the call | Call from the MCP client, not a page. |
+| 403 | `BROWSER_VERIFICATION_REQUIRED` | A session cookie and no key; checked before the MCP codes | Send the key; drop the cookie. |
+| 413 | `MCP_REQUEST_TOO_LARGE` | The request body is over 1 MiB | Send less in one call. |
+| 400 | `MCP_REQUEST_BODY_UNREADABLE` | The request body could not be read | Check the client and any proxy. |
+
+A call the tool cannot take is a JSON-RPC `invalid_params` error with
+`data.reason`:
+
+| `data.reason` | Meaning | Do |
+|---|---|---|
+| `MCP_TOOL_UNKNOWN` | No tool has this name | Use a tool from section 5 of SKILL.md. |
+| `MCP_ARGUMENTS_INVALID` | An argument is missing, of the wrong type, or not taken; `argument` names it | Fix that argument. |
+
+A tool error comes back with `isError` and
+`errors[{code, reason?, message, path?, ...}]`. A GraphQL error keeps its own
+`code` (`FORBIDDEN`, `INVALID_INPUT`, ...; tables above). The MCP layer's
+own refusals:
+
+| Code | Meaning | Do |
+|---|---|---|
+| `MCP_OPERATION_UNKNOWN` | No operation has this name; `skills` lists skills that have it when another skill does | Call `list_operations`, or name one of `skills`. |
+| `MCP_OPERATION_AMBIGUOUS` | Skills ship different text under this name; `skills` lists them | Name one with `skill`. |
+| `MCP_SKILL_UNKNOWN` | No served operation is in this skill; `skills` lists those that are | Use one of them. |
+| `MCP_OPERATION_KIND_MISMATCH` | A query sent to `run_mutation`, or the reverse; `tool` names the right one | Use that tool. |
+| `MCP_RESULT_TOO_LARGE` | The result is over 32 KiB (`result_bytes`, `max_bytes`); `applied: true` when a mutation already took effect | Narrow with paging or filters. After `applied: true`, do not repeat it; re-read instead. |
+| `MCP_CONFIRMATION_MISMATCH` | The token was for a different call; it is now spent | Show the changed call; ask the operator again. |
+| `MCP_CONFIRMATION_UNKNOWN` | The token is unknown, expired or used | Call again without a token for a new summary and yes. |
+| `MCP_GRAPHQL_ERROR` | A GraphQL error that carried no code of its own | Report the message. |
+| `MCP_SCHEMA_UNREADABLE` | The server could not read its own schema | Server fault: report. |
