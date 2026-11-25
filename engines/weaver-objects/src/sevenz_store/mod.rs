@@ -246,6 +246,9 @@ pub struct SevenZipStore {
     // The candidate that opened the header or the folders.
     #[serde(skip)]
     opened: Option<usize>,
+    // The candidate the coded run last started under, by index.
+    #[serde(skip)]
+    ran: Option<usize>,
     // Whether the header or a proof file proved it. A candidate opened
     // unproven is on trial: a checksum it fails on verified bytes condemns
     // it. Kept: the candidate a restart offers again is the one that proved
@@ -372,6 +375,7 @@ impl SevenZipStore {
             candidates: Vec::new(),
             latest: None,
             opened: None,
+            ran: None,
             proven: false,
             wrong_key: false,
             condemned: BTreeSet::new(),
@@ -1096,6 +1100,7 @@ impl Object for SevenZipStore {
 // every place is the store's own and settled.
 impl Engine for SevenZipStore {
     fn start(&mut self) -> Box<dyn Extraction> {
+        self.ran = self.opened.or(self.latest);
         coded::run(self.map.as_deref(), self.password())
     }
 

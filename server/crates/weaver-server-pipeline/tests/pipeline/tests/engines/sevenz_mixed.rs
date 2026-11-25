@@ -1265,8 +1265,12 @@ mod aes_coded {
     // The stored folders under AES too, a byte of the smallest stored member
     // wrong as posted: the store proves a candidate on that member before it
     // opens the folders, and bytes of the proof coming again are tried under
-    // every candidate the store holds. The right password alone, or after a
-    // wrong one, delivers every member once the proof is repaired.
+    // every candidate the store holds. The right password alone, before a
+    // wrong one or after it, delivers every member once the proof is
+    // repaired: right first, the damaged proof fails it and the run starts
+    // under the wrong one, and when the repaired proof opens the store under
+    // the right one, the store takes back what that run made and the next
+    // run decodes under the right one.
     #[tokio::test]
     async fn a_damaged_proof_repaired_delivers_every_member() {
         let (archive, files) = mixed_under(MKV, aes_copy(), under_aes(delta()), false);
@@ -1275,7 +1279,11 @@ mod aes_coded {
         let lumen = 32 + pad(files[0].1.len()) + pad(files[1].1.len() + files[2].1.len());
         let mut posted = archive.clone();
         posted[lumen + 70] ^= 0x5a;
-        for candidates in [vec![SECRET], vec!["ember-wrong-guess", SECRET]] {
+        for candidates in [
+            vec![SECRET],
+            vec!["ember-wrong-guess", SECRET],
+            vec![SECRET, "ember-wrong-guess"],
+        ] {
             let mut posts = with_par2(&archive);
             posts[0].bytes = posted.clone();
             let (scenario, spoken) = hearing(
@@ -1296,6 +1304,33 @@ mod aes_coded {
             for (name, bytes) in &files {
                 assert!(held.files[&delivered(name)] == *bytes, "{name} bytes");
             }
+        }
+    }
+
+    // The stored folders under AES too and nothing damaged: whatever the
+    // order of the candidates, the store opens under the right one before
+    // its run starts, and one run makes the coded members.
+    #[tokio::test]
+    async fn an_undamaged_proof_delivers_every_member_with_one_run() {
+        let (archive, files) = mixed_under(MKV, aes_copy(), under_aes(delta()), false);
+        for candidates in [
+            vec![SECRET],
+            vec!["ember-wrong-guess", SECRET],
+            vec![SECRET, "ember-wrong-guess"],
+        ] {
+            let (scenario, spoken) = hearing(candidates.iter().fold(
+                Scenario::new(vec![Post::plain("lantern.7z", archive.clone())]),
+                |scenario, candidate| scenario.global_password(candidate),
+            ));
+            let graph = run(&scenario).await;
+            assert_members(&graph, &files);
+            assert_runs_made_only_coded(&spoken);
+            assert_eq!(
+                closing(&spoken).len(),
+                1,
+                "{candidates:?} {:?}",
+                spoken.lock().unwrap()
+            );
         }
     }
 
