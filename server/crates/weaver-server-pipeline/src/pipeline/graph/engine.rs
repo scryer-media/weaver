@@ -29,7 +29,7 @@ use std::sync::Arc;
 
 use tokio::sync::mpsc;
 use weaver_graph::slots::{Admissions, Asked, AskerId, Slots, Ticket};
-use weaver_graph::{Emit, Extraction, Marks, MemberId, NodeId, Why};
+use weaver_graph::{Emit, Extraction, Marks, NodeId, Why};
 use weaver_server_disk::operations::disk::writer::{Credit, Stand};
 
 pub use self::pool::DecodePool;
@@ -377,23 +377,9 @@ enum Life {
     Stopped { generation: Option<u64> },
 }
 
-// What a run makes, as its object said when the run started, kept on the
-// run for its life: through its end, until it is forgotten or starts again.
-// Every decision about what the run made reads this, never the object as it
-// stands then, so none changes meaning while the object is out on loan.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Made {
-    // Every member: an engine, which places nothing itself.
-    Every,
-    // Only these: an object that places the rest itself.
-    Only(BTreeSet<MemberId>),
-}
-
 #[derive(Debug)]
 struct Run {
     life: Life,
-    // What the run makes, from its start (`Runs::record`).
-    made: Option<Made>,
     ticket: Option<Ticket>,
     // The reader the run is out with, through which its owner stops it.
     volumes: Option<Arc<RunVolumes>>,
@@ -435,7 +421,6 @@ impl Run {
     fn queued() -> Self {
         Self {
             life: Life::Queued,
-            made: None,
             ticket: None,
             volumes: None,
             reserved: 0,
@@ -704,27 +689,6 @@ impl Runs {
             .iter()
             .filter(|(_, run)| matches!(run.life, Life::Running { .. }))
             .map(|(node, _)| *node)
-    }
-
-    // What the node's run makes, as its object said as it started.
-    pub fn record(&mut self, node: NodeId, made: Made) {
-        if let Some(run) = self.runs.get_mut(&node) {
-            run.made = Some(made);
-        }
-    }
-
-    // A member announced since the run started, which it makes, joins what
-    // its record says it makes. A run that makes every member already has
-    // it.
-    pub fn grow(&mut self, node: NodeId, member: MemberId) {
-        if let Some(Made::Only(made)) = self.runs.get_mut(&node).and_then(|run| run.made.as_mut()) {
-            made.insert(member);
-        }
-    }
-
-    // What the node's run makes, from its start; `None` before one started.
-    pub fn made(&self, node: NodeId) -> Option<&Made> {
-        self.runs.get(&node)?.made.as_ref()
     }
 
     // The node's object is out on loan, as the run is to start: a run that

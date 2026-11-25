@@ -13,7 +13,7 @@ use weaver_graph::tree::Mark;
 use weaver_graph::{Emit, Engine, MemberId, NodeId, VolumeIndex, Why};
 
 use super::{GraphError, GraphJob};
-use crate::pipeline::graph::engine::{Heard, Made, Reservation, Said};
+use crate::pipeline::graph::engine::{Heard, Reservation, Said};
 use crate::pipeline::graph::namespace::{Coming, Returned, Tailed, WriteError, archive_name};
 use crate::pipeline::graph::status::RepairSlots;
 
@@ -172,7 +172,6 @@ impl GraphJob {
     ) -> Result<(), GraphError> {
         let _job =
             weaver_server_base::runtime::panic_trap::JobScope::enter(crate::JobId(said.scope));
-        self.grow_made();
         let node = said.node;
         let admitted = match said.heard {
             Heard::Repaired(returned) => {
@@ -437,13 +436,12 @@ impl GraphJob {
             // object, and what it placed, stand. A window the job waits for
             // room for is waited for as below.
             Heard::Emit(Emit::Refuse(why))
-                if matches!(self.runs.made(node), Some(Made::Only(_)))
+                if self.runs.has(node)
+                    && self.tree.places_own(node)
                     && !(matches!(why, Why::TooLarge { .. })
                         && self.runs.window_needs(node).is_some()) =>
             {
-                if let Some(Made::Only(made)) = self.runs.made(node) {
-                    self.writer.refuse_made(&self.tree, node, made, why);
-                }
+                self.writer.refuse_made(&self.tree, node, why);
                 Vec::new()
             }
             Heard::Emit(emit) => {
@@ -690,7 +688,6 @@ impl GraphJob {
         }
         loop {
             let limit = self.run_limit(pipeline_limit);
-            self.grow_made();
             self.invalidate_runs();
             let (engines, gone) = self.touched_engines();
             admitted.extend(self.runs.forget(gone, limit));
@@ -734,48 +731,25 @@ impl GraphJob {
         }
     }
 
-    // A member announced since a run of an object that places members of
-    // its own started, which the run makes, is the run's as much as one it
-    // made from the start: what its record says it makes grows by it, so a
-    // refusal, a restart and a retraction reach it too. Each announce costs
-    // one lookup of the node's run and one insert into its set. One
-    // announced while the object is out on loan is kept until it is back,
-    // which steps the runs before any starts.
-    fn grow_made(&mut self) {
-        let mut kept = Vec::new();
-        for (node, member) in self.writer.take_announced() {
-            if !matches!(self.runs.made(node), Some(Made::Only(_))) {
+    // An object that retracted, of its own accord, a member its run makes
+    // invalidates the node's run on record: its shelf starts over, as behind
+    // a repair, and the run is retracted and asked again once its node is
+    // brought up. The member is the run's when the tree's record said so as
+    // it went, which reaches one a replaced map dropped, or says so now: one
+    // the object said again under a map that has its run make it.
+    fn invalidate_runs(&mut self) {
+        for (node, member, made) in self.writer.take_retracted() {
+            if !self.runs.has(node) {
                 continue;
             }
-            match self.tree.engine(node) {
-                Some(engine) if engine.makes(member) => self.runs.grow(node, member),
-                Some(_) => {}
-                None if self.tree.lent(node) => kept.push((node, member)),
-                None => {}
-            }
-        }
-        self.writer.keep_announced(kept);
-    }
-
-    // An object that retracted, of its own accord, a member its run makes
-    // invalidates the run: its shelf starts over, as behind a repair, and
-    // the run is retracted and asked again once its node is brought up. A
-    // run makes the member when the run's record says so, or the object says
-    // so now: a run started on a map the object has since replaced may have
-    // made a member the object now places itself.
-    fn invalidate_runs(&mut self) {
-        for (node, member) in self.writer.take_retracted() {
-            let made = match self.runs.made(node) {
-                Some(Made::Every) => true,
-                Some(Made::Only(made)) => made.contains(&member),
-                None => false,
-            };
-            let makes = self.tree.is_live(node)
+            let now = self.tree.is_live(node)
+                && self.tree.engine(node).is_some()
                 && self
                     .tree
-                    .engine(node)
-                    .is_some_and(|engine| engine.makes(member));
-            if made || makes {
+                    .namespace(node)
+                    .and_then(|namespace| namespace.get(member))
+                    .is_some_and(|record| !record.own);
+            if made || now {
                 self.writer.restart_shelf(node);
             }
         }
@@ -790,10 +764,9 @@ impl GraphJob {
         if !self.tree.run_asking(node) {
             return;
         }
-        self.grow_made();
-        if let Some(Made::Only(made)) = self.runs.made(node) {
+        if self.runs.has(node) && self.tree.places_own(node) {
             self.writer
-                .refuse_made(&self.tree, node, made, Why::EncryptedHeader);
+                .refuse_made(&self.tree, node, Why::EncryptedHeader);
         }
     }
 
@@ -811,13 +784,13 @@ impl GraphJob {
         // An object out on loan answers nothing, and one with nothing to
         // run on declares no window: the run waits unstarted, holding no
         // slot, and is asked again once the node is touched.
-        let Some((window, lends, made)) = self.tree.engine(node).and_then(|engine| {
-            let window = engine.reserve()?;
-            Some((window, engine.lends(), self.made(node, engine)))
-        }) else {
+        let Some((window, lends)) = self
+            .tree
+            .engine(node)
+            .and_then(|engine| Some((engine.reserve()?, engine.lends())))
+        else {
             return Ok(self.runs.defer(node, limit));
         };
-        self.runs.record(node, made);
         // Whether the decoder borrows a window over its grant from a
         // scratch file as it asks for it, or is given it in RAM
         // (`Engine::lends`).
@@ -834,8 +807,8 @@ impl GraphJob {
             // As a run's own refusal: only what the run makes fails, and
             // the run ends where it stands, under the shelf's generation,
             // so it is not asked again until a repair or an offer moves it.
-            if let Some(Made::Only(made)) = self.runs.made(node) {
-                self.writer.refuse_made(&self.tree, node, made, why);
+            if self.tree.places_own(node) {
+                self.writer.refuse_made(&self.tree, node, why);
                 let generation = self.writer.shelf(node).generation();
                 return Ok(self.runs.ended(node, generation, limit));
             }
@@ -849,8 +822,8 @@ impl GraphJob {
             self.settle(effects)?;
             return Ok(Vec::new());
         }
-        if let Some(Made::Only(made)) = self.runs.made(node) {
-            self.writer.unrefuse_made(&self.tree, node, made);
+        if self.tree.places_own(node) {
+            self.writer.unrefuse_made(&self.tree, node);
         }
         if let Some(extraction) = self.tree.start(node) {
             let shelf = self.writer.shelf(node);
@@ -882,41 +855,20 @@ impl GraphJob {
         settled
     }
 
-    // What a run of the node's object makes, read once as it starts: every
-    // member of an engine, and of an object that places some members itself
-    // only the rest, which a restart never retracts, reopens or writes again.
-    fn made(&self, node: NodeId, engine: &dyn Engine) -> Made {
-        let mut own = false;
-        let made = self
-            .tree
+    // The members the node's run made: those of its namespace the tree's
+    // record does not give its object, every one of an engine. None before
+    // a run is on record.
+    fn members(&self, node: NodeId) -> Vec<MemberId> {
+        if !self.runs.has(node) {
+            return Vec::new();
+        }
+        self.tree
             .namespace(node)
             .into_iter()
             .flat_map(|namespace| namespace.members())
+            .filter(|member| !member.own)
             .map(|member| member.id)
-            .filter(|member| {
-                let makes = engine.makes(*member);
-                own |= !makes;
-                makes
-            })
-            .collect();
-        if own { Made::Only(made) } else { Made::Every }
-    }
-
-    // The members the node's run made, as its record says: none before a
-    // run started.
-    fn members(&self, node: NodeId) -> Vec<MemberId> {
-        let Some(namespace) = self.tree.namespace(node) else {
-            return Vec::new();
-        };
-        match self.runs.made(node) {
-            Some(Made::Every) => namespace.members().map(|member| member.id).collect(),
-            Some(Made::Only(made)) => made
-                .iter()
-                .copied()
-                .filter(|member| namespace.get(*member).is_some())
-                .collect(),
-            None => Vec::new(),
-        }
+            .collect()
     }
 
     // The engines a step brings up, each with what its parent tells it, and

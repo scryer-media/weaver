@@ -487,12 +487,9 @@ pub struct NamespaceWriter {
     // applied: what it retracts is the run's, not its object's.
     run_speaking: Option<NodeId>,
     // Members an object retracted of its own accord since the job last
-    // asked: one its run makes invalidates that run (`GraphJob::step_runs`).
-    retracted: Vec<(NodeId, MemberId)>,
-    // Members objects below the root announced since the job last asked:
-    // one a live run makes joins what its record says it makes
-    // (`GraphJob::grow_made`).
-    announced: Vec<(NodeId, MemberId)>,
+    // asked, each with whether the tree's record made it the run's as it
+    // went: one its run makes invalidates that run (`GraphJob::step_runs`).
+    retracted: Vec<(NodeId, MemberId, bool)>,
     // Ranges of root members given back that came and are no longer in
     // hand, since the job last asked: the job fetches them again.
     unkept: Vec<(MemberId, ByteRange)>,
@@ -660,7 +657,6 @@ impl NamespaceWriter {
             given_back: Vec::new(),
             run_speaking: None,
             retracted: Vec::new(),
-            announced: Vec::new(),
             unkept: Vec::new(),
             given_up: BTreeSet::new(),
             run_refusals: BTreeMap::new(),
@@ -1101,20 +1097,9 @@ impl NamespaceWriter {
     }
 
     // Members objects retracted of their own accord since the job last
-    // asked, in the order they went.
-    pub(crate) fn take_retracted(&mut self) -> Vec<(NodeId, MemberId)> {
+    // asked, in the order they went, each with whether it was the run's.
+    pub(crate) fn take_retracted(&mut self) -> Vec<(NodeId, MemberId, bool)> {
         std::mem::take(&mut self.retracted)
-    }
-
-    // Members objects below the root announced since the job last asked.
-    pub(crate) fn take_announced(&mut self) -> Vec<(NodeId, MemberId)> {
-        std::mem::take(&mut self.announced)
-    }
-
-    // Announces the job could not weigh yet, its object out on loan: asked
-    // again with the next.
-    pub(crate) fn keep_announced(&mut self, kept: Vec<(NodeId, MemberId)>) {
-        self.announced.extend(kept);
     }
 
     // The node's run starts over, as behind a repair: the shelf moves on a
@@ -2311,9 +2296,6 @@ impl NamespaceWriter {
                 return self.capture(tree, (*child, *volume), &arrival, took);
             }
             Effect::Announced { node, member } => {
-                if *node != NodeId::ROOT {
-                    self.announced.push((*node, *member));
-                }
                 self.announce(tree, builder, segments, *node, *member, out)?;
             }
             Effect::Closed { node, member } => {
@@ -2427,9 +2409,9 @@ impl NamespaceWriter {
             } => {
                 self.unkept((*node, *member, *child), (*range, *envelope, *at))?;
             }
-            Effect::Retracted { node, member } => {
+            Effect::Retracted { node, member, made } => {
                 if self.run_speaking != Some(*node) {
-                    self.retracted.push((*node, *member));
+                    self.retracted.push((*node, *member, *made));
                 }
                 self.retract(tree, *node, *member)?;
                 self.prune(tree)?;
@@ -4530,14 +4512,8 @@ impl NamespaceWriter {
     // why they are not there. The archive is noted for the job's events with
     // that reason, once per archive, as one given up is; the object and what
     // it placed stand.
-    pub(crate) fn refuse_made(
-        &mut self,
-        tree: &Tree,
-        node: NodeId,
-        made: &BTreeSet<MemberId>,
-        why: Why,
-    ) {
-        let open = Self::made_open(tree, node, made);
+    pub(crate) fn refuse_made(&mut self, tree: &Tree, node: NodeId, why: Why) {
+        let open = Self::made_open(tree, node);
         for &member in &open {
             self.refuse(tree, node, member, why, false);
         }
@@ -4555,21 +4531,22 @@ impl NamespaceWriter {
     }
 
     // A new run makes them again: why the last one did not is forgotten.
-    pub(crate) fn unrefuse_made(&mut self, tree: &Tree, node: NodeId, made: &BTreeSet<MemberId>) {
+    pub(crate) fn unrefuse_made(&mut self, tree: &Tree, node: NodeId) {
         self.run_refusals.remove(&node);
-        for member in Self::made_open(tree, node, made) {
+        for member in Self::made_open(tree, node) {
             self.files_mut(node).unrefuse(member);
         }
     }
 
-    // The members of `made`, what the node's run makes, it left open.
-    fn made_open(tree: &Tree, node: NodeId, made: &BTreeSet<MemberId>) -> Vec<MemberId> {
+    // The members the node's run makes, those the tree's record does not
+    // give its object, that it left open.
+    fn made_open(tree: &Tree, node: NodeId) -> Vec<MemberId> {
         let Some(namespace) = tree.namespace(node) else {
             return Vec::new();
         };
-        made.iter()
-            .filter_map(|member| namespace.get(*member))
-            .filter(|member| !member.closed && !member.is_complete())
+        namespace
+            .members()
+            .filter(|member| !member.own && !member.closed && !member.is_complete())
             .map(|member| member.id)
             .collect()
     }

@@ -446,6 +446,10 @@ pub enum Effect {
     Retracted {
         node: NodeId,
         member: MemberId,
+        // The member was the run's by the tree's record as it was
+        // retracted: its object has an engine face and did not place it
+        // itself.
+        made: bool,
     },
     // The object at `node` wants a password.
     NeedsPassword {
@@ -1440,14 +1444,24 @@ impl Tree {
     }
 
     // Whether the object at `node` places members itself beside those its
-    // run makes, as a 7z store that codes some folders does: it has an
-    // engine face, and some member of its namespace is not its run's.
+    // run makes, as a 7z store that codes some folders does: some member of
+    // its namespace is its own, by the tree's record. It answers while the
+    // object is out on loan.
     pub fn places_own(&self, node: NodeId) -> bool {
-        let Some(engine) = self.engine(node) else {
-            return false;
-        };
         self.namespace(node)
-            .is_some_and(|namespace| namespace.members().any(|member| !engine.makes(member.id)))
+            .is_some_and(|namespace| namespace.members().any(|member| member.own))
+    }
+
+    // The object's word on whether it places `member` itself, when it is in
+    // its node: an object with an engine face places what its run does not
+    // make, and any other object has no run. `None` for an object out of
+    // its node, which says nothing: only its run speaks then, and a run
+    // announces only members it makes, so the record stands as it is; a
+    // member the object placed itself was marked when the object said it,
+    // and a stale run's word does not unmark it.
+    pub(crate) fn own_word(object: Option<&dyn Object>, member: MemberId) -> Option<bool> {
+        let object = object?;
+        Some(object.engine().is_some_and(|engine| !engine.makes(member)))
     }
 
     // A run of the engine at `node`, from its object's present state. A
@@ -4887,12 +4901,16 @@ impl Tree {
                     // length said again is the producer's word on it now: a
                     // store whose geometry moved says its member anew.
                     let mut renamed = false;
+                    let own = Self::own_word(self.object(node), member);
                     if let Some(record) = self
                         .namespace_mut(node)
                         .and_then(|namespace| namespace.get_mut(member))
                     {
                         record.length = length.or(record.length);
                         renamed = record.name != name;
+                        if let Some(own) = own {
+                            record.own = own;
+                        }
                     }
                     if renamed {
                         self.rename(node, member, &name, builder, effects);
@@ -5239,6 +5257,14 @@ impl Tree {
     // is dropped with its subtree, and the member is a fresh, undecided
     // member again.
     fn retract(&mut self, node: NodeId, member: MemberId, effects: &mut Vec<Effect>) {
+        // Read before the retraction takes the record back. A retraction
+        // while the object is out on loan is its run's, and its owner knows
+        // the run speaks.
+        let made = self.engine(node).is_some()
+            && self
+                .namespace(node)
+                .and_then(|namespace| namespace.get(member))
+                .is_some_and(|record| !record.own);
         if let Some((child, _)) = self
             .nodes
             .get(&node)
@@ -5273,7 +5299,7 @@ impl Tree {
         if let Some(found) = self.nodes.get_mut(&node) {
             found.close_windows(member);
         }
-        effects.push(Effect::Retracted { node, member });
+        effects.push(Effect::Retracted { node, member, made });
     }
 
     // The object at `node` gives its members up: every volume it owned
@@ -5726,8 +5752,14 @@ impl Tree {
             };
             // What a run makes restarts with the run; what the object
             // places itself replays, and so does what is bound below it.
-            let engine = object.engine();
-            let made = |member: MemberId| engine.is_some_and(|engine| engine.makes(member));
+            let faced = object.engine().is_some();
+            let made = |member: MemberId| {
+                faced
+                    && found
+                        .namespace
+                        .get(member)
+                        .is_some_and(|record| !record.own)
+            };
             pending.extend(self.bound_below_where(node, |member| !made(member)));
             let mut extents = Vec::new();
             for member in found.namespace.members() {
@@ -8295,7 +8327,8 @@ mod tests {
             effects,
             vec![Effect::Retracted {
                 node: child,
-                member: MemberId(0)
+                member: MemberId(0),
+                made: false,
             }]
         );
         let inner = tree.namespace(child).unwrap().get(MemberId(0)).unwrap();

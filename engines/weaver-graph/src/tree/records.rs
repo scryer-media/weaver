@@ -247,6 +247,7 @@ impl Tree {
                 crc32: member.crc32,
                 fronted: member.fronted,
                 refuted: member.refuted,
+                own: Tree::own_word(node.object.as_deref(), member.member).unwrap_or(false),
                 reached: None,
             });
             if member.undecided {

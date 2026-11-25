@@ -1,12 +1,12 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
-// A mixed 7z store lent out while its run stands. The store places its
-// stored members itself and its run makes the coded ones; what the run makes
-// is recorded as it starts, so a refusal the run says, a repair that retracts
-// the run, or a start that falls while the store is out never reaches a
-// stored member, and a start that falls while it is out happens once it is
-// back.
+// A mixed 7z store lent out while its run stands, or restored. The store
+// places its stored members itself and its run makes the coded ones; the
+// tree records which of each member as the store names it, so a refusal the
+// run says, a repair that retracts the run, or a start that falls while the
+// store is out never reaches a stored member, and a start that falls while
+// it is out happens once it is back.
 
 use std::collections::BTreeSet;
 use std::io::Cursor;
@@ -19,8 +19,10 @@ use sevenz_turbo::{
 use weaver_graph::holds::{HoldBudgets, HoldsAccountant};
 use weaver_graph::{MemberId, NodeId};
 
-use super::GraphJob;
 use super::loan_tests::holds;
+use super::verification_tests::rows;
+use super::{Caps, GraphJob, Pending, Storage};
+use crate::pipeline::graph::checkpoint;
 use crate::pipeline::graph::engine::{DecodePool, Heard, RunMail, Runs};
 use crate::pipeline::graph::hardware::Hardware;
 use crate::pipeline::graph::namespace::NamespaceWriter;
@@ -478,4 +480,83 @@ async fn a_hybrid_run_asking_while_its_store_is_lent_reaches_the_right_candidate
         SECRET,
     ])
     .await;
+}
+
+// (v) The job checkpointed while the run stands and restored: the store
+// comes back from its facts, and the tree's record of which members the
+// run makes with it. A byte of the coded pack wrong in the post: the
+// restored run's refusal fails the coded members, never a stored one.
+#[tokio::test]
+async fn a_restored_hybrids_refusal_fails_only_the_coded_members() {
+    let (mut volume, files) = archive_under(
+        false,
+        vec![EncoderConfiguration::new(EncoderMethod::COPY)],
+        delta(),
+    );
+    volume[32 + files[0].1.len() + 7] ^= 0x5a;
+    let (mut rig, node) = started((volume, files));
+    let checkpoint = Pending::default();
+    assert!(checkpoint.put(&rig.job, Vec::new()));
+    let snapshot = checkpoint::snapshot(&rows(checkpoint.take().0.unwrap())).unwrap();
+    let sizes: Vec<u32> = rig
+        .volume
+        .chunks(FRAME)
+        .map(|chunk| chunk.len() as u32)
+        .collect();
+    let mail = RunMail::default();
+    let restored = GraphJob::restore(
+        &snapshot,
+        &[file("lantern.7z", &sizes)],
+        1,
+        Storage {
+            working_dir: rig.directory.path().to_owned(),
+            output: None,
+            accountant: Arc::new(HoldsAccountant::new(HoldBudgets {
+                resident_limit: u64::MAX,
+                scratch_total: u64::MAX,
+                scratch_ceiling: u64::MAX,
+                disk_reserve: 0,
+            })),
+            decode: DecodePool::unbounded(),
+            free_disk: CapacityReader::unknown(),
+            slots: 1,
+            mail: mail.sender(),
+            passwords: Vec::new(),
+            caps: Caps::unbounded(),
+            nesting: u32::MAX,
+            hardware: Hardware::default(),
+            metrics: None,
+            data_dir: None,
+            window_ledger: Default::default(),
+            disk: None,
+        },
+        LIMIT,
+    )
+    .unwrap();
+    rig.job = restored.job;
+    rig.mail = mail;
+    rig.job.hold_loans();
+    assert!(rig.job.tree.places_own(node), "restored as a hybrid");
+    let made: Vec<u32> = rig
+        .job
+        .tree
+        .namespace(node)
+        .expect("the store's namespace")
+        .members()
+        .filter(|member| !member.own)
+        .map(|member| member.id.0)
+        .collect();
+    assert_eq!(made, CODED, "the run makes the coded members");
+    rig.job.resume_runs(&mut rig.slots, LIMIT).unwrap();
+    rig.take();
+    assert_eq!(rig.job.runs.holding(), vec![node], "the run runs again");
+    rig.hear_until_ended(node).await;
+    rig.settle();
+    for index in CODED {
+        assert!(
+            rig.job.writer.refused(node, MemberId(index)).is_some(),
+            "coded member {index} carries the run's refusal"
+        );
+    }
+    rig.assert_stored_stand(node);
 }

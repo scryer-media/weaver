@@ -21,7 +21,7 @@ use weaver_server_disk::operations::disk::volume::LoopSite;
 
 use super::{GraphJob, RootFile};
 use crate::pipeline::graph::engine::echo::{HEADER, SIGNATURE};
-use crate::pipeline::graph::engine::{DecodePool, Heard, Made, RunMail, Runs};
+use crate::pipeline::graph::engine::{DecodePool, Heard, RunMail, Runs};
 use crate::pipeline::graph::namespace::NamespaceWriter;
 use crate::pipeline::graph::root::intake::Decoded;
 use crate::pipeline::graph::status::RepairSlots;
@@ -392,11 +392,21 @@ impl Rig {
         }
     }
 
+    // The members the store's run makes, by the tree's record, while a run
+    // is on record and the store places members itself.
     fn made(&self) -> Option<Vec<MemberId>> {
-        match self.job.runs().made(self.store())? {
-            Made::Only(made) => Some(made.iter().copied().collect()),
-            Made::Every => None,
+        let (tree, store) = (self.job.tree(), self.store());
+        if !self.job.runs().has(store) || !tree.places_own(store) {
+            return None;
         }
+        let namespace = tree.namespace(store)?;
+        Some(
+            namespace
+                .members()
+                .filter(|member| !member.own)
+                .map(|member| member.id)
+                .collect(),
+        )
     }
 
     fn refused(&self, member: MemberId) -> Option<Why> {

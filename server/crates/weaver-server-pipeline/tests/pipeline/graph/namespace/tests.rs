@@ -3247,6 +3247,7 @@ fn a_retraction_discards_the_leaf_and_keeps_its_name_for_what_comes_back() {
     assert!(job.out.contains(&Effect::Retracted {
         node: child,
         member: MemberId(0),
+        made: false,
     }));
     assert!(job.dir.path().join("inner.bin").exists());
     job.commit();

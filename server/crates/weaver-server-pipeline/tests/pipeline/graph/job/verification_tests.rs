@@ -39,7 +39,7 @@ fn pending() -> (GraphJob, tempfile::TempDir, RunMail, Vec<RootFile>) {
     (job, dir, mail, files)
 }
 
-fn rows(delta: Delta) -> GraphCheckpoint {
+pub(super) fn rows(delta: Delta) -> GraphCheckpoint {
     assert!(delta.whole);
     GraphCheckpoint {
         feed_verdict: delta.feed_verdict,
