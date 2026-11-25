@@ -9,6 +9,8 @@
     "preview": "vite preview",
     "typecheck": "tsc --noEmit",
     "lint": "npm run typecheck && oxlint src",
+    "format": "prettier --write .",
+    "format:check": "prettier --check .",
     "test": "node --test tests/*.test.ts",
     "test:browser": "node --test tests/browser/*.test.mjs",
     "test:graphql-compat": "node --test scripts/check-graphql-schema-compat.test.mjs"
@@ -37,6 +39,7 @@
     "babel-plugin-react-compiler": "^1.0.0",
     "oxlint": "^1.91.0",
     "postcss": "^8.5.32",
+    "prettier": "3.9.10",
     "tailwindcss": "^4.3.4",
     "typescript": "^7.0.2",
     "vite": "^8.3.5",
