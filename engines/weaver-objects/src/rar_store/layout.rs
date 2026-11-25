@@ -131,21 +131,20 @@ fn same(entry: &Entry, member: &StoredMember) -> bool {
 }
 
 // Whether an entry `same` holds, that its headers now name otherwise, is
-// renamed where it stands: a stored entry whose length stands and, when it
-// is enciphered, whose pieces are keyed as before, so its bytes read the
-// same. A member the run makes is retracted and made again under its new
-// name, as the run names what it makes when it starts. An enciphered entry
-// whose keying is not known, as one restored before its headers are walked
-// again, is retracted as any other changed entry.
+// renamed where it stands, stored or made alike: one whose length stands
+// and, when it is enciphered, whose pieces are keyed as before, so its
+// bytes read the same. A made member's new name reaches its run as the
+// run starts again: the repair replaced header bytes its shelf holds, so
+// the job restarts the run, which names what it makes as it starts. An
+// enciphered entry whose keying is not known, as one restored before its
+// headers are walked again, is retracted as any other changed entry.
 fn renamed_in_place(entry: &Entry, member: &StoredMember) -> bool {
     let length = match is_directory(member) {
         true => Some(0),
         false => member.unpacked_size,
     };
     let keyed = |store: Option<EncryptedStore>| store.map(|store| store.keying());
-    !entry.made
-        && entry.length == length
-        && keyed(entry.store) == keyed(member.eligibility.encrypted_store())
+    entry.length == length && keyed(entry.store) == keyed(member.eligibility.encrypted_store())
 }
 
 // The headers the layout takes a volume on, and whether it reads on past
@@ -764,14 +763,19 @@ impl RarStore {
             self.entries.truncate(keep);
             self.remap();
         }
-        // A stored entry its headers now name otherwise is renamed where it
-        // stands: its bytes, and every entry after it, are as they were.
+        // An entry its headers now name otherwise is renamed where it
+        // stands, under the name `announce` gives its kind: its bytes, and
+        // every entry after it, are as they were.
         for (id, member) in members.iter().enumerate().take(keep).skip(start) {
             if self.entries[id].name != member.name {
                 self.entries[id].name.clone_from(&member.name);
+                let name = match self.entries[id].made {
+                    true => super::made::name(&member.name),
+                    false => member_name(&member.name, is_directory(member)),
+                };
                 out.push(Emit::Member {
                     member: MemberId(id as u32),
-                    name: member_name(&member.name, is_directory(member)),
+                    name,
                     length: self.entries[id].length,
                 });
             }

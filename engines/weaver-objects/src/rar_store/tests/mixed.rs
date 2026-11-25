@@ -713,13 +713,12 @@ fn a_nameless_rar4_volume_the_run_reads_stays_where_it_was_laid() {
 }
 
 // A repaired header that names the compressed member otherwise than the
-// bytes first posted did: the store retracts it and what follows it, never
-// the stored member before it, and announces it again as made; the run
-// then makes it under its repaired name. Plain and enciphered headers. The
+// bytes first posted did: the store renames it where it stands, retracting
+// nothing, and the run then makes it under its repaired name. Plain and enciphered headers. The
 // store's keys are its own, derived as the bytes come; enciphered RAR5
 // headers also under keys already in the cache.
 #[test]
-fn a_repaired_header_of_a_made_member_retracts_it_and_the_run_makes_it_again() {
+fn a_repaired_header_of_a_made_member_renames_it_and_the_run_makes_it_again() {
     for version in [Version::Rar5, Version::Rar4] {
         for headers in [false, true] {
             repaired_header_of_a_made_member(version, headers, false);
@@ -801,14 +800,25 @@ fn repaired_header_of_a_made_member(version: Version, headers: bool, warm: bool)
         None,
     );
     owner.close(0);
-    assert_eq!(
-        owner.said.contains(&Emit::Retract(MemberId(1))),
-        ran,
+    assert!(
+        !owner
+            .said
+            .iter()
+            .any(|emit| matches!(emit, Emit::Retract(_))),
         "{label}: {:?}",
         owner.said
     );
-    assert!(!owner.said.contains(&Emit::Retract(MemberId(0))), "{label}");
-    // Made again, the member's data is not given back.
+    assert_eq!(owner.members[&1].name, "notes.nfo", "{label}");
+    assert_eq!(
+        owner
+            .renamed
+            .iter()
+            .any(|(member, _, name)| *member == 1 && name == "notes.nfo"),
+        ran,
+        "{label}: {:?}",
+        owner.renamed
+    );
+    // Still made, the member's data is not given back.
     assert!(
         !owner.said.iter().any(|emit| matches!(
             emit,
@@ -824,7 +834,13 @@ fn repaired_header_of_a_made_member(version: Version, headers: bool, warm: bool)
             .expect("still mixed")
             .makes(MemberId(1))
     );
-    assert!(owner.run().is_empty(), "{label}");
+    // The repair replaced header bytes the shelf holds: the run starts
+    // again, and makes the member under its repaired name.
+    let strays = match ran {
+        true => owner.rerun(),
+        false => owner.run(),
+    };
+    assert!(strays.is_empty(), "{label}");
     for (name, bytes) in unrar(std::slice::from_ref(&real), options.password) {
         let got = owner.member(&name);
         assert!(got.closed && got.bytes == bytes, "{label}: {name}");

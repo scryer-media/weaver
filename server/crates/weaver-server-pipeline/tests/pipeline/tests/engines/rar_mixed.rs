@@ -983,14 +983,9 @@ async fn a_mixed_rar_with_a_recovery_record_delivers_every_member() {
 // set over the set as it should be. The compressed member is the set's
 // last, after two stored ones. The run decodes under the posted name; the
 // recovery volume is held until nothing moves, so it ends first. The repair
-// rewrites the header, the re-lay retracts the made member and the run
-// makes it again under the repaired name; the stored members before it are
-// never retracted.
-//
-// The member is last because a re-lay that renames a member drops every
-// member from it on, and the store does not stream a dropped stored member
-// again: the same holds in a set that stores everything, and is the
-// store's, not the run's.
+// rewrites the header, the re-lay renames the made member where it stands,
+// and the run, started again behind the repair, makes it again under the
+// repaired name; the stored members before it are never retracted.
 async fn renamed(version: Version, options: &Options, password: Option<&str>) {
     let label = format!("{version:?} {:?}", options.password);
     let build = |name: &'static str| {
@@ -1052,8 +1047,9 @@ async fn a_repaired_header_renaming_the_compressed_member_makes_it_again() {
 // the repair rewrites the header. A stored member whose pieces the repair
 // leaves as they were is renamed where it stands: its file keeps the bytes
 // already written and is not written again, nor is any member after it. A
-// made member renamed is retracted and made again by its run, with every
-// member after it.
+// made member renamed is renamed where it stands too, and its run, started
+// again behind the repair, makes it again under its new name: the stored
+// members beside it are written once.
 //
 // `which` is the member renamed: 0 the first, 1 the middle one. A mixed set
 // is a stored file, the compressed one and a stored file; otherwise all
@@ -1119,12 +1115,8 @@ async fn renamed_member(version: Version, options: &Options, mixed: bool, which:
     }
     // Each stored member's file was written once: one file, never cut back.
     // The compressed member of a mixed set is its run's: a repair that
-    // replaces bytes its run read restarts the run, which makes it again,
-    // and when it is the member renamed it is retracted with every member
-    // after it.
-    let written_once = (0..renamed_names(mixed).len())
-        .filter(|&member| !(mixed && member == 1))
-        .filter(|&member| !(mixed && which == 1 && member > which));
+    // replaces bytes its run read restarts the run, which makes it again.
+    let written_once = (0..renamed_names(mixed).len()).filter(|&member| !(mixed && member == 1));
     let files = &graph.graph().member_files;
     for member in written_once {
         let seen = files
@@ -1194,12 +1186,12 @@ async fn a_repaired_enciphered_header_renaming_the_middle_member_gives_the_set_t
     renamed_member(Version::Rar5, &sealed_headers(Version::Rar5), false, 1).await;
 }
 
-// The compressed member of a mixed set renamed: its run's member is
-// retracted with the stored member after it, and made again under its new
-// name.
+// The compressed member of a mixed set renamed: it is renamed where it
+// stands, its run makes it again under its new name, and the stored
+// members beside it are written once.
 #[tokio::test]
-#[ignore = "blocked: a renamed made member is retracted with the stored members after it, whose posted bytes are gone before they can be read back; the store refuses the set as unmapped and the whole engine makes it, and under -p the job ends Partial without them"]
-async fn a_repaired_header_renaming_the_made_member_of_a_mixed_set_makes_it_again() {
+async fn a_repaired_header_renaming_the_made_member_makes_it_again_and_writes_the_stored_ones_once()
+{
     for version in VERSIONS {
         let mut sealed = options(version);
         sealed.password = Some(SECRET);

@@ -681,6 +681,28 @@ impl Owner {
         self.run_started(started)
     }
 
+    // The store's run started again behind a repair that replaced bytes
+    // its shelf holds, as the job restarts it: each member it makes starts
+    // over, the member staying the store's, with nothing written.
+    pub fn rerun(&mut self) -> Vec<(u32, u64, usize)> {
+        let made: Vec<u32> = {
+            let engine = self.object.engine().expect("a mixed set runs");
+            self.members
+                .keys()
+                .copied()
+                .filter(|&member| engine.makes(weaver_graph::MemberId(member)))
+                .collect()
+        };
+        for member in made {
+            if let Some(got) = self.members.get_mut(&member) {
+                got.bytes.clear();
+                got.coverage = Coverage::default();
+                got.closed = false;
+            }
+        }
+        self.run()
+    }
+
     // The store's run as it starts now, to be run later (`run_started`).
     pub fn start(&mut self) -> Box<dyn weaver_graph::Extraction> {
         self.object.engine_mut().expect("a mixed set runs").start()
