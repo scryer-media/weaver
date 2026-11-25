@@ -337,12 +337,67 @@ pub(super) mod refusal {
     // by its declared length or by the bytes that arrived.
     pub(in crate::http) const REQUEST_TOO_LARGE: &str = "REQUEST_TOO_LARGE";
 
+    // The MCP endpoint's codes. The first five are HTTP refusals sent as
+    // `code` beside `error`, before rmcp sees the request.
+    //
+    // 403: the request came from a browser page on an origin the GraphQL
+    // socket would refuse.
+    pub(in crate::http) const MCP_ORIGIN_NOT_ALLOWED: &str = "MCP_ORIGIN_NOT_ALLOWED";
+    // 401: no API key came with the request; a browser session or local
+    // access is not one.
+    pub(in crate::http) const MCP_API_KEY_REQUIRED: &str = "MCP_API_KEY_REQUIRED";
+    // 401: an API key was presented and refused.
+    pub(in crate::http) const MCP_API_KEY_INVALID: &str = "MCP_API_KEY_INVALID";
+    // 413: the body is larger than the endpoint takes.
+    pub(in crate::http) const MCP_REQUEST_TOO_LARGE: &str = "MCP_REQUEST_TOO_LARGE";
+    // 400: the body could not be read.
+    pub(in crate::http) const MCP_REQUEST_BODY_UNREADABLE: &str = "MCP_REQUEST_BODY_UNREADABLE";
+    // The rest are a tool error's `reason`, or a JSON-RPC error's
+    // `data.reason`. A tool name that is not served.
+    pub(in crate::http) const MCP_TOOL_UNKNOWN: &str = "MCP_TOOL_UNKNOWN";
+    // A tool argument that is missing, the wrong type or not taken.
+    pub(in crate::http) const MCP_ARGUMENTS_INVALID: &str = "MCP_ARGUMENTS_INVALID";
+    // A GraphQL error that carries no code of its own.
+    pub(in crate::http) const MCP_GRAPHQL_ERROR: &str = "MCP_GRAPHQL_ERROR";
+    // A run tool's result past its byte cap.
+    pub(in crate::http) const MCP_RESULT_TOO_LARGE: &str = "MCP_RESULT_TOO_LARGE";
+    // A confirmation token presented for a call other than its own.
+    pub(in crate::http) const MCP_CONFIRMATION_MISMATCH: &str = "MCP_CONFIRMATION_MISMATCH";
+    // A confirmation token that is unknown, expired or spent.
+    pub(in crate::http) const MCP_CONFIRMATION_UNKNOWN: &str = "MCP_CONFIRMATION_UNKNOWN";
+    // A query sent to the mutation tool, or the reverse.
+    pub(in crate::http) const MCP_OPERATION_KIND_MISMATCH: &str = "MCP_OPERATION_KIND_MISMATCH";
+    // No catalog operation has the name, or none in the named skill.
+    pub(in crate::http) const MCP_OPERATION_UNKNOWN: &str = "MCP_OPERATION_UNKNOWN";
+    // The name has differing texts in several skills and none was named.
+    pub(in crate::http) const MCP_OPERATION_AMBIGUOUS: &str = "MCP_OPERATION_AMBIGUOUS";
+    // No served operation is in the named skill.
+    pub(in crate::http) const MCP_SKILL_UNKNOWN: &str = "MCP_SKILL_UNKNOWN";
+    // The served schema could not be read.
+    pub(in crate::http) const MCP_SCHEMA_UNREADABLE: &str = "MCP_SCHEMA_UNREADABLE";
+
     #[cfg(test)]
     pub(in crate::http) const ALL: &[&str] = &[
         INVALID_API_KEY,
         AUTHENTICATION_REQUIRED,
         BROWSER_VERIFICATION_REQUIRED,
         REQUEST_TOO_LARGE,
+        MCP_ORIGIN_NOT_ALLOWED,
+        MCP_API_KEY_REQUIRED,
+        MCP_API_KEY_INVALID,
+        MCP_REQUEST_TOO_LARGE,
+        MCP_REQUEST_BODY_UNREADABLE,
+        MCP_TOOL_UNKNOWN,
+        MCP_ARGUMENTS_INVALID,
+        MCP_GRAPHQL_ERROR,
+        MCP_RESULT_TOO_LARGE,
+        MCP_CONFIRMATION_MISMATCH,
+        MCP_CONFIRMATION_UNKNOWN,
+        MCP_OPERATION_KIND_MISMATCH,
+        MCP_OPERATION_UNKNOWN,
+        MCP_OPERATION_AMBIGUOUS,
+        MCP_SKILL_UNKNOWN,
+        MCP_SCHEMA_UNREADABLE,
     ];
 }
 
@@ -496,8 +551,9 @@ pub(super) async fn graphql_handler(
 //
 // Browsers always send `Origin` on a socket upgrade and page scripts cannot
 // forge it; a request without one is a machine client, which carries its own
-// credential rather than riding on a browser's cookies.
-fn upgrade_origin_allowed(
+// credential rather than riding on a browser's cookies. The MCP endpoint
+// admits the same origins.
+pub(super) fn upgrade_origin_allowed(
     auth: &super::RequestAuthContext,
     peer: Option<SocketAddr>,
     headers: &HeaderMap,

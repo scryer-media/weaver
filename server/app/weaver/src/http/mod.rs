@@ -8,6 +8,7 @@ mod diagnostics;
 mod graphql;
 mod health;
 mod jobs;
+mod mcp;
 mod metrics;
 mod nzbget;
 mod request_metrics;

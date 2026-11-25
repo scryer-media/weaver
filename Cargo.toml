@@ -128,6 +128,9 @@ tower = { version = "0.5", default-features = false }
 rust-embed = { version = "8", default-features = false }
 mime_guess = { version = "2", default-features = false }
 async-graphql-axum = { version = "7.2", default-features = false }
+# The MCP endpoint: server side of the streamable HTTP transport only. No
+# client, no auth or child-process transports.
+rmcp = { version = "3.11", default-features = false, features = ["server", "transport-streamable-http-server"] }
 socket2 = { version = "0.6.5", features = ["all"] }
 memchr = { version = "2", default-features = false, features = ["std"] }
 subtle = { version = "2", default-features = false }

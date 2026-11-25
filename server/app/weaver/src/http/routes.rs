@@ -212,6 +212,7 @@ pub(super) fn build_router(runtime: super::ServerRuntime) -> Router {
             torrent_facade,
         ))
         .route("/graphql", post(super::graphql::graphql_handler))
+        .route("/mcp", post(super::mcp::mcp_handler))
         .route(
             "/graphql/ws",
             get(super::graphql::ws_handler::<weaver_server_api::WeaverSchema>),
@@ -249,6 +250,7 @@ pub(super) fn build_router(runtime: super::ServerRuntime) -> Router {
         .layer(middleware::from_fn(super::auth::enforce_browser_csrf))
         .layer(Extension(handle))
         .layer(Extension(pipeline_state))
+        .layer(Extension(super::mcp::McpState::new(schema.clone())))
         .layer(Extension(schema))
         .layer(Extension(backup))
         .layer(Extension(db))

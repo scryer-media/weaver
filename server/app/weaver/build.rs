@@ -8,6 +8,66 @@ use std::process::Command;
 fn main() {
     emit_git_commit();
     compile_windows_resources();
+    let out_dir = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR"));
+    generate_skill_operations(&out_dir);
+}
+
+// Embed every operator-skill operation file, `skills/*/operations/*.graphql`,
+// for the MCP catalog. The list is sorted so the generated file is stable.
+fn generate_skill_operations(out_dir: &Path) {
+    let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"));
+    let skills = manifest_dir.join("../../../skills");
+    // A directory is scanned whole, so a new skill or operation file reruns
+    // this as well as an edited one.
+    println!("cargo:rerun-if-changed={}", skills.display());
+    let mut rows = Vec::new();
+    // No skills directory is an empty catalog, not a failed build; the
+    // rerun line above picks the directory up when it appears.
+    let skill_dirs = match std::fs::read_dir(&skills) {
+        Ok(entries) => entries.collect::<Vec<_>>(),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(error) => panic!("read {}: {error}", skills.display()),
+    };
+    for skill in skill_dirs {
+        let skill = skill.expect("skill entry").path();
+        let operations = skill.join("operations");
+        if !operations.is_dir() {
+            continue;
+        }
+        println!("cargo:rerun-if-changed={}", operations.display());
+        let skill_name = skill
+            .file_name()
+            .and_then(|name| name.to_str())
+            .expect("skill directory name")
+            .to_string();
+        for file in std::fs::read_dir(&operations)
+            .unwrap_or_else(|error| panic!("read {}: {error}", operations.display()))
+        {
+            let path = file.expect("operation entry").path();
+            if path.extension().and_then(|extension| extension.to_str()) != Some("graphql") {
+                continue;
+            }
+            let file_name = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .expect("operation file name")
+                .to_string();
+            // Joined, not canonicalized: a canonical Windows path is a
+            // verbatim `\\?\` path.
+            let embedded = skills.join(&skill_name).join("operations").join(&file_name);
+            rows.push((skill_name.clone(), file_name, embedded));
+        }
+    }
+    rows.sort();
+    let mut code = String::from("pub(crate) static SKILL_OPERATIONS: &[SkillOperationFile] = &[\n");
+    for (skill, file, path) in &rows {
+        let path = path.to_str().expect("operation file path is UTF-8");
+        code.push_str(&format!(
+            "    SkillOperationFile {{ skill: {skill:?}, file: {file:?}, text: include_str!({path:?}) }},\n"
+        ));
+    }
+    code.push_str("];\n");
+    std::fs::write(out_dir.join("skill_operations.rs"), code).expect("write skill_operations.rs");
 }
 
 // Stamp the short commit into the binary for `weaver_build_info{commit=...}`.
