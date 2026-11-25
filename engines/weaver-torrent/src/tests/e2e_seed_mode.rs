@@ -979,7 +979,9 @@ async fn test_a_torrents_seed_check_across_a_pause_checks_the_paused_torrent() -
 // check of every piece that follows ends the run and lets the peer go, as
 // libtorrent's `torrent::leave_seed_mode` with `check_files` does at once
 // (`set_have_all(false)`, `force_recheck`, `disconnect_all`). The peer asks
-// for the damaged piece and another together, and is sent no block.
+// for the damaged piece, and for another once that check has failed, and is
+// sent no block. Asked for together, the other piece's own check may pass
+// first, and it is then served before any failure, as it should be.
 #[tokio::test(start_paused = true)]
 async fn test_seed_mode_failed_check_serves_no_other_unchecked_piece() -> anyhow::Result<()> {
     use crate::peer_info_reader::tests::{Dialed, MockPeer};
@@ -1043,7 +1045,11 @@ async fn test_seed_mode_failed_check_serves_no_other_unchecked_piece() -> anyhow
     peer.send(Message::Interested).await;
     peer.send(Message::Request(Request::new(DAMAGED, 0, PIECE_LENGTH)))
         .await;
-    peer.send(Message::Request(Request::new(OTHER, 0, PIECE_LENGTH)))
+    while torrent.seed_mode() {
+        tokio::task::yield_now().await;
+    }
+    // The check of every piece may have let the peer go already.
+    peer.send_if_open(Message::Request(Request::new(OTHER, 0, PIECE_LENGTH)))
         .await;
     // What the peer receives until the check of every piece lets it go.
     assert_eq!(
