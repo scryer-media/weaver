@@ -15,8 +15,8 @@ extracts and capped searches.
   provides `../weaver-connect/scripts/gql.sh`).
 - `S` = this skill's directory (absolute). Work in a separate directory the
   operator agrees to, so output never lands inside the skill.
-- Scope: `READ` covers every operation but `ServiceLogs`. `ServiceLogs` and
-  the bundle need `ADMIN`. Without it, skip those steps and say so.
+- Scope: `READ` covers every operation but `ServiceLogs`. `ServiceLogs`, the
+  bundle and the two MCP diagnostics tools need `ADMIN`. Without it, skip those steps and say so.
 - Local tools: `curl`, `jq`; `zstd` and `tar` to unpack a bundle.
 
 ## Operations
@@ -96,9 +96,15 @@ Each file's leading comment gives its purpose and a variables example.
    sh "$S"/scripts/log-search.sh logs.json '<regex>' WARN 40
    ```
 
-   Weaver keeps about the last 1000 records in memory. These records are not
-   sanitized: they can name jobs, servers and folders. Keep `logs.json` in
-   the work directory; quote only the lines that matter.
+   Weaver keeps about the last 1000 records in memory. `ServiceLogs` records
+   are not sanitized: they can name jobs, servers and folders. Keep
+   `logs.json` in the work directory; quote only the lines that matter.
+
+   With an MCP client, prefer `search_service_logs` (sanitized):
+   `{"pattern": "<regex>", "level": "WARN", "max_lines": 40}`. Lines are
+   sanitized before matching: write the pattern against stand-in names, not
+   real ones. Newest first; page with `before` set to `next_cursor`. A call
+   can take many seconds.
 
 6. **Bundle, when live data is not enough** (`ADMIN`; at least 10 s):
 
@@ -110,6 +116,10 @@ Each file's leading comment gives its purpose and a variables example.
    not `ADMIN`). Then unpack and read as `references/bundle.md` says. The
    operator can also download it from **System info → Download
    diagnostics**. Names in the bundle are stand-ins.
+
+   With an MCP client, first read one section with `read_diagnostics_section`
+   (`{"section": "server_health"}`; sections in `references/bundle.md`).
+   Fetch the whole bundle only when sections are not enough.
 
 7. **Report**: likely cause, evidence (codes and counts, not raw dumps), fix.
    For each fix say who does it: an operator action in the web UI, a

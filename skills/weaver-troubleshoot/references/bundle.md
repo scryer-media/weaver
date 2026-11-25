@@ -96,6 +96,29 @@ jq -r '.files[] | "\(.name) \(.bytes) \(.partial)"' "$B/manifest.json"
 sh "$S"/scripts/log-search.sh "$B/service-log.txt" --summary
 ```
 
+## One section over MCP
+
+`read_diagnostics_section` (`ADMIN`) returns one section, sanitized as the
+bundle is: `{section, files, stand_in_table_complete}`, each file
+`{name, value | text | error | withheld_for_size_bytes}`.
+
+| `section` | Member |
+|---|---|
+| `system_info` | `system-info.json` |
+| `server_health` | `server-health.json` |
+| `queue` | `queue.json` |
+| `servers` | `servers.json` |
+| `settings` | `settings.json` |
+| `schedules` | `schedules.json` |
+| `database` | `database.json` |
+| `host` | `host.json` |
+| `config` | `config/config-N.toml` |
+| `pipeline_metrics` | not mapped here: read the `files` names |
+| `metrics` | not mapped here; needs `metric_families` (1 to 10 names): `{section, families, returned, lines, truncated?}`, at most 60 lines |
+
+The member column follows the names only. A result is capped at 32 KiB
+(`MCP_RESULT_TOO_LARGE`).
+
 ## Which members matter per symptom
 
 | Symptom | Read |

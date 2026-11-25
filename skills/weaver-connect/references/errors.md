@@ -96,6 +96,7 @@ Refusals at `POST $WEAVER_URL/mcp` answer `{"code": "...", "error": "..."}`:
 
 | HTTP | `code` | Meaning | Do |
 |---|---|---|---|
+| 403 | `MCP_DISABLED` | The MCP server is turned off; answered before any other check | The operator turns on **Allow the MCP server** (**Settings → Security**). If the switch is locked, `WEAVER_MCP_ENABLED` sets it on the host: the operator's call. |
 | 401 | `MCP_API_KEY_REQUIRED` | No key, or a browser session or local access instead of a key | Configure the key in the MCP client. |
 | 401 | `MCP_API_KEY_INVALID` | A key was sent and refused | Ask the operator for a new key. No retry. |
 | 403 | `MCP_ORIGIN_NOT_ALLOWED` | A browser page on another origin made the call | Call from the MCP client, not a page. |
@@ -125,5 +126,7 @@ own refusals:
 | `MCP_RESULT_TOO_LARGE` | The result is over 32 KiB (`result_bytes`, `max_bytes`); `applied: true` when a mutation already took effect | Narrow with paging or filters. After `applied: true`, do not repeat it; re-read instead. |
 | `MCP_CONFIRMATION_MISMATCH` | The token was for a different call; it is now spent | Show the changed call; ask the operator again. |
 | `MCP_CONFIRMATION_UNKNOWN` | The token is unknown, expired or used | Call again without a token for a new summary and yes. |
+| `MCP_ADMIN_REQUIRED` | Reason under `FORBIDDEN`: a diagnostics tool needs an `ADMIN` key | Name the scope; stop. |
+| `MCP_LOG_PATTERN_INVALID` | Reason under `BAD_USER_INPUT`: `search_service_logs` refused the pattern | Fix it: a case-insensitive regex, at most 256 characters. |
 | `MCP_GRAPHQL_ERROR` | A GraphQL error that carried no code of its own | Report the message. |
 | `MCP_SCHEMA_UNREADABLE` | The server could not read its own schema | Server fault: report. |
