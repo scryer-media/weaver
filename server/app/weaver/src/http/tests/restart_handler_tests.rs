@@ -127,6 +127,7 @@ async fn a_deployment_that_must_not_exit_is_refused_before_anything_happens() {
             .expect("the refusal explains itself")
             .contains("container")
     );
+    assert_eq!(payload["code"], "CONFLICT");
     assert!(
         tokio::time::timeout(NOT_REQUESTED_WINDOW, controller.requested())
             .await

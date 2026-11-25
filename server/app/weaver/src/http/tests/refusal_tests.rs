@@ -189,3 +189,45 @@ async fn diagnostics_refuse_with_a_code() {
     assert_eq!(status, StatusCode::FORBIDDEN);
     assert_eq!(payload["code"], refusal::FORBIDDEN);
 }
+
+// A refusal that names no code of its own carries the one its status means,
+// beside its sentence when it had one; no sentence is added to one that had
+// none, and a status with no meaning here keeps its bare body.
+#[tokio::test]
+async fn a_status_refusal_carries_the_code_its_status_means() {
+    for (status, code) in [
+        (StatusCode::NOT_FOUND, "NOT_FOUND"),
+        (StatusCode::BAD_REQUEST, "INVALID_INPUT"),
+        (StatusCode::CONFLICT, "CONFLICT"),
+        (StatusCode::PAYLOAD_TOO_LARGE, "UPLOAD_TOO_LARGE"),
+        (StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL"),
+    ] {
+        let (got, payload) = refusal_of(status_error_response(status, "as it stands")).await;
+        assert_eq!(got, status);
+        assert_eq!(
+            payload,
+            serde_json::json!({ "code": code, "error": "as it stands" })
+        );
+
+        let response = coded_status_response(status);
+        assert_eq!(response.status(), status);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(payload, serde_json::json!({ "code": code }));
+    }
+
+    let (got, payload) = refusal_of(status_error_response(
+        StatusCode::TOO_MANY_REQUESTS,
+        "slow down",
+    ))
+    .await;
+    assert_eq!(got, StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(payload, serde_json::json!({ "error": "slow down" }));
+    let bare = coded_status_response(StatusCode::TOO_MANY_REQUESTS);
+    assert!(
+        to_bytes(bare.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}

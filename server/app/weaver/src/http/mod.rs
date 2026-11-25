@@ -129,6 +129,38 @@ fn coded_error_response(status: StatusCode, code: &str, message: &str) -> Respon
         .into_response()
 }
 
+// The code a refusal's status means, for a refusal that names no code of its
+// own: not found, bad input, a conflict, an upload past its limit, or a
+// fault. Any other status has none.
+fn status_code_name(status: StatusCode) -> Option<&'static str> {
+    match status {
+        StatusCode::NOT_FOUND => Some("NOT_FOUND"),
+        StatusCode::BAD_REQUEST => Some("INVALID_INPUT"),
+        StatusCode::CONFLICT => Some("CONFLICT"),
+        StatusCode::PAYLOAD_TOO_LARGE => Some("UPLOAD_TOO_LARGE"),
+        StatusCode::INTERNAL_SERVER_ERROR => Some("INTERNAL"),
+        _ => None,
+    }
+}
+
+// A refusal that had no sentence, with the code its status means. The body
+// carries only the code; no sentence is added to a refusal that never had
+// one.
+fn coded_status_response(status: StatusCode) -> Response {
+    match status_code_name(status) {
+        Some(code) => (status, Json(serde_json::json!({ "code": code }))).into_response(),
+        None => status.into_response(),
+    }
+}
+
+// `error_response` with the code its status means beside the sentence.
+fn status_error_response(status: StatusCode, message: &str) -> Response {
+    match status_code_name(status) {
+        Some(code) => coded_error_response(status, code, message),
+        None => error_response(status, message),
+    }
+}
+
 // Why a request was refused before its handler did any work.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Refused {

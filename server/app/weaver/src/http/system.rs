@@ -56,7 +56,7 @@ pub(super) async fn restart_handler(
             .reason
             .unwrap_or_else(|| "this deployment cannot restart Weaver".to_string());
         tracing::warn!(reason, "refused a restart request");
-        return super::error_response(StatusCode::CONFLICT, &reason);
+        return super::coded_error_response(StatusCode::CONFLICT, "CONFLICT", &reason);
     }
 
     tracing::info!(

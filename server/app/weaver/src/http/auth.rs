@@ -1494,7 +1494,11 @@ pub(super) async fn verify_password_handler(
         .await
         .is_err()
     {
-        return super::error_response(StatusCode::FORBIDDEN, "browser verification required");
+        return super::coded_error_response(
+            StatusCode::FORBIDDEN,
+            super::graphql::refusal::BROWSER_VERIFICATION_REQUIRED,
+            "browser verification required",
+        );
     }
     let caller = match resolve_caller(
         &request_auth.db,
@@ -1511,7 +1515,11 @@ pub(super) async fn verify_password_handler(
         Err(status) => return super::refusal_response(super::Refused::Caller(status), &headers),
     };
     let CallerIdentity::Jwt(_) = caller.identity else {
-        return super::error_response(StatusCode::FORBIDDEN, "browser session required");
+        return super::coded_error_response(
+            StatusCode::FORBIDDEN,
+            super::graphql::refusal::BROWSER_VERIFICATION_REQUIRED,
+            "browser session required",
+        );
     };
     let Some(auth) = request_auth.auth_cache.snapshot() else {
         return super::refusal_response(super::Refused::Caller(StatusCode::UNAUTHORIZED), &headers);
@@ -1526,11 +1534,15 @@ pub(super) async fn verify_password_handler(
     let username = auth.username.clone();
     let valid = match verify_password_bounded(body.password, auth.password_hash).await {
         Ok(valid) => valid,
-        Err(status) => return status.into_response(),
+        Err(status) => return super::coded_status_response(status),
     };
     if !valid {
         login_limiter.record_failure(&username, &client_id);
-        return super::error_response(StatusCode::UNAUTHORIZED, "invalid password");
+        return super::coded_error_response(
+            StatusCode::UNAUTHORIZED,
+            "INVALID_PASSWORD",
+            "invalid password",
+        );
     }
     login_limiter.record_success(&username, &client_id);
     let Some(token) = extract_session_cookie(&headers) else {
@@ -1546,7 +1558,7 @@ pub(super) async fn verify_password_handler(
     .and_then(Result::ok)
     .is_none()
     {
-        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        return super::coded_status_response(StatusCode::INTERNAL_SERVER_ERROR);
     }
     Json(serde_json::json!({ "ok": true })).into_response()
 }

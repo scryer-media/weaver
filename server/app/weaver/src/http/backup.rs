@@ -138,7 +138,7 @@ pub(super) async fn backup_status_handler(
     }
     match backup.status() {
         Ok(status) => Json::<BackupStatus>(status).into_response(),
-        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+        Err(_) => super::coded_status_response(StatusCode::INTERNAL_SERVER_ERROR),
     }
 }
 
@@ -192,13 +192,15 @@ pub(super) async fn backup_export_handler(
                     })),
                 )
                     .into_response(),
-                Err(error) => super::error_response(
+                Err(error) => super::status_error_response(
                     StatusCode::INTERNAL_SERVER_ERROR,
                     &format!("failed to open backup artifact: {error}"),
                 ),
             }
         }
-        Err(error) => super::error_response(backup_error_status_code(&error), &error.to_string()),
+        Err(error) => {
+            super::status_error_response(backup_error_status_code(&error), &error.to_string())
+        }
     }
 }
 
@@ -220,7 +222,9 @@ pub(super) async fn backup_create_handler(
     }
     match backup.create_stored_backup(body.password).await {
         Ok(info) => (StatusCode::ACCEPTED, Json(info)).into_response(),
-        Err(error) => super::error_response(backup_error_status_code(&error), &error.to_string()),
+        Err(error) => {
+            super::status_error_response(backup_error_status_code(&error), &error.to_string())
+        }
     }
 }
 
@@ -276,12 +280,15 @@ pub(super) async fn backup_download_handler(
                     })),
                 )
                     .into_response(),
-                Err(error) => {
-                    super::error_response(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string())
-                }
+                Err(error) => super::status_error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    &error.to_string(),
+                ),
             }
         }
-        Err(error) => super::error_response(backup_error_status_code(&error), &error.to_string()),
+        Err(error) => {
+            super::status_error_response(backup_error_status_code(&error), &error.to_string())
+        }
     }
 }
 
@@ -303,8 +310,10 @@ pub(super) async fn backup_delete_handler(
     }
     match backup.delete_backup(&filename).await {
         Ok(true) => StatusCode::NO_CONTENT.into_response(),
-        Ok(false) => StatusCode::NOT_FOUND.into_response(),
-        Err(error) => super::error_response(backup_error_status_code(&error), &error.to_string()),
+        Ok(false) => super::coded_status_response(StatusCode::NOT_FOUND),
+        Err(error) => {
+            super::status_error_response(backup_error_status_code(&error), &error.to_string())
+        }
     }
 }
 
@@ -363,12 +372,13 @@ pub(super) async fn backup_inspect_handler(
             };
             match result {
                 Ok(result) => Json(result).into_response(),
-                Err(error) => {
-                    super::error_response(backup_error_status_code(&error), &error.to_string())
-                }
+                Err(error) => super::status_error_response(
+                    backup_error_status_code(&error),
+                    &error.to_string(),
+                ),
             }
         }
-        Err((status, message)) => super::error_response(status, &message),
+        Err((status, message)) => super::status_error_response(status, &message),
     }
 }
 
@@ -410,19 +420,23 @@ pub(super) async fn backup_restore_handler(
                 category_remaps: upload.category_remaps,
             };
             if options.data_dir.trim().is_empty() {
-                return super::error_response(StatusCode::BAD_REQUEST, "data_dir is required");
+                return super::status_error_response(
+                    StatusCode::BAD_REQUEST,
+                    "data_dir is required",
+                );
             }
             match backup
                 .restore_backup(&upload.file_path, upload.password, options)
                 .await
             {
                 Ok(report) => Json(report).into_response(),
-                Err(error) => {
-                    super::error_response(backup_error_status_code(&error), &error.to_string())
-                }
+                Err(error) => super::status_error_response(
+                    backup_error_status_code(&error),
+                    &error.to_string(),
+                ),
             }
         }
-        Err((status, message)) => super::error_response(status, &message),
+        Err((status, message)) => super::status_error_response(status, &message),
     }
 }
 

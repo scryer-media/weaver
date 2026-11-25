@@ -83,8 +83,8 @@ pub(super) async fn job_nzb_download_handler(
 
     let job = match load_job_nzb_download(&request_auth.db, &handle, job_id).await {
         Ok(Some(job)) => job,
-        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
-        Err(status) => return status.into_response(),
+        Ok(None) => return super::coded_status_response(StatusCode::NOT_FOUND),
+        Err(status) => return super::coded_status_response(status),
     };
 
     match load_uncompressed_nzb_bytes(job.nzb_zstd).await {
@@ -103,7 +103,7 @@ pub(super) async fn job_nzb_download_handler(
             )
         }
         .into_response(),
-        Err(status) => status.into_response(),
+        Err(status) => super::coded_status_response(status),
     }
 }
 
@@ -157,18 +157,18 @@ async fn job_output_file_download(
 
     let output_dir = match load_job_output_dir(&request_auth.db, &handle, job_id).await {
         Ok(Some(path)) => path,
-        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
-        Err(status) => return status.into_response(),
+        Ok(None) => return super::coded_status_response(StatusCode::NOT_FOUND),
+        Err(status) => return super::coded_status_response(status),
     };
 
     let resolved_path = match resolve_output_file_path(&output_dir, &request.path).await {
         Ok(path) => path,
-        Err(status) => return status.into_response(),
+        Err(status) => return super::coded_status_response(status),
     };
 
     match stream_output_file(resolved_path).await {
         Ok(response) => response,
-        Err(status) => status.into_response(),
+        Err(status) => super::coded_status_response(status),
     }
 }
 
