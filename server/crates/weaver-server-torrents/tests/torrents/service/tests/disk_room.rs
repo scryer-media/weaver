@@ -1396,6 +1396,156 @@ async fn a_restart_promises_a_torrent_that_downloaded_unjudged() {
     disk.seeding.stop().await;
 }
 
+// The torrent of `a_restart_promises_a_torrent_that_downloaded_unjudged`
+// as its first run left it, having downloaded, and a second service over
+// its database not opened yet; its folder, and the disks of the restart.
+struct Restart {
+    disk: OnDisk,
+    again: TorrentService,
+    capacity: Arc<StorageCapacity>,
+    dir: PathBuf,
+}
+
+async fn downloaded_then_stopped() -> Restart {
+    let room = Arc::new(AtomicU64::new(1));
+    let disk = on_disk(&room).await;
+    let job_id = disk.job_id;
+    view_once(&disk.rig.service, job_id, |view| {
+        view.stated == Some(Stated::DiskSpace)
+    })
+    .await;
+    let dir = {
+        let mut live = disk.rig.service.inner.live.lock().await;
+        let torrent = live.get_mut(&job_id).unwrap();
+        torrent.counters.downloaded_bytes = 32_768;
+        files_dir(torrent)
+    };
+    disk.rig.service.stop().await;
+
+    let probe = Arc::new(move |_: &Path| {
+        Ok(DiskSpace {
+            total_bytes: 1 << 40,
+            available_bytes: RESERVE + room.load(Ordering::Acquire),
+        })
+    });
+    let roots = [0, 1, 2].map(|_| disk._seeds.path().to_path_buf());
+    let capacity = Arc::new(StorageCapacity::with_probe(roots, NEVER, probe));
+    for root in StorageRoot::ALL {
+        capacity.wait_for_probes(root, 1);
+    }
+    let again = service_on(
+        &disk.rig.db,
+        disk.rig.dir.path(),
+        &disk.rig.routes,
+        disk_env(&capacity),
+        set_clock(),
+    );
+    again.publish_to(queue());
+    Restart {
+        disk,
+        again,
+        capacity,
+        dir,
+    }
+}
+
+impl Restart {
+    // The restored torrent was promised what it had left, unjudged, and
+    // fetches it from the seeder.
+    async fn runs_promised(self) {
+        let Restart {
+            disk,
+            again,
+            capacity,
+            ..
+        } = self;
+        let job_id = disk.job_id;
+        let torrent = handle_of(&again, job_id).await;
+        torrent.wait_until_completed().await.unwrap();
+        assert!(!torrent.live().is_some_and(|run| run.upload_mode()));
+        assert!(!locked(&again.inner.disk_waits).contains_key(&job_id));
+        assert!(!again.inner.live.lock().await[&job_id].restored_unjudged);
+        promised(capacity.ledger(StorageRoot::Complete), 0).await;
+        again.stop().await;
+        disk.seeding.stop().await;
+    }
+}
+
+// Its start promised: the torrent's room holds a start.
+async fn start_taken(service: &TorrentService, job_id: JobId) -> bool {
+    let live = service.inner.live.lock().await;
+    live[&job_id]
+        .intake
+        .as_ref()
+        .is_some_and(|intake| intake.room().started())
+}
+
+// The restored torrent's disk is known before it joins its session (its
+// route is down until then): it is promised unjudged, before or as it
+// joins, and runs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_restart_promises_unjudged_when_the_disk_is_known_before_the_join() {
+    let restart = downloaded_then_stopped().await;
+    let (again, job_id) = (&restart.again, restart.disk.job_id);
+    restart.disk.rig.routes.set_down(Some("the leg is down"));
+    let mut moved = again.inner.disk_waits_moved.subscribe();
+    reopen(again).await;
+    let intake = again.inner.live.lock().await[&job_id]
+        .intake
+        .clone()
+        .unwrap();
+    moved
+        .wait_for(|_| intake.room().place().is_some() && !intake.room().placing())
+        .await
+        .unwrap();
+    passes_settled(again).await;
+    assert!(
+        again.inner.live.lock().await[&job_id].attached.is_none(),
+        "it has not joined its session"
+    );
+
+    restart.disk.rig.routes.set_down(None);
+    again.tick().await;
+    again.restored().await;
+    again.opened(job_id).await;
+    assert!(start_taken(again, job_id).await, "its start was promised");
+    assert!(
+        !handle_of(again, job_id).await.is_paused(),
+        "it joined running"
+    );
+    restart.runs_promised().await;
+}
+
+// The restored torrent joins its session while the look for its disk is
+// held: it joins paused, still to be judged, and the pass after the look
+// promises it unjudged, as its join would have.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_restart_promises_unjudged_when_it_joins_before_its_disk_is_known() {
+    let restart = downloaded_then_stopped().await;
+    let (again, job_id) = (&restart.again, restart.disk.job_id);
+    let (hold, mut reads) = weaver_server_disk::runtime::fs::test_devices::hold(&restart.dir);
+    reopen(again).await;
+    again.opened(job_id).await;
+    assert_eq!(reads.recv().await.unwrap(), restart.dir);
+    {
+        let live = again.inner.live.lock().await;
+        let torrent = &live[&job_id];
+        assert!(
+            torrent.intake.as_ref().unwrap().room().place().is_none(),
+            "its look is held"
+        );
+        assert!(torrent.restored_unjudged, "its start is still to be judged");
+        assert!(
+            torrent.attached.as_ref().unwrap().handle.is_paused(),
+            "it joined paused, its disk unknown"
+        );
+    }
+    assert!(!start_taken(again, job_id).await);
+
+    drop(hold);
+    restart.runs_promised().await;
+}
+
 // Two torrents on a disk with no room over the reserve are kept from
 // starting, as usenet jobs are. One that downloaded earlier in this run is
 // judged by the same rule and stays held.

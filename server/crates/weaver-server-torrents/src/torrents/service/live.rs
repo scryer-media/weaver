@@ -206,6 +206,11 @@ pub struct Live {
     // (`start_waits_on_move`): the move's end makes one pass over the
     // queue for it, and none otherwise.
     pub(super) start_held: bool,
+    // Read from the database at start, and its start not judged yet in
+    // this run: one that downloaded before is promised what it has left,
+    // unjudged, whether its join or a pass judges it first. False for one
+    // added in this run, and once its start is judged.
+    pub restored_unjudged: bool,
     // A removal has begun writing its mark: no move starts, and a failure
     // leaves the torrent to the removal (`remove_as`).
     pub(super) removing: bool,
@@ -317,6 +322,7 @@ impl Live {
             peers: (0, 0, 0),
             moving: None,
             start_held: false,
+            restored_unjudged: false,
             removing: false,
             failed_removing: None,
             leveling: None,

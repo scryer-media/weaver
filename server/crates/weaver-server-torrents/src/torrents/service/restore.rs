@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
-use super::disk_room::PlaceBatch;
+use super::disk_room::{PlaceBatch, StartHold};
 use super::intake::{Fetched, Parsed, parse};
 use super::live::Live;
 use super::retire::{held_key, held_of, held_tops};
@@ -1226,6 +1226,19 @@ impl TorrentService {
         &self,
         settings: &TorrentSettings,
         rules: &super::live::Rules,
+        torrent: &mut Live,
+        now: i64,
+    ) -> bool {
+        self.turn_held(settings, rules, torrent, now)
+            || self.kept_from_starting(torrent) != StartHold::Free
+    }
+
+    // Whether `torrent` joins its session paused for anything but the
+    // start rule: its intent, its turn in the queue or a hold over it.
+    fn turn_held(
+        &self,
+        settings: &TorrentSettings,
+        rules: &super::live::Rules,
         torrent: &Live,
         now: i64,
     ) -> bool {
@@ -1235,7 +1248,6 @@ impl TorrentService {
                 .holds()
                 .reason_for(queued(settings, rules, torrent, now).target())
                 .is_some()
-            || self.kept_from_starting(torrent)
     }
 
     // What a torrent joins its route's session with, read as it stands, and
@@ -1575,12 +1587,20 @@ impl TorrentService {
                 torrent.run_error = None;
                 // A pause, resume or turn made while the session took it,
                 // which found it in no session, reaches it too.
-                let paused_now = self.held_back(
+                let turn_held = self.turn_held(
                     &self.settings(),
                     &self.rules(),
                     torrent,
                     self.inner.clock.unix_ms(),
                 );
+                let paused_now = turn_held || self.kept_from_starting(torrent) != StartHold::Free;
+                // Its join settled its start: one it does not start for its
+                // intent, turn or a hold is judged as any start from here.
+                // Only one waiting for its disk to be known keeps what its
+                // restore promised, for the pass after the look.
+                if turn_held {
+                    torrent.restored_unjudged = false;
+                }
                 let waits = !paused_now && torrent.start_waits_on_move();
                 if let Some(attached) = &torrent.attached
                     && attached.handle.is_paused() != paused_now
@@ -2186,6 +2206,7 @@ impl TorrentService {
         // The rule is the one its trackers match now (libtorrent keeps
         // the trackers, not what was made of them).
         let mut torrent = Live::new(record, ledger, resume, now);
+        torrent.restored_unjudged = true;
         let (listed, unopened) = match row.trackers {
             Ok(listed) => (listed, None),
             Err(error) => (Vec::new(), Some(format!("a tracker URL: {error}"))),
