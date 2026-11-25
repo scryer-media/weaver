@@ -2363,14 +2363,13 @@ mod chase {
     }
 
     // A second compressed member whose window is wider than the run
-    // reserved at its start. With room to lend, the run borrows it and
-    // decodes in one generation. Held to a ceiling that fits the wide
-    // window alone, the loan is refused: the run widens, every member it
-    // made is retracted, the late one too, and made again by a later
-    // generation, each article fetched once.
+    // reserved at its start. A lent window is scratch, not RAM, so the
+    // decode pool's ceiling does not bound it: with no ceiling or one that
+    // fits the wide window alone, the run borrows the window from scratch
+    // and decodes in one generation, never restarted, each member
+    // delivered and each article fetched once.
     #[tokio::test]
-    #[ignore = "the job's record of what a run makes is fixed at its start"]
-    async fn a_later_wider_window_is_lent_or_widens_the_run() {
+    async fn a_later_wider_window_is_lent_from_scratch_and_the_run_is_not_restarted() {
         use weaver_server_pipeline::pipeline::graph::engine::{DecodePool, RUN_OVERHEAD};
         let version = Version::Rar5;
         let wide: u64 = 64 << 20;
@@ -2399,13 +2398,11 @@ mod chase {
             assert_members(&label, &graph, &set.files);
             assert_fetched_once(&graph);
             let (_, generations) = named(&spoken);
-            match ceiling {
-                None => assert_eq!(generations.len(), 1, "{label}: lent, one generation"),
-                Some(_) => assert!(
-                    generations.len() > 1,
-                    "{label}: widened, made again: {generations:?}"
-                ),
-            }
+            assert_eq!(
+                generations.len(),
+                1,
+                "{label}: lent, one generation: {generations:?}"
+            );
         }
     }
 
