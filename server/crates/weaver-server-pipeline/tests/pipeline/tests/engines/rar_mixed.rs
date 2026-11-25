@@ -963,6 +963,75 @@ async fn a_rar4_set_laid_on_trust_runs_once_where_it_was_laid() {
     assert_runs_named_no_stored_member("on trust", &spoken);
 }
 
+// A RAR4 set whose volumes state no number, a stored file, a compressed
+// one across several volumes and a stored file, posted with the names of
+// two volumes only the compressed member's packed data lies in swapped,
+// under a PAR2 set that names them rightly. The names hold each where the
+// other belongs; the repair's renames send them back, and the compressed
+// member alone is retracted and made again once both are held at their
+// places. The stored file after it stands: the job ends Complete with
+// every file whole, each article fetched once, and the stored file after
+// the compressed one written once.
+#[tokio::test]
+async fn a_rar4_set_whose_made_only_volumes_par2_moves_writes_the_stored_file_after_once() {
+    let mut options = split(Version::Rar4, ARTICLE);
+    options.numbered = false;
+    let set = mixed(Version::Rar4, Size::Large, MKV, &options);
+    let notes = set.data_of(MKV[1], None);
+    let stored: BTreeSet<u32> = [MKV[0], MKV[2]]
+        .into_iter()
+        .flat_map(|name| set.data_of(name, None))
+        .map(|(volume, _)| volume)
+        .collect();
+    let made_only: Vec<u32> = notes
+        .iter()
+        .map(|(volume, _)| *volume)
+        .filter(|volume| !stored.contains(volume))
+        .collect();
+    let (a, b) = match made_only[..] {
+        [a, b, ..] if b == a + 1 => (a as usize, b as usize),
+        _ => panic!("two neighbouring volumes of packed data alone: {made_only:?}"),
+    };
+    let last = set.data_of(MKV[2], None);
+    assert!(
+        last.iter().all(|(volume, _)| *volume as usize > b),
+        "the stored file lies past the swapped volumes: {last:?}"
+    );
+    let mut swapped = set.posts();
+    let (name_a, name_b) = (swapped[a].name.clone(), swapped[b].name.clone());
+    swapped[a].name = name_b;
+    swapped[b].name = name_a;
+    let truth: Vec<(&str, &[u8])> = set
+        .volumes
+        .iter()
+        .map(|(name, bytes)| (name.as_str(), bytes.as_slice()))
+        .collect();
+    swapped.extend(par2_set("silver.horizon", &truth, 4));
+    let graph = run(&Scenario::new(swapped)).await;
+    assert_eq!(
+        graph.status,
+        Some(JobStatus::Complete),
+        "{:?}",
+        graph.failure
+    );
+    assert_members("made-only volumes swapped", &graph, &set.files);
+    assert_fetched_once(&graph);
+    // The stored file after the compressed member: one file, never cut
+    // back.
+    let files = &graph.graph().member_files;
+    let seen = files
+        .iter()
+        .filter(|((node, id), _)| *node != weaver_graph::NodeId::ROOT && id.0 == 2)
+        .map(|(_, seen)| seen)
+        .collect::<Vec<_>>();
+    assert_eq!(seen.len(), 1, "files {files:?}");
+    assert!(
+        seen[0].inodes.len() == 1 && !seen[0].shrank,
+        "the stored file after was written again: {:?}",
+        seen[0]
+    );
+}
+
 // A recovery record in every volume is the set's own: the store leaves it,
 // and the compressed member is made as without one.
 #[tokio::test]

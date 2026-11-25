@@ -682,9 +682,15 @@ impl RarStore {
         // member its entry holds: it is passed over. So is no announced
         // entry, which the loop below announces.
         let low = layout.take_low();
+        // A slot retracted where it stood is looked at again from its own
+        // place: the layout may lay its member there now.
+        let waiting = self.waiting.first().copied().unwrap_or(usize::MAX);
         let start = match relaid {
             true => 0,
-            false => low.unwrap_or(usize::MAX).min(self.entries.len()),
+            false => low
+                .unwrap_or(usize::MAX)
+                .min(self.entries.len())
+                .min(waiting),
         };
         #[cfg(test)]
         let start = if super::counts::old() { 0 } else { start };
@@ -716,46 +722,56 @@ impl RarStore {
                 member.name
             );
         }
-        // An entry stands until the layout lists something else for it. A
-        // layout laid afresh may reach less far than the one before, as when
-        // a volume's length is said anew and the headers at its new end are
-        // not in yet: what it does not list yet is unread, not refuted, and
-        // a stored entry's bytes stay where they were placed. A member the
-        // run made that its headers no longer give the run, as a repaired
-        // header that says it is stored, is something else too: the store
-        // streams it. A made entry stands only while the store holds every
-        // volume its pieces lie in: its bytes stayed in the envelope, so one
-        // with a piece in a volume the store gave back was made in an order
-        // no longer the set's, and is made again where the layout lays it.
-        // One whose volume the layout only dropped, held still, is compared
+        // An entry stands while it is still the member the layout lists at
+        // its id: the same pieces, the same name or one it is renamed to
+        // where it stands, and the same kind, made by the run or not. Each
+        // is judged on its own: one that no longer stands is retracted where
+        // it is, its slot and id kept for the member the layout lays there,
+        // and the entries after it that stand are not touched. A layout laid
+        // afresh may reach less far than the one before, as when a volume's
+        // length is said anew and the headers at its new end are not in
+        // yet: what it does not list yet is unread, not refuted, and a
+        // stored entry's bytes stay where they were placed. A member the run
+        // made that its headers no longer give the run, as a repaired header
+        // that says it is stored, is something else: the store streams it.
+        // A made entry stands only while the store holds every volume its
+        // pieces lie in: its bytes stayed in the envelope, so one with a
+        // piece in a volume the store gave back was made in an order no
+        // longer the set's, and is made again where the layout lays it. One
+        // whose volume the layout only dropped, held still, is compared
         // again when the layout lays that volume once more.
-        let keep = self.entries[start..]
-            .iter()
-            .enumerate()
-            .position(|(at, entry)| {
-                let id = start + at;
-                let gone = entry.made
-                    && entry
-                        .pieces
-                        .iter()
-                        .any(|piece| !self.volumes.contains_key(&piece.volume));
-                let Some(member) = members.get(id) else {
-                    return gone;
-                };
-                #[cfg(test)]
-                super::counts::bump(|counts| counts.compared += 1);
-                !same(entry, member)
-                    || (entry.name != member.name && !renamed_in_place(entry, member))
-                    || gone
-                    || (entry.made && !self.made_by_run(id, member, format))
-            })
-            .map_or(self.entries.len(), |at| start + at);
+        let mut retracted = Vec::new();
+        for (id, entry) in self.entries.iter().enumerate().skip(start) {
+            if entry.waiting {
+                continue;
+            }
+            let gone = entry.made
+                && entry
+                    .pieces
+                    .iter()
+                    .any(|piece| !self.volumes.contains_key(&piece.volume));
+            let stands = match members.get(id) {
+                None => !gone,
+                Some(member) => {
+                    #[cfg(test)]
+                    super::counts::bump(|counts| counts.compared += 1);
+                    same(entry, member)
+                        && (entry.name == member.name || renamed_in_place(entry, member))
+                        && !gone
+                        && !(entry.made && !self.made_by_run(id, member, format))
+                }
+            };
+            if !stands {
+                retracted.push(id);
+            }
+        }
         // A made entry whose place the layout now gives a member the run
         // does not make, as a repaired header that says it is stored: its
         // data the shelf kept for the run is no longer the shelf's, and
         // comes again to the member streamed in its place. One made again
         // stays the run's, and its bytes stay where they were.
-        for (id, entry) in self.entries.iter().enumerate().skip(keep) {
+        for &id in &retracted {
+            let entry = &self.entries[id];
             let streamed = entry.made
                 && members
                     .get(id)
@@ -772,29 +788,41 @@ impl RarStore {
                 });
             }
         }
-        for id in (keep..self.entries.len()).rev() {
+        for &id in retracted.iter().rev() {
             out.push(Emit::Retract(MemberId(id as u32)));
         }
-        if keep < self.entries.len() {
-            self.entries.truncate(keep);
+        if !retracted.is_empty() {
+            for &id in &retracted {
+                let name = std::mem::take(&mut self.entries[id].name);
+                self.entries[id] = Entry::waiting(name);
+            }
+            // Slots at the tail hold nothing after them: the next member
+            // laid there is announced as any new one is.
+            while self.entries.last().is_some_and(|entry| entry.waiting) {
+                self.entries.pop();
+            }
             self.remap();
         }
         // An entry its headers now name otherwise is renamed where it
         // stands, under the name `announce` gives its kind: its bytes, and
         // every entry after it, are as they were.
-        for (id, member) in members.iter().enumerate().take(keep).skip(start) {
-            if self.entries[id].name != member.name {
-                self.entries[id].name.clone_from(&member.name);
-                let name = match self.entries[id].made {
-                    true => super::made::name(&member.name),
-                    false => member_name(&member.name, is_directory(member)),
-                };
-                out.push(Emit::Member {
-                    member: MemberId(id as u32),
-                    name,
-                    length: self.entries[id].length,
-                });
+        for (id, member) in members.iter().enumerate().skip(start) {
+            let Some(entry) = self.entries.get_mut(id) else {
+                break;
+            };
+            if entry.waiting || entry.name == member.name {
+                continue;
             }
+            entry.name.clone_from(&member.name);
+            let name = match entry.made {
+                true => super::made::name(&member.name),
+                false => member_name(&member.name, is_directory(member)),
+            };
+            out.push(Emit::Member {
+                member: MemberId(id as u32),
+                name,
+                length: entry.length,
+            });
         }
         for (id, member) in members.iter().enumerate().skip(start) {
             if refusal.is_some() {
@@ -807,8 +835,8 @@ impl RarStore {
                 refusal = Some(emit);
                 break;
             }
-            if id == self.entries.len() {
-                self.announce(member, made, out);
+            if self.entries.get(id).is_none_or(|entry| entry.waiting) {
+                self.announce(id, member, made, out);
             }
             self.extend(id, member, out);
         }
@@ -839,10 +867,12 @@ impl RarStore {
         }
     }
 
-    fn announce(&mut self, member: &StoredMember, made: bool, out: &mut Vec<Emit>) {
+    // The member the layout lays at `id`: the next slot, or one retracted
+    // where it stood.
+    fn announce(&mut self, at: usize, member: &StoredMember, made: bool, out: &mut Vec<Emit>) {
         let dir = is_directory(member);
         let length = if dir { Some(0) } else { member.unpacked_size };
-        let id = MemberId(self.entries.len() as u32);
+        let id = MemberId(at as u32);
         // A member the run makes is named as the RAR engine names it, so a
         // mixed set delivers it where the engine would (`made`).
         let name = match made {
@@ -861,7 +891,8 @@ impl RarStore {
         if store.is_some() {
             self.locked.insert(id.0 as usize);
         }
-        self.entries.push(Entry {
+        self.waiting.remove(&at);
+        let entry = Entry {
             name: member.name.clone(),
             length,
             crc: None,
@@ -880,7 +911,12 @@ impl RarStore {
             plain_runs: CrcRuns::default(),
             parts: Default::default(),
             made,
-        });
+            waiting: false,
+        };
+        match self.entries.get_mut(at) {
+            Some(slot) => *slot = entry,
+            None => self.entries.push(entry),
+        }
         if dir {
             Arc::make_mut(&mut self.entries[id.0 as usize].out).closed = true;
             out.push(Emit::MemberClosed(id));

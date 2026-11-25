@@ -785,6 +785,123 @@ fn a_volume_only_made_pieces_lie_in_named_elsewhere_goes_back_and_is_made_again(
     }
 }
 
+// The same swap with a stored file after the compressed member, laid in
+// the volumes past the two: once the repair's names send the two back, the
+// compressed member alone is retracted, where it stands. The stored file
+// after it is still the member the layout lists at its id: it stays closed
+// with its bytes, and nothing of it is said or written again, while the
+// compressed member is laid and made anew into its own slot once both
+// volumes are held at their places.
+#[test]
+fn a_made_member_retracted_where_it_stands_leaves_the_stored_file_after_it_whole() {
+    let mut options = Options::new(Version::Rar4);
+    options.split = Some(6_000);
+    let mut items = stored_then_made();
+    items.push(Item::File("omega.mkv", payload(4, 9_000)));
+    let volumes = write(&items, &options);
+    let made = made_only(&volumes);
+    let (a, b) = (made[1], made[2]);
+    assert_eq!(b, a + 1, "{made:?}");
+    let mut posted = volumes.clone();
+    posted.swap(a, b);
+    let mut owner = Owner::named(store(), posted);
+    owner.whole(4096);
+    let id_of = |owner: &Owner, name: &str| {
+        owner
+            .object
+            .entries
+            .iter()
+            .position(|entry| entry.name == name)
+            .unwrap_or_else(|| panic!("{name} is laid"))
+    };
+    let notes = id_of(&owner, "notes.nfo");
+    let omega = id_of(&owner, "omega.mkv");
+    assert!(owner.object.entries[notes].made);
+    assert!(!owner.object.entries[omega].made);
+    assert!(omega > notes);
+    let laid_in = owner.object.entries[notes]
+        .pieces
+        .iter()
+        .map(|piece| piece.volume.0 as usize)
+        .collect::<Vec<_>>();
+    assert!(laid_in.contains(&a) && laid_in.contains(&b), "{laid_in:?}");
+    let extracted = unrar(&volumes, None);
+    let streamed = &extracted
+        .iter()
+        .find(|(name, _)| name == "omega.mkv")
+        .expect("omega.mkv")
+        .1;
+    let whole = |owner: &Owner| {
+        let got = &owner.members[&(omega as u32)];
+        got.closed && got.bytes == *streamed
+    };
+    assert!(whole(&owner));
+    owner.said.clear();
+    let from = owner.log.len();
+
+    owner.renamed(a, &format!("alpha.part{}.rar", b + 1));
+    owner.renamed(b, &format!("alpha.part{}.rar", a + 1));
+    let retracted: Vec<&Emit> = owner
+        .said
+        .iter()
+        .filter(|emit| matches!(emit, Emit::Retract(_)))
+        .collect();
+    assert_eq!(
+        retracted,
+        [&Emit::Retract(MemberId(notes as u32))],
+        "{:?}",
+        owner.said
+    );
+    // Laid again into its own slot, only as far as the volumes still held.
+    let entry = &owner.object.entries[notes];
+    assert!(
+        entry.name == "notes.nfo" && entry.made && !entry.waiting,
+        "{}",
+        entry.name
+    );
+    assert!(
+        entry
+            .pieces
+            .iter()
+            .all(|piece| (piece.volume.0 as usize) < a),
+        "{:?}",
+        entry
+            .pieces
+            .iter()
+            .map(|piece| piece.volume)
+            .collect::<Vec<_>>()
+    );
+    assert!(!owner.object.entries[omega].waiting);
+    assert!(whole(&owner));
+
+    owner.exchanged(a, b);
+    for volume in [a, b] {
+        owner.close(volume);
+    }
+    assert_eq!(owner.object.volumes.len(), volumes.len());
+    assert!(!owner.object.entries[notes].waiting);
+    assert!(owner.run().is_empty());
+    // Nothing of the stored file was said again: no retraction, no new
+    // name, no byte and no close.
+    let said_of_omega: Vec<&Emit> = owner.log[from..]
+        .iter()
+        .filter(|emit| match emit {
+            Emit::Member { member, .. }
+            | Emit::Bytes { member, .. }
+            | Emit::Checksum { member, .. }
+            | Emit::MemberClosed(member) => member.0 as usize == omega,
+            Emit::Retract(member) => member.0 as usize == omega,
+            _ => false,
+        })
+        .collect();
+    assert!(said_of_omega.is_empty(), "{said_of_omega:?}");
+    assert!(whole(&owner));
+    for (name, bytes) in extracted {
+        let got = owner.member(&name);
+        assert!(got.closed && got.bytes == bytes, "{name}");
+    }
+}
+
 // Its twin: a volume a stored member's bytes were streamed from, named
 // elsewhere, stays. Its bytes went to that member's file, and the tree,
 // handed it, could only refuse the member.
@@ -984,13 +1101,29 @@ fn repaired_header_of_a_made_member(version: Version, headers: bool, warm: bool)
 // bytes: no byte of its data comes again.
 #[test]
 fn a_repaired_header_turning_a_made_member_stored_gives_back_its_data() {
+    turned_stored(false);
+}
+
+// The same with a stored file after the turned member: the turned member
+// alone is retracted, where it stands, and only its own data is given
+// back. The file after it stays closed with its bytes, and nothing of it is
+// said again.
+#[test]
+fn a_member_turned_stored_is_retracted_alone_before_a_stored_file() {
+    turned_stored(true);
+}
+
+fn turned_stored(after: bool) {
     let version = Version::Rar4;
     let (notes, _) = packed(version, "notes.nfo");
-    let items = vec![
+    let mut items = vec![
         Item::File("alpha.mkv", payload(1, 10_000)),
         notes,
         Item::File("beta.mkv", payload(2, 5_003)),
     ];
+    if after {
+        items.push(Item::File("gamma.srt", payload(3, 3_000)));
+    }
     let real = write(&items, &Options::new(version)).remove(0);
     let length = real.len() as u64;
     // beta.mkv's header, its method byte set to a compressed one.
@@ -1023,20 +1156,37 @@ fn a_repaired_header_turning_a_made_member_stored_gives_back_its_data() {
     let made = owner.object.engine().expect("a mixed set runs");
     assert!(made.makes(MemberId(2)), "beta.mkv is made");
 
+    let gamma = |owner: &Owner| {
+        owner
+            .members
+            .get(&3)
+            .map(|got| (got.closed, got.bytes.clone()))
+    };
+    let before = gamma(&owner);
+    assert_eq!(before.is_some(), after);
+    assert!(before.as_ref().is_none_or(|(closed, _)| *closed));
     owner.said.clear();
+    let from = owner.log.len();
     owner.deliver_as(0, header, weaver_graph::Provenance::Repaired, None);
-    assert!(
-        owner.said.contains(&Emit::Retract(MemberId(2))),
-        "{:?}",
-        owner.said
-    );
-    assert!(
-        owner.said.contains(&Emit::Unkept {
+    let retracted: Vec<&Emit> = owner
+        .said
+        .iter()
+        .filter(|emit| matches!(emit, Emit::Retract(_)))
+        .collect();
+    assert_eq!(retracted, [&Emit::Retract(MemberId(2))], "{:?}", owner.said);
+    let unkept: Vec<&Emit> = owner
+        .said
+        .iter()
+        .filter(|emit| matches!(emit, Emit::Unkept { .. }))
+        .collect();
+    assert_eq!(
+        unkept,
+        [&Emit::Unkept {
             volume: VolumeIndex(0),
             range: data,
             envelope: 0,
             at: data.start,
-        }),
+        }],
         "{:?}",
         owner.said
     );
@@ -1048,6 +1198,26 @@ fn a_repaired_header_turning_a_made_member_stored_gives_back_its_data() {
             .makes(MemberId(2))
     );
     assert!(owner.run().is_empty());
+    // Nothing of the file after it was said again.
+    assert!(
+        owner.log[from..].iter().all(|emit| !matches!(
+            emit,
+            Emit::Member {
+                member: MemberId(3),
+                ..
+            } | Emit::Bytes {
+                member: MemberId(3),
+                ..
+            } | Emit::Checksum {
+                member: MemberId(3),
+                ..
+            } | Emit::MemberClosed(MemberId(3))
+                | Emit::Retract(MemberId(3))
+        )),
+        "{:?}",
+        owner.said
+    );
+    assert_eq!(gamma(&owner), before);
     for (name, bytes) in unrar(std::slice::from_ref(&real), None) {
         let got = owner.member(&name);
         assert!(got.closed && got.bytes == bytes, "{name}");

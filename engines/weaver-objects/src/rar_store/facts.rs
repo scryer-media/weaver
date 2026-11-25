@@ -159,6 +159,11 @@ pub(super) struct EntryFacts {
     // before a set could be mixed, when no member was.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     made: bool,
+    // Whether the slot waits for the member the layout lays there next,
+    // retracted where it stood; false in facts written before a member was
+    // retracted short of the tail.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    waiting: bool,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -330,6 +335,7 @@ pub(super) fn of(store: &RarStore) -> Facts {
                     .collect(),
             }),
             made: entry.made,
+            waiting: entry.waiting,
         })
         .collect();
     let facts = StoreFacts {
@@ -440,6 +446,7 @@ pub(super) fn restored(facts: &Facts) -> Result<RarStore, RestoreError> {
 fn entry(facts: EntryFacts) -> Entry {
     Entry {
         made: facts.made,
+        waiting: facts.waiting,
         name: facts.name,
         length: facts.length,
         crc: facts.crc,

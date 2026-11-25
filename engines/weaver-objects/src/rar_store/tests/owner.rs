@@ -7,7 +7,7 @@
 // does and holds them again when the store says they are no longer its own,
 // answers seeks, and writes members the way a namespace does.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io;
 use std::sync::{Arc, Mutex};
 
@@ -105,6 +105,9 @@ pub(super) struct Owner {
     delivered: BTreeMap<u32, Coverage>,
     bound: Vec<bool>,
     next: u32,
+    // Members retracted, whose records the tree keeps for them to be
+    // announced into again.
+    retracted: BTreeSet<u32>,
     // When set, every delivery comes with the CRC32 of each article of this
     // size it holds, cut where the delivery is cut, as a decoder hands it.
     pub articles: Option<u64>,
@@ -151,6 +154,7 @@ impl Owner {
             delivered: BTreeMap::new(),
             bound: vec![false; count],
             next: 0,
+            retracted: BTreeSet::new(),
             articles: None,
             asked: None,
             skipped: false,
@@ -553,6 +557,22 @@ impl Owner {
                     member,
                     name,
                     length,
+                } if self.retracted.remove(&member.0) => {
+                    // Announced again into the record its retraction kept,
+                    // as the tree takes it: a fresh member at the same id.
+                    self.members.insert(
+                        member.0,
+                        Got {
+                            name,
+                            length,
+                            ..Got::default()
+                        },
+                    );
+                }
+                Emit::Member {
+                    member,
+                    name,
+                    length,
                 } if member.0 < self.next => {
                     // Said again under another name, as the tree takes it:
                     // the member is renamed where it stands, its bytes kept.
@@ -599,8 +619,10 @@ impl Owner {
                     got.closed = true;
                 }
                 Emit::Retract(member) => {
+                    // The tree keeps the member's record, unbound, for it
+                    // to be announced into again.
                     self.members.remove(&member.0);
-                    self.next = self.next.min(member.0);
+                    self.retracted.insert(member.0);
                     self.said.push(Emit::Retract(member));
                 }
                 Emit::Unkept {

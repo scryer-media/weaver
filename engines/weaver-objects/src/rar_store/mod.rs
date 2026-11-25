@@ -404,9 +404,36 @@ struct Entry {
     // solid beside members the store streams: its data is the envelope's,
     // and its bytes, checksum and close are the run's (`made`).
     made: bool,
+    // A slot whose member was retracted where it stood, its id kept for the
+    // member the layout lays there next: it holds no piece and is said to
+    // nothing until that member is announced into it.
+    waiting: bool,
 }
 
 impl Entry {
+    // The slot a member retracted where it stood leaves: its name, and
+    // nothing of its bytes.
+    fn waiting(name: String) -> Self {
+        Self {
+            name,
+            length: None,
+            crc: None,
+            uses_mac: false,
+            store: None,
+            pieces: Vec::new(),
+            complete: false,
+            lock: Lock::Plain,
+            hash_key: None,
+            trial: None,
+            condemned_on: Coverage::new(),
+            out: Arc::default(),
+            plain_runs: CrcRuns::default(),
+            parts: BTreeMap::new(),
+            made: false,
+            waiting: true,
+        }
+    }
+
     // The part of the file whose packed stream holds all of `stream`: a
     // range the entry has not taken a part for yet is no member's bytes.
     fn piece_of(&self, stream: ByteRange) -> Option<usize> {
@@ -501,6 +528,9 @@ pub struct RarStore {
     // The entries the store's run makes, filed as entries come and go, so
     // the question scans no entry.
     made: BTreeSet<usize>,
+    // The slots retracted where they stood, waiting for the member the
+    // layout lays there: filed where `made` is.
+    waiting: BTreeSet<usize>,
     // The window each made entry's decode holds, by entry, and how many
     // hold each window: filed where the made entries are, so the run's
     // reserve reads the widest without a scan.
@@ -619,6 +649,7 @@ impl RarStore {
             giving: BTreeMap::new(),
             unmapped: BTreeSet::new(),
             made: BTreeSet::new(),
+            waiting: BTreeSet::new(),
             windows: BTreeMap::new(),
             widest: BTreeMap::new(),
             open: BTreeSet::new(),
@@ -748,9 +779,13 @@ impl RarStore {
         self.pieces_in.clear();
         self.locked.clear();
         self.made.clear();
+        self.waiting.clear();
         for (id, entry) in self.entries.iter().enumerate() {
             if entry.made {
                 self.made.insert(id);
+            }
+            if entry.waiting {
+                self.waiting.insert(id);
             }
             if matches!(entry.lock, Lock::Locked | Lock::Sealed(_)) {
                 self.locked.insert(id);

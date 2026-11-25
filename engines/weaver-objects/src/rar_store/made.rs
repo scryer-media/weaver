@@ -112,8 +112,9 @@ pub(crate) fn by_run(solid_archive: bool, first: Traits) -> bool {
 }
 
 impl RarStore {
-    // Whether member `id` is the run's to make: newly met, or made before,
-    // by the rule the run reads its headers by (`by_run`), and refused by
+    // Whether member `id` is the run's to make: newly met, laid again into
+    // a slot retracted where it stood, or made before, by the rule the run
+    // reads its headers by (`by_run`), and refused by
     // nothing only the store sees. Both go by the member's first header
     // only, as unrar decodes a member by it: a later part's header that
     // disagrees, or one held on trust in a volume not yet proven its place,
@@ -130,7 +131,10 @@ impl RarStore {
         member: &StoredMember,
         format: ArchiveFormat,
     ) -> bool {
-        let fresh = self.entries.get(id).is_none_or(|entry| entry.made);
+        let fresh = self
+            .entries
+            .get(id)
+            .is_none_or(|entry| entry.made || entry.waiting);
         let eligible = matches!(
             &member.eligibility,
             MemberEligibility::Ineligible(
