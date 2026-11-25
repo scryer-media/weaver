@@ -555,6 +555,7 @@ impl GraphJob {
             };
             let mut effects = Vec::new();
             let placed = self.tree.placement(node);
+            let faced = self.tree.engine(node).is_some();
             if quiet {
                 self.refuse_unanswered(node);
             }
@@ -566,8 +567,17 @@ impl GraphJob {
             }
             // An object that placed its volumes anew changed the job though
             // the tree said nothing: the bytes held for it go down now, as
-            // after any write, and it hears quiet again once they have.
+            // after any write, and it hears quiet again once they have. A
+            // face that shows or goes is a change though the tree said
+            // nothing too: nothing is applied, but the runs are stepped
+            // again, so a run is asked for a face that showed. A quiet that
+            // changed none of these is no change.
             if effects.is_empty() && self.tree.placement(node) == placed {
+                if self.tree.engine(node).is_some() != faced
+                    && let Some(quieting) = self.quieting.as_mut()
+                {
+                    quieting.changed = true;
+                }
                 continue;
             }
             if let Some(quieting) = self.quieting.as_mut() {
