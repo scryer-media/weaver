@@ -1,0 +1,22 @@
+# Write. Adds a news server. An active server is first tested against the
+# provider; a failed test saves nothing. Needs the operator's yes naming the
+# host. Login fields only through scripts/add-secret.sh. Scope: ADMIN.
+# Variables: {"input": {"host": "news.example.com", "port": 563, "tls": true,
+#   "connections": 20, "active": true, "priority": 0, "backfill": false,
+#   "retentionDays": 0}}
+mutation AddServer($input: ServerInput!) {
+  addServer(input: $input) {
+    id
+    host
+    port
+    tls
+    connections
+    active
+    priority
+    backfill
+    retentionDays
+    maxDownloadSpeed
+    supportsPipelining
+    tlsCipherSuite
+  }
+}

@@ -1,0 +1,28 @@
+# One news server's saved settings, the base for UpdateServer's input
+# (includes the adopted certificate the list only fingerprints). No username
+# or password. null = no server with this id. Scope: ADMIN.
+# Variables: {"id": 1}
+query ServerSettings($id: Int!) {
+  server(id: $id) {
+    id
+    host
+    port
+    tls
+    connections
+    active
+    priority
+    backfill
+    retentionDays
+    maxDownloadSpeed
+    downloadQuota {
+      enabled
+      limitBytes
+      period
+      resetTimeMinutesLocal
+      weeklyResetWeekday
+      monthlyResetDay
+    }
+    tlsCaCert
+    tlsNameMismatchCertificateDerBase64
+  }
+}

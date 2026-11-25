@@ -1,0 +1,11 @@
+# Write. Adds a category. destDir null = a folder named after the category
+# under the completed folder. Needs the operator's yes. Scope: ADMIN.
+# Variables: {"input": {"name": "tv", "destDir": null, "aliases": "tv*, series"}}
+mutation AddCategory($input: CategoryInput!) {
+  addCategory(input: $input) {
+    id
+    name
+    destDir
+    aliases
+  }
+}
