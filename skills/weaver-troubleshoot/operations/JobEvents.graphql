@@ -1,0 +1,13 @@
+# One job's newest events, oldest first. For older events pass the first
+# event's cursor as "before". Scope: READ.
+# Variables: {"jobId": 42, "limit": 50, "before": null}
+# Keep limit at 200 or less; the server caps it at 2000.
+query JobEvents($jobId: Int!, $limit: Int = 50, $before: String) {
+  jobEvents(jobId: $jobId, limit: $limit, before: $before) {
+    kind
+    fileId
+    message
+    timestamp
+    cursor
+  }
+}

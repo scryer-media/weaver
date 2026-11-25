@@ -1,0 +1,12 @@
+# The newest service log records, oldest first, one JSON object per string:
+# {"timestamp","level","target","fields":{"message",...},"spans"}. Not
+# sanitized: may name jobs, servers and paths. Save to a file; search with
+# scripts/log-search.sh. Scope: ADMIN.
+# Variables: {"limit": 200}
+# limit 1 to 2000; Weaver keeps about the last 1000 records in memory.
+query ServiceLogs($limit: Int!) {
+  serviceLogs(limit: $limit) {
+    count
+    records
+  }
+}
