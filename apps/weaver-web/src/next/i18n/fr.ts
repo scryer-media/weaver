@@ -1117,6 +1117,8 @@ export const nextFr: LocaleDictionary = {
   "next.security.accessHelp": "Qui peut utiliser l'interface web sans se connecter.",
   "next.security.trustedNetworks": "Réseaux de confiance",
   "next.security.trustedNetworksHelp": "Un CIDR par ligne. Les navigateurs dans ces plages n'ont pas besoin de se connecter.",
+  "next.security.mcpEnabled": "Autoriser le serveur MCP",
+  "next.security.mcpEnabledHelp": "Permet aux agents munis d'une clé d'API d'exécuter les opérations des compétences de l'opérateur via /mcp.",
   "next.security.signIn": "Connexion",
   "next.security.signedInAs": "connecté en tant que {{name}}",
   "next.security.notConfigured": "non configurée",

@@ -87,6 +87,10 @@ pub(crate) async fn run(
         db.get_setting(weaver_server_core::security::SETTING_TRUSTED_PROXIES)?
             .as_deref(),
     );
+    security.apply_stored_mcp_enabled(
+        db.get_setting(weaver_server_core::security::SETTING_MCP_ENABLED)?
+            .as_deref(),
+    );
     if let Some(reason) = security.bind_fallback.as_deref() {
         warn!(reason, "stored bind address could not be honored");
     }

@@ -171,6 +171,41 @@ impl AuthMutation {
         Ok(true)
     }
 
+    /// Turn the MCP endpoint on or off. Applies to the next request.
+    ///
+    /// Refused when `WEAVER_MCP_ENABLED` is set, rather than stored and
+    /// silently overridden, as the bind address is.
+    #[graphql(guard = "FreshAdminGuard")]
+    async fn set_mcp_enabled(
+        &self,
+        ctx: &Context<'_>,
+        enabled: bool,
+    ) -> Result<crate::auth::types::McpServerStatus> {
+        use weaver_server_core::security::{
+            ENV_MCP_ENABLED, RuntimeSecurityConfig, SETTING_MCP_ENABLED,
+        };
+
+        let security = ctx.data::<RuntimeSecurityConfig>()?;
+        if security.mcp_enabled_env.is_some() {
+            return Err(async_graphql::Error::new(format!(
+                "{ENV_MCP_ENABLED} is set in this deployment's environment, which takes \
+                 precedence; change it there instead"
+            )));
+        }
+        let db = ctx.data::<Database>()?.clone();
+        tokio::task::spawn_blocking(move || {
+            db.set_setting(SETTING_MCP_ENABLED, if enabled { "true" } else { "false" })
+        })
+        .await
+        .map_err(|e| async_graphql::Error::new(e.to_string()))?
+        .map_err(|e| async_graphql::Error::new(e.to_string()))?;
+        // Published after the write commits, so a failed write leaves the
+        // endpoint as it was.
+        security.set_stored_mcp_enabled(enabled);
+        info!(enabled, "MCP endpoint switch changed");
+        Ok(crate::auth::types::McpServerStatus::of(security))
+    }
+
     /// Atomically update the authenticated browser policy and optional next
     /// listener address. Legacy access-policy mutations remain available for
     /// installations that have not migrated to authenticated browser access.

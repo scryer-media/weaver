@@ -1117,6 +1117,8 @@ export const nextEs: LocaleDictionary = {
   "next.security.accessHelp": "Quién puede usar la interfaz web sin iniciar sesión.",
   "next.security.trustedNetworks": "Redes de confianza",
   "next.security.trustedNetworksHelp": "Un CIDR por línea. Los navegadores dentro de estos rangos no necesitan iniciar sesión.",
+  "next.security.mcpEnabled": "Permitir el servidor MCP",
+  "next.security.mcpEnabledHelp": "Permite que los agentes con una clave de API ejecuten las operaciones de las habilidades del operador en /mcp.",
   "next.security.signIn": "Inicio de sesión",
   "next.security.signedInAs": "sesión iniciada como {{name}}",
   "next.security.notConfigured": "sin configurar",

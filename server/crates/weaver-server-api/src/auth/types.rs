@@ -138,6 +138,33 @@ pub struct AccessPolicyStatus {
     pub strict_security: bool,
 }
 
+/// The MCP endpoint's switch, and whether the UI may change it
+/// (`WEAVER_MCP_ENABLED` forces it read-only, like the bind variable).
+#[derive(Debug, Clone, async_graphql::SimpleObject)]
+pub struct McpServerStatus {
+    /// Whether `/mcp` answers right now: the forced value while
+    /// `WEAVER_MCP_ENABLED` is set, otherwise the stored switch.
+    pub enabled: bool,
+    /// The stored switch, on unless an operator turned it off. It applies
+    /// again once the environment variable is removed.
+    pub stored_enabled: bool,
+    /// False when the environment forces the switch.
+    pub editable: bool,
+    /// True when `WEAVER_MCP_ENABLED` is set.
+    pub env_pinned: bool,
+}
+
+impl McpServerStatus {
+    pub(crate) fn of(security: &weaver_server_core::security::RuntimeSecurityConfig) -> Self {
+        Self {
+            enabled: security.mcp_enabled(),
+            stored_enabled: security.stored_mcp_enabled(),
+            editable: security.mcp_enabled_env.is_none(),
+            env_pinned: security.mcp_enabled_env.is_some(),
+        }
+    }
+}
+
 // Request evidence made available to the network-access resolver by the HTTP
 // transport. It is deliberately optional: schema-only callers cannot invent
 // a peer or forwarding chain, and the resolver reports that absence instead

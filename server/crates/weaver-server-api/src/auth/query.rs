@@ -88,6 +88,13 @@ impl AuthQuery {
         })
     }
 
+    /// Whether the MCP endpoint answers, and whether that can be changed here.
+    #[graphql(guard = "AdminGuard")]
+    async fn mcp_server(&self, ctx: &Context<'_>) -> Result<crate::auth::types::McpServerStatus> {
+        let security = ctx.data::<weaver_server_core::security::RuntimeSecurityConfig>()?;
+        Ok(crate::auth::types::McpServerStatus::of(security))
+    }
+
     /// The effective browser network policy and a non-persistent draft
     /// validator for the accompanying network-access mutation.
     #[graphql(guard = "AdminGuard")]

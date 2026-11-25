@@ -1124,6 +1124,8 @@ export const nextEn: LocaleDictionary = {
   "next.security.accessHelp": "Who may use the web interface without signing in.",
   "next.security.trustedNetworks": "Trusted networks",
   "next.security.trustedNetworksHelp": "One CIDR per line. Browsers inside these ranges skip the sign-in.",
+  "next.security.mcpEnabled": "Allow the MCP server",
+  "next.security.mcpEnabledHelp": "Lets agents with an API key run the operator skills' operations at /mcp.",
   "next.security.signIn": "Sign-in",
   "next.security.signedInAs": "signed in as {{name}}",
   "next.security.notConfigured": "not configured",

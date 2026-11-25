@@ -4,9 +4,10 @@
 // The built-in MCP endpoint: Streamable HTTP, JSON responses only, no
 // server-side sessions.
 //
-// Every request is admitted here before rmcp sees it: the browser Origin
-// must be one the GraphQL socket would accept, and the caller must present
-// an API key. Tools then run operations from the operator skills' catalog
+// Every request is admitted here before rmcp sees it: the endpoint must be
+// turned on (it is by default; Settings > Security, or `WEAVER_MCP_ENABLED`),
+// the browser Origin must be one the GraphQL socket would accept, and the
+// caller must present an API key. Tools then run operations from the operator skills' catalog
 // through the same GraphQL schema `/graphql` serves, with that key's scope,
 // so guards and refusals match `/graphql` exactly. Nothing here dials,
 // binds, listens or resolves a name.
@@ -107,6 +108,15 @@ pub(super) async fn mcp_handler(
     peer: Option<Extension<ConnectInfo<SocketAddr>>>,
     request: Request<Body>,
 ) -> Response {
+    // The operator's switch comes first: a turned-off endpoint does no other
+    // work and reads nothing of the request. In-memory state, no query.
+    if !request_auth.security.mcp_enabled() {
+        return refusal_response(
+            StatusCode::FORBIDDEN,
+            refusal::MCP_DISABLED,
+            "the Weaver MCP endpoint is turned off in Settings > Security",
+        );
+    }
     let peer = peer.map(|Extension(ConnectInfo(peer))| peer);
     let headers = request.headers();
     if !super::graphql::upgrade_origin_allowed(

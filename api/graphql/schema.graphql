@@ -2282,6 +2282,31 @@ enum LookupTrust {
 	BOGUS
 }
 
+"""
+The MCP endpoint's switch, and whether the UI may change it
+(`WEAVER_MCP_ENABLED` forces it read-only, like the bind variable).
+"""
+type McpServerStatus {
+	"""
+	Whether `/mcp` answers right now: the forced value while
+	`WEAVER_MCP_ENABLED` is set, otherwise the stored switch.
+	"""
+	enabled: Boolean!
+	"""
+	The stored switch, on unless an operator turned it off. It applies
+	again once the environment variable is removed.
+	"""
+	storedEnabled: Boolean!
+	"""
+	False when the environment forces the switch.
+	"""
+	editable: Boolean!
+	"""
+	True when `WEAVER_MCP_ENABLED` is set.
+	"""
+	envPinned: Boolean!
+}
+
 type MetadataEntry {
 	key: String!
 	value: String!
@@ -2537,6 +2562,13 @@ type MutationRoot {
 	the loopback default.
 	"""
 	setHttpBindAddress(address: String!): Boolean!
+	"""
+	Turn the MCP endpoint on or off. Applies to the next request.
+
+	Refused when `WEAVER_MCP_ENABLED` is set, rather than stored and
+	silently overridden, as the bind address is.
+	"""
+	setMcpEnabled(enabled: Boolean!): McpServerStatus!
 	"""
 	Atomically update the authenticated browser policy and optional next
 	listener address. Legacy access-policy mutations remain available for
@@ -3680,6 +3712,10 @@ type QueryRoot {
 	The browser-admission policy: who gets in without a login.
 	"""
 	accessPolicy: AccessPolicyStatus!
+	"""
+	Whether the MCP endpoint answers, and whether that can be changed here.
+	"""
+	mcpServer: McpServerStatus!
 	"""
 	The effective browser network policy and a non-persistent draft
 	validator for the accompanying network-access mutation.

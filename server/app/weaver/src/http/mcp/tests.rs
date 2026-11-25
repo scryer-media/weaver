@@ -332,6 +332,87 @@ async fn mcp_refuses_every_caller_that_is_not_an_api_key() {
     assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
 }
 
+// A body that records whether anything polled it.
+fn watched_body(polled: Arc<std::sync::atomic::AtomicBool>) -> Body {
+    let stream = async_graphql::futures_util::stream::poll_fn(move |_| {
+        polled.store(true, std::sync::atomic::Ordering::SeqCst);
+        std::task::Poll::Ready(None::<Result<bytes::Bytes, std::io::Error>>)
+    });
+    Body::from_stream(stream)
+}
+
+fn security_with(stored: bool, forced: Option<bool>) -> Arc<RuntimeSecurityConfig> {
+    let mut security = RuntimeSecurityConfig::default();
+    security.mcp_enabled_env = forced;
+    security.set_stored_mcp_enabled(stored);
+    Arc::new(security)
+}
+
+#[tokio::test]
+async fn a_turned_off_endpoint_refuses_before_any_other_work() {
+    let router = router_with(db_with_keys(), security_with(false, None));
+    // A good key, a foreign origin, a wrong key and a browser cookie all get
+    // the same answer: none of them was looked at.
+    let requests = [
+        (Some(ADMIN_KEY), None),
+        (Some(ADMIN_KEY), Some("https://elsewhere.example.test")),
+        (Some("fixture-mcp-wrong-key"), None),
+        (None, None),
+    ];
+    for (key, origin) in requests {
+        let polled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut request = rpc_request(key, origin, json!({}));
+        request.headers_mut().insert(
+            header::COOKIE,
+            HeaderValue::from_static("weaver_session=fixture-mcp-browser"),
+        );
+        *request.body_mut() = watched_body(polled.clone());
+        let (status, headers, body) = send(&router, request).await;
+        assert_refused(
+            status,
+            &headers,
+            &body,
+            StatusCode::FORBIDDEN,
+            refusal::MCP_DISABLED,
+        );
+        assert!(headers.get(header::WWW_AUTHENTICATE).is_none());
+        assert!(
+            !polled.load(std::sync::atomic::Ordering::SeqCst),
+            "the body was read"
+        );
+    }
+}
+
+#[tokio::test]
+async fn the_mcp_variable_overrides_the_stored_switch() {
+    // Forced on over a stored off: served.
+    let router = router_with(db_with_keys(), security_with(false, Some(true)));
+    let (status, _, body) = send(&router, rpc_request(Some(ADMIN_KEY), None, initialize())).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    // Forced off over a stored on: refused.
+    let router = router_with(db_with_keys(), security_with(true, Some(false)));
+    let (status, headers, body) =
+        send(&router, rpc_request(Some(ADMIN_KEY), None, initialize())).await;
+    assert_refused(
+        status,
+        &headers,
+        &body,
+        StatusCode::FORBIDDEN,
+        refusal::MCP_DISABLED,
+    );
+
+    // A saved change reaches the running router: the switch is shared state.
+    let security = security_with(true, None);
+    let router = router_with(db_with_keys(), security.clone());
+    let (status, _, _) = send(&router, rpc_request(Some(ADMIN_KEY), None, initialize())).await;
+    assert_eq!(status, StatusCode::OK);
+    security.set_stored_mcp_enabled(false);
+    let (status, _, body) = send(&router, rpc_request(Some(ADMIN_KEY), None, initialize())).await;
+    assert_eq!(body["code"], refusal::MCP_DISABLED, "{body}");
+    assert_eq!(status, StatusCode::FORBIDDEN);
+}
+
 #[tokio::test]
 async fn mcp_refuses_a_browser_session() {
     let db = db_with_keys();

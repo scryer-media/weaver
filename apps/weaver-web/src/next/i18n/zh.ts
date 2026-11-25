@@ -1117,6 +1117,8 @@ export const nextZh: LocaleDictionary = {
   "next.security.accessHelp": "哪些人无需登录即可使用网页界面。",
   "next.security.trustedNetworks": "受信任网络",
   "next.security.trustedNetworksHelp": "每行一个 CIDR。这些范围内的浏览器无需登录。",
+  "next.security.mcpEnabled": "允许 MCP 服务器",
+  "next.security.mcpEnabledHelp": "允许持有 API 密钥的代理通过 /mcp 运行操作员技能的操作。",
   "next.security.signIn": "登录",
   "next.security.signedInAs": "已登录为 {{name}}",
   "next.security.notConfigured": "未配置",

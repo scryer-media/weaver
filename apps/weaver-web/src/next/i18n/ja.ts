@@ -1117,6 +1117,8 @@ export const nextJa: LocaleDictionary = {
   "next.security.accessHelp": "サインインせずに Web インターフェースを使える範囲。",
   "next.security.trustedNetworks": "信頼済みネットワーク",
   "next.security.trustedNetworksHelp": "1 行に 1 つの CIDR。この範囲内のブラウザーはサインインを省略します。",
+  "next.security.mcpEnabled": "MCP サーバーを許可",
+  "next.security.mcpEnabledHelp": "API キーを持つエージェントが /mcp でオペレーター スキルの操作を実行できるようにします。",
   "next.security.signIn": "サインイン",
   "next.security.signedInAs": "{{name}} としてサインイン中",
   "next.security.notConfigured": "未設定",

@@ -337,9 +337,12 @@ pub(super) mod refusal {
     // by its declared length or by the bytes that arrived.
     pub(in crate::http) const REQUEST_TOO_LARGE: &str = "REQUEST_TOO_LARGE";
 
-    // The MCP endpoint's codes. The first five are HTTP refusals sent as
+    // The MCP endpoint's codes. The first six are HTTP refusals sent as
     // `code` beside `error`, before rmcp sees the request.
     //
+    // 403: the endpoint is turned off, by the stored switch or by
+    // `WEAVER_MCP_ENABLED`. Sent before any other check.
+    pub(in crate::http) const MCP_DISABLED: &str = "MCP_DISABLED";
     // 403: the request came from a browser page on an origin the GraphQL
     // socket would refuse.
     pub(in crate::http) const MCP_ORIGIN_NOT_ALLOWED: &str = "MCP_ORIGIN_NOT_ALLOWED";
@@ -382,6 +385,7 @@ pub(super) mod refusal {
         AUTHENTICATION_REQUIRED,
         BROWSER_VERIFICATION_REQUIRED,
         REQUEST_TOO_LARGE,
+        MCP_DISABLED,
         MCP_ORIGIN_NOT_ALLOWED,
         MCP_API_KEY_REQUIRED,
         MCP_API_KEY_INVALID,
