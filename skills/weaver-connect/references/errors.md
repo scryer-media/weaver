@@ -100,7 +100,6 @@ Refusals at `POST $WEAVER_URL/mcp` answer `{"code": "...", "error": "..."}`:
 | 401 | `MCP_API_KEY_REQUIRED` | No key, or a browser session or local access instead of a key | Configure the key in the MCP client. |
 | 401 | `MCP_API_KEY_INVALID` | A key was sent and refused | Ask the operator for a new key. No retry. |
 | 403 | `MCP_ORIGIN_NOT_ALLOWED` | A browser page on another origin made the call | Call from the MCP client, not a page. |
-| 403 | `BROWSER_VERIFICATION_REQUIRED` | A session cookie and no key; checked before the MCP codes | Send the key; drop the cookie. |
 | 413 | `MCP_REQUEST_TOO_LARGE` | The request body is over 1 MiB | Send less in one call. |
 | 400 | `MCP_REQUEST_BODY_UNREADABLE` | The request body could not be read | Check the client and any proxy. |
 

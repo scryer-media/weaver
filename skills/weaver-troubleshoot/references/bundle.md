@@ -113,11 +113,10 @@ bundle is: `{section, files, stand_in_table_complete}`, each file
 | `database` | `database.json` |
 | `host` | `host.json` |
 | `config` | `config/config-N.toml` |
-| `pipeline_metrics` | not mapped here: read the `files` names |
-| `metrics` | not mapped here; needs `metric_families` (1 to 10 names): `{section, families, returned, lines, truncated?}`, at most 60 lines |
+| `pipeline_metrics` | `metrics.json` |
+| `metrics` | one Prometheus sample, only the lines of the named families; needs `metric_families` (1 to 10 names): `{section, families, returned, lines, truncated?}`, at most 60 lines |
 
-The member column follows the names only. A result is capped at 32 KiB
-(`MCP_RESULT_TOO_LARGE`).
+A result is capped at 32 KiB (`MCP_RESULT_TOO_LARGE`).
 
 ## Which members matter per symptom
 
