@@ -2510,6 +2510,12 @@ fn run_weaver_web_lint(ctx: &TaskContext, prefix: &'static str) -> Result<()> {
     run_streaming(&mut lint, prefix)?;
     prefixed_ok(prefix, "Web lint passed");
 
+    prefixed_step(prefix, "Running Prettier format check");
+    let mut format_check = ctx.command_in("npm", &web_dir);
+    format_check.args(["run", "format:check"]);
+    run_streaming(&mut format_check, prefix)?;
+    prefixed_ok(prefix, "Web format check passed");
+
     prefixed_step(prefix, "Running GraphQL compatibility checker tests");
     let mut graphql_compat_tests = ctx.command_in("npm", &web_dir);
     graphql_compat_tests.args(["run", "test:graphql-compat"]);

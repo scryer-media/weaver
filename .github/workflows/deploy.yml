@@ -143,6 +143,9 @@ jobs:
       - name: Lint
         working-directory: apps/weaver-web
         run: npm run lint
+      - name: Format check
+        working-directory: apps/weaver-web
+        run: npm run format:check
       - name: Build web app
         working-directory: apps/weaver-web
         run: npm run build
