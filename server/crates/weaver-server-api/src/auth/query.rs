@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
+use crate::observability::{spawn_blocking_with, state_error};
+
 use super::*;
 use weaver_server_core::auth::api_keys::AuthApiKeysQueries;
 use weaver_server_core::settings::queries::SettingsQueries;
@@ -69,10 +71,8 @@ impl AuthQuery {
 
         let security = ctx.data::<weaver_server_core::security::RuntimeSecurityConfig>()?;
         let db = ctx.data::<weaver_server_core::Database>()?.clone();
-        let stored_mode = tokio::task::spawn_blocking(move || db.get_setting(SETTING_ACCESS_MODE))
-            .await
-            .map_err(|e| async_graphql::Error::new(e.to_string()))?
-            .map_err(|e| async_graphql::Error::new(e.to_string()))?;
+        let stored_mode =
+            spawn_blocking_with(move || db.get_setting(SETTING_ACCESS_MODE), state_error).await?;
         // Read before the default is applied: an install upgraded from a
         // version without this setting must be distinguishable from one whose
         // operator chose login-required, or the wizard could never know it has
@@ -140,10 +140,7 @@ impl AuthQuery {
     async fn api_keys(&self, ctx: &Context<'_>) -> Result<Vec<ApiKey>> {
         let db = ctx.data::<weaver_server_core::Database>()?;
         let db = db.clone();
-        let rows = tokio::task::spawn_blocking(move || db.list_api_keys())
-            .await
-            .map_err(|e| async_graphql::Error::new(e.to_string()))?
-            .map_err(|e| async_graphql::Error::new(e.to_string()))?;
+        let rows = spawn_blocking_with(move || db.list_api_keys(), state_error).await?;
         Ok(rows
             .into_iter()
             .map(|r| ApiKey {
@@ -170,12 +167,13 @@ pub(crate) async fn http_bind_address_status(
     let security = ctx.data::<weaver_server_core::security::RuntimeSecurityConfig>()?;
     let auth_cache = ctx.data::<crate::auth::LoginAuthCache>()?.clone();
     let db = ctx.data::<weaver_server_core::Database>()?.clone();
-    let stored = tokio::task::spawn_blocking(move || db.get_setting(SETTING_HTTP_BIND_ADDRESS))
-        .await
-        .map_err(|e| async_graphql::Error::new(e.to_string()))?
-        .map_err(|e| async_graphql::Error::new(e.to_string()))?
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty());
+    let stored = spawn_blocking_with(
+        move || db.get_setting(SETTING_HTTP_BIND_ADDRESS),
+        state_error,
+    )
+    .await?
+    .map(|value| value.trim().to_string())
+    .filter(|value| !value.is_empty());
     let editable = security.bind_address_source.is_editable();
     let (pending, restart_required) = crate::auth::types::pending_bind_state(
         security.http_bind_address,

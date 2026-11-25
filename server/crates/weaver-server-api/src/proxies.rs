@@ -308,7 +308,10 @@ pub(crate) fn refresh<'a>(
 // Reload the routes from what is saved, when the server runs them.
 pub(crate) async fn reload_routes(handle: &SchedulerHandle) -> Result<()> {
     if let Some(runtime) = handle.proxy_runtime() {
-        runtime.reload().await.map_err(async_graphql::Error::new)?;
+        runtime
+            .reload()
+            .await
+            .map_err(|error| crate::auth::graphql_error("INTERNAL", error))?;
     }
     Ok(())
 }
@@ -328,7 +331,7 @@ fn refresh_profile<'a>(
         if feeds_servers && handle.server_transfer_policy().is_some() {
             weaver_server_core::runtime::rebuild_nntp_from_config(ctx.data()?, handle)
                 .await
-                .map_err(|e| async_graphql::Error::new(e.to_string()))?;
+                .map_err(crate::observability::scheduler_error)?;
         }
         Ok(())
     })

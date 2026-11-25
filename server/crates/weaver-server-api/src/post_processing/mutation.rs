@@ -11,50 +11,101 @@ use weaver_server_core::post_processing::settings::PostProcessingSettingsQueries
 use weaver_server_core::post_processing::test_run::PostProcessingTestRunQueries;
 
 use super::*;
-use crate::auth::{AdminGuard, FreshAdminGuard, graphql_error};
+use crate::auth::{AdminGuard, FreshAdminGuard, graphql_error, invalid_input, not_found};
+use crate::observability::{scheduler_error, spawn_blocking_with, state_code, state_error};
 use weaver_server_core::post_processing::executor::{
     PostProcessingExecutor, strict_security_enabled,
 };
 use weaver_server_core::post_processing::instances::ScriptInstance;
+use weaver_server_core::post_processing::instances::ScriptInstanceError;
+use weaver_server_core::post_processing::listing::ListingError;
 use weaver_server_core::post_processing::listing::resolve_script;
 use weaver_server_core::post_processing::model::{
     PipelineOutcome, PostProcessingSettings, ScriptName,
 };
+use weaver_server_core::post_processing::preset::HeaderSetupError;
 use weaver_server_core::post_processing::runner::{CompatibilityFacts, JobExecutionContext};
 use weaver_server_core::post_processing::secrets::SecretError;
+use weaver_server_core::post_processing::settings::ScriptDirectoryError;
 use weaver_server_core::post_processing::settings::normalize_script_directory;
+use weaver_server_core::post_processing::test_run::ScriptTestError;
 use weaver_server_core::post_processing::test_run::start_script_test;
 
 fn parse_script_name(value: String) -> Result<ScriptName> {
-    ScriptName::new(value).map_err(|error| async_graphql::Error::new(error.to_string()))
+    ScriptName::new(value).map_err(|error| invalid_input(error.to_string()))
 }
 
-fn refused(error: impl std::fmt::Display) -> async_graphql::Error {
-    async_graphql::Error::new(error.to_string())
-}
-
-// Run blocking store work off the async threads and flatten its errors.
-async fn blocking<T, E, F>(work: F) -> Result<T>
+// Run blocking store work off the async threads; its errors are already the
+// answer.
+async fn blocking<T, F>(work: F) -> Result<T>
 where
     T: Send + 'static,
-    E: std::fmt::Display + Send + 'static,
-    F: FnOnce() -> std::result::Result<T, E> + Send + 'static,
+    F: FnOnce() -> Result<T> + Send + 'static,
 {
-    tokio::task::spawn_blocking(work)
-        .await
-        .map_err(refused)?
-        .map_err(refused)
+    spawn_blocking_with(work, |error| error).await
 }
 
 // A script job can only be pointed at a script that is there to run. One whose
 // script has since gone can still be edited, so long as it keeps naming it.
-fn require_script(db: &Database, script: &ScriptName) -> std::result::Result<(), String> {
-    let directory = db
-        .post_processing_script_directory()
-        .map_err(|error| error.to_string())?;
+fn require_script(db: &Database, script: &ScriptName) -> Result<()> {
+    let directory = db.post_processing_script_directory().map_err(state_error)?;
     resolve_script(&directory, script)
         .map(|_| ())
-        .map_err(|error| error.to_string())
+        .map_err(listing_error)
+}
+
+// A named script that is not there to run. A manifest the script directory
+// holds that does not parse fits no code: it is neither the caller's input
+// nor a fault inside Weaver.
+pub(super) fn listing_error(error: ListingError) -> async_graphql::Error {
+    let message = error.to_string();
+    match error {
+        ListingError::NotFound(_) => not_found(message),
+        ListingError::Validation(_) => invalid_input(message),
+        ListingError::Io(_) => graphql_error("INTERNAL", message),
+        ListingError::Manifest(_) => async_graphql::Error::new(message),
+    }
+}
+
+fn instance_error(error: ScriptInstanceError) -> async_graphql::Error {
+    let message = error.to_string();
+    match error {
+        ScriptInstanceError::Invalid(_) | ScriptInstanceError::NoOwnSecret(_) => {
+            invalid_input(message)
+        }
+        ScriptInstanceError::NotFound => not_found(message),
+        ScriptInstanceError::Storage(state) => state_error(state),
+    }
+}
+
+// A header the script carries that cannot be read, or declares nothing, fits
+// no code: the first arrives as a sentence with its cause already lost.
+fn header_error(error: HeaderSetupError) -> async_graphql::Error {
+    match error {
+        HeaderSetupError::Instance(error) => instance_error(error),
+        HeaderSetupError::Storage(state) => state_error(state),
+        error @ (HeaderSetupError::Script(_) | HeaderSetupError::NothingDeclared) => {
+            async_graphql::Error::new(error.to_string())
+        }
+    }
+}
+
+// A test the settings refuse, one whose script is not there, and one past
+// the limit of runs fit no code; a test that could not be set up is a fault.
+fn script_test_error(error: ScriptTestError) -> async_graphql::Error {
+    let message = error.to_string();
+    match error {
+        ScriptTestError::NotFound => not_found(message),
+        ScriptTestError::Setup(_) => graphql_error("INTERNAL", message),
+        ScriptTestError::Refused(_) | ScriptTestError::Unavailable(_) | ScriptTestError::Busy => {
+            async_graphql::Error::new(message)
+        }
+    }
+}
+
+// The rerun's preconditions on the job and its scripts.
+fn rerun_refused(message: &'static str) -> async_graphql::Error {
+    graphql_error("CONFLICT", message)
 }
 
 // The messages carry names only, never a secret's value.
@@ -65,7 +116,7 @@ fn secret_error(error: SecretError) -> async_graphql::Error {
         SecretError::NameTaken => graphql_error("NAME_TAKEN", message),
         SecretError::InUse(_) => graphql_error("SECRET_IN_USE", message),
         SecretError::NotFound => graphql_error("NOT_FOUND", message),
-        SecretError::Storage(_) => graphql_error("INTERNAL", message),
+        SecretError::Storage(state) => graphql_error(state_code(&state), message),
     }
 }
 
@@ -100,7 +151,7 @@ impl PostProcessingMutation {
             global_scripts_run,
         } = input;
         if unacceptable_extensions.is_null() {
-            return Err(async_graphql::Error::new(
+            return Err(invalid_input(
                 "unacceptableExtensions must be omitted or a list, not null",
             ));
         }
@@ -113,55 +164,56 @@ impl PostProcessingMutation {
             ));
         }
         let db = ctx.data::<Database>()?.clone();
-        let (settings, script_directory) = tokio::task::spawn_blocking(move || {
-            let (unacceptable_extensions, preserve_extensions) = match unacceptable_extensions {
-                async_graphql::MaybeUndefined::Undefined => (Vec::new(), true),
-                async_graphql::MaybeUndefined::Value(extensions) => (extensions, false),
-                async_graphql::MaybeUndefined::Null => unreachable!("checked before worker"),
-            };
-            let current = db.post_processing_settings()?;
-            let mut event_scripts = current.event_scripts;
-            if let Some(value) = event_script_timeout_seconds {
-                event_scripts.event_script_timeout_seconds = value;
-            }
-            if let Some(value) = file_downloaded_event_interval {
-                event_scripts.file_downloaded_event_interval = value;
-            }
-            if let Some(value) = script_output_runs_per_job {
-                event_scripts.script_output_runs_per_job = value;
-            }
-            if let Some(value) = script_output_failed_runs_per_job {
-                event_scripts.script_output_failed_runs_per_job = value;
-            }
-            let settings = PostProcessingSettings {
-                event_scripts,
-                execution_enabled,
-                concurrency,
-                termination_grace_seconds,
-                python_interpreter,
-                powershell_interpreter,
-                batch_interpreter,
-                go_interpreter,
-                unacceptable_extensions,
-                // Saved on its own (`set_unwanted_extension_action`); the
-                // save keeps the stored one.
-                unwanted_extension_action: current.unwanted_extension_action,
-                global_scripts_run: global_scripts_run
-                    .map(Into::into)
-                    .unwrap_or(current.global_scripts_run),
-            };
-            let settings = db.save_post_processing_settings_preserving_extensions(
-                settings,
-                preserve_extensions,
-            )?;
-            Ok::<_, weaver_server_core::StateError>((
-                settings,
-                db.post_processing_script_directory()?,
-            ))
-        })
-        .await
-        .map_err(|error| async_graphql::Error::new(error.to_string()))?
-        .map_err(|error| async_graphql::Error::new(error.to_string()))?;
+        let (settings, script_directory) = spawn_blocking_with(
+            move || {
+                let (unacceptable_extensions, preserve_extensions) = match unacceptable_extensions {
+                    async_graphql::MaybeUndefined::Undefined => (Vec::new(), true),
+                    async_graphql::MaybeUndefined::Value(extensions) => (extensions, false),
+                    async_graphql::MaybeUndefined::Null => unreachable!("checked before worker"),
+                };
+                let current = db.post_processing_settings()?;
+                let mut event_scripts = current.event_scripts;
+                if let Some(value) = event_script_timeout_seconds {
+                    event_scripts.event_script_timeout_seconds = value;
+                }
+                if let Some(value) = file_downloaded_event_interval {
+                    event_scripts.file_downloaded_event_interval = value;
+                }
+                if let Some(value) = script_output_runs_per_job {
+                    event_scripts.script_output_runs_per_job = value;
+                }
+                if let Some(value) = script_output_failed_runs_per_job {
+                    event_scripts.script_output_failed_runs_per_job = value;
+                }
+                let settings = PostProcessingSettings {
+                    event_scripts,
+                    execution_enabled,
+                    concurrency,
+                    termination_grace_seconds,
+                    python_interpreter,
+                    powershell_interpreter,
+                    batch_interpreter,
+                    go_interpreter,
+                    unacceptable_extensions,
+                    // Saved on its own (`set_unwanted_extension_action`); the
+                    // save keeps the stored one.
+                    unwanted_extension_action: current.unwanted_extension_action,
+                    global_scripts_run: global_scripts_run
+                        .map(Into::into)
+                        .unwrap_or(current.global_scripts_run),
+                };
+                let settings = db.save_post_processing_settings_preserving_extensions(
+                    settings,
+                    preserve_extensions,
+                )?;
+                Ok::<_, weaver_server_core::StateError>((
+                    settings,
+                    db.post_processing_script_directory()?,
+                ))
+            },
+            state_error,
+        )
+        .await?;
         Ok(PostProcessingSettingsGql::from_settings(
             settings,
             script_directory.to_string_lossy(),
@@ -178,11 +230,11 @@ impl PostProcessingMutation {
         extensions: Vec<String>,
     ) -> Result<Vec<String>> {
         let db = ctx.data::<Database>()?.clone();
-        let settings =
-            tokio::task::spawn_blocking(move || db.save_unacceptable_extensions(extensions))
-                .await
-                .map_err(|error| async_graphql::Error::new(error.to_string()))?
-                .map_err(|error| async_graphql::Error::new(error.to_string()))?;
+        let settings = spawn_blocking_with(
+            move || db.save_unacceptable_extensions(extensions),
+            state_error,
+        )
+        .await?;
         Ok(settings.unacceptable_extensions)
     }
 
@@ -195,11 +247,11 @@ impl PostProcessingMutation {
         action: UnwantedExtensionActionGql,
     ) -> Result<UnwantedExtensionActionGql> {
         let db = ctx.data::<Database>()?.clone();
-        let settings =
-            tokio::task::spawn_blocking(move || db.save_unwanted_extension_action(action.into()))
-                .await
-                .map_err(|error| async_graphql::Error::new(error.to_string()))?
-                .map_err(|error| async_graphql::Error::new(error.to_string()))?;
+        let settings = spawn_blocking_with(
+            move || db.save_unwanted_extension_action(action.into()),
+            state_error,
+        )
+        .await?;
         Ok(settings.unwanted_extension_action.into())
     }
 
@@ -214,26 +266,36 @@ impl PostProcessingMutation {
         directory: String,
     ) -> Result<PostProcessingSettingsGql> {
         let requested = PathBuf::from(directory.trim());
-        let script_directory = tokio::task::spawn_blocking(move || {
-            normalize_script_directory(&requested)
-                .map_err(|error| async_graphql::Error::new(error.to_string()))
-        })
-        .await
-        .map_err(|error| async_graphql::Error::new(error.to_string()))??;
+        // A path that is not absolute, or not a directory, is the caller's; one
+        // that could not be created or listed is a fault.
+        let script_directory = spawn_blocking_with(
+            move || normalize_script_directory(&requested),
+            |error| {
+                let message = error.to_string();
+                match error {
+                    ScriptDirectoryError::RelativePath | ScriptDirectoryError::NotDirectory(_) => {
+                        invalid_input(message)
+                    }
+                    ScriptDirectoryError::Io(_) => graphql_error("INTERNAL", message),
+                }
+            },
+        )
+        .await?;
 
         let db = ctx.data::<Database>()?.clone();
         let saved_directory = script_directory.clone();
-        let (settings, script_directory, changed) = tokio::task::spawn_blocking(move || {
-            let changed = db.replace_post_processing_script_directory(&saved_directory)?;
-            Ok::<_, weaver_server_core::StateError>((
-                db.post_processing_settings()?,
-                db.post_processing_script_directory()?,
-                changed,
-            ))
-        })
-        .await
-        .map_err(|error| async_graphql::Error::new(error.to_string()))?
-        .map_err(|error| async_graphql::Error::new(error.to_string()))?;
+        let (settings, script_directory, changed) = spawn_blocking_with(
+            move || {
+                let changed = db.replace_post_processing_script_directory(&saved_directory)?;
+                Ok::<_, weaver_server_core::StateError>((
+                    db.post_processing_settings()?,
+                    db.post_processing_script_directory()?,
+                    changed,
+                ))
+            },
+            state_error,
+        )
+        .await?;
         if changed {
             ctx.data::<PostProcessingExecutor>()?
                 .set_script_directory(script_directory.clone());
@@ -254,14 +316,12 @@ impl PostProcessingMutation {
         ctx: &Context<'_>,
         input: ScriptInstanceInput,
     ) -> Result<ScriptInstanceGql> {
-        let draft = input.into_draft().map_err(async_graphql::Error::new)?;
+        let draft = input.into_draft().map_err(invalid_input)?;
         let db = ctx.data::<Database>()?.clone();
         blocking(move || {
             require_script(&db, &draft.script)?;
-            let instance = db
-                .create_script_instance(draft)
-                .map_err(|error| error.to_string())?;
-            Ok::<_, String>(view(&db, instance))
+            let instance = db.create_script_instance(draft).map_err(instance_error)?;
+            Ok(view(&db, instance))
         })
         .await
     }
@@ -278,11 +338,9 @@ impl PostProcessingMutation {
         value: String,
     ) -> Result<SecretGql> {
         let db = ctx.data::<Database>()?.clone();
-        tokio::task::spawn_blocking(move || db.create_secret(&name, &value))
+        spawn_blocking_with(move || db.create_secret(&name, &value), secret_error)
             .await
-            .map_err(refused)?
             .map(Into::into)
-            .map_err(secret_error)
     }
 
     /// Rename a secret, replace its value, or both. Whatever links it follows
@@ -296,24 +354,21 @@ impl PostProcessingMutation {
         value: Option<String>,
     ) -> Result<SecretGql> {
         let db = ctx.data::<Database>()?.clone();
-        tokio::task::spawn_blocking(move || {
-            db.update_secret(&id, name.as_deref(), value.as_deref())
-        })
+        spawn_blocking_with(
+            move || db.update_secret(&id, name.as_deref(), value.as_deref()),
+            secret_error,
+        )
         .await
-        .map_err(refused)?
         .map(Into::into)
-        .map_err(secret_error)
     }
 
     /// Remove a secret. Refused while any script job links it.
     #[graphql(guard = "FreshAdminGuard")]
     async fn delete_secret(&self, ctx: &Context<'_>, id: String) -> Result<bool> {
         let db = ctx.data::<Database>()?.clone();
-        tokio::task::spawn_blocking(move || db.delete_secret(&id))
+        spawn_blocking_with(move || db.delete_secret(&id), secret_error)
             .await
-            .map_err(refused)?
             .map(|()| true)
-            .map_err(secret_error)
     }
 
     /// Replace everything saved in a script job. Each input is sent as a value,
@@ -329,13 +384,13 @@ impl PostProcessingMutation {
         input: ScriptInstanceInput,
     ) -> Result<ScriptInstanceGql> {
         let keep_schedule = input.schedule.is_none();
-        let mut draft = input.into_draft().map_err(async_graphql::Error::new)?;
+        let mut draft = input.into_draft().map_err(invalid_input)?;
         let db = ctx.data::<Database>()?.clone();
         blocking(move || {
             let existing = db
                 .script_instance(&id)
-                .map_err(|error| error.to_string())?
-                .ok_or("script job does not exist")?;
+                .map_err(state_error)?
+                .ok_or_else(|| not_found("script job does not exist"))?;
             if keep_schedule {
                 draft.schedule = existing.schedule.clone();
             }
@@ -344,8 +399,8 @@ impl PostProcessingMutation {
             }
             let instance = db
                 .update_script_instance(&id, draft)
-                .map_err(|error| error.to_string())?;
-            Ok::<_, String>(view(&db, instance))
+                .map_err(instance_error)?;
+            Ok(view(&db, instance))
         })
         .await
     }
@@ -354,11 +409,7 @@ impl PostProcessingMutation {
     #[graphql(guard = "FreshAdminGuard")]
     async fn delete_script_instance(&self, ctx: &Context<'_>, id: String) -> Result<bool> {
         let db = ctx.data::<Database>()?.clone();
-        let deleted = blocking(move || {
-            Ok::<_, weaver_server_core::StateError>(db.delete_script_instance(&id))
-        })
-        .await?;
-        deleted.map_err(refused)
+        spawn_blocking_with(move || db.delete_script_instance(&id), state_error).await
     }
 
     /// Put the script jobs of one trigger in the order given. They keep the
@@ -373,7 +424,7 @@ impl PostProcessingMutation {
     ) -> Result<Vec<ScriptInstanceGql>> {
         let db = ctx.data::<Database>()?.clone();
         blocking(move || {
-            let all = db.script_instances().map_err(|error| error.to_string())?;
+            let all = db.script_instances().map_err(state_error)?;
             let in_group =
                 |instance: &ScriptInstance| ScriptKindGql::from(instance.trigger.kind()) == trigger;
             let mut named = std::collections::BTreeSet::new();
@@ -382,10 +433,12 @@ impl PostProcessingMutation {
                     .iter()
                     .any(|instance| &instance.id == id && in_group(instance))
                 {
-                    return Err(format!("'{id}' is not a script job with that trigger"));
+                    return Err(invalid_input(format!(
+                        "'{id}' is not a script job with that trigger"
+                    )));
                 }
                 if !named.insert(id.as_str()) {
-                    return Err(format!("'{id}' is named more than once"));
+                    return Err(invalid_input(format!("'{id}' is named more than once")));
                 }
             }
             let mut group = ids.iter().cloned().chain(
@@ -403,12 +456,11 @@ impl PostProcessingMutation {
                     }
                 })
                 .collect::<Vec<_>>();
-            db.reorder_script_instances(&order)
-                .map_err(|error| error.to_string())?;
+            db.reorder_script_instances(&order).map_err(state_error)?;
             let directory = crate::post_processing::query::directory_view(&db);
             Ok(db
                 .script_instances()
-                .map_err(|error| error.to_string())?
+                .map_err(state_error)?
                 .into_iter()
                 .map(|instance| directory.instance(instance))
                 .collect())
@@ -431,15 +483,13 @@ impl PostProcessingMutation {
         blocking(move || {
             let setup = db
                 .set_up_script_from_header(&script)
-                .map_err(|error| error.to_string())?;
+                .map_err(header_error)?;
             let directory = crate::post_processing::query::directory_view(&db);
-            Ok::<_, String>(
-                setup
-                    .instances
-                    .into_iter()
-                    .map(|instance| directory.instance(instance))
-                    .collect::<Vec<_>>(),
-            )
+            Ok(setup
+                .instances
+                .into_iter()
+                .map(|instance| directory.instance(instance))
+                .collect::<Vec<_>>())
         })
         .await
     }
@@ -455,10 +505,8 @@ impl PostProcessingMutation {
     ) -> Result<ScriptInstanceGql> {
         let db = ctx.data::<Database>()?.clone();
         blocking(move || {
-            let instance = db
-                .reapply_script_header(&id)
-                .map_err(|error| error.to_string())?;
-            Ok::<_, String>(view(&db, instance))
+            let instance = db.reapply_script_header(&id).map_err(header_error)?;
+            Ok(view(&db, instance))
         })
         .await
     }
@@ -482,7 +530,7 @@ impl PostProcessingMutation {
         )
         .await
         .map(Into::into)
-        .map_err(|error| async_graphql::Error::new(error.to_string()))
+        .map_err(script_test_error)
     }
 
     /// Stop a running test. False when there is no such run or it has ended.
@@ -510,12 +558,10 @@ impl PostProcessingMutation {
         let db = ctx.data::<Database>()?.clone();
         let executor = ctx.data::<PostProcessingExecutor>()?.clone();
         let db_for_load = db.clone();
-        let history = tokio::task::spawn_blocking(move || db_for_load.get_job_history(job_id))
-            .await
-            .map_err(|error| async_graphql::Error::new(error.to_string()))?
-            .map_err(|error| async_graphql::Error::new(error.to_string()))?
+        let history = spawn_blocking_with(move || db_for_load.get_job_history(job_id), state_error)
+            .await?
             .ok_or_else(|| {
-                async_graphql::Error::new("post-processing reruns require a terminal history job")
+                rerun_refused("post-processing reruns require a terminal history job")
             })?;
         let metadata = history
             .metadata
@@ -524,12 +570,10 @@ impl PostProcessingMutation {
             .unwrap_or_default();
         let admission = executor
             .admit_job_scripts(history.category.as_deref())
-            .map_err(|error| async_graphql::Error::new(error.to_string()))?
-            .ok_or_else(|| {
-                async_graphql::Error::new("post-processing script execution is disabled")
-            })?;
+            .map_err(state_error)?
+            .ok_or_else(|| rerun_refused("post-processing script execution is disabled"))?;
         if !admission.has_enabled_entries() {
-            return Err(async_graphql::Error::new(
+            return Err(rerun_refused(
                 "no post-processing scripts are configured for this job",
             ));
         }
@@ -537,9 +581,7 @@ impl PostProcessingMutation {
             .output_dir
             .as_deref()
             .map(PathBuf::from)
-            .ok_or_else(|| {
-                async_graphql::Error::new("terminal job has no retained output directory")
-            })?;
+            .ok_or_else(|| rerun_refused("terminal job has no retained output directory"))?;
         let (data_dir, intermediate_dir, complete_dir) = {
             let config = ctx.data::<SharedConfig>()?.read().await;
             (
@@ -605,7 +647,7 @@ impl PostProcessingMutation {
             .cancel_post_processing(JobId(job_id))
             .await;
         if !background {
-            pass.map_err(|error| async_graphql::Error::new(error.to_string()))?;
+            pass.map_err(scheduler_error)?;
         }
         Ok(true)
     }

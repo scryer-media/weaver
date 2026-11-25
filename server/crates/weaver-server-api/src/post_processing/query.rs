@@ -1,8 +1,10 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
+use super::post_processing_mutation::listing_error;
 use super::*;
-use crate::auth::graphql_error;
+use crate::auth::invalid_input;
+use crate::observability::{spawn_blocking_with, state_error};
 use weaver_server_core::post_processing::executor::strict_security_enabled;
 use weaver_server_core::post_processing::instances::PostProcessingInstancesQueries;
 use weaver_server_core::post_processing::listing::list_scripts;
@@ -37,15 +39,16 @@ impl PostProcessingQuery {
         ctx: &Context<'_>,
     ) -> Result<PostProcessingSettingsGql> {
         let db = ctx.data::<Database>()?.clone();
-        let (settings, script_directory) = tokio::task::spawn_blocking(move || {
-            Ok::<_, weaver_server_core::StateError>((
-                db.post_processing_settings()?,
-                db.post_processing_script_directory()?,
-            ))
-        })
-        .await
-        .map_err(|error| async_graphql::Error::new(error.to_string()))?
-        .map_err(|error| async_graphql::Error::new(error.to_string()))?;
+        let (settings, script_directory) = spawn_blocking_with(
+            move || {
+                Ok::<_, weaver_server_core::StateError>((
+                    db.post_processing_settings()?,
+                    db.post_processing_script_directory()?,
+                ))
+            },
+            state_error,
+        )
+        .await?;
         Ok(PostProcessingSettingsGql::from_settings(
             settings,
             script_directory.to_string_lossy(),
@@ -57,18 +60,19 @@ impl PostProcessingQuery {
     #[graphql(guard = "AdminGuard")]
     async fn script_instances(&self, ctx: &Context<'_>) -> Result<Vec<ScriptInstanceGql>> {
         let db = ctx.data::<Database>()?.clone();
-        tokio::task::spawn_blocking(move || {
-            let directory = directory_view(&db);
-            Ok::<_, weaver_server_core::StateError>(
-                db.script_instances()?
-                    .into_iter()
-                    .map(|instance| directory.instance(instance))
-                    .collect(),
-            )
-        })
+        spawn_blocking_with(
+            move || {
+                let directory = directory_view(&db);
+                Ok::<_, weaver_server_core::StateError>(
+                    db.script_instances()?
+                        .into_iter()
+                        .map(|instance| directory.instance(instance))
+                        .collect(),
+                )
+            },
+            state_error,
+        )
         .await
-        .map_err(|error| async_graphql::Error::new(error.to_string()))?
-        .map_err(|error| async_graphql::Error::new(error.to_string()))
     }
 
     /// One saved script job, or null when there is none by that id.
@@ -79,15 +83,16 @@ impl PostProcessingQuery {
         id: String,
     ) -> Result<Option<ScriptInstanceGql>> {
         let db = ctx.data::<Database>()?.clone();
-        tokio::task::spawn_blocking(move || {
-            Ok::<_, weaver_server_core::StateError>(
-                db.script_instance(&id)?
-                    .map(|instance| directory_view(&db).instance(instance)),
-            )
-        })
+        spawn_blocking_with(
+            move || {
+                Ok::<_, weaver_server_core::StateError>(
+                    db.script_instance(&id)?
+                        .map(|instance| directory_view(&db).instance(instance)),
+                )
+            },
+            state_error,
+        )
         .await
-        .map_err(|error| async_graphql::Error::new(error.to_string()))?
-        .map_err(|error| async_graphql::Error::new(error.to_string()))
     }
 
     /// Every named secret, by name, with the script jobs that link it. Values
@@ -95,11 +100,9 @@ impl PostProcessingQuery {
     #[graphql(guard = "AdminGuard")]
     async fn secrets(&self, ctx: &Context<'_>) -> Result<Vec<SecretGql>> {
         let db = ctx.data::<Database>()?.clone();
-        tokio::task::spawn_blocking(move || db.secrets())
+        spawn_blocking_with(move || db.secrets(), state_error)
             .await
-            .map_err(|error| graphql_error("INTERNAL", error.to_string()))?
             .map(|secrets| secrets.into_iter().map(Into::into).collect())
-            .map_err(|error| graphql_error("INTERNAL", error.to_string()))
     }
 
     /// Live listing of the scripts directory, each script with the preset its
@@ -110,19 +113,19 @@ impl PostProcessingQuery {
     #[graphql(guard = "AdminGuard")]
     async fn discovered_scripts(&self, ctx: &Context<'_>) -> Result<ScriptListingGql> {
         let db = ctx.data::<Database>()?.clone();
-        tokio::task::spawn_blocking(move || {
-            let script_directory = db
-                .post_processing_script_directory()
-                .map_err(|error| async_graphql::Error::new(error.to_string()))?;
-            let listing = list_scripts(&script_directory)
-                .map_err(|error| async_graphql::Error::new(error.to_string()))?;
-            Ok(ScriptListingGql {
-                scripts: listing.scripts.iter().map(ScriptGql::new).collect(),
-                problems: listing.problems.into_iter().map(Into::into).collect(),
-            })
-        })
+        spawn_blocking_with(
+            move || {
+                let script_directory =
+                    db.post_processing_script_directory().map_err(state_error)?;
+                let listing = list_scripts(&script_directory).map_err(listing_error)?;
+                Ok(ScriptListingGql {
+                    scripts: listing.scripts.iter().map(ScriptGql::new).collect(),
+                    problems: listing.problems.into_iter().map(Into::into).collect(),
+                })
+            },
+            |error| error,
+        )
         .await
-        .map_err(|error| async_graphql::Error::new(error.to_string()))?
     }
 
     /// Script results recorded for a job, from the live row or from history.
@@ -133,27 +136,28 @@ impl PostProcessingQuery {
         job_id: u64,
     ) -> Result<Vec<ScriptResultGql>> {
         let db = ctx.data::<Database>()?.clone();
-        tokio::task::spawn_blocking(move || {
-            let mut results = db.job_post_processing_results(job_id)?;
-            results.extend(db.event_script_results(job_id)?);
-            let retained_ids = db.retained_script_output_ids(job_id)?;
-            results
-                .into_iter()
-                .map(|result| {
-                    let retained = result
-                        .output_id
-                        .as_deref()
-                        .map(|id| retained_ids.contains(id))
-                        .unwrap_or(false);
-                    let mut result = ScriptResultGql::from(result);
-                    result.output_retained = retained;
-                    Ok::<_, weaver_server_core::StateError>(result)
-                })
-                .collect::<std::result::Result<Vec<_>, _>>()
-        })
+        spawn_blocking_with(
+            move || {
+                let mut results = db.job_post_processing_results(job_id)?;
+                results.extend(db.event_script_results(job_id)?);
+                let retained_ids = db.retained_script_output_ids(job_id)?;
+                results
+                    .into_iter()
+                    .map(|result| {
+                        let retained = result
+                            .output_id
+                            .as_deref()
+                            .map(|id| retained_ids.contains(id))
+                            .unwrap_or(false);
+                        let mut result = ScriptResultGql::from(result);
+                        result.output_retained = retained;
+                        Ok::<_, weaver_server_core::StateError>(result)
+                    })
+                    .collect::<std::result::Result<Vec<_>, _>>()
+            },
+            state_error,
+        )
         .await
-        .map_err(|error| async_graphql::Error::new(error.to_string()))?
-        .map_err(|error| async_graphql::Error::new(error.to_string()))
     }
 
     /// Recorded script runs, latest first, whatever started them. Runs that
@@ -177,7 +181,7 @@ impl PostProcessingQuery {
         let before = before
             .map(|before| before.parse::<i64>())
             .transpose()
-            .map_err(|_| async_graphql::Error::new("before is not a position in the list"))?;
+            .map_err(|_| invalid_input("before is not a position in the list"))?;
         let filter = ScriptRunFilter {
             job_id,
             script,
@@ -185,15 +189,16 @@ impl PostProcessingQuery {
             status: status.map(Into::into),
         };
         // One more than asked for says whether another page follows.
-        let (mut runs, total, status_counts) = tokio::task::spawn_blocking(move || {
-            let total = db.script_run_count(&filter)?;
-            let status_counts = db.script_run_status_counts(&filter)?;
-            db.script_runs(filter, before, limit as u32 + 1)
-                .map(|runs| (runs, total, status_counts))
-        })
-        .await
-        .map_err(|error| async_graphql::Error::new(error.to_string()))?
-        .map_err(|error| async_graphql::Error::new(error.to_string()))?;
+        let (mut runs, total, status_counts) = spawn_blocking_with(
+            move || {
+                let total = db.script_run_count(&filter)?;
+                let status_counts = db.script_run_status_counts(&filter)?;
+                db.script_runs(filter, before, limit as u32 + 1)
+                    .map(|runs| (runs, total, status_counts))
+            },
+            state_error,
+        )
+        .await?;
         let more = runs.len() > limit;
         runs.truncate(limit);
         // A job still in the queue has no history row to name it: its name
@@ -247,9 +252,6 @@ impl PostProcessingQuery {
     #[graphql(guard = "ReadGuard")]
     async fn script_output(&self, ctx: &Context<'_>, output_id: String) -> Result<Option<String>> {
         let db = ctx.data::<Database>()?.clone();
-        tokio::task::spawn_blocking(move || db.script_output(&output_id))
-            .await
-            .map_err(|error| async_graphql::Error::new(error.to_string()))?
-            .map_err(|error| async_graphql::Error::new(error.to_string()))
+        spawn_blocking_with(move || db.script_output(&output_id), state_error).await
     }
 }

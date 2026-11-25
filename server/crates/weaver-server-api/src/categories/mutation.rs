@@ -7,7 +7,10 @@ use weaver_server_core::categories::persistence::CategoriesPersistenceQueries;
 
 use crate::auth::{AdminGuard, graphql_error};
 use crate::categories::types::{Category, CategoryInput};
-use crate::observability::{spawn_blocking_db, with_timed_config_read, with_timed_config_write};
+use crate::observability::{
+    spawn_blocking_db, state_error, watch_folder_error, with_timed_config_read,
+    with_timed_config_write,
+};
 use weaver_server_core::Database;
 use weaver_server_core::categories::{CategoryConfig, Made, category_writes, make_category};
 use weaver_server_core::settings::SharedConfig;
@@ -35,7 +38,10 @@ impl CategoriesMutation {
 
         let name = input.name.trim().to_string();
         if name.is_empty() {
-            return Err(async_graphql::Error::new("category name must not be empty"));
+            return Err(graphql_error(
+                "INVALID_INPUT",
+                "category name must not be empty",
+            ));
         }
         let dest_dir = input.dest_dir.clone().filter(|value| !value.is_empty());
         validate_category_name(&name, dest_dir.as_deref())?;
@@ -54,13 +60,14 @@ impl CategoriesMutation {
         };
         let added = match make_category(&held, config, db, category)
             .await
-            .map_err(|error| async_graphql::Error::new(error.to_string()))?
+            .map_err(state_error)?
         {
             Made::New(category) => category,
             Made::There(_) => {
-                return Err(async_graphql::Error::new(format!(
-                    "category '{name}' already exists"
-                )));
+                return Err(graphql_error(
+                    "NAME_TAKEN",
+                    format!("category '{name}' already exists"),
+                ));
             }
         };
         drop(held);
@@ -88,7 +95,10 @@ impl CategoriesMutation {
 
         let name = input.name.trim().to_string();
         if name.is_empty() {
-            return Err(async_graphql::Error::new("category name must not be empty"));
+            return Err(graphql_error(
+                "INVALID_INPUT",
+                "category name must not be empty",
+            ));
         }
         let dest_dir = input.dest_dir.clone().filter(|value| !value.is_empty());
         validate_category_name(&name, dest_dir.as_deref())?;
@@ -101,7 +111,9 @@ impl CategoriesMutation {
                     .categories
                     .iter()
                     .find(|category| category.id == id)
-                    .ok_or_else(|| async_graphql::Error::new(format!("category {id} not found")))?;
+                    .ok_or_else(|| {
+                        graphql_error("NOT_FOUND", format!("category {id} not found"))
+                    })?;
 
                 if !current.name.eq_ignore_ascii_case(&name)
                     && cfg
@@ -109,9 +121,10 @@ impl CategoriesMutation {
                         .iter()
                         .any(|other| other.id != id && other.name.eq_ignore_ascii_case(&name))
                 {
-                    return Err(async_graphql::Error::new(format!(
-                        "category '{name}' already exists"
-                    )));
+                    return Err(graphql_error(
+                        "NAME_TAKEN",
+                        format!("category '{name}' already exists"),
+                    ));
                 }
 
                 let fields = input.torrent_fields(Some(current))?;
@@ -175,9 +188,10 @@ impl CategoriesMutation {
                 if cfg.categories.iter().any(|category| category.id == id) {
                     Ok(())
                 } else {
-                    Err(async_graphql::Error::new(format!(
-                        "category {id} not found"
-                    )))
+                    Err(graphql_error(
+                        "NOT_FOUND",
+                        format!("category {id} not found"),
+                    ))
                 }
             },
         )
@@ -191,9 +205,10 @@ impl CategoriesMutation {
                 })
                 .await?;
             if !deleted {
-                return Err(async_graphql::Error::new(format!(
-                    "category {id} not found"
-                )));
+                return Err(graphql_error(
+                    "NOT_FOUND",
+                    format!("category {id} not found"),
+                ));
             }
         }
 
@@ -220,7 +235,7 @@ async fn reconcile_watch_folder(ctx: &Context<'_>) -> Result<()> {
     ctx.data::<WatchFolderService>()?
         .reconcile_from_config()
         .await
-        .map_err(|error| async_graphql::Error::new(error.to_string()))
+        .map_err(watch_folder_error)
 }
 
 #[cfg(test)]

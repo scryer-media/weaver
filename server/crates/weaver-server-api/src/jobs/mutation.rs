@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
+use crate::observability::{spawn_blocking_with, state_error};
+
 use std::collections::{HashMap, HashSet};
 use weaver_server_core::history::queries::HistoryQueries;
 use weaver_server_core::jobs::duplicate_persistence::JobsDuplicatePersistenceAdmitDuplicateSubmissionQueries;
@@ -231,9 +233,11 @@ impl JobsMutation {
         }
 
         let db = ctx.data::<Database>()?.clone();
-        let scan_before_parse = tokio::task::spawn_blocking(move || {
-            let settings = db.post_processing_settings()?;
-            Ok::<_, weaver_server_core::StateError>(
+        let scan_before_parse =
+            spawn_blocking_with(
+                move || {
+                    let settings = db.post_processing_settings()?;
+                    Ok::<_, weaver_server_core::StateError>(
                 settings.execution_enabled
                     && !weaver_server_core::post_processing::executor::strict_security_enabled()
                     && weaver_server_core::post_processing::listing::list_scripts(
@@ -249,8 +253,10 @@ impl JobsMutation {
                             .contains(&weaver_server_core::post_processing::model::ScriptKind::Scan)
                     }),
             )
-        })
-        .await??;
+                },
+                state_error,
+            )
+            .await?;
         match manager
             .stage_upload(caller_identity, upload, input.filename, scan_before_parse)
             .await
@@ -487,21 +493,30 @@ impl JobsMutation {
     #[graphql(guard = "ControlGuard")]
     async fn pause_job(&self, ctx: &Context<'_>, id: u64) -> Result<bool> {
         let handle = ctx.data::<SchedulerHandle>()?;
-        handle.pause_job(JobId(id)).await?;
+        handle
+            .pause_job(JobId(id))
+            .await
+            .map_err(crate::observability::scheduler_error)?;
         Ok(true)
     }
     /// Resume a paused job.
     #[graphql(guard = "ControlGuard")]
     async fn resume_job(&self, ctx: &Context<'_>, id: u64) -> Result<bool> {
         let handle = ctx.data::<SchedulerHandle>()?;
-        handle.resume_job(JobId(id)).await?;
+        handle
+            .resume_job(JobId(id))
+            .await
+            .map_err(crate::observability::scheduler_error)?;
         Ok(true)
     }
     /// Cancel and remove a job.
     #[graphql(guard = "ControlGuard")]
     async fn cancel_job(&self, ctx: &Context<'_>, id: u64) -> Result<bool> {
         let handle = ctx.data::<SchedulerHandle>()?;
-        handle.cancel_job(JobId(id)).await?;
+        handle
+            .cancel_job(JobId(id))
+            .await
+            .map_err(crate::observability::scheduler_error)?;
         Ok(true)
     }
     /// Cancel and remove several jobs in one pipeline command. Each id gets
@@ -603,27 +618,25 @@ impl JobsMutation {
         let handle = ctx.data::<SchedulerHandle>()?;
         let replay = ctx.data::<crate::jobs::replay::QueueEventReplay>()?;
         let db = ctx.data::<Database>()?.clone();
-        delete_history_ids(handle, replay, [id], delete_files).await?;
+        delete_history_ids(handle, replay, [id], delete_files)
+            .await
+            .map_err(crate::observability::scheduler_error)?;
         history_items_from_db(ctx, db, crate::history::query::live_job_ids(handle)).await
     }
     /// Explicitly forget durable duplicate identity for a job without deleting history or files.
     #[graphql(guard = "ControlGuard")]
     async fn forget_duplicate_identity(&self, ctx: &Context<'_>, id: u64) -> Result<bool> {
         let db = ctx.data::<Database>()?.clone();
-        tokio::task::spawn_blocking(move || db.forget_duplicate_identity(JobId(id)))
-            .await
-            .map_err(|error| graphql_error("INTERNAL", error.to_string()))?
-            .map_err(|error| graphql_error("INTERNAL", error.to_string()))
+        spawn_blocking_with(move || db.forget_duplicate_identity(JobId(id)), state_error).await
     }
     #[graphql(guard = "ControlGuard")]
     async fn mark_duplicate_good(&self, ctx: &Context<'_>, id: u64) -> Result<bool> {
         let db = ctx.data::<Database>()?.clone();
-        tokio::task::spawn_blocking(move || {
-            weaver_server_core::post_processing::hooks::mark_history_good(&db, JobId(id))
-        })
+        spawn_blocking_with(
+            move || weaver_server_core::post_processing::hooks::mark_history_good(&db, JobId(id)),
+            state_error,
+        )
         .await
-        .map_err(|error| graphql_error("INTERNAL", error.to_string()))?
-        .map_err(|error| graphql_error("INTERNAL", error.to_string()))
     }
 
     #[graphql(guard = "ControlGuard")]
@@ -634,13 +647,14 @@ impl JobsMutation {
     ) -> Result<SemanticPromotionResult> {
         let db = ctx.data::<Database>()?.clone();
         let handle = ctx.data::<SchedulerHandle>()?;
-        let candidate = tokio::task::spawn_blocking({
-            let db = db.clone();
-            move || db.semantic_candidate_snapshot(JobId(id))
-        })
-        .await
-        .map_err(|error| graphql_error("INTERNAL", error.to_string()))?
-        .map_err(|error| graphql_error("INTERNAL", error.to_string()))?;
+        let candidate = spawn_blocking_with(
+            {
+                let db = db.clone();
+                move || db.semantic_candidate_snapshot(JobId(id))
+            },
+            state_error,
+        )
+        .await?;
         if candidate.is_none()
             || candidate.is_some_and(|candidate| {
                 matches!(
@@ -687,13 +701,14 @@ impl JobsMutation {
             }
             Err(error) => return Err(graphql_error("CONFLICT", error.to_string())),
         }
-        let marked = tokio::task::spawn_blocking({
-            let db = db.clone();
-            move || db.mark_semantic_candidate_bad(JobId(id))
-        })
-        .await
-        .map_err(|error| graphql_error("INTERNAL", error.to_string()))?
-        .map_err(|error| graphql_error("INTERNAL", error.to_string()))?;
+        let marked = spawn_blocking_with(
+            {
+                let db = db.clone();
+                move || db.mark_semantic_candidate_bad(JobId(id))
+            },
+            state_error,
+        )
+        .await?;
         if !marked {
             return Ok(SemanticPromotionResult {
                 accepted: false,
@@ -727,7 +742,9 @@ impl JobsMutation {
         let handle = ctx.data::<SchedulerHandle>()?;
         let replay = ctx.data::<crate::jobs::replay::QueueEventReplay>()?;
         let db = ctx.data::<Database>()?.clone();
-        delete_history_ids(handle, replay, ids, delete_files).await?;
+        delete_history_ids(handle, replay, ids, delete_files)
+            .await
+            .map_err(crate::observability::scheduler_error)?;
         history_items_from_db(ctx, db, crate::history::query::live_job_ids(handle)).await
     }
     /// Archive up to 100 history entries: remove their files and keep the
@@ -750,10 +767,8 @@ impl JobsMutation {
             ));
         }
         let db = ctx.data::<Database>()?.clone();
-        let acceptance = tokio::task::spawn_blocking(move || db.accept_archive_history(&ids))
-            .await
-            .map_err(|error| graphql_error("INTERNAL", error.to_string()))?
-            .map_err(|error| graphql_error("INTERNAL", error.to_string()))?;
+        let acceptance =
+            spawn_blocking_with(move || db.accept_archive_history(&ids), state_error).await?;
         Ok(ArchiveHistoryAcceptance::from_core(acceptance))
     }
     /// Delete all completed/failed/cancelled jobs from history.
@@ -767,10 +782,8 @@ impl JobsMutation {
         let handle = ctx.data::<SchedulerHandle>()?;
         let db = ctx.data::<Database>()?.clone();
         let lookup_db = db.clone();
-        let mut ids = tokio::task::spawn_blocking(move || lookup_db.list_all_history_job_ids())
-            .await
-            .map_err(|error| graphql_error("INTERNAL", error.to_string()))?
-            .map_err(|error| graphql_error("INTERNAL", error.to_string()))?;
+        let mut ids =
+            spawn_blocking_with(move || lookup_db.list_all_history_job_ids(), state_error).await?;
         let state = ctx.data::<weaver_server_core::SharedPipelineState>()?;
         let finished = |status: &weaver_server_core::JobStatus| {
             matches!(
@@ -799,7 +812,9 @@ impl JobsMutation {
         // The jobs listed above, in batches: a refused id never holds back the
         // rest, and a job that reaches history after the listing stays.
         let replay = ctx.data::<crate::jobs::replay::QueueEventReplay>()?;
-        delete_history_ids(handle, replay, ids, delete_files).await?;
+        delete_history_ids(handle, replay, ids, delete_files)
+            .await
+            .map_err(crate::observability::scheduler_error)?;
         history_items_from_db(ctx, db, crate::history::query::live_job_ids(handle)).await
     }
     /// Update category and/or priority for one or more jobs.
@@ -814,7 +829,10 @@ impl JobsMutation {
         let handle = ctx.data::<SchedulerHandle>()?;
         let update = job_update(ctx, category.as_deref(), priority.as_deref()).await?;
         for &id in &ids {
-            handle.update_job(JobId(id), update.clone()).await?;
+            handle
+                .update_job(JobId(id), update.clone())
+                .await
+                .map_err(crate::observability::scheduler_error)?;
         }
         Ok(true)
     }
@@ -1194,7 +1212,10 @@ fn scheduler_graphql_error(error: SchedulerError) -> async_graphql::Error {
         SchedulerError::Assembly(error) => {
             graphql_error("INTERNAL", format!("assembly error: {error}"))
         }
-        SchedulerError::State(error) => graphql_error("INTERNAL", format!("state error: {error}")),
+        SchedulerError::State(error) => graphql_error(
+            crate::observability::state_code(&error),
+            format!("state error: {error}"),
+        ),
         SchedulerError::Io(error) => graphql_error("INTERNAL", format!("i/o error: {error}")),
     }
 }
@@ -1349,11 +1370,11 @@ async fn materialize_claim_for_api(
     trigger_job_id: JobId,
 ) -> Result<SemanticPromotionResult> {
     let db_for_claim = db.clone();
-    let claim =
-        tokio::task::spawn_blocking(move || db_for_claim.claim_semantic_promotion(trigger_job_id))
-            .await
-            .map_err(|error| graphql_error("INTERNAL", error.to_string()))?
-            .map_err(|error| graphql_error("INTERNAL", error.to_string()))?;
+    let claim = spawn_blocking_with(
+        move || db_for_claim.claim_semantic_promotion(trigger_job_id),
+        state_error,
+    )
+    .await?;
     let Some(claim) = claim else {
         return Ok(SemanticPromotionResult {
             accepted: false,
@@ -1533,7 +1554,7 @@ async fn submit_from_facade_input(
     let (nzb_bytes, upload, filename) = match (input.nzb_base64, input.url, input.nzb_upload) {
         (Some(b64), None, None) => {
             crate::jobs::staging::inline_nzb_base64_fits(b64.len())
-                .map_err(|e| graphql_error("INVALID_INPUT", e.to_string()))?;
+                .map_err(crate::jobs::staging::upload_refusal)?;
             let bytes = base64::engine::general_purpose::STANDARD
                 .decode(&b64)
                 .map_err(|e| graphql_error("INVALID_INPUT", format!("invalid base64: {e}")))?;
@@ -1685,7 +1706,7 @@ async fn submit_nzb_source(ctx: &Context<'_>, nzb: NzbSubmission) -> Result<Subm
             Ok(submission_result_from_submitted(handle, client_request_id, &submitted).await)
         }
         Err(error) => submission_result_from_error(client_request_id, error)
-            .map_err(|e| graphql_error("INVALID_INPUT", e.to_string())),
+            .map_err(crate::jobs::staging::upload_refusal),
     }
 }
 

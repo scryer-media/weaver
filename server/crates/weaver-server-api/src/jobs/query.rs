@@ -14,7 +14,7 @@ use crate::jobs::types::{
 use crate::jobs::types::{
     JobOutputSource, OutputFilesCursor, decode_output_files_cursor, encode_output_files_cursor,
 };
-use crate::observability::with_timed_config_read;
+use crate::observability::{join_error, spawn_blocking_with, state_error, with_timed_config_read};
 
 // The most rows `queueItems` and `jobs` return when the caller names a size.
 const QUEUE_LIST_MAX_FIRST: usize = 10_000;
@@ -280,7 +280,7 @@ impl JobsQuery {
         match handle.get_job(weaver_server_core::jobs::ids::JobId(id)) {
             Ok(info) => Ok(Some(Job::from(&info))),
             Err(weaver_server_core::SchedulerError::JobNotFound(_)) => Ok(None),
-            Err(e) => Err(e.into()),
+            Err(e) => Err(crate::observability::scheduler_error(e)),
         }
     }
     /// Durable duplicate identity and semantic candidate state for a queue,
@@ -292,21 +292,21 @@ impl JobsQuery {
         id: u64,
     ) -> Result<Option<DuplicateIdentitySnapshotInfo>> {
         let db = ctx.data::<Database>()?.clone();
-        let snapshot = tokio::task::spawn_blocking(move || {
-            db.duplicate_snapshot(weaver_server_core::jobs::ids::JobId(id))
-        })
-        .await
-        .map_err(|e| async_graphql::Error::new(e.to_string()))??;
+        let snapshot = spawn_blocking_with(
+            move || db.duplicate_snapshot(weaver_server_core::jobs::ids::JobId(id)),
+            state_error,
+        )
+        .await?;
         let Some(snapshot) = snapshot else {
             return Ok(None);
         };
 
         let db = ctx.data::<Database>()?.clone();
-        let semantic = tokio::task::spawn_blocking(move || {
-            db.semantic_candidate_snapshot(weaver_server_core::jobs::ids::JobId(id))
-        })
-        .await
-        .map_err(|e| async_graphql::Error::new(e.to_string()))??;
+        let semantic = spawn_blocking_with(
+            move || db.semantic_candidate_snapshot(weaver_server_core::jobs::ids::JobId(id)),
+            state_error,
+        )
+        .await?;
         Ok(Some(DuplicateIdentitySnapshotInfo::from_parts(
             &snapshot,
             semantic.as_ref(),
@@ -336,13 +336,14 @@ impl JobsQuery {
             info.output_dir
         } else {
             let db = ctx.data::<Database>()?.clone();
-            let entry = tokio::task::spawn_blocking(move || {
-                db.list_job_history_file_states(&[id])
-                    .map(|mut states| states.remove(&id))
-            })
-            .await
-            .map_err(|e| async_graphql::Error::new(e.to_string()))?
-            .map_err(|e| async_graphql::Error::new(e.to_string()))?;
+            let entry = spawn_blocking_with(
+                move || {
+                    db.list_job_history_file_states(&[id])
+                        .map(|mut states| states.remove(&id))
+                },
+                state_error,
+            )
+            .await?;
             match entry {
                 Some(entry) if entry.archived_at.is_some() => {
                     let Some(output_dir) = entry.output_dir else {
@@ -356,12 +357,11 @@ impl JobsQuery {
                     if next_cursor.is_some() {
                         let db = ctx.data::<Database>()?.clone();
                         let next = offset.saturating_add(limit) as u64;
-                        let kept = tokio::task::spawn_blocking(move || {
-                            db.has_archived_history_file(job_id, next)
-                        })
-                        .await
-                        .map_err(|e| async_graphql::Error::new(e.to_string()))?
-                        .map_err(|e| async_graphql::Error::new(e.to_string()))?;
+                        let kept = spawn_blocking_with(
+                            move || db.has_archived_history_file(job_id, next),
+                            state_error,
+                        )
+                        .await?;
                         if !kept {
                             next_cursor = None;
                         }
@@ -384,7 +384,7 @@ impl JobsQuery {
                 None => match ctx.data::<SchedulerHandle>()?.get_job(id) {
                     Ok(info) => info.output_dir,
                     Err(weaver_server_core::SchedulerError::JobNotFound(_)) => None,
-                    Err(e) => return Err(e.into()),
+                    Err(e) => return Err(crate::observability::scheduler_error(e)),
                 },
             }
         };
@@ -396,7 +396,7 @@ impl JobsQuery {
         let result =
             tokio::task::spawn_blocking(move || list_output_files(&dir_path, &cursor, limit))
                 .await
-                .map_err(|e| async_graphql::Error::new(e.to_string()))??;
+                .map_err(join_error)??;
         Ok(Some(result))
     }
 }
@@ -429,12 +429,11 @@ impl JobOutputResult {
             } => {
                 let db = ctx.data::<Database>()?.clone();
                 let (job_id, offset, limit) = (*job_id, *offset, *limit);
-                let rows = tokio::task::spawn_blocking(move || {
-                    db.list_archived_history_files(job_id, offset, limit)
-                })
-                .await
-                .map_err(|e| async_graphql::Error::new(e.to_string()))?
-                .map_err(|e| async_graphql::Error::new(e.to_string()))?;
+                let rows = spawn_blocking_with(
+                    move || db.list_archived_history_files(job_id, offset, limit),
+                    state_error,
+                )
+                .await?;
                 let root = PathBuf::from(&self.output_dir);
                 Ok(rows
                     .into_iter()
@@ -492,7 +491,7 @@ fn list_output_files(
         cursor.after.as_ref(),
         limit,
     )
-    .map_err(|e| async_graphql::Error::new(format!("failed to read directory: {e}")))?;
+    .map_err(|e| graphql_error("INTERNAL", format!("failed to read directory: {e}")))?;
     // A next page exists when the walk found a file after this page's last,
     // whatever moved before it since the first page.
     let listing = page.listing;
@@ -566,11 +565,11 @@ impl DuplicateSummaryCache {
         if !missing.is_empty() {
             self.reads += 1;
             let wanted = missing.clone();
-            let summaries =
-                tokio::task::spawn_blocking(move || load_duplicate_summaries_chunked(&db, wanted))
-                    .await
-                    .map_err(|error| graphql_error("INTERNAL", error.to_string()))?
-                    .map_err(|error| graphql_error("INTERNAL", error.to_string()))?;
+            let summaries = spawn_blocking_with(
+                move || load_duplicate_summaries_chunked(&db, wanted),
+                state_error,
+            )
+            .await?;
             for id in missing {
                 self.by_id.insert(
                     id.0,
@@ -648,11 +647,11 @@ async fn attach_duplicate_summaries(db: Database, items: &mut [QueueItem]) -> Re
         .iter()
         .map(|item| weaver_server_core::jobs::ids::JobId(item.id))
         .collect::<Vec<_>>();
-    let summaries =
-        tokio::task::spawn_blocking(move || load_duplicate_summaries_chunked(&db, job_ids))
-            .await
-            .map_err(|error| graphql_error("INTERNAL", error.to_string()))?
-            .map_err(|error| graphql_error("INTERNAL", error.to_string()))?;
+    let summaries = spawn_blocking_with(
+        move || load_duplicate_summaries_chunked(&db, job_ids),
+        state_error,
+    )
+    .await?;
     for item in items {
         if let Some(summary) = summaries.get(&weaver_server_core::jobs::ids::JobId(item.id)) {
             item.duplicate_summary = Some(DuplicateSummaryInfo::from_summary(summary));

@@ -46,6 +46,13 @@ impl ServerConnectivityResult {
             tls_honors_client_cipher_order: None,
         }
     }
+
+    // Whether the probe failed because the server's certificate names another
+    // host: the handshake was refused for that alone, and the certificate it
+    // presented is held for the operator to review.
+    pub fn certificate_names_another_host(&self) -> bool {
+        !self.success && self.adoptable_tls_name_mismatch_certificate_der.is_some()
+    }
 }
 
 // Probe a server over each leg of its drafted route, in leg order, then
