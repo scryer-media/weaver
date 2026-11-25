@@ -2236,6 +2236,8 @@ pub struct Held {
     pub after: Vec<(JobStatus, bool)>,
     pub status: Option<JobStatus>,
     pub files: BTreeMap<String, Vec<u8>>,
+    // The most password candidates each node was offered at any look.
+    pub offered: BTreeMap<weaver_graph::NodeId, usize>,
 }
 
 // Plays the server, holding every article of post `held` as a server holds
@@ -2358,9 +2360,16 @@ pub(in crate::pipeline::tests) async fn run_holding_where(
     }
     let mut after = Vec::new();
     let mut stalled = None;
+    let mut offered: BTreeMap<weaver_graph::NodeId, usize> = BTreeMap::new();
     while !finished(&pipeline) {
         if let Some(report) = pipeline.job_report(JOB) {
             after.push((report.status.clone(), report.fetching_repair_data));
+        }
+        if let Some(job) = pipeline.graph_jobs.get(&JOB) {
+            for (node, count) in job.passwords_offered() {
+                let most = offered.entry(node).or_default();
+                *most = (*most).max(count);
+            }
         }
         let before = look(&pipeline);
         settle(&mut pipeline, scenario, &held, &mut out).await;
@@ -2380,6 +2389,7 @@ pub(in crate::pipeline::tests) async fn run_holding_where(
         after,
         status,
         files,
+        offered,
     }
 }
 

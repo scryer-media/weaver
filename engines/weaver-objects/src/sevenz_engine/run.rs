@@ -38,6 +38,9 @@ use crate::verdict;
 
 pub(crate) struct Run {
     password: Option<String>,
+    // Whether something other than this run proved the password: a failure
+    // that would ask for one is then damage (`verdict::sevenz_under`).
+    proven: bool,
     scope: Scope,
 }
 
@@ -57,11 +60,15 @@ pub(crate) enum Scope {
 
 impl Run {
     pub(crate) fn new(password: Option<String>) -> Self {
-        Self::of(password, Scope::Whole)
+        Self::of(password, false, Scope::Whole)
     }
 
-    pub(crate) fn of(password: Option<String>, scope: Scope) -> Self {
-        Self { password, scope }
+    pub(crate) fn of(password: Option<String>, proven: bool, scope: Scope) -> Self {
+        Self {
+            password,
+            proven,
+            scope,
+        }
     }
 }
 
@@ -111,7 +118,7 @@ impl Extraction for Run {
         // all of what it holds there on one thread, so one start in RAM is
         // enough, not just the window refused. What it was allowed there is
         // the run's memory, which it keeps in RAM what fits.
-        let said = match verdict::sevenz(&error) {
+        let said = match verdict::sevenz_under(&error, self.proven) {
             Emit::Refuse(Why::TooLarge {
                 needed: Some(needed),
                 allowed: None,

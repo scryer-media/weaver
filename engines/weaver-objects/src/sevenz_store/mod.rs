@@ -1101,7 +1101,10 @@ impl Object for SevenZipStore {
 impl Engine for SevenZipStore {
     fn start(&mut self) -> Box<dyn Extraction> {
         self.ran = self.opened.or(self.latest);
-        coded::run(self.map.as_deref(), self.password())
+        // The password is proven only when the candidate that opened the
+        // store and proved itself is the one the run decodes under.
+        let proven = self.proven && self.opened.is_some();
+        coded::run(self.map.as_deref(), self.password(), proven)
     }
 
     fn reserve(&self) -> Option<u64> {

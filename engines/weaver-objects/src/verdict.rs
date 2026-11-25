@@ -32,16 +32,29 @@ const PASSWORD: Emit = Emit::NeedsPassword;
 const DAMAGED: Emit = Emit::Refuse(Why::Unrepairable);
 const TERMINAL: Emit = Emit::Refuse(Why::Unsupported);
 
+// What a run's failure says when the run decodes under a password: a
+// failure that would ask for one, under a password the header or a stored
+// folder proved (`proven`), is damage in the bytes, as in a plain folder.
+// A different password per folder is not catered for: the proven one is the
+// password.
+pub(crate) fn sevenz_under(error: &sevenz_turbo::Error, proven: bool) -> Emit {
+    match sevenz(error) {
+        Emit::NeedsPassword if proven => DAMAGED,
+        said => said,
+    }
+}
+
 pub(crate) fn sevenz(error: &sevenz_turbo::Error) -> Emit {
     use sevenz_turbo::{BlockErrorKind, Error};
     match error {
         // A decode that fails under a candidate key, or a checksum of an
         // enciphered folder that fails, says the key or the bytes are wrong,
-        // and a run reads bytes no repair has verified yet. It is taken as
-        // the key, and the next candidate is tried; a repair landing behind
-        // what the run read sends the job's cursor back to the first
-        // candidate (`Passwords::rewind`), so a candidate failed on damage
-        // is tried again on the repaired bytes.
+        // and a run reads bytes no repair has verified yet. With nothing to
+        // prove the key it is taken as the key, and the next candidate is
+        // tried; a repair landing behind what the run read sends the job's
+        // cursor back to the first candidate (`Passwords::rewind`), so a
+        // candidate failed on damage is tried again on the repaired bytes.
+        // Under a key the store proved, it is the bytes: `sevenz_under`.
         Error::PasswordRequired | Error::MaybeBadPassword(_) => PASSWORD,
         Error::BlockDecode {
             kind: BlockErrorKind::Corrupted | BlockErrorKind::ChecksumMismatch,
