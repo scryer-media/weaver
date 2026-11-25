@@ -913,6 +913,9 @@ impl RarStore {
             made,
             waiting: false,
         };
+        if entry.streams() {
+            self.streamed += 1;
+        }
         match self.entries.get_mut(at) {
             Some(slot) => *slot = entry,
             None => self.entries.push(entry),

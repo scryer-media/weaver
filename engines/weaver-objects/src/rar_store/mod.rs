@@ -468,6 +468,13 @@ impl Entry {
         }
     }
 
+    // Whether the store places bytes of the member itself, in the step they
+    // arrive: a file it streams, not one its run makes, a directory, an
+    // empty file or a retracted slot.
+    fn streams(&self) -> bool {
+        !self.made && !self.waiting && self.length != Some(0)
+    }
+
     // Whether the member's parts, all in, carry fewer bytes than the size
     // its header states: it ends where they do only once its CRC proves it.
     // A made member's parts are packed, and say nothing of its size.
@@ -533,6 +540,9 @@ pub struct RarStore {
     // The entries the store's run makes, filed as entries come and go, so
     // the question scans no entry.
     made: BTreeSet<usize>,
+    // How many entries the store streams itself (`Entry::streams`), counted
+    // where `made` is filed, so whether it passes bytes on scans no entry.
+    streamed: usize,
     // The slots retracted where they stood, waiting for the member the
     // layout lays there: filed where `made` is.
     waiting: BTreeSet<usize>,
@@ -654,6 +664,7 @@ impl RarStore {
             giving: BTreeMap::new(),
             unmapped: BTreeSet::new(),
             made: BTreeSet::new(),
+            streamed: 0,
             waiting: BTreeSet::new(),
             windows: BTreeMap::new(),
             widest: BTreeMap::new(),
@@ -785,6 +796,7 @@ impl RarStore {
         self.locked.clear();
         self.made.clear();
         self.waiting.clear();
+        self.streamed = self.entries.iter().filter(|entry| entry.streams()).count();
         for (id, entry) in self.entries.iter().enumerate() {
             if entry.made {
                 self.made.insert(id);
@@ -1190,9 +1202,15 @@ impl Object for RarStore {
     }
 
     // Stored members take their bytes as they arrive, until I give the set
-    // to an engine or up.
+    // to an engine or up. Before any member is laid, any may be one; once
+    // members are laid, only while one of them is streamed here: a set
+    // whose laid members are all made by its run keeps its volumes' bytes
+    // for that run, and none goes on in the step. A later header that lays
+    // the first streamed member makes the answer true from then on; the
+    // step that lays it was armed under the old answer and goes without
+    // the prepay on the members' volume.
     fn passes_on(&self) -> bool {
-        !self.gone
+        !self.gone && (self.entries.is_empty() || self.streamed > 0)
     }
 
     fn facts(&self) -> weaver_graph::Facts {

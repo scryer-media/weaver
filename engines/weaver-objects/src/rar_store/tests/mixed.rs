@@ -442,6 +442,36 @@ fn a_set_of_compressed_files_alone_stays_with_the_store() {
     }
 }
 
+// The store passes bytes on to its members in a step only while it may
+// stream one: before any member is laid, and while one laid is stored. A set
+// whose members its run makes alone keeps its bytes for that run; a restored
+// store answers as it did.
+#[test]
+fn a_store_passes_bytes_on_only_while_it_streams_a_member() {
+    assert!(store().passes_on());
+    for version in [Version::Rar5, Version::Rar4] {
+        let (first, _) = packed(version, "first.nfo");
+        let (second, _) = packed(version, "second.nfo");
+        for (label, items, streams) in [
+            ("compressed alone", vec![first, second], false),
+            ("mixed", mixed_items(version), true),
+            ("compressed first", compressed_first(version), true),
+        ] {
+            let volumes = write(&items, &Options::new(version));
+            let mut owner = Owner::named(store(), volumes);
+            owner.whole(4096);
+            assert_eq!(owner.object.passes_on(), streams, "{version:?} {label}");
+            let restored =
+                crate::rar_store::facts::restored(&owner.object.facts()).expect("restores");
+            assert_eq!(
+                restored.passes_on(),
+                streams,
+                "{version:?} {label} restored"
+            );
+        }
+    }
+}
+
 // A set whose first file is compressed and is followed by a stored one: the
 // stored one is streamed and the compressed one made.
 #[test]

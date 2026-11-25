@@ -827,33 +827,73 @@ fn articles(posts: &[Post], index: u32) -> u32 {
 // A plain file, then an archive of `volumes`: a stored RAR5 set of one
 // member, `inside.mkv`, or a one-volume set whose member is compressed.
 fn archive_posts(compressed: bool, seed: u8) -> (Vec<Post>, Vec<u8>) {
+    if compressed {
+        return compressed_posts(false, seed);
+    }
+    let member = payload(6 * ARTICLE + 7, seed);
+    let mut posts = vec![Post::plain("lantern.bin", payload(24 * ARTICLE, seed + 1))];
+    posts.extend(
+        crate::pipeline::tests::direct_store::single_member_store_set("inside.mkv", &member, 2)
+            .into_iter()
+            .map(|(name, bytes)| Post::plain(&name, bytes)),
+    );
+    (posts, member)
+}
+
+// A plain file, then a one-volume RAR5 set whose one member is compressed:
+// not solid, the store keeps the set and its run makes the member; solid,
+// the set goes to the engine.
+fn compressed_posts(solid: bool, seed: u8) -> (Vec<Post>, Vec<u8>) {
     use crate::pipeline::tests::{
         TEST_RAR5_SIG, build_test_rar_compressed_file_header, build_test_rar_end_header,
         build_test_rar_main_header, test_rar_compression_info,
     };
     let member = payload(6 * ARTICLE + 7, seed);
     let mut posts = vec![Post::plain("lantern.bin", payload(24 * ARTICLE, seed + 1))];
-    if compressed {
-        let mut bytes = TEST_RAR5_SIG.to_vec();
-        bytes.extend_from_slice(&build_test_rar_main_header(0, None));
-        bytes.extend_from_slice(&build_test_rar_compressed_file_header(
-            "inside.mkv",
-            0,
-            member.len() as u64,
-            member.len() as u64,
-            Some(par2_rs::checksum::crc32(&member)),
-            test_rar_compression_info(1, false),
-        ));
-        bytes.extend_from_slice(&member);
-        bytes.extend_from_slice(&build_test_rar_end_header(false));
-        posts.push(Post::plain("silver.horizon.rar", bytes));
-    } else {
-        posts.extend(
-            crate::pipeline::tests::direct_store::single_member_store_set("inside.mkv", &member, 2)
-                .into_iter()
-                .map(|(name, bytes)| Post::plain(&name, bytes)),
-        );
-    }
+    let mut bytes = TEST_RAR5_SIG.to_vec();
+    bytes.extend_from_slice(&build_test_rar_main_header(0, None));
+    bytes.extend_from_slice(&build_test_rar_compressed_file_header(
+        "inside.mkv",
+        0,
+        member.len() as u64,
+        member.len() as u64,
+        Some(par2_rs::checksum::crc32(&member)),
+        test_rar_compression_info(1, solid),
+    ));
+    bytes.extend_from_slice(&member);
+    bytes.extend_from_slice(&build_test_rar_end_header(false));
+    posts.push(Post::plain("silver.horizon.rar", bytes));
+    (posts, member)
+}
+
+// A plain file, then a mixed RAR5 set in two volumes: `inside.mkv` stored,
+// spanning both, then `notes.nfo` compressed, which the store's run makes.
+fn mixed_posts(seed: u8) -> (Vec<Post>, Vec<u8>) {
+    use weaver_objects::rar_store::writer::{Item, Options, Version, lifted, write};
+    let fixture: &[u8] = include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../weaver-server-core/tests/fixtures/extraction_profiles/rar5_multifile_lz.rar"
+    ));
+    let (plain, packed, codec) = lifted(fixture, "zeros_64k.bin");
+    let member = payload(6 * ARTICLE + 7, seed);
+    let items = [
+        Item::File("inside.mkv", member.clone()),
+        Item::Packed {
+            name: "notes.nfo",
+            plain,
+            packed,
+            codec,
+        },
+    ];
+    let mut options = Options::new(Version::Rar5);
+    options.split = Some(4 * ARTICLE);
+    options.numbered = true;
+    let volumes = write(&items, &options);
+    assert_eq!(volumes.len(), 2);
+    let mut posts = vec![Post::plain("lantern.bin", payload(24 * ARTICLE, seed + 1))];
+    posts.extend(volumes.into_iter().enumerate().map(|(index, bytes)| {
+        Post::plain(&format!("silver.horizon.part{:02}.rar", index + 1), bytes)
+    }));
     (posts, member)
 }
 
@@ -889,16 +929,23 @@ async fn stored_archive_run(
     job_id: JobId,
     pressure: bool,
 ) -> (Vec<u8>, Option<Delivery>, Option<JobStatus>) {
-    stored_run(job_id, pressure, archive_posts(false, 21)).await
+    let (member, delivery, status, _) =
+        stored_run(job_id, pressure, archive_posts(false, 21)).await;
+    (member, delivery, status)
 }
 
 // The same over a plain file and a stored set of `posts`, whose member is
-// delivered as `inside.mkv`.
+// delivered as `inside.mkv`, and every file delivered, by name.
 async fn stored_run(
     job_id: JobId,
     pressure: bool,
     (posts, member): (Vec<Post>, Vec<u8>),
-) -> (Vec<u8>, Option<Delivery>, Option<JobStatus>) {
+) -> (
+    Vec<u8>,
+    Option<Delivery>,
+    Option<JobStatus>,
+    Vec<(String, Vec<u8>)>,
+) {
     let _threads = threads::real();
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, staging_dir, working, output) =
@@ -928,9 +975,12 @@ async fn stored_run(
         hold.open();
         assert_eq!(hand_on_all_parked(&mut pipeline).await, 2);
         assert_eq!(pipeline.parked_results_tried_for_test(), 2);
+        // The plain file's rest, then the set's: the set ends last, so a
+        // run it starts writes while `settle` hears it, not while an
+        // article waits on output's room.
+        rest.extend((next..articles(&posts, 0)).map(|ordinal| (0, ordinal)));
         rest.extend((2..articles(&posts, 1)).map(|ordinal| (1, ordinal)));
         rest.extend((1..articles(&posts, 2)).map(|ordinal| (2, ordinal)));
-        rest.extend((next..articles(&posts, 0)).map(|ordinal| (0, ordinal)));
     } else {
         for index in 0..posts.len() as u32 {
             rest.extend((0..articles(&posts, index)).map(|ordinal| (index, ordinal)));
@@ -949,10 +999,26 @@ async fn stored_run(
     no_budget_waits(&output);
     within_limit(&working);
     nothing_waits_counted(&pipeline, job_id);
+    let mut files: Vec<(String, Vec<u8>)> = std::fs::read_dir(&staging_dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| {
+            path.is_file()
+                && !path
+                    .file_name()
+                    .is_some_and(|name| name.to_string_lossy().starts_with('.'))
+        })
+        .map(|path| {
+            let name = path.file_name().unwrap().to_string_lossy().into_owned();
+            (name, read(&path))
+        })
+        .collect();
+    files.sort();
     let ended = (
         delivered,
         pipeline.graph_delivery(job_id),
         pipeline.graph_terminal_status(job_id),
+        files,
     );
     retire_pipeline_database(pipeline).await;
     ended
@@ -997,6 +1063,46 @@ async fn a_compressed_archives_volume_does_not_park_on_a_full_output() {
     drop(fill);
     hold.open();
     retire_pipeline_database(pipeline).await;
+}
+
+// A solid set's volume goes to the engine whole, which only keeps it: a
+// full output parks none of its results either.
+#[tokio::test]
+async fn a_solid_compressed_archives_volume_does_not_park_on_a_full_output() {
+    let _threads = threads::real();
+    let temp_dir = tempfile::tempdir().unwrap();
+    let job_id = JobId(92_963);
+    let (posts, _) = compressed_posts(true, 24);
+    let (mut pipeline, _, _, output) =
+        two_volume_job(&temp_dir, job_id, &posts, 16 * ARTICLE as u64).await;
+    let hold = pipeline.volume_writers.hold(&output);
+    let (_, fill) = fill_output(&mut pipeline, job_id, &posts, &output).await;
+    assert!(pipeline.landing_or_for_test(file(job_id, 1)).is_none());
+    for ordinal in 1..articles(&posts, 1) {
+        assert_eq!(
+            offer(&mut pipeline, job_id, &posts, 1, ordinal).await,
+            Some(true)
+        );
+    }
+    assert_eq!(pipeline.parked_download_results_for_test(), 0);
+    no_budget_waits(&output);
+    no_loop_waits(&output);
+    drop(fill);
+    hold.open();
+    retire_pipeline_database(pipeline).await;
+}
+
+// A mixed set streams its stored member to output in the step as a stored
+// set does: its volumes' results park for a full output, and once output
+// drains, the job ends as it does with no pressure: the same member, the
+// same delivery and status, the same files. This harness starts no run, so
+// the made member is left to the engines' mixed-set tests.
+#[tokio::test]
+async fn a_mixed_archives_volume_parks_for_a_full_output_and_ends_the_same() {
+    let pressed = stored_run(JobId(92_964), true, mixed_posts(26)).await;
+    let free = stored_run(JobId(92_965), false, mixed_posts(26)).await;
+    assert!(free.2.is_some());
+    assert_eq!(pressed, free);
 }
 
 // After each step of a stored set, output counts only what its writer was
