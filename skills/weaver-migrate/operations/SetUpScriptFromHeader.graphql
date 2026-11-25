@@ -2,7 +2,7 @@
 # that the script has no job for yet, filled from the header. Jobs arrive
 # ENABLED, blocking, for every category; a secret input is left out unless
 # another job of the script already links one. The header is not read again.
-# Refused when the header declares nothing. Needs the operator's yes.
+# SCRIPT_HEADER_INVALID when the header is unreadable or declares nothing. Needs the operator's yes.
 # Scope: ADMIN.
 # Variables: {"script": "VideoSort"}
 mutation SetUpScriptFromHeader($script: String!) {

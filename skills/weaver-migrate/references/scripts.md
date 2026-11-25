@@ -20,10 +20,10 @@ scripts directory; a **script job** wires it to one trigger with its inputs.
 ## Execution switch
 
 - `executionEnabled` is off on a new install. Off: scripts are listed, never
-  run, and test runs are refused (`post-processing script execution is
-  disabled`). Web label: **Run scripts**.
+  run, and test runs are refused (`CONFLICT`). Web label: **Run scripts**.
 - `strictSecurityRefusesExecution` true (`WEAVER_STRICT_SECURITY=1` on the
-  host): nothing runs and turning execution on is refused. Host setting; stop.
+  host): nothing runs, a test run is refused (`CONFLICT`) and turning execution
+  on is refused (`STRICT_SECURITY`). Host setting; stop.
 
 ## Triggers
 
@@ -206,6 +206,8 @@ Scheduler and feed scripts: no commands. A command not allowed logs
 - `setUpScriptFromHeader` reads the header once. Later header edits change no
   job; `headerDrift` true says the inputs no longer match. Report it; this
   skill does not reapply a header.
+- A header or manifest that cannot be read, or declares nothing:
+  `SCRIPT_HEADER_INVALID`. Wire the script with `CreateScriptJob` instead.
 
 ## Inputs and secrets
 
@@ -225,7 +227,8 @@ arguments a real run gets, built from a made-up download
 scratch folder under Weaver's data folder, removed afterwards. Inputs and
 secrets are real. Commands are listed in `commands`, never applied. Held to
 the job's timeout. A disabled job can be tested. Refused while execution is
-off.
+off (`CONFLICT`). Four already running: `SCRIPT_TEST_BUSY`; try again when
+one ends.
 
 `ScriptTestResult`: `running` false → done. `status`: `SUCCEEDED`, `SKIPPED`,
 `WARNING`, `FAILED`, `TIMED_OUT`, `CANCELLED`, `INTERRUPTED`.

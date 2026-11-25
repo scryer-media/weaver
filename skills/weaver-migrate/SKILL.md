@@ -111,7 +111,7 @@ Each file's leading comment gives its purpose and a variables example.
      `SetUpScriptFromHeader` with `{"script": "<name>"}`. The summary says
      the jobs arrive **enabled**. When `executionEnabled` is true, follow
      straight away with `UpdateScriptJob` setting `enabled: false`, unless the
-     operator wants them live.
+     operator wants them live. `SCRIPT_HEADER_INVALID`: use `CreateScriptJob`.
    - Otherwise: `CreateScriptJob` with `"enabled": false`.
 
 7. **Inputs and secrets.**
@@ -130,9 +130,11 @@ Each file's leading comment gives its purpose and a variables example.
 
 8. **Test run**, only after a yes on: "This executes `<script>` on the Weaver
    host, against a made-up download in a scratch folder, with the job's real
-   inputs and secrets." If `executionEnabled` is false, the test is refused:
-   turning it on needs its own yes naming `executionEnabled`, and makes every
-   enabled job live. Then `TestScriptJob` with `{"id": "<job id>"}`.
+   inputs and secrets." If `executionEnabled` is false, the test is refused
+   (`CONFLICT`): turning it on needs its own yes naming `executionEnabled`,
+   and makes every enabled job live (`STRICT_SECURITY` on that write: a host
+   setting; stop). Then `TestScriptJob` with `{"id": "<job id>"}`.
+   `SCRIPT_TEST_BUSY`: four tests are running; ask again later.
 
 9. **Report**: read `ScriptTestResult` with `{"id": "<test run id>"}` once,
    and again only when the operator asks. When `running` is false, report
