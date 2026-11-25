@@ -1,15 +1,18 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
-pub(super) use weaver_server_pipeline::pipeline::tests::engines::sfv::{crc, listing};
+pub(super) use weaver_server_pipeline::pipeline::tests::engines::sfv::{
+    assert_twin, assert_twin_but_text, crc, listing,
+};
 
 // SFV listings: a listing that agrees, one that names a
 // file the job does not carry, one that disagrees, one whose names differ
 // from the members' only in case, one that leaves a file unnamed, two that
-// contradict each other, and one naming a file the post lost.
+// contradict each other, and one naming a file the post lost. A listing
+// never claims damage: one that disagrees, or names a file the post lost,
+// leaves the job as the same posts without it.
 
-use super::harness::{ARTICLE, Claim, Outcome, Post, Scenario, assert_fetched_once, payload, run};
-use crate::history::HistoryFailureKind;
+use super::harness::{ARTICLE, Claim, Post, Scenario, assert_fetched_once, payload, run};
 use crate::jobs::model::JobStatus;
 
 fn claims_all(claims: &std::collections::BTreeMap<String, Claim>, expected: Claim) -> bool {
@@ -51,66 +54,63 @@ async fn an_sfv_entry_naming_no_member_never_fails_the_job() {
     assert!(claims_all(&graph.claims, Claim::Complete));
 }
 
-// A listing that disagrees with the only payload file fails the job: the
-// graph names the listing as a recovery set that could not repair it, and
-// the file it found damaged, as it does for a PAR2 set short of blocks.
-fn assert_failed_as_repair(graph: &Outcome, member: &str, listed_in: &str) {
-    assert_fetched_once(graph);
-    let graph_failure = graph.failure.as_deref().unwrap_or_default();
-    assert!(
-        graph_failure.starts_with(&format!(
-            "SFV recovery failed for 1 set(s): {listed_in} ({member}): "
-        )),
-        "{graph_failure:?}"
-    );
-    assert_eq!(graph.failure_kind, Some(HistoryFailureKind::Repair));
-}
-
-#[tokio::test]
-async fn an_sfv_mismatch_ends_partial_as_repair() {
+// The posts of the mismatch case, with the listing or without it.
+fn mismatch(listed: bool) -> Scenario {
     let lantern = payload(3 * ARTICLE, 24);
     let beacon = payload(2 * ARTICLE, 25);
-    let scenario = Scenario::new(vec![
+    let mut posts = vec![
         Post::plain("lantern.mkv", lantern.clone()),
         Post::plain("beacon.mkv", beacon.clone()),
-        listing(
+    ];
+    if listed {
+        posts.push(listing(
             "lantern.sfv",
             &[
                 ("lantern.mkv", crc(&lantern)),
                 ("beacon.mkv", crc(&beacon) ^ 0xffff_ffff),
             ],
-        ),
-    ]);
-    let graph = run(&scenario).await;
+        ));
+    }
+    Scenario::new(posts)
+}
+
+// A listing that disagrees with a file whose bytes arrived as posted does
+// not mark it: both files are delivered as posted and the job completes,
+// as the same posts without the listing do.
+#[tokio::test]
+async fn an_sfv_mismatch_leaves_the_job_as_without_the_listing() {
+    let graph = run(&mismatch(true)).await;
     assert!(graph.refetched().is_empty());
-    // The file the listing agrees with is delivered whole beside the one it
-    // does not, so the job ends Partial, its failure the repair's.
     assert_eq!(
         graph.status,
-        Some(JobStatus::Partial),
+        Some(JobStatus::Complete),
         "{:?}",
         graph.failure
     );
-    assert_eq!(graph.failure_kind, Some(HistoryFailureKind::Repair));
-    // Both files are delivered as posted; the namespace marks the one the
-    // listing found bad.
+    assert_eq!(graph.failure_kind, None);
     assert_eq!(graph.files.len(), 3, "{:?}", graph.files.keys());
     let view = graph.graph();
     assert_eq!(view.claims["lantern.mkv"], Claim::Complete);
-    assert_eq!(view.claims["beacon.mkv"], Claim::Damaged);
+    assert_eq!(view.claims["beacon.mkv"], Claim::Complete);
+    assert_twin(&graph, &run(&mismatch(false)).await);
 }
 
-// The listing disagrees with the member, so only an entry bound to it across
-// the case difference can fail the job.
+// An entry naming a member in another case binds it: the listing
+// disagrees with the member, and the job still ends as the post without it.
 #[tokio::test]
 async fn an_sfv_naming_a_member_in_another_case_binds_and_verifies_it() {
     let lantern = payload(3 * ARTICLE, 26);
-    let scenario = Scenario::new(vec![
-        Post::plain("lantern.bin", lantern.clone()),
-        listing("lantern.sfv", &[("LANTERN.BIN", crc(&lantern) ^ 1)]),
-    ]);
-    let graph = run(&scenario).await;
-    assert_failed_as_repair(&graph, "lantern.bin", "lantern.sfv");
+    let posts = |listed: bool| {
+        let mut posts = vec![Post::plain("lantern.bin", lantern.clone())];
+        if listed {
+            posts.push(listing("lantern.sfv", &[("LANTERN.BIN", crc(&lantern) ^ 1)]));
+        }
+        Scenario::new(posts)
+    };
+    let graph = run(&posts(true)).await;
+    assert_fetched_once(&graph);
+    assert!(graph.completed(), "{:?}", graph.failure);
+    assert_twin(&graph, &run(&posts(false)).await);
 }
 
 // A payload file no listing names is left as posted, and the job completes.
@@ -153,30 +153,34 @@ async fn listings_that_disagree_about_a_name_fail_neither_way() {
 }
 
 // A file the listing names whose every article is lost is the one file not
-// delivered whole: the job ends Partial, the namespace marking that file.
+// delivered whole: the job ends Partial, as the same posts without the
+// listing do. The listing claims no damage of its own.
 #[tokio::test]
 async fn a_listed_file_whose_articles_are_all_lost_ends_partial_marking_it() {
     let lantern = payload(2 * ARTICLE, 35);
     let beacon = payload(2 * ARTICLE, 36);
-    let scenario = Scenario::new(vec![
-        Post::plain("lantern.mkv", lantern.clone()),
-        Post::plain("beacon.mkv", beacon.clone()),
-        listing(
-            "lantern.sfv",
-            &[("lantern.mkv", crc(&lantern)), ("beacon.mkv", crc(&beacon))],
-        ),
-    ])
-    .lost(1, 0)
-    .lost(1, 1);
-    let graph = run(&scenario).await;
+    let posts = |listed: bool| {
+        let mut posts = vec![
+            Post::plain("lantern.mkv", lantern.clone()),
+            Post::plain("beacon.mkv", beacon.clone()),
+        ];
+        if listed {
+            posts.push(listing(
+                "lantern.sfv",
+                &[("lantern.mkv", crc(&lantern)), ("beacon.mkv", crc(&beacon))],
+            ));
+        }
+        Scenario::new(posts).lost(1, 0).lost(1, 1)
+    };
+    let graph = run(&posts(true)).await;
     assert_eq!(
         graph.status,
         Some(JobStatus::Partial),
         "{:?}",
         graph.failure
     );
-    assert_eq!(graph.failure_kind, Some(HistoryFailureKind::Repair));
     let view = graph.graph();
     assert_eq!(view.claims["lantern.mkv"], Claim::Complete);
-    assert_eq!(view.claims["beacon.mkv"], Claim::Damaged);
+    assert_ne!(view.claims["beacon.mkv"], Claim::Complete);
+    assert_twin(&graph, &run(&posts(false)).await);
 }

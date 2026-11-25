@@ -409,19 +409,27 @@ async fn a_set_too_small_to_save_the_gate_case_is_given_up_as_before() {
 // with: the feed does not count it as recovery. Every data file loses its
 // second article; with no recovery the line is the 85% the names draw, and
 // the run asks the articles it asked before the graph's bindings were
-// counted, and fails in the same words. Counted as recovery, the listing's
-// 250 bytes drew the line at 99.9%, and the post was given up at its first
-// loss.
+// counted, and fails in the feed's own words, as the same posts without
+// the listing do: a listing never claims damage. Counted as recovery, the
+// listing's 250 bytes drew the line at 99.9%, and the post was given up at
+// its first loss.
 #[tokio::test]
 async fn a_checksum_listing_is_not_counted_as_recovery() {
     let graph = run(&losing(Scenario::new(listed()).framed(ARTICLE), 1)).await;
     let case = summary(&graph);
     assert_eq!(
         graph.failure.as_deref(),
-        Some(
-            "SFV recovery failed for 1 set(s): lantern.sfv (lantern00.mkv, lantern01.mkv, lantern02.mkv, lantern03.mkv, lantern04.mkv, lantern05.mkv, lantern06.mkv, lantern07.mkv, lantern08.mkv, lantern09.mkv): not repairable: 10 damaged slices, only 0 recovery blocks reachable"
-        ),
+        Some("health probe: 6 of 10 samples missing; health 38.4% below critical 85.0%"),
         "{case}"
+    );
+    let mut bare = listed();
+    bare.pop();
+    let twin = run(&losing(Scenario::new(bare).framed(ARTICLE), 1)).await;
+    assert_eq!(
+        (graph.status.clone(), graph.failure.clone(), graph.failure_kind),
+        (twin.status.clone(), twin.failure.clone(), twin.failure_kind),
+        "{case} | {}",
+        summary(&twin)
     );
     assert_eq!(
         asked(&graph),

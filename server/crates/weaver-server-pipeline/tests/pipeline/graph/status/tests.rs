@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
-use crate::history::nzbget_state::HistoryNzbgetStateQueries;
 use crate::pipeline::extraction::ExtractionFailure;
 use weaver_graph::recovery::RepairOutcome;
 use weaver_graph::slots::AskerId;
@@ -11,7 +10,6 @@ use super::claims::{Claim, ClaimedMember, Delivered, Unarrived, refused};
 use super::{
     Delivery, RecoverySummary, RepairSlots, RootJob, SetSummary, Step, drive, failure, shown_status,
 };
-use crate::history::HistoryFailureKind;
 use crate::jobs::model::{
     DownloadState, JobStatus, PostState, RunState, runtime_lanes_from_status_snapshot,
 };
@@ -1231,39 +1229,27 @@ async fn a_job_with_a_listing_moves_to_complete() {
     assert_eq!((record.failed_bytes, record.health), (0, 1000));
 }
 
-// The listing's own object rules for a graph job, and its failure reads as a
-// recovery failure does today, at the repair stage.
+// A listing that disagrees with the member claims no damage: the graph job
+// moves to complete as it does under a listing that agrees, with nothing
+// counted failed.
 #[tokio::test]
-async fn a_disagreeing_listing_fails_a_graph_job_through_its_object() {
+async fn a_disagreeing_listing_moves_a_graph_job_to_complete() {
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
-    let mut events = pipeline.event_tx.subscribe();
     let job_id = JobId(91_208);
     job_with_a_listing(&mut pipeline, job_id, false).await;
-    if pipeline.jobs.contains_key(&job_id) {
+    // The last article may already have advanced the job to its move.
+    if !pipeline.inflight_moves.contains(&job_id) {
         settle_download_state(&mut pipeline, job_id);
         pipeline.check_job_completion(job_id).await;
     }
 
-    assert_eq!(
-        job_status_for_assert(&pipeline, job_id),
-        Some(JobStatus::Failed {
-            error: "SFV recovery failed for 1 set(s): ember.field.sfv (ember.field.bin): \
-                    not repairable: \
-                    1 damaged slices, only 0 recovery blocks reachable"
-                .to_string()
-        })
-    );
-    crate::pipeline::tests::settle_failed_releases(&mut pipeline).await;
-    while !matches!(
-        events.recv().await.expect("pipeline event channel closed"),
-        PipelineEvent::JobFailed { job_id: failed, .. } if failed == job_id
-    ) {}
-    let states = pipeline.db.nzbget_history_states(&[job_id.0]).unwrap();
-    assert_eq!(
-        states[&job_id.0].failure_kind,
-        Some(HistoryFailureKind::Repair)
-    );
+    if let Some(JobStatus::Failed { error }) = job_status_for_assert(&pipeline, job_id) {
+        panic!("the graph job failed: {error}");
+    }
+    assert!(pipeline.inflight_moves.contains(&job_id));
+    let record = &pipeline.terminal_reconciliations[&job_id];
+    assert_eq!((record.failed_bytes, record.health), (0, 1000));
 }
 
 #[tokio::test]

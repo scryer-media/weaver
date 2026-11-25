@@ -390,7 +390,16 @@ pub fn delivery_of(job: &GraphJob, posted: Posted<'_>) -> (Delivery, Option<Fail
         // is short there is short because that recovery could not be used.
         // Undecided recovery names still count as possible recovery, but
         // an object that identified an archive has resolved that hint.
-        let posted_recovery = (0..posted.files).any(|index| !payload(MemberId(index)));
+        // A volume of a set that does not rebuild, as a listing is, is no
+        // recovery: it stands aside, and the post carried none for it.
+        let checks_only = |member: MemberId| {
+            job.tree()
+                .child_of(NodeId::ROOT, member)
+                .is_some_and(|(owner, _)| !job.tree().rebuilds(owner))
+        };
+        let posted_recovery = (0..posted.files)
+            .map(MemberId)
+            .any(|member| !payload(member) && !checks_only(member));
         let unruled = |node: NodeId| {
             let carried = summary.sets.iter().any(|set| set.namespace == node)
                 || (node == NodeId::ROOT && posted_recovery);

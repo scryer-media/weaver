@@ -3,12 +3,11 @@
 
 mod facts;
 
-use weaver_graph::recovery::RepairOutcome;
-use weaver_graph::{ObjectId, Provenance, Recovery, SliceVerdict};
+use weaver_graph::{ObjectId, Recovery};
 
 use super::*;
 use crate::grid::crc32;
-use crate::testing::{Job, payload, segments};
+use crate::testing::{Job, payload};
 
 const OWN: ObjectId = ObjectId(9);
 
@@ -54,274 +53,27 @@ fn entries_are_keyed_by_lower_cased_basename() {
     );
 }
 
+// A listing stands aside: whatever it names, it covers nothing, so it is
+// never fed, never rules and never vouches.
 #[test]
-fn members_whose_names_differ_only_by_case_bind_to_nothing() {
+fn a_listing_covers_nothing_it_names() {
     let one = payload(6, 2000);
     let mut job = job(&sfv_text(&[("one.bin", crc32(&one))]));
-    let lower = job.member("one.bin", &one);
-    let upper = job.member("ONE.bin", &one);
+    let member = job.member("one.bin", &one);
     bind(&mut job);
-    assert!(!job.object.covers(lower) && !job.object.covers(upper));
-}
-
-#[test]
-fn changed_accepted_bytes_invalidate_sfv_ruling() {
-    let original = payload(13, 5000);
-    let mut job = job(&sfv_text(&[("one.bin", crc32(&original))]));
-    let member = job.member("one.bin", &original);
-    bind(&mut job);
-    let unchanged = segments(0, &original, 700, 700, true);
-    job.object.feed(member, &unchanged);
-    assert_eq!(
-        job.object
-            .repair(&mut job.store, weaver_graph::Budget::default()),
-        RepairOutcome::Clean
-    );
-    job.object.feed(member, &unchanged);
-    assert_eq!(
-        job.object.outcome(),
-        Some(RepairOutcome::Clean),
-        "proven unchanged replay retains the ruling"
-    );
-    job.object
-        .feed(weaver_graph::MemberId(u32::MAX), &unchanged);
-    assert_eq!(
-        job.object.outcome(),
-        Some(RepairOutcome::Clean),
-        "unbound input cannot invalidate this listing"
-    );
-    let mut replacement = original;
-    replacement[2000] ^= 0x5a;
-    job.store.members.insert(member, replacement.clone());
-    job.object
-        .feed(member, &segments(0, &replacement, 700, 700, true));
-    assert_eq!(
-        job.object.outcome(),
-        None,
-        "changed accepted bytes must become due again"
-    );
-    let mut verdicts = Vec::new();
-    job.object.verdicts(member, &mut verdicts);
-    assert_eq!(verdicts, [SliceVerdict::Damaged]);
-    assert_eq!(
-        job.object
-            .repair(&mut job.store, weaver_graph::Budget::default()),
-        RepairOutcome::Impossible {
-            damaged: 1,
-            reachable: 0
-        }
-    );
-}
-
-#[test]
-fn acknowledged_sfv_proof_retains_its_ruling() {
-    let original = payload(14, 5000);
-    let mut job = job(&sfv_text(&[("one.bin", crc32(&original))]));
-    let member = job.member("one.bin", &original);
-    bind(&mut job);
-    job.object
-        .feed(member, &segments(0, &original, 700, 700, false));
-    assert_eq!(
-        job.object
-            .repair(&mut job.store, weaver_graph::Budget::default()),
-        RepairOutcome::Clean
-    );
-    assert!(
-        job.store.reads > 0,
-        "readback establishes the unverified source proof"
-    );
-    job.object
-        .feed_proven(member, &segments(0, &original, 700, 700, true));
-    assert_eq!(job.object.outcome(), Some(RepairOutcome::Clean));
-}
-
-#[test]
-fn damaged_source_invalidates_restored_sfv_proof() {
-    let original = payload(15, 5000);
-    let mut job = job(&sfv_text(&[("one.bin", crc32(&original))]));
-    let member = job.member("one.bin", &original);
-    bind(&mut job);
-    job.object
-        .feed(member, &segments(0, &original, 700, 700, true));
-    assert_eq!(
-        job.object
-            .repair(&mut job.store, weaver_graph::Budget::default()),
-        RepairOutcome::Clean
-    );
-    let mut restored: Sfv = job.object.facts().read(Kind::Sfv).unwrap();
-    assert_eq!(restored.outcome(), Some(RepairOutcome::Clean));
-    restored.feed(member, &segments(0, &original, 700, 700, false));
-    assert_eq!(restored.outcome(), None);
-    job.store
-        .holes
-        .insert(member, vec![ByteRange::new(0, original.len() as u64)]);
-    assert_eq!(
-        restored.repair(&mut job.store, weaver_graph::Budget::default()),
-        RepairOutcome::Impossible {
-            damaged: 1,
-            reachable: 0
-        }
-    );
-}
-
-#[test]
-fn changed_complete_length_invalidates_sfv_ruling() {
-    let original = payload(16, 5000);
-    let mut job = job(&sfv_text(&[("one.bin", crc32(&original))]));
-    let member = job.member("one.bin", &original);
-    bind(&mut job);
-    job.object
-        .feed(member, &segments(0, &original, 700, 700, true));
-    assert_eq!(
-        job.object
-            .repair(&mut job.store, weaver_graph::Budget::default()),
-        RepairOutcome::Clean
-    );
-    job.store.members.get_mut(&member).unwrap().push(1);
-    let record = job.namespace.get_mut(member).unwrap();
-    record.length = Some(original.len() as u64 + 1);
-    record
-        .coverage
-        .write(ByteRange::at(original.len() as u64, 1), Provenance::Fresh);
-    bind(&mut job);
+    assert!(!job.object.covers(member));
+    assert!(!job.object.covers_some());
+    assert!(!job.object.rebuilds());
     assert_eq!(job.object.outcome(), None);
-    assert_eq!(
-        job.object
-            .repair(&mut job.store, weaver_graph::Budget::default()),
-        RepairOutcome::Impossible {
-            damaged: 1,
-            reachable: 0
-        }
-    );
 }
 
 #[test]
-fn sfv_verifies_fed_members_without_reading_them() {
-    let one = payload(1, 5000);
-    let two = payload(2, 3000);
-    let text = sfv_text(&[("one.bin", crc32(&one)), ("two.bin", crc32(&two))]);
-    let mut job = job(&text);
-    let first = job.member("one.bin", &one);
-    let second = job.member("two.bin", &two);
-    bind(&mut job);
-    assert!(job.object.covers(first) && job.object.covers(second));
-    job.object.feed(first, &segments(0, &one, 700, 700, true));
-    job.object.feed(second, &segments(0, &two, 700, 700, true));
-    let mut verdicts = Vec::new();
-    job.object.verdicts(first, &mut verdicts);
-    assert_eq!(verdicts, vec![SliceVerdict::Intact]);
-    assert_eq!(
-        job.object
-            .repair(&mut job.store, weaver_graph::Budget::default()),
-        RepairOutcome::Clean
-    );
-    assert_eq!(job.store.reads, 0);
-}
-
-// The text's pieces arrive last first: each waits for the text to reach
-// it, and every entry binds.
-#[test]
-fn sfv_text_delivered_out_of_order_binds_every_entry() {
+fn sfv_text_delivered_out_of_order_is_read_whole() {
     let one = payload(7, 2000);
     let two = payload(8, 3000);
     let text = sfv_text(&[("one.bin", crc32(&one)), ("two.bin", crc32(&two))]);
     let mut job = Job::new(Sfv::new(OWN), OWN);
     job.volume("check.sfv", &text, 7, true);
-    let first = job.member("one.bin", &one);
-    let second = job.member("two.bin", &two);
-    bind(&mut job);
-    assert!(job.object.covers(first) && job.object.covers(second));
     assert!(job.object.text == text);
-}
-
-#[test]
-fn sfv_reads_back_what_the_feed_missed() {
-    let one = payload(3, 9000);
-    let mut job = job(&sfv_text(&[("one.bin", crc32(&one))]));
-    let member = job.member("one.bin", &one);
-    bind(&mut job);
-    assert_eq!(
-        job.object
-            .repair(&mut job.store, weaver_graph::Budget::default()),
-        RepairOutcome::Clean
-    );
-    assert!(job.store.reads > 0);
-    assert!(job.store.members[&member] == one);
-}
-
-#[test]
-fn sfv_with_unknown_names_passes() {
-    let one = payload(4, 2000);
-    let text = sfv_text(&[
-        ("one.bin", crc32(&one)),
-        ("absent.bin", 0x1234_5678),
-        ("also-absent.bin", 0),
-    ]);
-    let mut job = job(&text);
-    let member = job.member("ONE.BIN", &one);
-    bind(&mut job);
-    assert!(job.object.covers(member));
-    assert_eq!(
-        job.object
-            .repair(&mut job.store, weaver_graph::Budget::default()),
-        RepairOutcome::Clean
-    );
-}
-
-#[test]
-fn sfv_reports_a_damaged_member_and_never_repairs() {
-    let one = payload(5, 2000);
-    let mut job = job(&sfv_text(&[("one.bin", crc32(&one))]));
-    let mut damaged = one.clone();
-    damaged[100] ^= 0xFF;
-    let member = job.member("one.bin", &damaged);
-    job.arrive(member, 0, &damaged[..700], Provenance::Damaged);
-    bind(&mut job);
-    job.object
-        .feed(member, &segments(0, &damaged, 700, 700, true));
-    assert_eq!(
-        job.object
-            .repair(&mut job.store, weaver_graph::Budget::default()),
-        RepairOutcome::Impossible {
-            damaged: 1,
-            reachable: 0
-        }
-    );
-    assert_eq!(job.store.writes, 0);
-}
-
-// A member past READ_CHUNK, its segments unproven, is read back in
-// several pieces whose CRC32s combine; one changed byte in its last piece
-// is found.
-#[test]
-fn sfv_readback_of_a_member_past_one_read_chunk() {
-    let original = payload(141, 2 * READ_CHUNK as usize + 4097);
-    let mut job = job(&sfv_text(&[("one.bin", crc32(&original))]));
-    let member = job.member("one.bin", &original);
-    bind(&mut job);
-    job.object
-        .feed(member, &segments(0, &original, 1 << 16, 1 << 16, false));
-    assert_eq!(
-        job.object
-            .repair(&mut job.store, weaver_graph::Budget::default()),
-        RepairOutcome::Clean
-    );
-    assert!(job.store.reads >= 3, "{} reads", job.store.reads);
-
-    let mut job = self::job(&sfv_text(&[("one.bin", crc32(&original))]));
-    let mut changed = original;
-    let last = changed.len() - 9;
-    changed[last] ^= 0x10;
-    let member = job.member("one.bin", &changed);
-    bind(&mut job);
-    job.object
-        .feed(member, &segments(0, &changed, 1 << 16, 1 << 16, false));
-    assert_eq!(
-        job.object
-            .repair(&mut job.store, weaver_graph::Budget::default()),
-        RepairOutcome::Impossible {
-            damaged: 1,
-            reachable: 0
-        }
-    );
+    assert_eq!(entries(&job.object.text).len(), 2);
 }
