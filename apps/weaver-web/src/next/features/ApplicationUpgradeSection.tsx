@@ -1,7 +1,10 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
-import { useApplicationUpgrade, RunProgress } from "@/next/features/updates/use-application-upgrade";
+import {
+  useApplicationUpgrade,
+  RunProgress,
+} from "@/next/features/updates/use-application-upgrade";
 import { upgradeFailureKey } from "@/next/features/updates/application-upgrade";
 import { useTranslate } from "@/lib/context/translate-context";
 import { SectionHeader } from "../components/chrome";
@@ -10,7 +13,8 @@ import { PrimaryButton } from "../components/controls";
 /** The in-application upgrade on the System Info page, drawn in the page's rows. */
 export function ApplicationUpgradeSection() {
   const t = useTranslate();
-  const { status, installable, run, install, starting, startError } = useApplicationUpgrade();
+  const { status, installable, run, install, starting, startError } =
+    useApplicationUpgrade();
   if (!status) {
     return null;
   }
@@ -19,14 +23,24 @@ export function ApplicationUpgradeSection() {
   return (
     <>
       <SectionHeader label={t("applicationUpgrade.title")} />
-      <div className={`${row} flex flex-wrap items-center gap-x-6 gap-y-2 text-wv-muted`}>
+      <div
+        className={`${row} flex flex-wrap items-center gap-x-6 gap-y-2 text-wv-muted`}
+      >
         <span className="min-w-0 flex-[1_1_260px]">
           {status.updateAvailable && status.updateVersion
-            ? t("applicationUpgrade.available", { version: status.updateVersion })
-            : t("applicationUpgrade.upToDate", { version: status.currentVersion })}
+            ? t("applicationUpgrade.available", {
+                version: status.updateVersion,
+              })
+            : t("applicationUpgrade.upToDate", {
+                version: status.currentVersion,
+              })}
         </span>
         {installable ? (
-          <PrimaryButton icon="update" disabled={starting} onClick={() => void install()}>
+          <PrimaryButton
+            icon="update"
+            disabled={starting}
+            onClick={() => void install()}
+          >
             {t("applicationUpgrade.install", { version: installable.version })}
           </PrimaryButton>
         ) : null}
@@ -34,17 +48,25 @@ export function ApplicationUpgradeSection() {
 
       {status.updateAvailable && !status.eligible ? (
         <div className={`${row} text-wv-muted`}>
-          {t("applicationUpgrade.notEligible", { reason: status.eligibilityReason })}
+          {t("applicationUpgrade.notEligible", {
+            reason: status.eligibilityReason,
+          })}
         </div>
       ) : null}
 
       {status.activeRun ? (
-        <RunProgress run={status.activeRun} className={`${row} text-wv-muted`} />
+        <RunProgress
+          run={status.activeRun}
+          className={`${row} text-wv-muted`}
+        />
       ) : null}
 
       {!status.activeRun && run?.status === "FAILED" ? (
         <div role="alert" className={`${row} text-wv-error`}>
-          {t(upgradeFailureKey(run.error), { version: run.targetVersion, error: run.error ?? "" })}
+          {t(upgradeFailureKey(run.error), {
+            version: run.targetVersion,
+            error: run.error ?? "",
+          })}
         </div>
       ) : null}
 

@@ -10,7 +10,11 @@ import {
 } from "@/graphql/queries";
 import { useGraphqlConnectionState } from "@/graphql/client";
 import { useReconnectPolling } from "@/lib/hooks/use-reconnect-polling";
-import { isRollupMetricsRange, type MetricsHistoryRange, type MetricsSnapshot } from "@/lib/metrics";
+import {
+  isRollupMetricsRange,
+  type MetricsHistoryRange,
+  type MetricsSnapshot,
+} from "@/lib/metrics";
 import type { DownloadBlockState } from "@/lib/context/live-data-context";
 
 /**
@@ -78,8 +82,9 @@ export function useMetricsSeries(range: MetricsHistoryRange): MetricsSeries {
     const find = (metric: string) => {
       const series = history?.series ?? [];
       return (
-        series.find((entry) => entry.metric === metric && entry.variant === preferred)
-        ?? series.find((entry) => entry.metric === metric)
+        series.find(
+          (entry) => entry.metric === metric && entry.variant === preferred,
+        ) ?? series.find((entry) => entry.metric === metric)
       );
     };
 
@@ -89,7 +94,10 @@ export function useMetricsSeries(range: MetricsHistoryRange): MetricsSeries {
       if (values.length >= timestamps.length) {
         return values.slice(0, timestamps.length);
       }
-      return [...values, ...Array.from({ length: timestamps.length - values.length }, () => 0)];
+      return [
+        ...values,
+        ...Array.from({ length: timestamps.length - values.length }, () => 0),
+      ];
     };
 
     const gauge = (metric: string): number[] => {
@@ -125,7 +133,9 @@ interface MetricsPageResponse {
  * The snapshot a screen holds, for the parts of it that show a figure from
  * it: a new sample redraws those, not the screen around them.
  */
-export const MetricsSnapshotContext = createContext<MetricsSnapshot | null>(null);
+export const MetricsSnapshotContext = createContext<MetricsSnapshot | null>(
+  null,
+);
 
 /** The full live metrics snapshot — the stat strip reads every field of it. */
 export function useMetricsSnapshot(): MetricsSnapshot | null {
@@ -133,9 +143,10 @@ export function useMetricsSnapshot(): MetricsSnapshot | null {
   const [{ data: queryData }, reexecute] = useQuery<MetricsPageResponse>({
     query: METRICS_PAGE_QUERY,
   });
-  const [{ data: subscriptionData, error: subscriptionError }] = useSubscription<{
-    systemMetricsUpdates: MetricsPageResponse;
-  }>({ query: METRICS_PAGE_SUBSCRIPTION });
+  const [{ data: subscriptionData, error: subscriptionError }] =
+    useSubscription<{
+      systemMetricsUpdates: MetricsPageResponse;
+    }>({ query: METRICS_PAGE_SUBSCRIPTION });
 
   const [polled, setPolled] = useState<MetricsPageResponse>();
   // Whether a polled answer is held. A live sample clears one only when there
@@ -168,11 +179,11 @@ export function useMetricsSnapshot(): MetricsSnapshot | null {
   }, [reexecute, subscriptionError]);
 
   const snapshot =
-    polled
-    ?? (connection.status === "connected" && !subscriptionError
+    polled ??
+    (connection.status === "connected" && !subscriptionError
       ? subscriptionData?.systemMetricsUpdates
-      : undefined)
-    ?? queryData;
+      : undefined) ??
+    queryData;
 
   return snapshot?.metrics ?? null;
 }

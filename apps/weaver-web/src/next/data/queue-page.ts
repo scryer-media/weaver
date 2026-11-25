@@ -104,13 +104,18 @@ export function queueSelection({
   const states = tabStates(tab);
   if (states) selection.states = states;
   if (facets.size > 0) {
-    selection.categories = [...facets].map((key) => (key === UNCATEGORISED ? "" : key));
+    selection.categories = [...facets].map((key) =>
+      key === UNCATEGORISED ? "" : key,
+    );
   }
   if (tag !== null) selection.tag = tag;
   return selection;
 }
 
-const SORT_FIELDS: Record<QueueSort, { sortField: string; sortDirection: string } | null> = {
+const SORT_FIELDS: Record<
+  QueueSort,
+  { sortField: string; sortDirection: string } | null
+> = {
   // Queue order is priority order, and the order every time left counts in.
   priority: null,
   eta: null,
@@ -144,8 +149,15 @@ export interface QueueStateCount {
  * Jobs per section across every page, from the daemon's counts taken before
  * the tab applies: a section's header counts the queue, not the page.
  */
-export function groupCounts(stateCounts: readonly QueueStateCount[]): Record<DownloadGroup, number> {
-  const counts: Record<DownloadGroup, number> = { active: 0, paused: 0, queued: 0, attention: 0 };
+export function groupCounts(
+  stateCounts: readonly QueueStateCount[],
+): Record<DownloadGroup, number> {
+  const counts: Record<DownloadGroup, number> = {
+    active: 0,
+    paused: 0,
+    queued: 0,
+    attention: 0,
+  };
   for (const { state, count } of stateCounts) {
     counts[downloadGroup(state)] += count;
   }
@@ -153,8 +165,16 @@ export function groupCounts(stateCounts: readonly QueueStateCount[]): Record<Dow
 }
 
 /** Jobs per tab, All included, from the daemon's counts taken before the tab applies. */
-export function tabCounts(stateCounts: readonly QueueStateCount[]): Record<QueueTab | "all", number> {
-  const counts: Record<QueueTab | "all", number> = { all: 0, downloading: 0, seeding: 0, queued: 0, paused: 0 };
+export function tabCounts(
+  stateCounts: readonly QueueStateCount[],
+): Record<QueueTab | "all", number> {
+  const counts: Record<QueueTab | "all", number> = {
+    all: 0,
+    downloading: 0,
+    seeding: 0,
+    queued: 0,
+    paused: 0,
+  };
   for (const { state, count } of stateCounts) {
     counts[queueTab(state)] += count;
     counts.all += count;
@@ -201,7 +221,10 @@ export function etaById(
   for (const { id, bytesThrough } of etaThrough) {
     const held = disk.byId.get(id);
     if (held && held.rate > 0) {
-      estimates.set(id, format(bytesThrough + held.waiting, Math.max(held.rate, speed)));
+      estimates.set(
+        id,
+        format(bytesThrough + held.waiting, Math.max(held.rate, speed)),
+      );
     } else if (fallback > 0) {
       estimates.set(id, format(bytesThrough, fallback));
     }
@@ -219,7 +242,11 @@ export function diskPace(
     status: string;
     diskWrite?: { volume: string; slow: boolean } | null;
   }[],
-  volumes: readonly { label: string; writeRateBytesPerSec: number; waitingBytes: number }[],
+  volumes: readonly {
+    label: string;
+    writeRateBytesPerSec: number;
+    waitingBytes: number;
+  }[],
 ): DiskPace {
   if (volumes.length === 0) return NO_DISK_PACE;
   const byId = new Map<number, { rate: number; waiting: number }>();
@@ -241,8 +268,12 @@ export function diskPace(
 const FETCHING_STATES = new Set(["DOWNLOADING", "FETCHING_REPAIR_DATA"]);
 
 /** Whether no job in the queue is fetching bytes, from the daemon's counts. */
-export function nothingDownloading(stateCounts: readonly QueueStateCount[]): boolean {
-  return !stateCounts.some(({ state, count }) => FETCHING_STATES.has(state) && count > 0);
+export function nothingDownloading(
+  stateCounts: readonly QueueStateCount[],
+): boolean {
+  return !stateCounts.some(
+    ({ state, count }) => FETCHING_STATES.has(state) && count > 0,
+  );
 }
 
 /**
@@ -250,11 +281,21 @@ export function nothingDownloading(stateCounts: readonly QueueStateCount[]): boo
  * the slowest measured rate among such disks, 0 when there is none.
  */
 export function slowDiskRate(
-  volumes: readonly { slow: boolean; writeRateBytesPerSec: number; waitingBytes: number }[],
+  volumes: readonly {
+    slow: boolean;
+    writeRateBytesPerSec: number;
+    waitingBytes: number;
+  }[],
 ): number {
   let slowest = 0;
   for (const { slow, writeRateBytesPerSec: rate, waitingBytes } of volumes) {
-    if (slow && waitingBytes > 0 && rate > 0 && (slowest === 0 || rate < slowest)) slowest = rate;
+    if (
+      slow &&
+      waitingBytes > 0 &&
+      rate > 0 &&
+      (slowest === 0 || rate < slowest)
+    )
+      slowest = rate;
   }
   return slowest;
 }
@@ -273,9 +314,9 @@ export interface QueueEventSummary {
 export function departedId(event: QueueEventSummary): number | null {
   if (event.itemId == null) return null;
   const gone =
-    event.kind === "ITEM_COMPLETED"
-    || event.kind === "ITEM_REMOVED"
-    || (event.kind === "ITEM_STATE_CHANGED" && event.state === "FAILED");
+    event.kind === "ITEM_COMPLETED" ||
+    event.kind === "ITEM_REMOVED" ||
+    (event.kind === "ITEM_STATE_CHANGED" && event.state === "FAILED");
   return gone ? event.itemId : null;
 }
 
@@ -315,10 +356,10 @@ export function batchTarget(
 ): QueueBatchTarget {
   if (!allMatching) return { ids: [...picked] };
   const unfiltered =
-    selection.search === undefined
-    && selection.states === undefined
-    && selection.categories === undefined
-    && selection.tag === undefined;
+    selection.search === undefined &&
+    selection.states === undefined &&
+    selection.categories === undefined &&
+    selection.tag === undefined;
   return {
     selection: unfiltered ? { ...selection, all: true } : selection,
     expectedMatched,
@@ -333,7 +374,9 @@ interface GraphqlErrorLike {
  * The count the daemon matches now, when it refused a selection batch
  * because the queue moved since the operator confirmed; otherwise null.
  */
-export function conflictCount(error: GraphqlErrorLike | undefined): number | null {
+export function conflictCount(
+  error: GraphqlErrorLike | undefined,
+): number | null {
   const extensions = error?.graphQLErrors?.[0]?.extensions;
   if (extensions?.code !== "CONFLICT") return null;
   const matched = Number(extensions.matched);

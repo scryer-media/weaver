@@ -51,13 +51,20 @@ function downloadTotals(job: ProgressJob): JobDownloadTotals | null {
 
 function start(job: ProgressJob): HeldState {
   return {
-    ...advanceJobProgress(NO_PROGRESS_STATE, job.status, job.phaseProgress, Date.now(), downloadTotals(job)),
+    ...advanceJobProgress(
+      NO_PROGRESS_STATE,
+      job.status,
+      job.phaseProgress,
+      Date.now(),
+      downloadTotals(job),
+    ),
     jobId: job.id,
   };
 }
 
 export function useJobProgress(job: ProgressJob): JobProgressView {
-  const { id, status, phaseProgress, downloadedBytes, totalBytes, progress } = job;
+  const { id, status, phaseProgress, downloadedBytes, totalBytes, progress } =
+    job;
   const [state, setState] = useState<HeldState>(() => start(job));
   // The first render's state already holds what it was given, and the same
   // answer computed again would draw the row twice; time is the timer's job.
@@ -68,11 +75,24 @@ export function useJobProgress(job: ProgressJob): JobProgressView {
       started.current = false;
       return;
     }
-    const current = { id, status, phaseProgress, downloadedBytes, totalBytes, progress };
+    const current = {
+      id,
+      status,
+      phaseProgress,
+      downloadedBytes,
+      totalBytes,
+      progress,
+    };
     setState((previous) =>
       previous.jobId === id
         ? {
-            ...advanceJobProgress(previous, status, phaseProgress, Date.now(), downloadTotals(current)),
+            ...advanceJobProgress(
+              previous,
+              status,
+              phaseProgress,
+              Date.now(),
+              downloadTotals(current),
+            ),
             jobId: id,
           }
         : start(current),
@@ -84,19 +104,43 @@ export function useJobProgress(job: ProgressJob): JobProgressView {
     if (nextChangeAt === null) {
       return;
     }
-    const current = { id, status, phaseProgress, downloadedBytes, totalBytes, progress };
-    const timer = window.setTimeout(() => {
-      setState((previous) =>
-        previous.jobId === id
-          ? {
-              ...advanceJobProgress(previous, status, phaseProgress, Date.now(), downloadTotals(current)),
-              jobId: id,
-            }
-          : previous,
-      );
-    }, Math.max(0, nextChangeAt - Date.now()));
+    const current = {
+      id,
+      status,
+      phaseProgress,
+      downloadedBytes,
+      totalBytes,
+      progress,
+    };
+    const timer = window.setTimeout(
+      () => {
+        setState((previous) =>
+          previous.jobId === id
+            ? {
+                ...advanceJobProgress(
+                  previous,
+                  status,
+                  phaseProgress,
+                  Date.now(),
+                  downloadTotals(current),
+                ),
+                jobId: id,
+              }
+            : previous,
+        );
+      },
+      Math.max(0, nextChangeAt - Date.now()),
+    );
     return () => window.clearTimeout(timer);
-  }, [id, nextChangeAt, status, phaseProgress, downloadedBytes, totalBytes, progress]);
+  }, [
+    id,
+    nextChangeAt,
+    status,
+    phaseProgress,
+    downloadedBytes,
+    totalBytes,
+    progress,
+  ]);
 
   // The render that switches to another job has not been through the effect
   // yet; it shows that job as reported rather than the last one's bars.
@@ -169,12 +213,17 @@ export const PhaseBars = memo(function PhaseBars({
         }));
 
   // The names are set in a monospace face, where a character is one `ch`.
-  const nameWidth = Math.max(0, ...lines.map((line) => (line.labelled ? [...line.name].length : 0)));
+  const nameWidth = Math.max(
+    0,
+    ...lines.map((line) => (line.labelled ? [...line.name].length : 0)),
+  );
 
   return (
     <div className={cn("flex min-w-0 flex-col gap-[7px]", className)}>
       {lines.map((line) => {
-        const percent = Number.isFinite(line.percent) ? Math.max(0, Math.min(100, line.percent)) : 0;
+        const percent = Number.isFinite(line.percent)
+          ? Math.max(0, Math.min(100, line.percent))
+          : 0;
         return (
           <div key={line.key} className="flex min-w-0 items-center gap-3">
             <Bar

@@ -16,7 +16,11 @@ import { NextShell } from "./NextShell";
 export function NextRouteFallback() {
   return (
     <NextShell title="Weaver">
-      <div role="status" aria-busy="true" className="flex flex-1 items-center justify-center bg-wv-list">
+      <div
+        role="status"
+        aria-busy="true"
+        className="flex flex-1 items-center justify-center bg-wv-list"
+      >
         <LoadingMark className="h-10" reveal />
       </div>
     </NextShell>

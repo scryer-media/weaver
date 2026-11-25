@@ -58,8 +58,14 @@ function reportFingerprint(report: SupportReport): string | null {
 }
 
 /** Save the JSON form under a name that carries no title. */
-export function downloadSupportReportJson(report: SupportReport, jobId?: number) {
-  const stem = jobId === undefined ? reportFingerprint(report) ?? "report" : `job-${jobId}`;
+export function downloadSupportReportJson(
+  report: SupportReport,
+  jobId?: number,
+) {
+  const stem =
+    jobId === undefined
+      ? (reportFingerprint(report) ?? "report")
+      : `job-${jobId}`;
   saveBlobAsDownload(
     new Blob([report.json], { type: "application/json" }),
     `weaver-support-${stem}.json`,

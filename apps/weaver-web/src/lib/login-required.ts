@@ -50,7 +50,9 @@ let checking: Promise<void> | null = null;
 /** Ask the server whether a refused request means this browser must sign in. */
 export function recheckLoginRequired(): Promise<void> {
   checking ??= fetch(authStatusUrl(), { credentials: "include" })
-    .then((response) => (response.ok ? (response.json() as Promise<AuthStatus>) : {}))
+    .then((response) =>
+      response.ok ? (response.json() as Promise<AuthStatus>) : {},
+    )
     .then(noteAuthStatus)
     .catch(() => {
       // Unreachable: the connection banner already says so.
@@ -74,7 +76,10 @@ export function watchForSignOut() {
   window.fetch = async (input, init) => {
     const response = await nativeFetch(input, init);
     if (response.status === 401 || response.status === 403) {
-      const url = new URL(input instanceof Request ? input.url : String(input), document.baseURI);
+      const url = new URL(
+        input instanceof Request ? input.url : String(input),
+        document.baseURI,
+      );
       if (url.origin === origin && !ownEndpoints.has(url.href)) {
         void recheckLoginRequired();
       }
@@ -132,10 +137,15 @@ export function useLoginEnabled(): boolean {
   );
 }
 
-type SignInOutcome = { ok: true } | { ok: false; status: number; message: string };
+type SignInOutcome =
+  { ok: true } | { ok: false; status: number; message: string };
 
 /** Post the credentials; rejects only when Weaver cannot be reached at all. */
-async function signIn(username: string, password: string, remember: boolean): Promise<SignInOutcome> {
+async function signIn(
+  username: string,
+  password: string,
+  remember: boolean,
+): Promise<SignInOutcome> {
   const response = await fetch(loginUrl(), {
     method: "POST",
     credentials: "include",
@@ -145,8 +155,14 @@ async function signIn(username: string, password: string, remember: boolean): Pr
   if (response.ok) {
     return { ok: true };
   }
-  const payload = (await response.json().catch(() => ({}))) as { error?: string };
-  return { ok: false, status: response.status, message: payload.error ?? `HTTP ${response.status}` };
+  const payload = (await response.json().catch(() => ({}))) as {
+    error?: string;
+  };
+  return {
+    ok: false,
+    status: response.status,
+    message: payload.error ?? `HTTP ${response.status}`,
+  };
 }
 
 /**

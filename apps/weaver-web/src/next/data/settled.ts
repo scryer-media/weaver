@@ -13,22 +13,38 @@ import { useRef } from "react";
 export function shallowEqual<T extends object>(left: T, right: T): boolean {
   const keys = Object.keys(left) as (keyof T)[];
   return (
-    keys.length === Object.keys(right).length && keys.every((key) => Object.is(left[key], right[key]))
+    keys.length === Object.keys(right).length &&
+    keys.every((key) => Object.is(left[key], right[key]))
   );
 }
 
 /** The same length, and each item shallowly equal to the one at its index. */
-export function sameItems<T extends object>(left: readonly T[], right: readonly T[]): boolean {
-  return left.length === right.length && left.every((item, index) => shallowEqual(item, right[index]));
+export function sameItems<T extends object>(
+  left: readonly T[],
+  right: readonly T[],
+): boolean {
+  return (
+    left.length === right.length &&
+    left.every((item, index) => shallowEqual(item, right[index]))
+  );
 }
 
 /** The same length, and the very same value at every index. */
-export function sameElements<T>(left: readonly T[], right: readonly T[]): boolean {
-  return left.length === right.length && left.every((item, index) => Object.is(item, right[index]));
+export function sameElements<T>(
+  left: readonly T[],
+  right: readonly T[],
+): boolean {
+  return (
+    left.length === right.length &&
+    left.every((item, index) => Object.is(item, right[index]))
+  );
 }
 
 /** The same keys in the same order, each with the very same value. */
-export function sameEntries<K, V>(left: ReadonlyMap<K, V>, right: ReadonlyMap<K, V>): boolean {
+export function sameEntries<K, V>(
+  left: ReadonlyMap<K, V>,
+  right: ReadonlyMap<K, V>,
+): boolean {
   if (left.size !== right.size) {
     return false;
   }
@@ -43,7 +59,10 @@ export function sameEntries<K, V>(left: ReadonlyMap<K, V>, right: ReadonlyMap<K,
 }
 
 /** `value`, or the one last returned while the two are still equal. */
-export function useSettled<T>(value: T, isEqual: (left: T, right: T) => boolean): T {
+export function useSettled<T>(
+  value: T,
+  isEqual: (left: T, right: T) => boolean,
+): T {
   const settled = useRef(value);
   if (!isEqual(settled.current, value)) {
     settled.current = value;

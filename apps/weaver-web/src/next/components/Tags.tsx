@@ -3,7 +3,10 @@
 
 import { memo, useState } from "react";
 import { useMutation } from "urql";
-import { ADD_JOB_TAGS_MUTATION, REMOVE_JOB_TAGS_MUTATION } from "@/graphql/queries";
+import {
+  ADD_JOB_TAGS_MUTATION,
+  REMOVE_JOB_TAGS_MUTATION,
+} from "@/graphql/queries";
 import { useTranslate } from "@/lib/context/translate-context";
 import { cn } from "@/lib/utils";
 import { splitTags } from "@/next/data/tags";
@@ -24,7 +27,10 @@ export const TagChips = memo(function TagChips({
 }) {
   if (!tags || tags.length === 0) return null;
   return (
-    <span data-testid={jobIds.jobTags} className={cn("flex min-w-0 flex-wrap items-center gap-1", className)}>
+    <span
+      data-testid={jobIds.jobTags}
+      className={cn("flex min-w-0 flex-wrap items-center gap-1", className)}
+    >
       {tags.map((tag) => (
         <span key={tag} title={tag} className={CHIP}>
           <span className="truncate">{tag}</span>
@@ -35,11 +41,19 @@ export const TagChips = memo(function TagChips({
 });
 
 /** A job's tags with a way to add and take them off. */
-export function TagEditor({ jobId, tags }: { jobId: number; tags: readonly string[] }) {
+export function TagEditor({
+  jobId,
+  tags,
+}: {
+  jobId: number;
+  tags: readonly string[];
+}) {
   const t = useTranslate();
   const [text, setText] = useState("");
   const [{ fetching: adding }, addTags] = useMutation(ADD_JOB_TAGS_MUTATION);
-  const [{ fetching: removing }, removeTags] = useMutation(REMOVE_JOB_TAGS_MUTATION);
+  const [{ fetching: removing }, removeTags] = useMutation(
+    REMOVE_JOB_TAGS_MUTATION,
+  );
   const busy = adding || removing;
   const wanted = splitTags(text);
   const add = async () => {
@@ -83,7 +97,12 @@ export function TagEditor({ jobId, tags }: { jobId: number; tags: readonly strin
           testId={jobIds.tagInput}
           className="min-w-0 flex-1"
         />
-        <SecondaryButton icon="add" size="compact" disabled={busy || wanted.length === 0} onClick={() => void add()}>
+        <SecondaryButton
+          icon="add"
+          size="compact"
+          disabled={busy || wanted.length === 0}
+          onClick={() => void add()}
+        >
           {t("next.tags.add")}
         </SecondaryButton>
       </span>

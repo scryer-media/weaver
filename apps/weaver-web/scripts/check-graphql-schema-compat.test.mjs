@@ -46,15 +46,31 @@ function changesFor(newSchema) {
 }
 
 test("first use of a specified directive does not compare exporter spec versions", () => {
-  const declaration='directive @deprecated(reason:String="No longer supported") on FIELD_DEFINITION | ARGUMENT_DEFINITION | INPUT_FIELD_DEFINITION | ENUM_VALUE';
-  const changes=changesFor(`${BASE_SCHEMA.replace("name: String!",'name: String! @deprecated(reason:"Use displayName")')}\n${declaration}`);
-  assert.equal(hasSchemaCompatibilityFailure(changes),false);
+  const declaration =
+    'directive @deprecated(reason:String="No longer supported") on FIELD_DEFINITION | ARGUMENT_DEFINITION | INPUT_FIELD_DEFINITION | ENUM_VALUE';
+  const changes = changesFor(
+    `${BASE_SCHEMA.replace("name: String!", 'name: String! @deprecated(reason:"Use displayName")')}\n${declaration}`,
+  );
+  assert.equal(hasSchemaCompatibilityFailure(changes), false);
 });
 
 test("explicit directive restrictions and custom directive removals still fail", () => {
-  const old=`${BASE_SCHEMA}\ndirective @deprecated(reason:String="No longer supported") on FIELD_DEFINITION | ENUM_VALUE`;
-  assert.equal(hasSchemaCompatibilityFailure(findSchemaCompatibilityChanges(old,old.replace(" | ENUM_VALUE",""))),true);
-  assert.equal(hasSchemaCompatibilityFailure(findSchemaCompatibilityChanges(`${BASE_SCHEMA}\ndirective @audit on FIELD`,BASE_SCHEMA)),true);
+  const old = `${BASE_SCHEMA}\ndirective @deprecated(reason:String="No longer supported") on FIELD_DEFINITION | ENUM_VALUE`;
+  assert.equal(
+    hasSchemaCompatibilityFailure(
+      findSchemaCompatibilityChanges(old, old.replace(" | ENUM_VALUE", "")),
+    ),
+    true,
+  );
+  assert.equal(
+    hasSchemaCompatibilityFailure(
+      findSchemaCompatibilityChanges(
+        `${BASE_SCHEMA}\ndirective @audit on FIELD`,
+        BASE_SCHEMA,
+      ),
+    ),
+    true,
+  );
 });
 
 test("allows additive nullable fields", () => {
@@ -94,19 +110,26 @@ test("allows additive nullable fields", () => {
 });
 
 test("allows additive optional input fields", () => {
-  const changes = changesFor(BASE_SCHEMA.replace(
-    "reason: String",
-    "reason: String\n    propagationDelaySecs: Int",
-  ));
+  const changes = changesFor(
+    BASE_SCHEMA.replace(
+      "reason: String",
+      "reason: String\n    propagationDelaySecs: Int",
+    ),
+  );
   assert.equal(hasSchemaCompatibilityFailure(changes), false);
 });
 
 test("optional input additions do not hide breaking changes", () => {
-  const changes = changesFor(BASE_SCHEMA
-    .replace("reason: String", "reason: String\n    propagationDelaySecs: Int")
-    .replace("name: String!", "name: Int!"));
+  const changes = changesFor(
+    BASE_SCHEMA.replace(
+      "reason: String",
+      "reason: String\n    propagationDelaySecs: Int",
+    ).replace("name: String!", "name: Int!"),
+  );
   assert.equal(hasSchemaCompatibilityFailure(changes), true);
-  assert.ok(changes.breaking.some((change) => change.description.includes("name")));
+  assert.ok(
+    changes.breaking.some((change) => change.description.includes("name")),
+  );
 });
 
 test("rejects removed fields", () => {
@@ -259,23 +282,36 @@ test("rejects enum value additions as dangerous", () => {
   assert.equal(hasSchemaCompatibilityFailure(changes), true);
   assert.equal(changes.breaking.length, 0);
   assert.ok(
-    changes.dangerous.some((change) => change.description.includes("REPAIRING")),
+    changes.dangerous.some((change) =>
+      change.description.includes("REPAIRING"),
+    ),
   );
 });
 
 test("permits dangerous changes only with an explicit override", () => {
-  const changes = changesFor(BASE_SCHEMA.replace("COMPLETED", "COMPLETED\n    REPAIRING"));
+  const changes = changesFor(
+    BASE_SCHEMA.replace("COMPLETED", "COMPLETED\n    REPAIRING"),
+  );
   assert.equal(hasSchemaCompatibilityFailure(changes), true);
-  assert.equal(hasSchemaCompatibilityFailure(changes, { allowDangerous: true }), false);
+  assert.equal(
+    hasSchemaCompatibilityFailure(changes, { allowDangerous: true }),
+    false,
+  );
 });
 
 test("the dangerous override still rejects breaking changes", () => {
-  const changes = changesFor(BASE_SCHEMA
-    .replace("COMPLETED", "COMPLETED\n    REPAIRING")
-    .replace("name: String!", "name: Int!"));
+  const changes = changesFor(
+    BASE_SCHEMA.replace("COMPLETED", "COMPLETED\n    REPAIRING").replace(
+      "name: String!",
+      "name: Int!",
+    ),
+  );
   assert.ok(changes.breaking.length > 0);
   assert.ok(changes.dangerous.length > 0);
-  assert.equal(hasSchemaCompatibilityFailure(changes, { allowDangerous: true }), true);
+  assert.equal(
+    hasSchemaCompatibilityFailure(changes, { allowDangerous: true }),
+    true,
+  );
 });
 
 test("breaking changes fail without --allow-breaking and pass with it", () => {
@@ -283,28 +319,51 @@ test("breaking changes fail without --allow-breaking and pass with it", () => {
   assert.ok(changes.breaking.length > 0);
   assert.equal(changes.dangerous.length, 0);
   assert.equal(hasSchemaCompatibilityFailure(changes), true);
-  assert.equal(hasSchemaCompatibilityFailure(changes, { allowDangerous: true }), true);
-  assert.equal(hasSchemaCompatibilityFailure(changes, { allowBreaking: true }), false);
+  assert.equal(
+    hasSchemaCompatibilityFailure(changes, { allowDangerous: true }),
+    true,
+  );
+  assert.equal(
+    hasSchemaCompatibilityFailure(changes, { allowBreaking: true }),
+    false,
+  );
 });
 
 test("the breaking override permits dangerous changes too", () => {
-  const changes = changesFor(BASE_SCHEMA.replace("COMPLETED", "COMPLETED\n    REPAIRING"));
+  const changes = changesFor(
+    BASE_SCHEMA.replace("COMPLETED", "COMPLETED\n    REPAIRING"),
+  );
   assert.equal(changes.breaking.length, 0);
   assert.ok(changes.dangerous.length > 0);
   assert.equal(hasSchemaCompatibilityFailure(changes), true);
-  assert.equal(hasSchemaCompatibilityFailure(changes, { allowBreaking: true }), false);
+  assert.equal(
+    hasSchemaCompatibilityFailure(changes, { allowBreaking: true }),
+    false,
+  );
 });
 
 test("the breaking override alone permits breaking and dangerous changes together", () => {
-  const changes = changesFor(BASE_SCHEMA
-    .replace("COMPLETED", "COMPLETED\n    REPAIRING")
-    .replace("name: String!", "name: Int!"));
+  const changes = changesFor(
+    BASE_SCHEMA.replace("COMPLETED", "COMPLETED\n    REPAIRING").replace(
+      "name: String!",
+      "name: Int!",
+    ),
+  );
   assert.ok(changes.breaking.length > 0);
   assert.ok(changes.dangerous.length > 0);
-  assert.equal(hasSchemaCompatibilityFailure(changes, { allowBreaking: true }), false);
-  assert.equal(hasSchemaCompatibilityFailure(changes, { allowDangerous: true }), true);
   assert.equal(
-    hasSchemaCompatibilityFailure(changes, { allowDangerous: true, allowBreaking: true }),
+    hasSchemaCompatibilityFailure(changes, { allowBreaking: true }),
+    false,
+  );
+  assert.equal(
+    hasSchemaCompatibilityFailure(changes, { allowDangerous: true }),
+    true,
+  );
+  assert.equal(
+    hasSchemaCompatibilityFailure(changes, {
+      allowDangerous: true,
+      allowBreaking: true,
+    }),
     false,
   );
 });
@@ -349,6 +408,10 @@ test("unknown or repeated options print usage and fail", async () => {
     } finally {
       console.error = original;
     }
-    assert.ok(errors.some((line) => line.includes("[--allow-dangerous] [--allow-breaking]")));
+    assert.ok(
+      errors.some((line) =>
+        line.includes("[--allow-dangerous] [--allow-breaking]"),
+      ),
+    );
   }
 });

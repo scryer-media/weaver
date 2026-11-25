@@ -35,7 +35,9 @@ export function TorrentRemoveDialog({
   const t = useTranslate();
   const [deleteFiles, setDeleteFiles] = useState(false);
   const [unmet, setUnmet] = useState(false);
-  const [state, removeTorrent] = useMutation<{ removeTorrent: boolean }>(REMOVE_TORRENT_MUTATION);
+  const [state, removeTorrent] = useMutation<{ removeTorrent: boolean }>(
+    REMOVE_TORRENT_MUTATION,
+  );
 
   const close = () => {
     setDeleteFiles(false);

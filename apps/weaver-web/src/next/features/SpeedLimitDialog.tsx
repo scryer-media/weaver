@@ -30,22 +30,32 @@ import { LimitControl, SplitControl } from "@/next/features/networking/limits";
  */
 export function useSpeedLimitDialog() {
   const t = useTranslate();
-  const { speedLimit: ceiling, downloadBlock } = useNextData("speedLimit", "downloadBlock");
+  const { speedLimit: ceiling, downloadBlock } = useNextData(
+    "speedLimit",
+    "downloadBlock",
+  );
   const [saveState, setBandwidth] = useMutation(SET_BANDWIDTH);
   const [open, setOpen] = useState(false);
   const [limit, setLimit] = useState<number | null>(null);
   // Changes to what was read when the dialog opened; undefined is untouched.
-  const [uploadEdit, setUploadEdit] = useState<number | null | undefined>(undefined);
-  const [splitEdit, setSplitEdit] = useState<BandwidthSplit | null | undefined>(undefined);
+  const [uploadEdit, setUploadEdit] = useState<number | null | undefined>(
+    undefined,
+  );
+  const [splitEdit, setSplitEdit] = useState<BandwidthSplit | null | undefined>(
+    undefined,
+  );
   const torrentsOn = useTorrentsShown();
   const [error, setError] = useState<string | null>(null);
-  const [{ data: bandwidth }] = useQuery<{ networking: { bandwidth: Bandwidth } }>({
+  const [{ data: bandwidth }] = useQuery<{
+    networking: { bandwidth: Bandwidth };
+  }>({
     query: BANDWIDTH_QUERY,
     requestPolicy: "network-only",
     pause: !open,
   });
   const saved = bandwidth?.networking?.bandwidth;
-  const uploadBps = uploadEdit !== undefined ? uploadEdit : (saved?.uploadBps ?? null);
+  const uploadBps =
+    uploadEdit !== undefined ? uploadEdit : (saved?.uploadBps ?? null);
   const split = splitEdit !== undefined ? splitEdit : (saved?.split ?? null);
 
   const scheduled = downloadBlock.scheduledSpeedLimit;
@@ -63,7 +73,11 @@ export function useSpeedLimitDialog() {
       return;
     }
     setError(null);
-    const input = { downloadBps: limit, uploadBps, ...(torrentsOn ? { split } : {}) };
+    const input = {
+      downloadBps: limit,
+      uploadBps,
+      ...(torrentsOn ? { split } : {}),
+    };
     void setBandwidth({ input }).then((result) => {
       if (result.error || !result.data?.setBandwidth) {
         setError(result.error?.message ?? t("next.speedLimit.saveFailed"));
@@ -82,7 +96,9 @@ export function useSpeedLimitDialog() {
       onDismiss={() => setOpen(false)}
       footer={
         <>
-          <SecondaryButton onClick={() => setOpen(false)}>{t("action.cancel")}</SecondaryButton>
+          <SecondaryButton onClick={() => setOpen(false)}>
+            {t("action.cancel")}
+          </SecondaryButton>
           <PrimaryButton disabled={saveState.fetching || !saved} onClick={save}>
             {saveState.fetching ? t("settings.saving") : t("action.apply")}
           </PrimaryButton>
@@ -101,8 +117,19 @@ export function useSpeedLimitDialog() {
       {/* Only torrents upload, and the split shares the download limit with them: both show with torrents. */}
       {torrentsOn && saved ? (
         <>
-          <FormRow label={t("next.bandwidth.split")} help={limit === null ? t("next.bandwidth.needsDownloadLimit") : undefined}>
-            <SplitControl value={split} needsDownloadLimit={limit === null} onChange={setSplitEdit} />
+          <FormRow
+            label={t("next.bandwidth.split")}
+            help={
+              limit === null
+                ? t("next.bandwidth.needsDownloadLimit")
+                : undefined
+            }
+          >
+            <SplitControl
+              value={split}
+              needsDownloadLimit={limit === null}
+              onChange={setSplitEdit}
+            />
           </FormRow>
           <FormRow label={t("next.speedLimit.upload")}>
             <LimitControl
@@ -117,11 +144,15 @@ export function useSpeedLimitDialog() {
       ) : null}
       {scheduled !== null ? (
         <div className="border-b border-wv-hairline px-4 py-3 text-[12.5px] text-wv-warn sm:px-6">
-          {t("next.speedLimit.scheduleHolding", { rate: formatRate(scheduled) })}
+          {t("next.speedLimit.scheduleHolding", {
+            rate: formatRate(scheduled),
+          })}
         </div>
       ) : null}
       {error === null ? null : (
-        <div className="px-4 py-3 text-[12.5px] text-wv-error-text sm:px-6">{error}</div>
+        <div className="px-4 py-3 text-[12.5px] text-wv-error-text sm:px-6">
+          {error}
+        </div>
       )}
     </Dialog>
   );
@@ -151,8 +182,16 @@ export function SpeedLimitControl() {
       <SecondaryButton
         icon="bandwidth"
         // A limit in force reads as a warning: yellow outline, not a fill.
-        className={inForce !== null ? "border-wv-warn text-wv-warn hover:border-wv-warn-hover" : undefined}
-        title={bySchedule ? t("next.speedLimit.bySchedule") : t("next.speedLimit.buttonTitle")}
+        className={
+          inForce !== null
+            ? "border-wv-warn text-wv-warn hover:border-wv-warn-hover"
+            : undefined
+        }
+        title={
+          bySchedule
+            ? t("next.speedLimit.bySchedule")
+            : t("next.speedLimit.buttonTitle")
+        }
         onClick={openDialog}
       >
         {inForce !== null ? formatRate(inForce) : t("settings.unlimited")}

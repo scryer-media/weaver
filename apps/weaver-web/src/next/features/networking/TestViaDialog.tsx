@@ -5,8 +5,18 @@ import { Fragment, useEffect, useRef, useState } from "react";
 import { useMutation, useQuery } from "urql";
 import { DRAFT_ROUTE_QUERY, TEST_VIA } from "@/graphql/networking";
 import { useTranslate } from "@/lib/context/translate-context";
-import { SYSTEM_DNS_PROFILE_ID, dnsRouteProblem, type DnsProfileChoice } from "@/lib/dns";
-import { routeInput, routeProblem, type ConsumerKind, type NetworkRoute, type TorrentConsumerKind } from "@/lib/networking";
+import {
+  SYSTEM_DNS_PROFILE_ID,
+  dnsRouteProblem,
+  type DnsProfileChoice,
+} from "@/lib/dns";
+import {
+  routeInput,
+  routeProblem,
+  type ConsumerKind,
+  type NetworkRoute,
+  type TorrentConsumerKind,
+} from "@/lib/networking";
 import { proxyLabels } from "@/lib/proxies";
 import { proxyTestSentence } from "@/lib/proxy-fault";
 import { refusalMessage } from "@/lib/refusal";
@@ -35,7 +45,11 @@ import { StatusMark } from "./presentation";
 const DEFAULT_PORT = 443;
 
 /** What a drafted route may use, as the route editor reads it. */
-type DraftRouteData = { egressInterfaces: RouteEgress[]; proxyProfiles: RouteProxy[]; proxyPools: NetworkingData["proxyPools"] };
+type DraftRouteData = {
+  egressInterfaces: RouteEgress[];
+  proxyProfiles: RouteProxy[];
+  proxyPools: NetworkingData["proxyPools"];
+};
 
 /**
  * A route drafted for a test, never saved: it starts on `initial`, else on
@@ -53,13 +67,35 @@ export function useDraftRoute({
   initial?: NetworkRoute | null;
   kind: ConsumerKind;
 }) {
-  const [{ data, error: loadError }] = useQuery<DraftRouteData>({ query: DRAFT_ROUTE_QUERY });
+  const [{ data, error: loadError }] = useQuery<DraftRouteData>({
+    query: DRAFT_ROUTE_QUERY,
+  });
   // Null until the draft is first changed: it starts on the default route.
   const [edited, setEdited] = useState<NetworkRoute | null>(null);
-  const route = edited ?? initial ?? (data ? draftRoute(data.egressInterfaces, egressId) : null);
-  const problem = data && route ? routeProblem(route, { egresses: data.egressInterfaces, pools: data.proxyPools, kind }) : null;
-  const choices = data ? routeChoices(data.proxyProfiles, data.proxyPools, subject) : null;
-  return { data, loadError, route, setRoute: setEdited, problem, choices, kind };
+  const route =
+    edited ??
+    initial ??
+    (data ? draftRoute(data.egressInterfaces, egressId) : null);
+  const problem =
+    data && route
+      ? routeProblem(route, {
+          egresses: data.egressInterfaces,
+          pools: data.proxyPools,
+          kind,
+        })
+      : null;
+  const choices = data
+    ? routeChoices(data.proxyProfiles, data.proxyPools, subject)
+    : null;
+  return {
+    data,
+    loadError,
+    route,
+    setRoute: setEdited,
+    problem,
+    choices,
+    kind,
+  };
 }
 
 export type DraftRoute = ReturnType<typeof useDraftRoute>;
@@ -78,18 +114,27 @@ export function DraftRouteEditor({
   return (
     <>
       {loadError && !data ? (
-        <p role="alert" className="px-4 py-4 text-[12.5px] text-wv-error-text sm:px-6">
+        <p
+          role="alert"
+          className="px-4 py-4 text-[12.5px] text-wv-error-text sm:px-6"
+        >
           {refusalMessage(t, loadError)}
         </p>
       ) : null}
       {!data && !loadError ? (
-        <p role="status" className="px-4 py-4 text-[12.5px] text-wv-muted sm:px-6">
+        <p
+          role="status"
+          className="px-4 py-4 text-[12.5px] text-wv-muted sm:px-6"
+        >
           {t("next.common.loading")}
         </p>
       ) : null}
       {data && route && choices ? (
         <>
-          <SectionHeader label={t("next.networking.testVia.route")} sticky={false} />
+          <SectionHeader
+            label={t("next.networking.testVia.route")}
+            sticky={false}
+          />
           <div className="flex-none px-4 py-5 sm:px-6">
             <RouteEditor
               value={route}
@@ -108,7 +153,8 @@ export function DraftRouteEditor({
 }
 
 /** A connect time to the precision it is worth: tenths under ten milliseconds. */
-const millis = (value: number) => `${value < 10 ? value.toFixed(1) : Math.round(value)} ms`;
+const millis = (value: number) =>
+  `${value < 10 ? value.toFixed(1) : Math.round(value)} ms`;
 
 /**
  * Test a proxy, a pool, or a route alone through a route drafted for the test.
@@ -150,11 +196,16 @@ export function TestViaDialog({
     data && route
       ? dnsRouteProblem(
           route,
-          dnsProfiles?.find((choice) => choice.id === (route.dnsProfileId ?? SYSTEM_DNS_PROFILE_ID)),
+          dnsProfiles?.find(
+            (choice) =>
+              choice.id === (route.dnsProfileId ?? SYSTEM_DNS_PROFILE_ID),
+          ),
           { proxies: data.proxyProfiles, pools: data.proxyPools },
         )
       : null;
-  const [{ fetching: running }, testVia] = useMutation<{ testVia: PathTestResult[] }>(TEST_VIA);
+  const [{ fetching: running }, testVia] = useMutation<{
+    testVia: PathTestResult[];
+  }>(TEST_VIA);
   const [host, setHost] = useState("");
   const [port, setPort] = useState(DEFAULT_PORT);
   const [destinationOpen, setDestinationOpen] = useState(false);
@@ -170,12 +221,19 @@ export function TestViaDialog({
   }, [results, refusal]);
 
   // A destination folded away is not tested, whatever was typed into it.
-  const target = ((subject === null && !torrent) || destinationOpen) && host.trim() ? { host: host.trim(), port } : null;
+  const target =
+    ((subject === null && !torrent) || destinationOpen) && host.trim()
+      ? { host: host.trim(), port }
+      : null;
 
-  const egressName = (id: number) => data?.egressInterfaces.find((egress) => egress.id === id)?.name ?? String(id);
+  const egressName = (id: number) =>
+    data?.egressInterfaces.find((egress) => egress.id === id)?.name ??
+    String(id);
   const proxyName = (id: number) =>
-    data?.proxyProfiles.find((profile) => profile.id === id)?.name ?? t("next.networking.proxyNumber", { id });
-  const poolName = (id: number) => data?.proxyPools.find((pool) => pool.id === id)?.name ?? String(id);
+    data?.proxyProfiles.find((profile) => profile.id === id)?.name ??
+    t("next.networking.proxyNumber", { id });
+  const poolName = (id: number) =>
+    data?.proxyPools.find((pool) => pool.id === id)?.name ?? String(id);
 
   const subjectNote = (() => {
     if (!data || subject === null) {
@@ -194,7 +252,12 @@ export function TestViaDialog({
     }
     setResults(null);
     setRefusal(null);
-    const result = await testVia({ route: routeInput(route), subject, target, torrent: torrent !== undefined });
+    const result = await testVia({
+      route: routeInput(route),
+      subject,
+      target,
+      torrent: torrent !== undefined,
+    });
     if (result.error) {
       const sentence = refusalMessage(t, result.error);
       setRefusal(sentence);
@@ -218,13 +281,23 @@ export function TestViaDialog({
       onDismiss={onClose}
       footer={
         <>
-          <SecondaryButton onClick={onClose}>{t("next.networking.close")}</SecondaryButton>
+          <SecondaryButton onClick={onClose}>
+            {t("next.networking.close")}
+          </SecondaryButton>
           <PrimaryButton
             icon="test"
-            disabled={!route || running || problem !== null || dnsProblem !== null || (subject === null && target === null && !torrent)}
+            disabled={
+              !route ||
+              running ||
+              problem !== null ||
+              dnsProblem !== null ||
+              (subject === null && target === null && !torrent)
+            }
             onClick={() => void run()}
           >
-            {running ? t("next.networking.testVia.running") : t("next.networking.testVia.run")}
+            {running
+              ? t("next.networking.testVia.running")
+              : t("next.networking.testVia.run")}
           </PrimaryButton>
         </>
       }
@@ -234,7 +307,10 @@ export function TestViaDialog({
         <>
           {/* A route alone needs somewhere to connect; a proxy or pool is tested without one. */}
           {subject === null && !torrent ? (
-            <SectionHeader label={t("next.networking.testVia.destination")} sticky={false} />
+            <SectionHeader
+              label={t("next.networking.testVia.destination")}
+              sticky={false}
+            />
           ) : (
             <button
               type="button"
@@ -242,7 +318,14 @@ export function TestViaDialog({
               onClick={() => setDestinationOpen((open) => !open)}
               className="flex h-8 flex-none items-center gap-2 border-b border-wv-hairline px-4 text-left font-wv-mono text-[11px] text-wv-muted hover:text-wv-fg sm:px-6"
             >
-              <Icon name="expand" size={12} className={cn("flex-none transition-transform", destinationOpen && "rotate-90")} />
+              <Icon
+                name="expand"
+                size={12}
+                className={cn(
+                  "flex-none transition-transform",
+                  destinationOpen && "rotate-90",
+                )}
+              />
               {t("next.networking.testVia.optional")}
             </button>
           )}
@@ -257,21 +340,37 @@ export function TestViaDialog({
                 {
                   id: "port",
                   label: t("next.networking.testVia.port"),
-                  control: { kind: "number", value: port, min: 1, max: 65535, onChange: setPort },
+                  control: {
+                    kind: "number",
+                    value: port,
+                    min: 1,
+                    max: 65535,
+                    onChange: setPort,
+                  },
                 },
               ]}
             />
           ) : null}
           <div ref={outcomeRef} className="flex flex-none flex-col">
             {refusal === null ? null : (
-              <p role="alert" className="px-4 py-4 text-[12.5px] leading-[1.5] text-wv-error-text sm:px-6">
+              <p
+                role="alert"
+                className="px-4 py-4 text-[12.5px] leading-[1.5] text-wv-error-text sm:px-6"
+              >
                 {refusal}
               </p>
             )}
             {results === null ? null : (
               <>
-                <SectionHeader label={t("next.networking.testVia.paths")} count={results.length} sticky={false} />
-                <ul aria-label={t("next.networking.testVia.paths")} className="flex flex-col">
+                <SectionHeader
+                  label={t("next.networking.testVia.paths")}
+                  count={results.length}
+                  sticky={false}
+                />
+                <ul
+                  aria-label={t("next.networking.testVia.paths")}
+                  className="flex flex-col"
+                >
                   {results.map((result, index) => (
                     <PathRow
                       key={index}
@@ -307,7 +406,12 @@ function PathRow({
   poolName: (id: number) => string;
 }) {
   const t = useTranslate();
-  const hops: { key: string; name: string; picked?: string; failing: boolean }[] = [
+  const hops: {
+    key: string;
+    name: string;
+    picked?: string;
+    failing: boolean;
+  }[] = [
     { key: "egress", name: egressName(result.egressId), failing: false },
     ...result.carrierIds.map((id, position) => ({
       key: `carrier-${position}`,
@@ -319,22 +423,34 @@ function PathRow({
           {
             key: "subject",
             name: poolName(result.poolId),
-            picked: result.proxyId === null ? undefined : proxyName(result.proxyId),
+            picked:
+              result.proxyId === null ? undefined : proxyName(result.proxyId),
             failing: false,
           },
         ]
       : result.proxyId === null
         ? []
-        : [{ key: "subject", name: proxyName(result.proxyId), failing: !result.success && result.proxyId === result.failingProxyId }]),
+        : [
+            {
+              key: "subject",
+              name: proxyName(result.proxyId),
+              failing:
+                !result.success && result.proxyId === result.failingProxyId,
+            },
+          ]),
   ];
   const label = result.success
     ? t("next.networking.testVia.passed")
     : result.failingProxyId === null
       ? t("next.networking.testVia.failed")
-      : t("next.networking.testVia.failedAt", { name: proxyName(result.failingProxyId) });
+      : t("next.networking.testVia.failedAt", {
+          name: proxyName(result.failingProxyId),
+        });
   const detail = [
     ...(result.connectMillis > 0 ? [millis(result.connectMillis)] : []),
-    ...(result.sourceAddress ? [t("next.networking.testVia.source", { address: result.sourceAddress })] : []),
+    ...(result.sourceAddress
+      ? [t("next.networking.testVia.source", { address: result.sourceAddress })]
+      : []),
   ].join(" · ");
   return (
     <li className="flex min-w-0 flex-col gap-[6px] border-b border-wv-hairline px-4 py-3 sm:px-6">
@@ -342,8 +458,12 @@ function PathRow({
         <span className="min-w-0 font-wv-mono text-[12px] leading-[1.5] break-words text-wv-fg">
           {hops.map((hop, position) => (
             <Fragment key={hop.key}>
-              {position > 0 ? <span className="text-wv-muted">{" > "}</span> : null}
-              <span className={hop.failing ? "text-wv-error-text" : undefined}>{hop.name}</span>
+              {position > 0 ? (
+                <span className="text-wv-muted">{" > "}</span>
+              ) : null}
+              <span className={hop.failing ? "text-wv-error-text" : undefined}>
+                {hop.name}
+              </span>
               {hop.picked === undefined ? null : (
                 <>
                   {" ("}
@@ -354,12 +474,21 @@ function PathRow({
             </Fragment>
           ))}
         </span>
-        <StatusMark state={result.success ? "UP" : "DOWN"} label={label} detail={detail || undefined} />
+        <StatusMark
+          state={result.success ? "UP" : "DOWN"}
+          label={label}
+          detail={detail || undefined}
+        />
       </div>
-      <p className="text-[12.5px] leading-[1.5] text-pretty text-wv-secondary">{proxyTestSentence(t, result)}</p>
+      <p className="text-[12.5px] leading-[1.5] text-pretty text-wv-secondary">
+        {proxyTestSentence(t, result)}
+      </p>
       {result.resolution ? (
         <ResolutionLine
-          parts={resolutionParts(t, result.resolution, { egress: egressName(result.egressId), proxy: proxyName })}
+          parts={resolutionParts(t, result.resolution, {
+            egress: egressName(result.egressId),
+            proxy: proxyName,
+          })}
         />
       ) : null}
       {result.p2p ? <P2pRungs p2p={result.p2p} /> : null}
@@ -371,19 +500,31 @@ function PathRow({
 function P2pRungs({ p2p }: { p2p: P2pTestResult }) {
   const t = useTranslate();
   return (
-    <ul aria-label={t("next.networking.testVia.torrent")} className="flex flex-col gap-[2px]">
+    <ul
+      aria-label={t("next.networking.testVia.torrent")}
+      className="flex flex-col gap-[2px]"
+    >
       {p2p.rungs.map((rung) => (
-        <li key={rung.step} className="flex min-w-0 flex-wrap items-baseline gap-x-2 font-wv-mono text-[11px] leading-[1.5]">
+        <li
+          key={rung.step}
+          className="flex min-w-0 flex-wrap items-baseline gap-x-2 font-wv-mono text-[11px] leading-[1.5]"
+        >
           <span
             className={cn(
               "w-[72px] flex-none",
-              rung.outcome === "PASSED" ? "text-wv-fg" : rung.outcome === "FAILED" ? "text-wv-error-text" : "text-wv-muted",
+              rung.outcome === "PASSED"
+                ? "text-wv-fg"
+                : rung.outcome === "FAILED"
+                  ? "text-wv-error-text"
+                  : "text-wv-muted",
             )}
           >
             {t(`next.networking.testVia.step.${rung.step}`)}
           </span>
           <span className="min-w-0 break-words text-wv-muted">
-            {rung.outcome === "NOT_REACHED" ? t("next.networking.testVia.notReached") : rung.message}
+            {rung.outcome === "NOT_REACHED"
+              ? t("next.networking.testVia.notReached")
+              : rung.message}
           </span>
         </li>
       ))}
@@ -395,7 +536,10 @@ function P2pRungs({ p2p }: { p2p: P2pTestResult }) {
       {p2p.exposure === null
         ? null
         : exposureValues(t, p2p.exposure).map(({ label, value }) => (
-            <li key={label} className="flex min-w-0 flex-wrap items-baseline gap-x-2 font-wv-mono text-[11px] leading-[1.5]">
+            <li
+              key={label}
+              className="flex min-w-0 flex-wrap items-baseline gap-x-2 font-wv-mono text-[11px] leading-[1.5]"
+            >
               <span className="w-[72px] flex-none text-wv-muted">{label}</span>
               <span className="min-w-0 break-words text-wv-fg">{value}</span>
             </li>
@@ -416,7 +560,11 @@ function ResolutionLine({ parts }: { parts: ResolutionParts }) {
       {parts.addresses.map((part, index) => (
         <Fragment key={part.address}>
           {index > 0 ? ", " : null}
-          {part.connected ? <strong className="font-medium text-wv-fg">{part.address}</strong> : part.address}
+          {part.connected ? (
+            <strong className="font-medium text-wv-fg">{part.address}</strong>
+          ) : (
+            part.address
+          )}
         </Fragment>
       ))}
       {parts.said ? ` · ${parts.said}` : null}

@@ -6,7 +6,11 @@ import type { CombinedError } from "urql";
 import { authHeaders } from "@/graphql/client";
 import { useTranslate, type Translate } from "@/lib/context/translate-context";
 import { Dialog } from "../components/Dialog";
-import { PrimaryButton, SecondaryButton, TextField } from "../components/controls";
+import {
+  PrimaryButton,
+  SecondaryButton,
+  TextField,
+} from "../components/controls";
 
 /**
  * What an attempt reports: finished (it handled its own success or failure),
@@ -16,11 +20,18 @@ export type CheckedOutcome = "done" | "password";
 
 /** Whether a GraphQL failure is the server asking for a recent password check. */
 export function needsPasswordCheck(error: CombinedError | undefined): boolean {
-  return Boolean(error?.graphQLErrors.some((entry) => entry.extensions?.code === "REAUTH_REQUIRED"));
+  return Boolean(
+    error?.graphQLErrors.some(
+      (entry) => entry.extensions?.code === "REAUTH_REQUIRED",
+    ),
+  );
 }
 
 /** Has the server check the password; resolves to why it refused, or null once it accepted. */
-async function verifyPassword(t: Translate, password: string): Promise<string | null> {
+async function verifyPassword(
+  t: Translate,
+  password: string,
+): Promise<string | null> {
   try {
     const response = await fetch(new URL("api/auth/verify", document.baseURI), {
       method: "POST",
@@ -101,9 +112,16 @@ export function usePasswordCheck(): {
       onDismiss={dismiss}
       footer={
         <>
-          <SecondaryButton onClick={dismiss}>{t("next.security.checkCancel")}</SecondaryButton>
-          <PrimaryButton onClick={() => void check()} disabled={!password || checking}>
-            {checking ? t("next.security.checking") : t("next.security.checkContinue")}
+          <SecondaryButton onClick={dismiss}>
+            {t("next.security.checkCancel")}
+          </SecondaryButton>
+          <PrimaryButton
+            onClick={() => void check()}
+            disabled={!password || checking}
+          >
+            {checking
+              ? t("next.security.checking")
+              : t("next.security.checkContinue")}
           </PrimaryButton>
         </>
       }
@@ -125,7 +143,10 @@ export function usePasswordCheck(): {
           className="w-full"
         />
         {error ? (
-          <div role="alert" className="text-[12.5px] leading-[1.45] text-wv-error-text">
+          <div
+            role="alert"
+            className="text-[12.5px] leading-[1.45] text-wv-error-text"
+          >
             {error}
           </div>
         ) : null}

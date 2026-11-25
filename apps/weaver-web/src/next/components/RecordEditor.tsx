@@ -6,7 +6,11 @@ import { useTranslate } from "@/lib/context/translate-context";
 import { Dialog } from "./Dialog";
 import { DangerButton, PrimaryButton, SecondaryButton } from "./controls";
 import { SectionHeader } from "./chrome";
-import { FieldRows, Fold, type FieldSpec } from "@/next/pages/settings/framework";
+import {
+  FieldRows,
+  Fold,
+  type FieldSpec,
+} from "@/next/pages/settings/framework";
 import { testIds } from "@/next/testids";
 
 /**
@@ -87,21 +91,42 @@ export function RecordEditor({
       footer={
         <>
           {onDelete === undefined ? null : (
-            <DangerButton icon="remove" onClick={onDelete} disabled={busy} className="mr-auto" testId={testIds.editorDelete}>
+            <DangerButton
+              icon="remove"
+              onClick={onDelete}
+              disabled={busy}
+              className="mr-auto"
+              testId={testIds.editorDelete}
+            >
               {deleteLabel ?? t("action.delete")}
             </DangerButton>
           )}
           {extraActions}
-          <SecondaryButton onClick={onDismiss} testId={testIds.editorCancel}>{t("action.cancel")}</SecondaryButton>
-          <PrimaryButton onClick={onSave} disabled={busy || saveDisabled} testId={testIds.editorSave}>
+          <SecondaryButton onClick={onDismiss} testId={testIds.editorCancel}>
+            {t("action.cancel")}
+          </SecondaryButton>
+          <PrimaryButton
+            onClick={onSave}
+            disabled={busy || saveDisabled}
+            testId={testIds.editorSave}
+          >
             {busy ? t("settings.saving") : (saveLabel ?? t("action.save"))}
           </PrimaryButton>
         </>
       }
     >
       {sections.map((section) => (
-        <div key={section.id} data-testid={testIds.section(section.id)} className="flex flex-none flex-col">
-          <SectionHeader label={section.title} tag={section.tag} note={section.note} sticky={false} />
+        <div
+          key={section.id}
+          data-testid={testIds.section(section.id)}
+          className="flex flex-none flex-col"
+        >
+          <SectionHeader
+            label={section.title}
+            tag={section.tag}
+            note={section.note}
+            sticky={false}
+          />
           <FieldRows fields={section.fields} />
           {section.folded ? (
             <Fold open={section.folded.open}>
@@ -113,7 +138,11 @@ export function RecordEditor({
       ))}
       {children}
       {error ? (
-        <div data-testid={testIds.editorError} data-problem={errorCode ?? undefined} className="flex-none border-t border-wv-hairline px-4 sm:px-6 py-4 text-[12.5px] leading-[1.5] text-wv-error-text">
+        <div
+          data-testid={testIds.editorError}
+          data-problem={errorCode ?? undefined}
+          className="flex-none border-t border-wv-hairline px-4 sm:px-6 py-4 text-[12.5px] leading-[1.5] text-wv-error-text"
+        >
           {error}
         </div>
       ) : null}

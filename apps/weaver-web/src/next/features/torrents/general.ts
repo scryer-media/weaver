@@ -2,8 +2,18 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 import type { Translate } from "@/lib/context/translate-context";
-import { routeReasonText, statedReasonText, type TorrentData } from "../../../lib/torrents.ts";
-import { EM_DASH, formatDate, formatDuration, formatRate, formatSize } from "../../data/format.ts";
+import {
+  routeReasonText,
+  statedReasonText,
+  type TorrentData,
+} from "../../../lib/torrents.ts";
+import {
+  EM_DASH,
+  formatDate,
+  formatDuration,
+  formatRate,
+  formatSize,
+} from "../../data/format.ts";
 
 /** One row of a torrent's general sections; a wide one spans the whole row. */
 export interface TorrentField {
@@ -14,22 +24,37 @@ export interface TorrentField {
   wide?: boolean;
 }
 
-const seconds = (value: number | null) => (value === null ? EM_DASH : formatDuration(value));
-const text = (value: string | null) => (value === null || value === "" ? EM_DASH : value);
+const seconds = (value: number | null) =>
+  value === null ? EM_DASH : formatDuration(value);
+const text = (value: string | null) =>
+  value === null || value === "" ? EM_DASH : value;
 
 /** Why the torrent is in its state: its route's reason while the route holds it, else the reason the server states, else the server's free words. */
-export function transferNote(t: Translate, torrent: TorrentData): string | undefined {
-  if (torrent.routeReason !== null) return routeReasonText(t, torrent.routeReason);
+export function transferNote(
+  t: Translate,
+  torrent: TorrentData,
+): string | undefined {
+  if (torrent.routeReason !== null)
+    return routeReasonText(t, torrent.routeReason);
   if (torrent.stated !== null) return statedReasonText(t, torrent.stated);
   return torrent.detail ?? undefined;
 }
 
 /** The Transfer section, in qBittorrent's order. */
-export function transferFields(t: Translate, torrent: TorrentData): TorrentField[] {
+export function transferFields(
+  t: Translate,
+  torrent: TorrentData,
+): TorrentField[] {
   const total = (count: number, total: number | null) =>
-    t("next.torrent.totalValue", { count, total: total === null ? EM_DASH : String(total) });
+    t("next.torrent.totalValue", {
+      count,
+      total: total === null ? EM_DASH : String(total),
+    });
   const speed = (rate: number, average: number) =>
-    t("next.torrent.averageValue", { rate: formatRate(rate), average: formatRate(average) });
+    t("next.torrent.averageValue", {
+      rate: formatRate(rate),
+      average: formatRate(average),
+    });
   return [
     {
       key: "timeActive",
@@ -45,31 +70,86 @@ export function transferFields(t: Translate, torrent: TorrentData): TorrentField
             })
           : formatDuration(torrent.activeSeconds),
     },
-    { key: "eta", label: t("next.torrent.eta"), value: seconds(torrent.etaSeconds) },
+    {
+      key: "eta",
+      label: t("next.torrent.eta"),
+      value: seconds(torrent.etaSeconds),
+    },
     {
       key: "connections",
       label: t("next.torrent.connections"),
-      value: t("next.torrent.connectionsValue", { count: torrent.peers, max: torrent.maxPeers }),
+      value: t("next.torrent.connectionsValue", {
+        count: torrent.peers,
+        max: torrent.maxPeers,
+      }),
     },
-    { key: "downloaded", label: t("next.job.downloaded"), value: formatSize(torrent.downloadedBytes) },
-    { key: "uploaded", label: t("next.torrent.uploaded"), value: formatSize(torrent.uploadedBytes) },
-    { key: "seeds", label: t("next.torrent.seeds"), value: total(torrent.seeds, torrent.swarmSeeds) },
-    { key: "downloadSpeed", label: t("next.torrent.downloadSpeed"), value: speed(torrent.downloadBps, torrent.downloadAvgBps) },
-    { key: "uploadSpeed", label: t("next.torrent.uploadSpeed"), value: speed(torrent.uploadBps, torrent.uploadAvgBps) },
-    { key: "peers", label: t("next.torrent.peers"), value: total(torrent.leechers, torrent.swarmLeechers) },
-    { key: "wasted", label: t("next.torrent.wasted"), value: formatSize(torrent.wastedBytes) },
-    { key: "shareRatio", label: t("next.torrent.shareRatio"), value: torrent.ratio.toFixed(2) },
-    { key: "reannounceIn", label: t("next.torrent.reannounceIn"), value: seconds(torrent.reannounceSeconds) },
-    { key: "lastSeenComplete", label: t("next.torrent.lastSeenComplete"), value: formatDate(torrent.lastSeenCompleteMs) },
+    {
+      key: "downloaded",
+      label: t("next.job.downloaded"),
+      value: formatSize(torrent.downloadedBytes),
+    },
+    {
+      key: "uploaded",
+      label: t("next.torrent.uploaded"),
+      value: formatSize(torrent.uploadedBytes),
+    },
+    {
+      key: "seeds",
+      label: t("next.torrent.seeds"),
+      value: total(torrent.seeds, torrent.swarmSeeds),
+    },
+    {
+      key: "downloadSpeed",
+      label: t("next.torrent.downloadSpeed"),
+      value: speed(torrent.downloadBps, torrent.downloadAvgBps),
+    },
+    {
+      key: "uploadSpeed",
+      label: t("next.torrent.uploadSpeed"),
+      value: speed(torrent.uploadBps, torrent.uploadAvgBps),
+    },
+    {
+      key: "peers",
+      label: t("next.torrent.peers"),
+      value: total(torrent.leechers, torrent.swarmLeechers),
+    },
+    {
+      key: "wasted",
+      label: t("next.torrent.wasted"),
+      value: formatSize(torrent.wastedBytes),
+    },
+    {
+      key: "shareRatio",
+      label: t("next.torrent.shareRatio"),
+      value: torrent.ratio.toFixed(2),
+    },
+    {
+      key: "reannounceIn",
+      label: t("next.torrent.reannounceIn"),
+      value: seconds(torrent.reannounceSeconds),
+    },
+    {
+      key: "lastSeenComplete",
+      label: t("next.torrent.lastSeenComplete"),
+      value: formatDate(torrent.lastSeenCompleteMs),
+    },
   ];
 }
 
 /** The Information section, in qBittorrent's order, with the route and unpacking after it; a field this torrent has no value for is left out. */
-export function informationFields(t: Translate, torrent: TorrentData): TorrentField[] {
-  return allInformationFields(t, torrent).filter((field) => field.value !== EM_DASH);
+export function informationFields(
+  t: Translate,
+  torrent: TorrentData,
+): TorrentField[] {
+  return allInformationFields(t, torrent).filter(
+    (field) => field.value !== EM_DASH,
+  );
 }
 
-function allInformationFields(t: Translate, torrent: TorrentData): TorrentField[] {
+function allInformationFields(
+  t: Translate,
+  torrent: TorrentData,
+): TorrentField[] {
   const pieces =
     torrent.pieceCount === null || torrent.pieceSize === null
       ? EM_DASH
@@ -79,18 +159,70 @@ function allInformationFields(t: Translate, torrent: TorrentData): TorrentField[
           have: torrent.piecesHave ?? 0,
         });
   return [
-    { key: "totalSize", label: t("next.inspector.totalSize"), value: formatSize(torrent.totalBytes) },
+    {
+      key: "totalSize",
+      label: t("next.inspector.totalSize"),
+      value: formatSize(torrent.totalBytes),
+    },
     { key: "pieces", label: t("next.torrent.pieces"), value: pieces },
-    { key: "createdBy", label: t("next.torrent.createdBy"), value: text(torrent.createdBy) },
-    { key: "addedOn", label: t("next.torrent.addedOn"), value: formatDate(torrent.addedAtMs) },
-    { key: "completedOn", label: t("next.torrent.completedOn"), value: formatDate(torrent.completedAtMs) },
-    { key: "createdOn", label: t("next.torrent.createdOn"), value: formatDate(torrent.createdAtMs) },
-    { key: "private", label: t("next.torrent.private"), value: t(torrent.private ? "next.common.yes" : "next.common.no") },
-    { key: "route", label: t("next.torrent.route"), value: text(torrent.route) },
-    { key: "unpack", label: t("next.torrents.unpack"), value: t(torrent.unpack ? "next.common.on" : "next.common.off") },
-    { key: "infoHashV1", label: t("next.torrent.infoHashV1"), value: text(torrent.infohash), wide: true },
-    { key: "infoHashV2", label: t("next.torrent.infoHashV2"), value: text(torrent.infohashV2), wide: true },
-    { key: "savePath", label: t("next.torrent.savePath"), value: text(torrent.savePath), wide: true },
-    { key: "comment", label: t("next.torrent.comment"), value: text(torrent.comment), wide: true },
+    {
+      key: "createdBy",
+      label: t("next.torrent.createdBy"),
+      value: text(torrent.createdBy),
+    },
+    {
+      key: "addedOn",
+      label: t("next.torrent.addedOn"),
+      value: formatDate(torrent.addedAtMs),
+    },
+    {
+      key: "completedOn",
+      label: t("next.torrent.completedOn"),
+      value: formatDate(torrent.completedAtMs),
+    },
+    {
+      key: "createdOn",
+      label: t("next.torrent.createdOn"),
+      value: formatDate(torrent.createdAtMs),
+    },
+    {
+      key: "private",
+      label: t("next.torrent.private"),
+      value: t(torrent.private ? "next.common.yes" : "next.common.no"),
+    },
+    {
+      key: "route",
+      label: t("next.torrent.route"),
+      value: text(torrent.route),
+    },
+    {
+      key: "unpack",
+      label: t("next.torrents.unpack"),
+      value: t(torrent.unpack ? "next.common.on" : "next.common.off"),
+    },
+    {
+      key: "infoHashV1",
+      label: t("next.torrent.infoHashV1"),
+      value: text(torrent.infohash),
+      wide: true,
+    },
+    {
+      key: "infoHashV2",
+      label: t("next.torrent.infoHashV2"),
+      value: text(torrent.infohashV2),
+      wide: true,
+    },
+    {
+      key: "savePath",
+      label: t("next.torrent.savePath"),
+      value: text(torrent.savePath),
+      wide: true,
+    },
+    {
+      key: "comment",
+      label: t("next.torrent.comment"),
+      value: text(torrent.comment),
+      wide: true,
+    },
   ];
 }

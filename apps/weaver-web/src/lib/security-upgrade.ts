@@ -3,7 +3,10 @@
 
 import { useState } from "react";
 import { useMutation } from "urql";
-import { SET_ACCESS_POLICY_MUTATION, SET_HTTP_BIND_ADDRESS_MUTATION } from "@/graphql/queries";
+import {
+  SET_ACCESS_POLICY_MUTATION,
+  SET_HTTP_BIND_ADDRESS_MUTATION,
+} from "@/graphql/queries";
 import { isContainerDeployment, type AccessMode } from "@/lib/setup-flow";
 
 /**
@@ -29,13 +32,19 @@ export interface SecurityUpgradeState {
 /// Loopback judged on the spelling the server reports, including the
 /// IPv4-mapped form a dual-stack listener produces.
 function isLoopbackAddress(value: string): boolean {
-  const normalized = value.trim().toLowerCase().replace(/^::ffff:/, "");
+  const normalized = value
+    .trim()
+    .toLowerCase()
+    .replace(/^::ffff:/, "");
   return normalized === "::1" || normalized.startsWith("127.");
 }
 
 /// The upgrade form: its state, which modes this deployment refuses, and the
 /// writes behind Save and Keep my current setup.
-export function useSecurityUpgradeForm(state: SecurityUpgradeState, onDone: () => void) {
+export function useSecurityUpgradeForm(
+  state: SecurityUpgradeState,
+  onDone: () => void,
+) {
   const [mode, setMode] = useState<AccessMode | null>(null);
   const wideNow = !isLoopbackAddress(state.bindEffective);
   const [bindWide, setBindWide] = useState(wideNow);
@@ -64,7 +73,8 @@ export function useSecurityUpgradeForm(state: SecurityUpgradeState, onDone: () =
   const containerized = isContainerDeployment(state.deployment);
   // Only when the answer differs from what the next restart already does —
   // an unchanged choice must not produce a write or a restart notice.
-  const bindChanges = state.bindEditable && !containerized && bindWide !== wideNow;
+  const bindChanges =
+    state.bindEditable && !containerized && bindWide !== wideNow;
 
   const applyPolicy = async (chosen: AccessMode): Promise<boolean> => {
     const result = await setPolicy({ mode: chosen });
@@ -91,7 +101,9 @@ export function useSecurityUpgradeForm(state: SecurityUpgradeState, onDone: () =
       setSavedMode(mode);
     }
     if (bindChanges) {
-      const result = await setBindAddress({ address: bindWide ? "0.0.0.0" : "" });
+      const result = await setBindAddress({
+        address: bindWide ? "0.0.0.0" : "",
+      });
       if (result.error) {
         setError(result.error.message.replace(/^\[GraphQL\]\s*/, ""));
         setSubmitting(false);

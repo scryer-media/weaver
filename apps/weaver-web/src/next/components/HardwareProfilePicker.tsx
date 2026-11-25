@@ -58,7 +58,14 @@ export function HardwareProfilePicker({
                   : "border-wv-control bg-wv-input hover:border-wv-control-focus",
               )}
             >
-              <Icon aria-hidden="true" strokeWidth={1.5} className={cn("h-10 w-10", active ? "text-wv-accent" : "text-wv-muted")} />
+              <Icon
+                aria-hidden="true"
+                strokeWidth={1.5}
+                className={cn(
+                  "h-10 w-10",
+                  active ? "text-wv-accent" : "text-wv-muted",
+                )}
+              />
               <div className="flex flex-col items-center gap-1">
                 <span
                   className={cn(

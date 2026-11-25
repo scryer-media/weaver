@@ -20,7 +20,10 @@ export const PASSWORD_MANAGER_MARKERS = {
 } as const;
 
 /** The markers plus `autoComplete="off"`, for a field that sets no autocomplete of its own. */
-export const PASSWORD_MANAGER_IGNORE = { autoComplete: "off", ...PASSWORD_MANAGER_MARKERS } as const;
+export const PASSWORD_MANAGER_IGNORE = {
+  autoComplete: "off",
+  ...PASSWORD_MANAGER_MARKERS,
+} as const;
 
 /**
  * True under a screen none of whose fields is the Weaver login, so every one
@@ -45,7 +48,10 @@ export function ignoredByPasswordManagers(options: {
   if (options.secret !== undefined) {
     return options.secret;
   }
-  if (options.autoComplete === "current-password" || options.autoComplete === "new-password") {
+  if (
+    options.autoComplete === "current-password" ||
+    options.autoComplete === "new-password"
+  ) {
     return false;
   }
   return options.everyField === true || options.type === "password";
@@ -58,5 +64,7 @@ export function usePasswordManagerIgnore(options: {
   autoComplete?: string;
 }): typeof PASSWORD_MANAGER_IGNORE | null {
   const everyField = useContext(PasswordManagersKeptOut);
-  return ignoredByPasswordManagers({ ...options, everyField }) ? PASSWORD_MANAGER_IGNORE : null;
+  return ignoredByPasswordManagers({ ...options, everyField })
+    ? PASSWORD_MANAGER_IGNORE
+    : null;
 }

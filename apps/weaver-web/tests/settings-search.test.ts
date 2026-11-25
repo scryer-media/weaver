@@ -16,8 +16,15 @@ const section: SearchableBlock = {
   kind: "section",
   title: "Downloads",
   fields: [
-    { label: "Speed limit", help: "Caps every server together", keywords: "MiB/s bandwidth" },
-    { label: "Retry count", help: "How often a failed article is asked for again" },
+    {
+      label: "Speed limit",
+      help: "Caps every server together",
+      keywords: "MiB/s bandwidth",
+    },
+    {
+      label: "Retry count",
+      help: "How often a failed article is asked for again",
+    },
     { label: "Proxy timeout", help: "Seconds to wait", collapsed: true },
   ],
 };
@@ -32,7 +39,11 @@ const table: SearchableBlock = {
   ],
 };
 
-const custom: SearchableBlock = { kind: "custom", title: "Flow", searchText: "egress wan0 consumer feeds" };
+const custom: SearchableBlock = {
+  kind: "custom",
+  title: "Flow",
+  searchText: "egress wan0 consumer feeds",
+};
 
 test("a query becomes lower-cased whitespace terms, and a blank one has none", () => {
   assert.deepEqual(searchTerms("  Speed   LIMIT "), ["speed", "limit"]);
@@ -53,7 +64,11 @@ test("fields match on label, help and keywords, in any case and order", () => {
   for (const query of ["SPEED", "caps server", "bandwidth", "limit speed"]) {
     const [kept] = filterBlocks([section], query);
     assert.ok(kept?.kind === "section", query);
-    assert.deepEqual(kept.fields.map((field) => field.label), ["Speed limit"], query);
+    assert.deepEqual(
+      kept.fields.map((field) => field.label),
+      ["Speed limit"],
+      query,
+    );
   }
   assert.deepEqual(filterBlocks([section], "nothing like this"), []);
 });
@@ -61,7 +76,10 @@ test("fields match on label, help and keywords, in any case and order", () => {
 test("a term may come from the block's title", () => {
   const [kept] = filterBlocks([section], "downloads retry");
   assert.ok(kept?.kind === "section");
-  assert.deepEqual(kept.fields.map((field) => field.label), ["Retry count"]);
+  assert.deepEqual(
+    kept.fields.map((field) => field.label),
+    ["Retry count"],
+  );
 });
 
 test("a block whose title matches survives whole", () => {
@@ -75,9 +93,14 @@ test("a block whose title matches survives whole", () => {
 test("a shut row still matches, and comes back open", () => {
   const [kept] = filterBlocks([section], "timeout");
   assert.ok(kept?.kind === "section");
-  assert.deepEqual(kept.fields, [{ label: "Proxy timeout", help: "Seconds to wait", collapsed: false }]);
+  assert.deepEqual(kept.fields, [
+    { label: "Proxy timeout", help: "Seconds to wait", collapsed: false },
+  ]);
   // The panel's own copy is left alone.
-  assert.equal(section.kind === "section" && section.fields[2]!.collapsed, true);
+  assert.equal(
+    section.kind === "section" && section.fields[2]!.collapsed,
+    true,
+  );
 });
 
 test("a title match opens only the shut rows that match on their own", () => {
@@ -92,18 +115,27 @@ test("a title match opens only the shut rows that match on their own", () => {
   };
   const [kept] = filterBlocks([block], "proxy");
   assert.ok(kept?.kind === "section");
-  assert.deepEqual(kept.fields.map((field) => field.collapsed), [undefined, false, true]);
+  assert.deepEqual(
+    kept.fields.map((field) => field.collapsed),
+    [undefined, false, true],
+  );
 });
 
 test("table rows and grouped rows filter by their search text; a group title keeps its rows", () => {
   const [byRow] = filterBlocks([table], "block.example");
   assert.ok(byRow?.kind === "table");
   assert.deepEqual(byRow.rows, []);
-  assert.deepEqual(byRow.groups?.map((group) => group.rows.length), [1, 0]);
+  assert.deepEqual(
+    byRow.groups?.map((group) => group.rows.length),
+    [1, 0],
+  );
 
   const [byGroup] = filterBlocks([table], "disabled");
   assert.ok(byGroup?.kind === "table");
-  assert.deepEqual(byGroup.groups?.map((group) => group.rows.length), [0, 1]);
+  assert.deepEqual(
+    byGroup.groups?.map((group) => group.rows.length),
+    [0, 1],
+  );
 
   const [topLevel] = filterBlocks([table], "563");
   assert.ok(topLevel?.kind === "table");
@@ -134,7 +166,10 @@ test("the registry sums a panel's lists and forgets removed ones", () => {
   registry.report("a", "networking/proxies", { count: 1, loading: false });
   registry.report("b", "networking/proxies", { count: 2, loading: false });
   registry.report("c", "general", { count: 0, loading: true });
-  assert.deepEqual(registry.panel("networking/proxies"), { count: 3, loading: false });
+  assert.deepEqual(registry.panel("networking/proxies"), {
+    count: 3,
+    loading: false,
+  });
   assert.deepEqual(registry.panel("general"), { count: 0, loading: true });
   assert.deepEqual(registry.panel("backup"), { count: 0, loading: false });
   assert.equal(notified, 3);
@@ -144,7 +179,10 @@ test("the registry sums a panel's lists and forgets removed ones", () => {
   assert.equal(notified, 3);
 
   registry.remove("b");
-  assert.deepEqual(registry.panel("networking/proxies"), { count: 1, loading: false });
+  assert.deepEqual(registry.panel("networking/proxies"), {
+    count: 1,
+    loading: false,
+  });
   registry.remove("b");
   assert.equal(notified, 4);
 
@@ -159,10 +197,13 @@ test("the outcome lists matching panels in rail order", () => {
   registry.report("x", "backup", { count: 1, loading: false });
   registry.report("y", "general", { count: 2, loading: false });
   registry.report("z", "servers", { count: 0, loading: false });
-  assert.deepEqual(searchOutcome(rail, (slug) => registry.panel(slug)), {
-    state: "results",
-    panels: ["general", "backup"],
-  });
+  assert.deepEqual(
+    searchOutcome(rail, (slug) => registry.panel(slug)),
+    {
+      state: "results",
+      panels: ["general", "backup"],
+    },
+  );
 });
 
 test("results show while another panel still loads; an empty answer waits for it", () => {

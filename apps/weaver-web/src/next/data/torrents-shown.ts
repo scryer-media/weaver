@@ -38,7 +38,9 @@ export interface TorrentPresence {
 export type TorrentsState = "on" | "off" | "unavailable" | "unknown";
 
 /** The state from the server's answer: none yet, or a failed read, is unknown. */
-export function torrentsStateFrom(presence: TorrentPresence | null | undefined): TorrentsState {
+export function torrentsStateFrom(
+  presence: TorrentPresence | null | undefined,
+): TorrentsState {
   if (!presence) return "unknown";
   if (!presence.available) return "unavailable";
   return presence.enabled || presence.jobs ? "on" : "off";
@@ -58,8 +60,17 @@ export function torrentsAvailable(state: TorrentsState): boolean {
  * What a screen that is there whenever the server has torrents draws:
  * `there` while it has them, `none` once known not to, `pending` until then.
  */
-export function torrentsAvailableView<T>(state: TorrentsState, there: T, none: T, pending: T): T {
-  return torrentsAvailable(state) ? there : state === "unknown" ? pending : none;
+export function torrentsAvailableView<T>(
+  state: TorrentsState,
+  there: T,
+  none: T,
+  pending: T,
+): T {
+  return torrentsAvailable(state)
+    ? there
+    : state === "unknown"
+      ? pending
+      : none;
 }
 
 /** Whether torrent things show: only once known to. */
@@ -74,12 +85,19 @@ export function torrentsShown(state: TorrentsState): boolean {
  * since the server refuses it. Unknown offers none, as torrent things wait, and
  * so does a server without torrents.
  */
-export function torrentAddsOffered(presence: TorrentPresence | null | undefined): boolean {
+export function torrentAddsOffered(
+  presence: TorrentPresence | null | undefined,
+): boolean {
   return presence?.available === true && presence.enabled === true;
 }
 
 /** What a torrent-only screen draws: `on` while torrent things show, `off` once known not to, `pending` until then. */
-export function torrentsView<T>(state: TorrentsState, on: T, off: T, pending: T): T {
+export function torrentsView<T>(
+  state: TorrentsState,
+  on: T,
+  off: T,
+  pending: T,
+): T {
   return state === "on" ? on : state === "unknown" ? pending : off;
 }
 
@@ -110,17 +128,25 @@ export function asksHowTorrentsEnd(
  * Whether the Torrents switch waits: while it is on and the server has not
  * said which torrents run, turning it off could not ask how they end.
  */
-export function torrentSwitchWaits(enabled: boolean, presence: TorrentPresence | null | undefined): boolean {
+export function torrentSwitchWaits(
+  enabled: boolean,
+  presence: TorrentPresence | null | undefined,
+): boolean {
   return enabled && presence == null;
 }
 
 /** Whether a wind-down under way can be cut short: torrents off, some still let finish. */
-export function windDownStoppable(enabled: boolean, presence: TorrentPresence | null | undefined): boolean {
+export function windDownStoppable(
+  enabled: boolean,
+  presence: TorrentPresence | null | undefined,
+): boolean {
   return !enabled && presence?.windingDown === true;
 }
 
 /** The settings change that stops a wind-down under way: every torrent stops now. */
-export function stopNowInput(): { torrent: { enabled: false; whenDisabled: TorrentDisableMode } } {
+export function stopNowInput(): {
+  torrent: { enabled: false; whenDisabled: TorrentDisableMode };
+} {
   return { torrent: { enabled: false, whenDisabled: "STOP_NOW" } };
 }
 
@@ -129,9 +155,14 @@ export function stopNowInput(): { torrent: { enabled: false; whenDisabled: Torre
  * switch is off, whatever torrent jobs are left; the switch and the rest
  * while it is on.
  */
-export function torrentSettingsDisclosed<T>(enabled: boolean, toggle: T, rest: readonly T[]): T[] {
+export function torrentSettingsDisclosed<T>(
+  enabled: boolean,
+  toggle: T,
+  rest: readonly T[],
+): T[] {
   return enabled ? [toggle, ...rest] : [toggle];
 }
 
 /** How the torrents still running end when torrents are turned off. */
-export type TorrentDisableMode = "STOP_NOW" | "FINISH_DOWNLOADS" | "FINISH_SEEDING" | "FINISH_ALL";
+export type TorrentDisableMode =
+  "STOP_NOW" | "FINISH_DOWNLOADS" | "FINISH_SEEDING" | "FINISH_ALL";

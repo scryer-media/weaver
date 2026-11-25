@@ -52,7 +52,9 @@ export function pathCrumbs(path: string): PathCrumb[] {
   let current = origin.root;
   for (const segment of trimmed.slice(origin.root.length).split(/[\\/]+/)) {
     if (segment === "") continue;
-    current = current.endsWith(origin.separator) ? `${current}${segment}` : `${current}${origin.separator}${segment}`;
+    current = current.endsWith(origin.separator)
+      ? `${current}${segment}`
+      : `${current}${origin.separator}${segment}`;
     crumbs.push({ label: segment, path: current });
   }
   return crumbs;
@@ -65,16 +67,28 @@ export function parentPath(path: string): string | null {
 }
 
 /** Entries whose name contains `query`, ignoring case; every entry for a blank query. */
-export function filterEntries<T extends DirectoryEntry>(entries: readonly T[], query: string): readonly T[] {
+export function filterEntries<T extends DirectoryEntry>(
+  entries: readonly T[],
+  query: string,
+): readonly T[] {
   const needle = query.trim().toLowerCase();
-  return needle === "" ? entries : entries.filter((entry) => entry.name.toLowerCase().includes(needle));
+  return needle === ""
+    ? entries
+    : entries.filter((entry) => entry.name.toLowerCase().includes(needle));
 }
 
 /** "1,204 folders", or "12 of 1,204 folders" while a filter hides some. */
-export function describeEntryCount(t: Translate, shown: number, total: number): string {
+export function describeEntryCount(
+  t: Translate,
+  shown: number,
+  total: number,
+): string {
   const plural = total === 1 ? "one" : "other";
   const count = total.toLocaleString("en-US");
   return shown === total
     ? t(`next.folders.count.${plural}`, { count })
-    : t(`next.folders.filtered.${plural}`, { shown: shown.toLocaleString("en-US"), count });
+    : t(`next.folders.filtered.${plural}`, {
+        shown: shown.toLocaleString("en-US"),
+        count,
+      });
 }

@@ -11,7 +11,13 @@ import {
 } from "@/graphql/proxies";
 import { useTranslate, type Translate } from "@/lib/context/translate-context";
 import { proxyLabels, type ProxyKind, type ProxyProfile } from "@/lib/proxies";
-import { MAX_DNS_SERVERS, SYSTEM_DNS_PROFILE_ID, dnsProfileName, isIpv4, isIpv6 } from "@/lib/dns";
+import {
+  MAX_DNS_SERVERS,
+  SYSTEM_DNS_PROFILE_ID,
+  dnsProfileName,
+  isIpv4,
+  isIpv6,
+} from "@/lib/dns";
 import { settingsIds, testIds } from "@/next/testids";
 import { cn } from "@/lib/utils";
 import { useNamedRefusal } from "../../../features/networking/refusal-names";
@@ -26,8 +32,17 @@ import {
 } from "@/lib/wireguard-config";
 import { Square } from "../../../components/chrome";
 import { ConfirmDialog } from "../../../components/ConfirmDialog";
-import { RecordEditor, type EditorSection } from "../../../components/RecordEditor";
-import { DangerButton, SecondaryButton, Segmented, TextArea, TextField } from "../../../components/controls";
+import {
+  RecordEditor,
+  type EditorSection,
+} from "../../../components/RecordEditor";
+import {
+  DangerButton,
+  SecondaryButton,
+  Segmented,
+  TextArea,
+  TextField,
+} from "../../../components/controls";
 import { Cell } from "../../../components/rows";
 import { WV } from "../../../data/palette";
 import {
@@ -49,7 +64,13 @@ import {
  * password.
  */
 
-const SECRET_KEYS = ["username", "password", "privateKey", "passphrase", "presharedKey"] as const;
+const SECRET_KEYS = [
+  "username",
+  "password",
+  "privateKey",
+  "passphrase",
+  "presharedKey",
+] as const;
 type SecretKey = (typeof SECRET_KEYS)[number];
 
 interface ProxyForm {
@@ -74,7 +95,13 @@ interface ProxyForm {
 }
 
 const KINDS: { value: string; label: string }[] = (
-  ["WIRE_GUARD", "SOCKS5", "HTTP_CONNECT", "HTTP3_CONNECT", "SSH"] as ProxyKind[]
+  [
+    "WIRE_GUARD",
+    "SOCKS5",
+    "HTTP_CONNECT",
+    "HTTP3_CONNECT",
+    "SSH",
+  ] as ProxyKind[]
 ).map((kind) => ({ value: kind, label: proxyLabels[kind] }));
 
 const DEFAULT_PORTS: Record<ProxyKind, number> = {
@@ -125,7 +152,9 @@ const NEW_PROXY: ProxyForm = {
 function splitList(value: string): string[] {
   return value
     .split(/\r?\n/)
-    .flatMap((line) => stripConfigAssignment(line, CONFIG_KEYS.list).split(/[\s,]+/))
+    .flatMap((line) =>
+      stripConfigAssignment(line, CONFIG_KEYS.list).split(/[\s,]+/),
+    )
     .filter(Boolean);
 }
 
@@ -138,7 +167,10 @@ function splitEndpoint(raw: string): { host: string; port?: number } {
   const value = stripConfigAssignment(raw, CONFIG_KEYS.endpoint);
   const match = /^(?:\[([^\]]+)\]|([^:\s]+))(?::(\d+))?$/.exec(value);
   return match
-    ? { host: match[1] ?? match[2] ?? value, port: match[3] ? Number(match[3]) : undefined }
+    ? {
+        host: match[1] ?? match[2] ?? value,
+        port: match[3] ? Number(match[3]) : undefined,
+      }
     : { host: value };
 }
 
@@ -154,9 +186,11 @@ function formFor(profile: ProxyProfile): ProxyForm {
     addresses: profile.tunnelAddresses.join("\n"),
     peerPublicKey: profile.peerPublicKey ?? "",
     mtu: profile.mtu ? String(profile.mtu) : "",
-    keepaliveSeconds: profile.keepaliveSeconds == null ? "" : String(profile.keepaliveSeconds),
+    keepaliveSeconds:
+      profile.keepaliveSeconds == null ? "" : String(profile.keepaliveSeconds),
     natpmp: profile.natpmp,
-    forwardedPort: profile.forwardedPort == null ? "" : String(profile.forwardedPort),
+    forwardedPort:
+      profile.forwardedPort == null ? "" : String(profile.forwardedPort),
     timeoutSeconds: profile.timeoutSeconds,
     secrets: {},
   };
@@ -184,12 +218,19 @@ function normalized(form: ProxyForm): ProxyForm {
     ...form,
     host: endpoint.host,
     port: endpoint.port ?? form.port,
-    peerPublicKey: stripConfigAssignment(form.peerPublicKey, CONFIG_KEYS.peerPublicKey),
+    peerPublicKey: stripConfigAssignment(
+      form.peerPublicKey,
+      CONFIG_KEYS.peerPublicKey,
+    ),
     secrets,
   };
 }
 
-function wireguardProblem(t: Translate, form: ProxyForm, profile: ProxyProfile | null): string | null {
+function wireguardProblem(
+  t: Translate,
+  form: ProxyForm,
+  profile: ProxyProfile | null,
+): string | null {
   const privateKey = form.secrets.privateKey ?? "";
   if (!privateKey && !profile?.hasPrivateKey) {
     return t("next.proxies.needsPrivateKey");
@@ -249,26 +290,34 @@ function proxyInput(form: ProxyForm) {
 
 export function ProxiesPanel({ onChanged }: { onChanged?: () => void }) {
   const t = useTranslate();
-  const [{ data, fetching }, reexecute] = useQuery<{ proxyProfiles: ProxyProfile[] }>({
+  const [{ data, fetching }, reexecute] = useQuery<{
+    proxyProfiles: ProxyProfile[];
+  }>({
     query: PROXY_PROFILES_QUERY,
   });
   const [editingId, setEditingId] = useState<number | "new" | null>(null);
   const [testingId, setTestingId] = useState<number | null>(null);
   const [removing, setRemoving] = useState<ProxyProfile | null>(null);
   const [removeError, setRemoveError] = useState<string | null>(null);
-  const [{ fetching: removeBusy }, deleteProxy] = useMutation(DELETE_PROXY_MUTATION);
+  const [{ fetching: removeBusy }, deleteProxy] = useMutation(
+    DELETE_PROXY_MUTATION,
+  );
   const namedRefusal = useNamedRefusal();
   // Each proxy's last test in this session, in one sentence.
   const [health, setHealth] = useState<Record<number, string>>({});
 
   const profiles = data?.proxyProfiles ?? [];
   // Profile names are read only when a proxy follows one other than System.
-  const dnsNames = useProxyNameProfiles(profiles.some((profile) => profile.dnsProfileId !== SYSTEM_DNS_PROFILE_ID));
+  const dnsNames = useProxyNameProfiles(
+    profiles.some((profile) => profile.dnsProfileId !== SYSTEM_DNS_PROFILE_ID),
+  );
   const foundWithName = (id: number) =>
-    dnsNames?.find((choice) => choice.id === id)?.name ?? t("next.proxies.dnsProfileNumber", { id });
-  const editing = typeof editingId === "number"
-    ? (profiles.find((profile) => profile.id === editingId) ?? null)
-    : null;
+    dnsNames?.find((choice) => choice.id === id)?.name ??
+    t("next.proxies.dnsProfileNumber", { id });
+  const editing =
+    typeof editingId === "number"
+      ? (profiles.find((profile) => profile.id === editingId) ?? null)
+      : null;
 
   const blocks: SettingsBlock[] = [
     {
@@ -305,12 +354,22 @@ export function ProxiesPanel({ onChanged }: { onChanged?: () => void }) {
           <Cell key="host" mono className="text-wv-muted">
             {profile.host}:{profile.port}
             {profile.dnsProfileId === SYSTEM_DNS_PROFILE_ID ? null : (
-              <span className="block truncate text-[11px]" data-testid={settingsIds.proxyDnsProfile(profile.id)}>
-                {t("next.proxies.dnsProfileDetail", { name: foundWithName(profile.dnsProfileId) })}
+              <span
+                className="block truncate text-[11px]"
+                data-testid={settingsIds.proxyDnsProfile(profile.id)}
+              >
+                {t("next.proxies.dnsProfileDetail", {
+                  name: foundWithName(profile.dnsProfileId),
+                })}
               </span>
             )}
           </Cell>,
-          <Cell key="health" mono className="text-wv-muted" title={health[profile.id]}>
+          <Cell
+            key="health"
+            mono
+            className="text-wv-muted"
+            title={health[profile.id]}
+          >
             {health[profile.id] ?? "—"}
           </Cell>,
           <span
@@ -318,13 +377,25 @@ export function ProxiesPanel({ onChanged }: { onChanged?: () => void }) {
             className="ml-auto flex flex-wrap items-center justify-end gap-2"
             onClick={(event) => event.stopPropagation()}
           >
-            <SecondaryButton icon="test" className="h-7 px-2" onClick={() => setTestingId(profile.id)}>
+            <SecondaryButton
+              icon="test"
+              className="h-7 px-2"
+              onClick={() => setTestingId(profile.id)}
+            >
               {t("next.proxies.testVia")}
             </SecondaryButton>
-            <SecondaryButton icon="edit" className="h-7 px-2" onClick={() => setEditingId(profile.id)}>
+            <SecondaryButton
+              icon="edit"
+              className="h-7 px-2"
+              onClick={() => setEditingId(profile.id)}
+            >
               {t("next.common.edit")}
             </SecondaryButton>
-            <DangerButton icon="remove" className="h-7 px-2" onClick={() => setRemoving(profile)}>
+            <DangerButton
+              icon="remove"
+              className="h-7 px-2"
+              onClick={() => setRemoving(profile)}
+            >
               {t("next.common.remove")}
             </DangerButton>
           </span>,
@@ -354,7 +425,9 @@ export function ProxiesPanel({ onChanged }: { onChanged?: () => void }) {
         <TestViaDialog
           key={testingId}
           subject={{ proxy: testingId }}
-          onTested={(summary) => setHealth((current) => ({ ...current, [testingId]: summary }))}
+          onTested={(summary) =>
+            setHealth((current) => ({ ...current, [testingId]: summary }))
+          }
           onClose={() => setTestingId(null)}
         />
       )}
@@ -369,7 +442,10 @@ export function ProxiesPanel({ onChanged }: { onChanged?: () => void }) {
           <>
             {t("next.proxies.removeBody")}
             {removeError === null ? null : (
-              <span role="alert" className="mt-3 block text-[12.5px] text-wv-error-text">
+              <span
+                role="alert"
+                className="mt-3 block text-[12.5px] text-wv-error-text"
+              >
                 {removeError}
               </span>
             )}
@@ -412,7 +488,9 @@ export function ProxyEditorFor({
   onClose: () => void;
   onChanged: () => void;
 }) {
-  const [{ data }, reexecute] = useQuery<{ proxyProfiles: ProxyProfile[] }>({ query: PROXY_PROFILES_QUERY });
+  const [{ data }, reexecute] = useQuery<{ proxyProfiles: ProxyProfile[] }>({
+    query: PROXY_PROFILES_QUERY,
+  });
   const profile = data?.proxyProfiles.find((candidate) => candidate.id === id);
   return profile ? (
     <ProxyEditor
@@ -451,9 +529,13 @@ export function ProxyEditor({
   const [, resetTrust] = useMutation(RESET_PROXY_TRUST_MUTATION);
   const dnsChoices = useProxyNameProfiles();
 
-  const [form, setForm] = useState<ProxyForm>(() => (editing ? formFor(editing) : NEW_PROXY));
+  const [form, setForm] = useState<ProxyForm>(() =>
+    editing ? formFor(editing) : NEW_PROXY,
+  );
   // A stored profile opens on its details; a new one on the file most people have them in.
-  const [start, setStart] = useState<WireguardStart>(editing ? "manual" : "upload");
+  const [start, setStart] = useState<WireguardStart>(
+    editing ? "manual" : "upload",
+  );
   const [dragging, setDragging] = useState(false);
   const fileNameId = useId();
   const [configText, setConfigText] = useState("");
@@ -466,7 +548,8 @@ export function ProxyEditor({
   const [confirmRemove, setConfirmRemove] = useState<ProxyProfile | null>(null);
   const [confirmTrust, setConfirmTrust] = useState<ProxyProfile | null>(null);
 
-  const patch = (next: Partial<ProxyForm>) => setForm((current) => ({ ...current, ...next }));
+  const patch = (next: Partial<ProxyForm>) =>
+    setForm((current) => ({ ...current, ...next }));
   const setSecret = (key: SecretKey, value: string) =>
     setForm((current) => {
       const secrets = { ...current.secrets };
@@ -496,7 +579,9 @@ export function ProxyEditor({
   ): FieldControl => {
     const cleared = form.secrets[key] === null;
     const value = form.secrets[key] ?? "";
-    const placeholder = cleared ? t("next.proxies.clearedPlaceholder") : "••••••••";
+    const placeholder = cleared
+      ? t("next.proxies.clearedPlaceholder")
+      : "••••••••";
     return {
       kind: "custom",
       control: (
@@ -523,18 +608,25 @@ export function ProxyEditor({
             />
           )}
           <SecondaryButton onClick={() => setCleared(key, !cleared)}>
-            {cleared ? t("next.proxies.keepStored") : t("next.proxies.clearStored")}
+            {cleared
+              ? t("next.proxies.keepStored")
+              : t("next.proxies.clearStored")}
           </SecondaryButton>
         </div>
       ),
     };
   };
   const storedHelp = (key: SecretKey) =>
-    form.secrets[key] === null ? t("next.proxies.storedCleared") : t("next.proxies.storedKeep");
+    form.secrets[key] === null
+      ? t("next.proxies.storedCleared")
+      : t("next.proxies.storedKeep");
 
   const describeProblem = (problem: WireguardConfigProblem) =>
     problem.kind === "missing"
-      ? t("next.proxies.configMissing", { key: problem.key, section: problem.section })
+      ? t("next.proxies.configMissing", {
+          key: problem.key,
+          section: problem.section,
+        })
       : problem.kind === "key"
         ? t("next.proxies.configBadKey", { key: problem.key })
         : problem.kind === "number"
@@ -547,7 +639,9 @@ export function ProxyEditor({
       return [t("next.proxies.configTooLarge")];
     }
     const parsed = parseWireguardConfig(text);
-    return parsed ? wireguardConfigProblems(parsed).map(describeProblem) : [t("next.proxies.configNotWireguard")];
+    return parsed
+      ? wireguardConfigProblems(parsed).map(describeProblem)
+      : [t("next.proxies.configNotWireguard")];
   };
 
   /**
@@ -564,7 +658,9 @@ export function ProxyEditor({
       return;
     }
     const endpoint = parsed.endpoint ? splitEndpoint(parsed.endpoint) : null;
-    const keepalive = /^off$/i.test(parsed.tunnelKeepaliveSeconds) ? "0" : parsed.tunnelKeepaliveSeconds;
+    const keepalive = /^off$/i.test(parsed.tunnelKeepaliveSeconds)
+      ? "0"
+      : parsed.tunnelKeepaliveSeconds;
     setError(null);
     setForm((current) => ({
       ...current,
@@ -573,10 +669,13 @@ export function ProxyEditor({
       port: endpoint?.port ?? current.port,
       addresses: parsed.tunnelAddresses || current.addresses,
       // The tunnel's DNS servers answer inside it, so they are asked through it.
-      ...(parsed.tunnelDnsServers ? { dnsServers: splitList(parsed.tunnelDnsServers).join("\n") } : {}),
+      ...(parsed.tunnelDnsServers
+        ? { dnsServers: splitList(parsed.tunnelDnsServers).join("\n") }
+        : {}),
       peerPublicKey: parsed.peerPublicKey || current.peerPublicKey,
       mtu: digits(parsed.tunnelMtu, CONFIG_KEYS.mtu) || current.mtu,
-      keepaliveSeconds: digits(keepalive, CONFIG_KEYS.keepalive) || current.keepaliveSeconds,
+      keepaliveSeconds:
+        digits(keepalive, CONFIG_KEYS.keepalive) || current.keepaliveSeconds,
       secrets: {
         ...current.secrets,
         ...(parsed.privateKey ? { privateKey: parsed.privateKey } : {}),
@@ -586,9 +685,15 @@ export function ProxyEditor({
     setNote(
       [
         t("next.proxies.configFilled"),
-        ...(parsed.peerCount > 1 ? [t("next.proxies.configPeers", { count: parsed.peerCount })] : []),
+        ...(parsed.peerCount > 1
+          ? [t("next.proxies.configPeers", { count: parsed.peerCount })]
+          : []),
         ...(parsed.ignored.length
-          ? [t("next.proxies.configIgnored", { fields: parsed.ignored.join(", ") })]
+          ? [
+              t("next.proxies.configIgnored", {
+                fields: parsed.ignored.join(", "),
+              }),
+            ]
           : []),
       ].join(" "),
     );
@@ -666,7 +771,11 @@ export function ProxyEditor({
       id: "host",
       label: isWireguard ? t("next.proxies.endpoint") : t("next.proxies.host"),
       help: isWireguard ? t("next.proxies.endpointHelp") : undefined,
-      control: { kind: "text", value: form.host, onChange: (next) => patch({ host: next }) },
+      control: {
+        kind: "text",
+        value: form.host,
+        onChange: (next) => patch({ host: next }),
+      },
     },
     {
       id: "port",
@@ -688,7 +797,10 @@ export function ProxyEditor({
         value: String(form.dnsProfileId),
         // Until the profiles are read, the saved choice is the only one shown.
         options: dnsChoices
-          ? dnsChoices.map((choice) => ({ value: String(choice.id), label: dnsProfileName(t, choice, "PROXY_NAME") }))
+          ? dnsChoices.map((choice) => ({
+              value: String(choice.id),
+              label: dnsProfileName(t, choice, "PROXY_NAME"),
+            }))
           : [{ value: String(form.dnsProfileId), label: "…" }],
         onChange: (next) => patch({ dnsProfileId: Number(next) }),
       },
@@ -718,7 +830,10 @@ export function ProxyEditor({
             value: form.kind,
             options: KINDS,
             onChange: (next) =>
-              patch({ kind: next as ProxyKind, port: DEFAULT_PORTS[next as ProxyKind] }),
+              patch({
+                kind: next as ProxyKind,
+                port: DEFAULT_PORTS[next as ProxyKind],
+              }),
           },
     },
     // A WireGuard endpoint is one of the details its configuration carries, so it sits with them.
@@ -738,7 +853,11 @@ export function ProxyEditor({
     {
       id: "enabled",
       label: t("next.proxies.enabled"),
-      control: { kind: "toggle", value: form.enabled, onChange: (next) => patch({ enabled: next }) },
+      control: {
+        kind: "toggle",
+        value: form.enabled,
+        onChange: (next) => patch({ enabled: next }),
+      },
     },
   ];
 
@@ -748,7 +867,9 @@ export function ProxyEditor({
         {
           id: "privateKey",
           label: t("next.proxies.privateKey"),
-          help: editing?.hasPrivateKey ? t("next.proxies.storedKeep") : undefined,
+          help: editing?.hasPrivateKey
+            ? t("next.proxies.storedKeep")
+            : undefined,
           control: {
             kind: "text",
             type: "password",
@@ -769,9 +890,13 @@ export function ProxyEditor({
         {
           id: "presharedKey",
           label: t("next.proxies.presharedKey"),
-          help: editing?.hasPresharedKey ? storedHelp("presharedKey") : t("next.proxies.optional"),
+          help: editing?.hasPresharedKey
+            ? storedHelp("presharedKey")
+            : t("next.proxies.optional"),
           control: editing?.hasPresharedKey
-            ? storedSecret("presharedKey", t("next.proxies.presharedKey"), { password: true })
+            ? storedSecret("presharedKey", t("next.proxies.presharedKey"), {
+                password: true,
+              })
             : {
                 kind: "text",
                 type: "password",
@@ -826,7 +951,11 @@ export function ProxyEditor({
         {
           id: "natpmp",
           label: t("next.proxies.natpmp"),
-          control: { kind: "toggle", value: form.natpmp, onChange: (next) => patch({ natpmp: next }) },
+          control: {
+            kind: "toggle",
+            value: form.natpmp,
+            onChange: (next) => patch({ natpmp: next }),
+          },
         },
         // The gateway picks the port under NAT-PMP: there is none to give.
         ...(form.natpmp
@@ -851,7 +980,9 @@ export function ProxyEditor({
           label: t("next.proxies.username"),
           help: editing?.hasUsername
             ? storedHelp("username")
-            : isSsh ? undefined : t("next.proxies.optional"),
+            : isSsh
+              ? undefined
+              : t("next.proxies.optional"),
           control: editing?.hasUsername
             ? storedSecret("username", t("next.proxies.username"))
             : {
@@ -868,9 +999,13 @@ export function ProxyEditor({
               {
                 id: "password",
                 label: t("next.proxies.password"),
-                help: editing?.hasPassword ? storedHelp("password") : t("next.proxies.optional"),
+                help: editing?.hasPassword
+                  ? storedHelp("password")
+                  : t("next.proxies.optional"),
                 control: editing?.hasPassword
-                  ? storedSecret("password", t("next.proxies.password"), { password: true })
+                  ? storedSecret("password", t("next.proxies.password"), {
+                      password: true,
+                    })
                   : {
                       kind: "text" as const,
                       type: "password" as const,
@@ -888,7 +1023,9 @@ export function ProxyEditor({
                   ? `${t("next.proxies.sshKeyHelp")} ${storedHelp("privateKey")}`
                   : t("next.proxies.sshKeyHelp"),
                 control: editing?.hasPrivateKey
-                  ? storedSecret("privateKey", t("next.proxies.privateKey"), { multiline: true })
+                  ? storedSecret("privateKey", t("next.proxies.privateKey"), {
+                      multiline: true,
+                    })
                   : {
                       kind: "textarea" as const,
                       secret: true,
@@ -900,9 +1037,13 @@ export function ProxyEditor({
               {
                 id: "passphrase",
                 label: t("next.proxies.passphrase"),
-                help: editing?.hasPassphrase ? storedHelp("passphrase") : t("next.proxies.optional"),
+                help: editing?.hasPassphrase
+                  ? storedHelp("passphrase")
+                  : t("next.proxies.optional"),
                 control: editing?.hasPassphrase
-                  ? storedSecret("passphrase", t("next.proxies.passphrase"), { password: true })
+                  ? storedSecret("passphrase", t("next.proxies.passphrase"), {
+                      password: true,
+                    })
                   : {
                       kind: "text" as const,
                       type: "password" as const,
@@ -916,7 +1057,10 @@ export function ProxyEditor({
 
   const problemList = (problems: readonly string[]) =>
     problems.length === 0 ? null : (
-      <ul role="alert" className="flex flex-col gap-1 text-[12.5px] leading-[1.5] text-wv-error-text">
+      <ul
+        role="alert"
+        className="flex flex-col gap-1 text-[12.5px] leading-[1.5] text-wv-error-text"
+      >
         {problems.map((problem) => (
           <li key={problem}>{problem}</li>
         ))}
@@ -979,9 +1123,14 @@ export function ProxyEditor({
                 : "border-wv-control bg-wv-input text-wv-muted hover:border-wv-control-hover-strong",
             )}
           >
-            <span className="font-medium text-wv-fg">{t("next.proxies.wgDropZone")}</span>
+            <span className="font-medium text-wv-fg">
+              {t("next.proxies.wgDropZone")}
+            </span>
             {fileName === null ? null : (
-              <span id={fileNameId} className="max-w-full truncate font-wv-mono text-[11px] text-wv-faint">
+              <span
+                id={fileNameId}
+                className="max-w-full truncate font-wv-mono text-[11px] text-wv-faint"
+              >
                 {fileName}
               </span>
             )}
@@ -997,12 +1146,18 @@ export function ProxyEditor({
             rows={9}
             secret
             className="w-full"
-            placeholder={"[Interface]\nPrivateKey = …\nAddress = 10.6.0.2/32\n\n[Peer]\nPublicKey = …\nEndpoint = vpn.example.com:51820"}
+            placeholder={
+              "[Interface]\nPrivateKey = …\nAddress = 10.6.0.2/32\n\n[Peer]\nPublicKey = …\nEndpoint = vpn.example.com:51820"
+            }
             onChange={setConfigText}
           />
           {problemList(pasteProblems)}
           <div className="flex justify-end">
-            <SecondaryButton icon="inspectFile" onClick={() => applyConfig(configText)} disabled={!pasteReady}>
+            <SecondaryButton
+              icon="inspectFile"
+              onClick={() => applyConfig(configText)}
+              disabled={!pasteReady}
+            >
               {t("next.proxies.parse")}
             </SecondaryButton>
           </div>
@@ -1015,15 +1170,28 @@ export function ProxyEditor({
   );
 
   const sections: EditorSection[] = [
-    { id: "connection", title: t("next.proxies.connection"), fields: connectionFields },
+    {
+      id: "connection",
+      title: t("next.proxies.connection"),
+      fields: connectionFields,
+    },
     ...(isWireguard
-      ? [{ id: "start", title: t("next.proxies.wgStart"), fields: [], body: startBody }]
+      ? [
+          {
+            id: "start",
+            title: t("next.proxies.wgStart"),
+            fields: [],
+            body: startBody,
+          },
+        ]
       : []),
     ...(detailsOpen
       ? [
           {
             id: "credentials",
-            title: isWireguard ? t("next.proxies.tunnel") : t("next.proxies.credentials"),
+            title: isWireguard
+              ? t("next.proxies.tunnel")
+              : t("next.proxies.credentials"),
             note: t("next.proxies.secretsNote"),
             fields: credentialFields,
           },
@@ -1035,7 +1203,11 @@ export function ProxyEditor({
     <>
       <RecordEditor
         open
-        title={editingId === "new" ? t("next.proxies.add") : (editing?.name ?? t("next.proxies.proxy"))}
+        title={
+          editingId === "new"
+            ? t("next.proxies.add")
+            : (editing?.name ?? t("next.proxies.proxy"))
+        }
         note={editingId === "new" ? undefined : proxyLabels[form.kind]}
         testId={testIds.dialog("proxy")}
         width={620}
@@ -1049,7 +1221,10 @@ export function ProxyEditor({
         deleteLabel={t("next.proxies.remove")}
         extraActions={
           editing?.hostKeyFingerprint ? (
-            <SecondaryButton icon="forget" onClick={() => setConfirmTrust(editing)}>
+            <SecondaryButton
+              icon="forget"
+              onClick={() => setConfirmTrust(editing)}
+            >
               {t("next.proxies.forgetHostKey")}
             </SecondaryButton>
           ) : null

@@ -6,13 +6,21 @@ import { Link } from "react-router";
 import { useQuery } from "urql";
 import { OVERVIEW_USAGE_QUERY, STORAGE_VOLUMES_QUERY } from "@/graphql/queries";
 import { useTranslate, type Translate } from "@/lib/context/translate-context";
-import { formatEtaFromRemainingBytes, useStableEtaSpeed } from "@/lib/hooks/use-stable-queue-eta";
+import {
+  formatEtaFromRemainingBytes,
+  useStableEtaSpeed,
+} from "@/lib/hooks/use-stable-queue-eta";
 import { MetricCell, SectionHeader, Square } from "../../components/chrome";
 import { columnStyle } from "../../components/columns";
 import { StorageMounts, type StorageVolume } from "../../components/storage";
 import { useNow, useStartOfToday } from "../../data/clock";
 import { NO_FACETS } from "../../data/categories";
-import { downloadsState, lastDays, providersUp, sumDays } from "../../data/dashboards";
+import {
+  downloadsState,
+  lastDays,
+  providersUp,
+  sumDays,
+} from "../../data/dashboards";
 import {
   EM_DASH,
   formatClock,
@@ -25,7 +33,12 @@ import {
 } from "../../data/format";
 import { useNextData } from "../../data/next-data";
 import { WV } from "../../data/palette";
-import { nothingDownloading, queuePageInput, queueSelection, slowDiskRate } from "../../data/queue-page";
+import {
+  nothingDownloading,
+  queuePageInput,
+  queueSelection,
+  slowDiskRate,
+} from "../../data/queue-page";
 import { useQueuePage } from "../../data/use-live-queue";
 import { countLabel } from "../../i18n/labels";
 import { DailyBars } from "./DailyBars";
@@ -40,7 +53,11 @@ const QUEUE_TOTALS_INPUT = queuePageInput(
   1,
 );
 
-function downloadsWord(t: Translate, state: ReturnType<typeof downloadsState>["state"], egressName: string) {
+function downloadsWord(
+  t: Translate,
+  state: ReturnType<typeof downloadsState>["state"],
+  egressName: string,
+) {
   switch (state) {
     case "paused":
       return t("status.paused");
@@ -57,7 +74,15 @@ function downloadsWord(t: Translate, state: ReturnType<typeof downloadsState>["s
 
 export function OverviewDashboard() {
   const t = useTranslate();
-  const { speed, peakSpeed, downloadBlock, isPaused, queue, providers, diskVolumes } = useNextData(
+  const {
+    speed,
+    peakSpeed,
+    downloadBlock,
+    isPaused,
+    queue,
+    providers,
+    diskVolumes,
+  } = useNextData(
     "speed",
     "peakSpeed",
     "downloadBlock",
@@ -67,13 +92,22 @@ export function OverviewDashboard() {
     "diskVolumes",
   );
   const midnight = useStartOfToday();
-  const range = useMemo(() => ({ period: "CUSTOM" as const, ...lastDays(midnight, 30) }), [midnight]);
-  const { usage, error } = useUsageHistory(OVERVIEW_USAGE_QUERY, range, "SERVER");
+  const range = useMemo(
+    () => ({ period: "CUSTOM" as const, ...lastDays(midnight, 30) }),
+    [midnight],
+  );
+  const { usage, error } = useUsageHistory(
+    OVERVIEW_USAGE_QUERY,
+    range,
+    "SERVER",
+  );
   const page = useQueuePage(QUEUE_TOTALS_INPUT);
   const [{ data: systemInfo }] = useQuery<{
     systemInfo: { configuredStorage: StorageVolume[] };
   }>({ query: STORAGE_VOLUMES_QUERY });
-  const counting = providers.some((provider) => provider.activityUntilEpochMs != null);
+  const counting = providers.some(
+    (provider) => provider.activityUntilEpochMs != null,
+  );
   const now = useNow(1000, counting);
 
   const etaSample = useMemo(
@@ -93,7 +127,10 @@ export function OverviewDashboard() {
   );
   // The limit the daemon holds the wire to, as the queue header shows it.
   const limit = downloadBlock.speedLimitInForce;
-  const idle = useMemo(() => nothingDownloading(page.stateCounts), [page.stateCounts]);
+  const idle = useMemo(
+    () => nothingDownloading(page.stateCounts),
+    [page.stateCounts],
+  );
   const diskRate = useMemo(() => slowDiskRate(diskVolumes), [diskVolumes]);
   const etaConditions = useMemo(
     () => ({ paused: isPaused, speedLimit: limit ?? 0, idle, diskRate }),
@@ -106,7 +143,11 @@ export function OverviewDashboard() {
   const peak = splitSpeed(peakSpeed);
   const total = usage?.total ?? null;
   const today = splitBytes(total?.today.bytes ?? 0);
-  const finished = usage?.finishedToday ?? { complete: 0, partial: 0, failed: 0 };
+  const finished = usage?.finishedToday ?? {
+    complete: 0,
+    partial: 0,
+    failed: 0,
+  };
   const finishedCount = finished.complete + finished.partial + finished.failed;
   const up = providersUp(providers, t, now);
   const block = downloadsState(isPaused, downloadBlock);
@@ -129,18 +170,34 @@ export function OverviewDashboard() {
             value={speedNow.value}
             unit={speedNow.unit}
             note={[
-              peakSpeed > 0 ? t("next.monitoring.peak", { value: peak.value, unit: peak.unit }) : t("next.monitoring.noTraffic"),
-              limit === null ? null : t("next.overview.limit", { rate: formatRate(limit) }),
+              peakSpeed > 0
+                ? t("next.monitoring.peak", {
+                    value: peak.value,
+                    unit: peak.unit,
+                  })
+                : t("next.monitoring.noTraffic"),
+              limit === null
+                ? null
+                : t("next.overview.limit", { rate: formatRate(limit) }),
             ]
               .filter(Boolean)
               .join(" · ")}
           />
           <MetricCell
             eyebrow={t("next.overview.queue")}
-            value={remaining > 0 ? formatEtaFromRemainingBytes(remaining, etaSpeed) : EM_DASH}
+            value={
+              remaining > 0
+                ? formatEtaFromRemainingBytes(remaining, etaSpeed)
+                : EM_DASH
+            }
             note={
               queue.summary.totalItems > 0
-                ? countLabel(t, "next.overview.jobs", queue.summary.totalItems, { size: formatSize(remaining) })
+                ? countLabel(
+                    t,
+                    "next.overview.jobs",
+                    queue.summary.totalItems,
+                    { size: formatSize(remaining) },
+                  )
                 : t("next.overview.queueEmpty")
             }
           />
@@ -182,7 +239,10 @@ export function OverviewDashboard() {
               ) : (
                 <span className="flex flex-col gap-1">
                   {up.down.map((line) => (
-                    <span key={line.key} className="flex items-center gap-[7px]">
+                    <span
+                      key={line.key}
+                      className="flex items-center gap-[7px]"
+                    >
                       <Square color={WV.warn} />
                       <span className="truncate">
                         {line.host} · {line.reason}
@@ -196,8 +256,14 @@ export function OverviewDashboard() {
           <MetricCell
             last
             eyebrow={t("next.overview.downloads")}
-            value={downloadsWord(t, block.state, downloadBlock.egressName ?? "")}
-            valueClassName={block.state === "running" ? "text-wv-accent" : "text-wv-warn"}
+            value={downloadsWord(
+              t,
+              block.state,
+              downloadBlock.egressName ?? "",
+            )}
+            valueClassName={
+              block.state === "running" ? "text-wv-accent" : "text-wv-warn"
+            }
             note={
               block.state === "running"
                 ? EM_DASH
@@ -214,10 +280,20 @@ export function OverviewDashboard() {
         </div>
 
         <section className="flex flex-none flex-col">
-          <SectionHeader label={t("next.overview.last30")} note={formatSize(last30.bytes)} sticky={false} />
+          <SectionHeader
+            label={t("next.overview.last30")}
+            note={formatSize(last30.bytes)}
+            sticky={false}
+          />
           <DailyBars
             days={days.map((day) => day.day)}
-            series={[{ label: t("next.overview.last30"), color: WV.accent, values: days.map((day) => day.bytes) }]}
+            series={[
+              {
+                label: t("next.overview.last30"),
+                color: WV.accent,
+                values: days.map((day) => day.bytes),
+              },
+            ]}
             format={formatSize}
             label={t("next.overview.last30")}
           />

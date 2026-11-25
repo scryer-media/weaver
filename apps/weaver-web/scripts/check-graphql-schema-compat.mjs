@@ -17,12 +17,26 @@ export function findSchemaCompatibilityChanges(oldSdl, newSdl) {
   // Rust's exporter emits a specified directive only once the schema uses it.
   // Compare an omitted declaration with that same declaration, rather than
   // GraphQL.js's potentially newer spec default. Explicit changes still count.
-  const declarations = (sdl) => parse(sdl).definitions.filter(d => d.kind === "DirectiveDefinition");
-  const oldDirectives = declarations(oldSdl), newDirectives = declarations(newSdl);
-  const specified = new Set(specifiedDirectives.map(d => d.name));
-  const missing = (own, other) => other.filter(d => specified.has(d.name.value) && !own.some(o => o.name.value === d.name.value)).map(print).join("\n");
-  const oldSchema = buildSchema(`${oldSdl}\n${missing(oldDirectives,newDirectives)}`);
-  const newSchema = buildSchema(`${newSdl}\n${missing(newDirectives,oldDirectives)}`);
+  const declarations = (sdl) =>
+    parse(sdl).definitions.filter((d) => d.kind === "DirectiveDefinition");
+  const oldDirectives = declarations(oldSdl),
+    newDirectives = declarations(newSdl);
+  const specified = new Set(specifiedDirectives.map((d) => d.name));
+  const missing = (own, other) =>
+    other
+      .filter(
+        (d) =>
+          specified.has(d.name.value) &&
+          !own.some((o) => o.name.value === d.name.value),
+      )
+      .map(print)
+      .join("\n");
+  const oldSchema = buildSchema(
+    `${oldSdl}\n${missing(oldDirectives, newDirectives)}`,
+  );
+  const newSchema = buildSchema(
+    `${newSdl}\n${missing(newDirectives, oldDirectives)}`,
+  );
   return {
     breaking: findBreakingChanges(oldSchema, newSchema),
     // Existing callers can omit newly added optional input fields.
@@ -63,7 +77,8 @@ export function parseSchemaCompatibilityOptions(options) {
   if (new Set(options).size !== options.length) return null;
   return {
     allowDangerous:
-      options.includes("--allow-dangerous") || options.includes("--allow-breaking"),
+      options.includes("--allow-dangerous") ||
+      options.includes("--allow-breaking"),
     allowBreaking: options.includes("--allow-breaking"),
   };
 }
@@ -91,7 +106,9 @@ export async function main(args) {
     readFile(newSchemaPath, "utf8"),
   ]);
   const changes = findSchemaCompatibilityChanges(oldSdl, newSdl);
-  if (hasSchemaCompatibilityFailure(changes, { allowDangerous, allowBreaking })) {
+  if (
+    hasSchemaCompatibilityFailure(changes, { allowDangerous, allowBreaking })
+  ) {
     console.error("GraphQL API compatibility check failed.");
     console.error(`Old schema: ${oldSchemaPath}`);
     console.error(`New schema: ${newSchemaPath}`);
@@ -100,7 +117,9 @@ export async function main(args) {
   }
 
   if (allowBreaking && changes.breaking.length > 0) {
-    console.warn("GraphQL breaking changes explicitly permitted by --allow-breaking:");
+    console.warn(
+      "GraphQL breaking changes explicitly permitted by --allow-breaking:",
+    );
     console.warn(formatChangeSection("Breaking changes", changes.breaking));
   }
   if (allowDangerous && changes.dangerous.length > 0) {

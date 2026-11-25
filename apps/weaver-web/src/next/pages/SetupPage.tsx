@@ -1,10 +1,19 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
-import { useLayoutEffect, useRef, useState, type CSSProperties, type ReactNode } from "react";
+import {
+  useLayoutEffect,
+  useRef,
+  useState,
+  type CSSProperties,
+  type ReactNode,
+} from "react";
 import { BrandLockup, BrandMark } from "@/lib/brand";
 import { PASSWORD_MANAGER_IGNORE } from "@/lib/password-manager";
-import { SETUP_CODE_DISPLAY_LENGTH, SETUP_CODE_PLACEHOLDER } from "@/lib/setup-code";
+import {
+  SETUP_CODE_DISPLAY_LENGTH,
+  SETUP_CODE_PLACEHOLDER,
+} from "@/lib/setup-code";
 import {
   BIND_CHOICES,
   CONTAINER_BIND_NOTE,
@@ -18,7 +27,12 @@ import {
 } from "@/lib/setup-flow";
 import { cn } from "@/lib/utils";
 import { Eyebrow } from "../components/chrome";
-import { DangerButton, PrimaryButton, SecondaryButton, TextField } from "../components/controls";
+import {
+  DangerButton,
+  PrimaryButton,
+  SecondaryButton,
+  TextField,
+} from "../components/controls";
 
 /**
  * The Next interface's first-run setup page: who can open Weaver, the
@@ -29,7 +43,11 @@ import { DangerButton, PrimaryButton, SecondaryButton, TextField } from "../comp
  * comes with the shared setup flow, in English, because no translations have
  * loaded yet.
  */
-export default function SetupPage({ environment }: { environment?: SetupEnvironment | null }) {
+export default function SetupPage({
+  environment,
+}: {
+  environment?: SetupEnvironment | null;
+}) {
   const form = useSetupForm(environment);
 
   if (form.restart) {
@@ -51,7 +69,11 @@ export default function SetupPage({ environment }: { environment?: SetupEnvironm
     <SetupFrame>
       <SetupHeading
         title="Set up Weaver"
-        body={form.authenticatedAccess ? undefined : "Two decisions, changeable later in Settings → Security."}
+        body={
+          form.authenticatedAccess
+            ? undefined
+            : "Two decisions, changeable later in Settings → Security."
+        }
       />
 
       {!form.authenticatedAccess ? (
@@ -109,7 +131,9 @@ export default function SetupPage({ environment }: { environment?: SetupEnvironm
               />
             </FormField>
           </div>
-          {form.passwordsDiffer ? <ErrorLine>Passwords do not match.</ErrorLine> : null}
+          {form.passwordsDiffer ? (
+            <ErrorLine>Passwords do not match.</ErrorLine>
+          ) : null}
         </div>
       ) : null}
 
@@ -149,7 +173,9 @@ export default function SetupPage({ environment }: { environment?: SetupEnvironm
             />
           ))}
           {form.bindWide && form.mode === "no_login" ? (
-            <p className="pt-1 text-[12px] leading-[1.5] text-wv-warn">{NO_LOGIN_NETWORK_WARNING}</p>
+            <p className="pt-1 text-[12px] leading-[1.5] text-wv-warn">
+              {NO_LOGIN_NETWORK_WARNING}
+            </p>
           ) : null}
         </fieldset>
       ) : (
@@ -175,14 +201,22 @@ export default function SetupPage({ environment }: { environment?: SetupEnvironm
 const MARK_SHARE_OF_LOCKUP = 553 / 2500;
 
 function prefersReducedMotion() {
-  return window.matchMedia?.("(prefers-reduced-motion: reduce)").matches === true;
+  return (
+    window.matchMedia?.("(prefers-reduced-motion: reduce)").matches === true
+  );
 }
 
 /**
  * The page around a setup form: the lockup over one panel. `welcome` plays
  * the mark flying into the lockup, for a new install's first page.
  */
-export function SetupFrame({ children, welcome = true }: { children: ReactNode; welcome?: boolean }) {
+export function SetupFrame({
+  children,
+  welcome = true,
+}: {
+  children: ReactNode;
+  welcome?: boolean;
+}) {
   // The welcome plays once per page load. It stays mounted across the switch
   // to "Setup complete", so finishing setup does not play it again.
   const [intro, setIntro] = useState(() => welcome && !prefersReducedMotion());
@@ -212,7 +246,12 @@ export function SetupFrame({ children, welcome = true }: { children: ReactNode; 
 
   return (
     // The Next interface locks page scrolling, so the page scrolls itself.
-    <div className={cn("h-dvh overflow-y-auto bg-wv-app text-wv-fg", intro && "wv-setup-intro")}>
+    <div
+      className={cn(
+        "h-dvh overflow-y-auto bg-wv-app text-wv-fg",
+        intro && "wv-setup-intro",
+      )}
+    >
       <div className="mx-auto flex w-full max-w-[560px] flex-col gap-8 px-4 py-10 sm:px-6 sm:py-16">
         <div ref={lockupRef} className="h-[26px] self-center">
           <BrandLockup className="block h-full w-auto text-wv-strong" />
@@ -222,11 +261,17 @@ export function SetupFrame({ children, welcome = true }: { children: ReactNode; 
         </main>
       </div>
       {intro ? (
-        <div aria-hidden="true" className="pointer-events-none fixed inset-0 flex items-center justify-center">
+        <div
+          aria-hidden="true"
+          className="pointer-events-none fixed inset-0 flex items-center justify-center"
+        >
           <div
             ref={flyingRef}
             style={flight ?? { opacity: 0 }}
-            className={cn("aspect-[553/363] h-[min(38vmin,260px)]", flight && "wv-setup-intro-mark")}
+            className={cn(
+              "aspect-[553/363] h-[min(38vmin,260px)]",
+              flight && "wv-setup-intro-mark",
+            )}
             onAnimationEnd={() => setIntro(false)}
           >
             <BrandMark decorative className="block size-full" />
@@ -237,11 +282,21 @@ export function SetupFrame({ children, welcome = true }: { children: ReactNode; 
   );
 }
 
-export function SetupHeading({ title, body }: { title: string; body?: string }) {
+export function SetupHeading({
+  title,
+  body,
+}: {
+  title: string;
+  body?: string;
+}) {
   return (
     <div className="flex flex-col gap-1.5">
-      <h1 className="font-wv-title text-[19px] font-semibold text-wv-strong">{title}</h1>
-      {body ? <p className="text-[13px] leading-[1.55] text-wv-muted">{body}</p> : null}
+      <h1 className="font-wv-title text-[19px] font-semibold text-wv-strong">
+        {title}
+      </h1>
+      {body ? (
+        <p className="text-[13px] leading-[1.55] text-wv-muted">{body}</p>
+      ) : null}
     </div>
   );
 }
@@ -259,18 +314,28 @@ function FormField({
 }) {
   return (
     <div className="flex min-w-0 flex-col gap-[7px]">
-      <label htmlFor={htmlFor} className="text-[12px] font-medium text-wv-secondary">
+      <label
+        htmlFor={htmlFor}
+        className="text-[12px] font-medium text-wv-secondary"
+      >
         {label}
       </label>
       {children}
-      {help ? <span className="text-[11.5px] leading-[1.45] text-wv-muted">{help}</span> : null}
+      {help ? (
+        <span className="text-[11.5px] leading-[1.45] text-wv-muted">
+          {help}
+        </span>
+      ) : null}
     </div>
   );
 }
 
 export function ErrorLine({ children }: { children: ReactNode }) {
   return (
-    <div role="alert" className="text-[12.5px] leading-[1.45] text-wv-error-text">
+    <div
+      role="alert"
+      className="text-[12.5px] leading-[1.45] text-wv-error-text"
+    >
       {children}
     </div>
   );
@@ -329,7 +394,9 @@ export function Choice({
         <span className="text-[13px] font-medium text-wv-fg">{title}</span>
         <span className="text-[12px] leading-[1.5] text-wv-muted">{body}</span>
         {disabledReason ? (
-          <span className="text-[12px] leading-[1.5] text-wv-warn">{disabledReason}</span>
+          <span className="text-[12px] leading-[1.5] text-wv-warn">
+            {disabledReason}
+          </span>
         ) : null}
       </span>
     </label>
@@ -352,7 +419,9 @@ export function RestartActions({
     return (
       <div className="flex flex-col gap-3">
         {unsupportedReason ? (
-          <p className="text-[12.5px] leading-[1.5] text-wv-muted">{unsupportedReason}</p>
+          <p className="text-[12.5px] leading-[1.5] text-wv-muted">
+            {unsupportedReason}
+          </p>
         ) : null}
         <PrimaryButton onClick={onContinue} className="w-full justify-center">
           Continue on this machine
@@ -364,7 +433,8 @@ export function RestartActions({
   if (phase === "restarting") {
     return (
       <p role="status" className="text-[12.5px] leading-[1.5] text-wv-muted">
-        Restarting Weaver. This page reloads by itself as soon as Weaver answers again.
+        Restarting Weaver. This page reloads by itself as soon as Weaver answers
+        again.
       </p>
     );
   }
@@ -372,7 +442,9 @@ export function RestartActions({
   return (
     <div className="flex flex-col gap-3">
       {phase === "unreachable" ? (
-        <p className="text-[12.5px] leading-[1.5] text-wv-muted">{RESTART_UNREACHABLE_NOTE}</p>
+        <p className="text-[12.5px] leading-[1.5] text-wv-muted">
+          {RESTART_UNREACHABLE_NOTE}
+        </p>
       ) : null}
       {error ? <ErrorLine>{error}</ErrorLine> : null}
       {phase === "idle" ? (

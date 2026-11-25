@@ -4,7 +4,11 @@
 import { Fragment, memo, type ReactNode } from "react";
 import { Link, NavLink, useLocation } from "react-router";
 import { useQuery } from "urql";
-import { JOB_TAGS_QUERY, SERVERS_QUERY, SYSTEM_INFO_QUERY } from "@/graphql/queries";
+import {
+  JOB_TAGS_QUERY,
+  SERVERS_QUERY,
+  SYSTEM_INFO_QUERY,
+} from "@/graphql/queries";
 import { useTranslate, type Translate } from "@/lib/context/translate-context";
 import type { JobProtocol } from "@/lib/job-types";
 import { cn } from "@/lib/utils";
@@ -23,8 +27,17 @@ import { categoryColor, UNCATEGORISED_COLOR, WV } from "../data/palette";
 import { UNTAGGED } from "../data/tags";
 import { jobIds } from "../testids";
 import { useNow } from "../data/clock";
-import { formatClock, formatDayClock, formatLatency, formatRate, splitUptime } from "../data/format";
-import { providerActivityLabel, type ProviderActivity } from "../data/provider-activity";
+import {
+  formatClock,
+  formatDayClock,
+  formatLatency,
+  formatRate,
+  splitUptime,
+} from "../data/format";
+import {
+  providerActivityLabel,
+  type ProviderActivity,
+} from "../data/provider-activity";
 import { countLabel, providerStateLabel } from "../i18n/labels";
 
 /**
@@ -67,10 +80,15 @@ export function providerLoadPercent(provider: ProviderHealth): number {
 
 export const ProvidersBlock = memo(function ProvidersBlock() {
   const t = useTranslate();
-  const { providers, providersLoaded } = useNextData("providers", "providersLoaded");
+  const { providers, providersLoaded } = useNextData(
+    "providers",
+    "providersLoaded",
+  );
   // A holdoff counts down in the rail, so the clock has to be a value React
   // knows about; it ticks only while something is actually counting down.
-  const counting = providers.some((provider) => provider.activityUntilEpochMs != null);
+  const counting = providers.some(
+    (provider) => provider.activityUntilEpochMs != null,
+  );
   const now = useNow(1000, counting);
 
   // Server health lists the live pool, and the pool leaves out every server
@@ -90,7 +108,9 @@ export const ProvidersBlock = memo(function ProvidersBlock() {
       {providers.length === 0 ? (
         <>
           <div className="font-wv-mono text-[11px] text-wv-muted">
-            {configured?.length ? t("next.rail.noneEnabled") : t("next.rail.noneConfigured")}
+            {configured?.length
+              ? t("next.rail.noneEnabled")
+              : t("next.rail.noneConfigured")}
           </div>
           {configured?.length === 0 ? <AddProviderButton /> : null}
         </>
@@ -100,9 +120,14 @@ export const ProvidersBlock = memo(function ProvidersBlock() {
           const open = connectionPercent(provider.connectionsOpen, provider);
           const busy = connectionPercent(provider.connectionsBusy, provider);
           return (
-            <div key={`${provider.host}:${provider.port}`} className="flex flex-col gap-[5px]">
+            <div
+              key={`${provider.host}:${provider.port}`}
+              className="flex flex-col gap-[5px]"
+            >
               <div className="flex items-baseline justify-between gap-2 text-[12.5px]">
-                <span className="truncate text-wv-tertiary">{provider.host}</span>
+                <span className="truncate text-wv-tertiary">
+                  {provider.host}
+                </span>
                 <span
                   className="flex-none font-wv-mono text-[11px] text-wv-muted"
                   style={{ color: ACTIVITY_TONE[activity.tone] }}
@@ -205,7 +230,9 @@ function attentionItems(
     items.push({
       id: `holdoff:${holdoff.label}`,
       text: t("next.attention.overLimit", { server: holdoff.label }),
-      meta: t("next.attention.backingOff", { time: formatClock(holdoff.untilEpochMs) }),
+      meta: t("next.attention.backingOff", {
+        time: formatClock(holdoff.untilEpochMs),
+      }),
       color: WV.warn,
     });
   }
@@ -237,7 +264,10 @@ function attentionItems(
       }),
       // Nothing the failure counters say explains a provider-side refusal, so
       // that one row carries the cause instead.
-      meta: provider.activity === "over_limit" ? (activity.cause ?? failures) : failures,
+      meta:
+        provider.activity === "over_limit"
+          ? (activity.cause ?? failures)
+          : failures,
       color: provider.activity === "disabled" ? WV.error : WV.warn,
     });
   }
@@ -247,7 +277,9 @@ function attentionItems(
       id: "download-block",
       text:
         downloadBlock.kind === "EGRESS_QUOTA"
-          ? t("next.attention.egressQuotaReached", { name: downloadBlock.egressName ?? "" })
+          ? t("next.attention.egressQuotaReached", {
+              name: downloadBlock.egressName ?? "",
+            })
           : downloadBlock.kind === "SERVER_QUOTA"
             ? t("next.attention.quotaReached")
             : t("next.attention.scheduleHold"),
@@ -271,7 +303,9 @@ function attentionItems(
       id: `slow-disk:${volume.label}`,
       text:
         volume.writeRateBytesPerSec > 0
-          ? t("next.attention.slowDisk", { rate: formatRate(volume.writeRateBytesPerSec) })
+          ? t("next.attention.slowDisk", {
+              rate: formatRate(volume.writeRateBytesPerSec),
+            })
           : t("next.attention.slowDiskUnmeasured"),
       meta: volume.label,
       color: WV.warn,
@@ -291,12 +325,18 @@ export const AttentionBlock = memo(function AttentionBlock() {
   }
 
   return (
-    <RailBlock eyebrow={t("next.attention.title")} position="middle" className="gap-3">
+    <RailBlock
+      eyebrow={t("next.attention.title")}
+      position="middle"
+      className="gap-3"
+    >
       {items.map((item) => (
         <div key={item.id} className="flex gap-[9px]">
           <Square color={item.color} className="mt-[5px]" />
           <div className="flex min-w-0 flex-col gap-1">
-            <div className="text-[12.5px] leading-[1.35] text-wv-secondary">{item.text}</div>
+            <div className="text-[12.5px] leading-[1.35] text-wv-secondary">
+              {item.text}
+            </div>
             <div className="font-wv-mono text-[10.5px] leading-[1.35] text-wv-faint">
               {item.meta}
             </div>
@@ -309,14 +349,20 @@ export const AttentionBlock = memo(function AttentionBlock() {
 
 export const UptimeBlock = memo(function UptimeBlock() {
   const t = useTranslate();
-  const [{ data }] = useQuery<{ systemInfo: { uptimeSeconds: number; version: string } }>({
+  const [{ data }] = useQuery<{
+    systemInfo: { uptimeSeconds: number; version: string };
+  }>({
     query: SYSTEM_INFO_QUERY,
   });
   const uptime = splitUptime(data?.systemInfo?.uptimeSeconds ?? 0);
 
   return (
     <RailBlock eyebrow={t("next.rail.uptime")}>
-      <RailMetric value={uptime.value} unit={uptime.unit} note={t("next.rail.sinceRestart")} />
+      <RailMetric
+        value={uptime.value}
+        unit={uptime.unit}
+        note={t("next.rail.sinceRestart")}
+      />
     </RailBlock>
   );
 });
@@ -346,9 +392,14 @@ export function CategoryListBlock({
 }) {
   const t = useTranslate();
   return (
-    <RailBlock eyebrow={t("categories.title")} position="middle" className="gap-[9px]">
+    <RailBlock
+      eyebrow={t("categories.title")}
+      position="middle"
+      className="gap-[9px]"
+    >
       {items.map((item) => {
-        const isActive = item.key === null ? selected.size === 0 : selected.has(item.key);
+        const isActive =
+          item.key === null ? selected.size === 0 : selected.has(item.key);
         // A facet's colour is the rail's business, not the list's: "all" and
         // "uncategorised" are the absence of a category and share its grey.
         const color =
@@ -396,11 +447,19 @@ export function ProtocolFilterBlock({
   const t = useTranslate();
   const items: { facet: ProtocolFacet; label: string; count: number }[] = [
     { facet: null, label: t("history.filterAll"), count: counts.ALL },
-    { facet: "TORRENT", label: t("next.protocol.torrent"), count: counts.TORRENT },
+    {
+      facet: "TORRENT",
+      label: t("next.protocol.torrent"),
+      count: counts.TORRENT,
+    },
     { facet: "NZB", label: t("next.protocol.usenet"), count: counts.NZB },
   ];
   return (
-    <RailBlock eyebrow={t("next.protocol.type")} position="middle" className="gap-[9px]">
+    <RailBlock
+      eyebrow={t("next.protocol.type")}
+      position="middle"
+      className="gap-[9px]"
+    >
       {items.map((item) => (
         <FacetButton
           key={item.facet ?? "*"}
@@ -439,7 +498,11 @@ export function TagFilterBlock({
     { tag: UNTAGGED, label: t("next.tags.none") },
   ];
   return (
-    <RailBlock eyebrow={t("next.tags.title")} position="middle" className="gap-[9px]">
+    <RailBlock
+      eyebrow={t("next.tags.title")}
+      position="middle"
+      className="gap-[9px]"
+    >
       {items.map((item) => (
         <FacetButton
           key={item.tag ?? "*"}
@@ -480,7 +543,9 @@ function FacetButton({
       aria-pressed={active}
       className={cn(
         "flex items-center gap-[9px] text-left text-[12.5px]",
-        active ? "font-medium text-wv-strong" : "text-wv-fg hover:text-wv-secondary",
+        active
+          ? "font-medium text-wv-strong"
+          : "text-wv-fg hover:text-wv-secondary",
       )}
     >
       {/*
@@ -491,7 +556,9 @@ function FacetButton({
       <Square color={color} hollow={!active} />
       <span className="min-w-0 truncate">{children}</span>
       {count === undefined ? null : (
-        <span className="ml-auto flex-none font-wv-mono text-[11px] text-wv-faint">{count}</span>
+        <span className="ml-auto flex-none font-wv-mono text-[11px] text-wv-faint">
+          {count}
+        </span>
       )}
     </button>
   );
@@ -531,7 +598,9 @@ function PanelRowContent({
         className={cn("h-[14px] w-[3px] flex-none", active && "bg-wv-accent")}
       />
       {/* As wide as an icon, so a nested row's icon starts under its parent's name. */}
-      {nested ? <span aria-hidden="true" className="w-[14px] flex-none" /> : null}
+      {nested ? (
+        <span aria-hidden="true" className="w-[14px] flex-none" />
+      ) : null}
       {item.icon === undefined ? null : (
         <Icon
           name={item.icon}
@@ -574,10 +643,17 @@ export const PanelListBlock = memo(function PanelListBlock({
       to={item.to}
       end
       className={({ isActive }) =>
-        cn(PANEL_ROW, isActive ? "bg-wv-nav-active font-medium text-wv-strong" : "text-wv-fg")
+        cn(
+          PANEL_ROW,
+          isActive
+            ? "bg-wv-nav-active font-medium text-wv-strong"
+            : "text-wv-fg",
+        )
       }
     >
-      {({ isActive }) => <PanelRowContent item={item} active={isActive} nested={nested} />}
+      {({ isActive }) => (
+        <PanelRowContent item={item} active={isActive} nested={nested} />
+      )}
     </NavLink>
   );
   return (
@@ -590,10 +666,20 @@ export const PanelListBlock = memo(function PanelListBlock({
           const open = item.children.some((child) => child.to === pathname);
           return (
             <Fragment key={`group:${item.to}`}>
-              <Link to={item.to} className={cn(PANEL_ROW, open ? "text-wv-strong" : "text-wv-fg")}>
+              <Link
+                to={item.to}
+                className={cn(
+                  PANEL_ROW,
+                  open ? "text-wv-strong" : "text-wv-fg",
+                )}
+              >
                 <PanelRowContent item={item} open={open} />
               </Link>
-              <div role="group" aria-label={item.label} className="flex flex-col">
+              <div
+                role="group"
+                aria-label={item.label}
+                className="flex flex-col"
+              >
                 {item.children.map((child) => row(child, true))}
               </div>
             </Fragment>

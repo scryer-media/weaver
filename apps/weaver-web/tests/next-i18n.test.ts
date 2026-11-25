@@ -45,8 +45,13 @@ function sourceFiles(dir: string): string[] {
 /** Keys the base dictionaries define, which screens reuse for shared wording. */
 function baseKeys(): Set<string> {
   const keys = new Set<string>();
-  for (const file of ["lib/i18n/locales/en.ts", "lib/i18n/duplicate-locales.ts"]) {
-    for (const match of readFileSync(join(SRC, file), "utf8").matchAll(/^\s*"([\w.-]+)":/gm)) {
+  for (const file of [
+    "lib/i18n/locales/en.ts",
+    "lib/i18n/duplicate-locales.ts",
+  ]) {
+    for (const match of readFileSync(join(SRC, file), "utf8").matchAll(
+      /^\s*"([\w.-]+)":/gm,
+    )) {
       keys.add(match[1]!);
     }
   }
@@ -56,7 +61,11 @@ function baseKeys(): Set<string> {
 test("every locale carries exactly the English Next keys", () => {
   const english = Object.keys(nextEn).sort();
   for (const [code, dictionary] of Object.entries(LOCALES)) {
-    assert.deepEqual(Object.keys(dictionary).sort(), english, `${code} keys differ from en`);
+    assert.deepEqual(
+      Object.keys(dictionary).sort(),
+      english,
+      `${code} keys differ from en`,
+    );
   }
 });
 
@@ -65,7 +74,11 @@ test("translations keep every placeholder and are never empty", () => {
     for (const [key, english] of Object.entries(nextEn)) {
       const translated = dictionary[key] ?? "";
       assert.notEqual(translated.trim(), "", `${code} ${key} is empty`);
-      assert.deepEqual(placeholders(translated), placeholders(english), `${code} ${key} placeholders`);
+      assert.deepEqual(
+        placeholders(translated),
+        placeholders(english),
+        `${code} ${key} placeholders`,
+      );
     }
   }
 });
@@ -74,7 +87,11 @@ test("translations keep every placeholder and are never empty", () => {
 test("no text writes a placeholder in single braces", () => {
   for (const [code, dictionary] of Object.entries({ en: nextEn, ...LOCALES })) {
     for (const [key, text] of Object.entries(dictionary)) {
-      assert.doesNotMatch(text.replace(/\{\{\w+\}\}/g, ""), /\{\w+\}/, `${code} ${key}`);
+      assert.doesNotMatch(
+        text.replace(/\{\{\w+\}\}/g, ""),
+        /\{\w+\}/,
+        `${code} ${key}`,
+      );
     }
   }
 });
@@ -92,12 +109,16 @@ test("every key the Next screens name exists", () => {
     }
     for (const match of text.matchAll(/countLabel\(\s*t,\s*"([^"]+)"/g)) {
       for (const form of ["one", "other"]) {
-        if (!known.has(`${match[1]}.${form}`)) missing.push(`${file}: ${match[1]}.${form}`);
+        if (!known.has(`${match[1]}.${form}`))
+          missing.push(`${file}: ${match[1]}.${form}`);
       }
     }
     for (const match of text.matchAll(/"(next\.[\w.]+)"/g)) {
       const key = match[1]!;
-      if (!known.has(key) && !(known.has(`${key}.one`) && known.has(`${key}.other`))) {
+      if (
+        !known.has(key) &&
+        !(known.has(`${key}.one`) && known.has(`${key}.other`))
+      ) {
         missing.push(`${file}: ${key}`);
       }
     }

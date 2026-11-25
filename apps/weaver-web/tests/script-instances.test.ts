@@ -33,7 +33,10 @@ import {
 import { withoutTorrentOnly } from "../src/next/data/torrents-shown.ts";
 import { englishTranslate as t } from "./english-translate.ts";
 
-function instance(id: string, patch: Partial<ScriptInstance> = {}): ScriptInstance {
+function instance(
+  id: string,
+  patch: Partial<ScriptInstance> = {},
+): ScriptInstance {
   return {
     id,
     name: id,
@@ -53,7 +56,10 @@ function instance(id: string, patch: Partial<ScriptInstance> = {}): ScriptInstan
   };
 }
 
-function script(name: string, patch: Partial<DiscoveredScript> = {}): DiscoveredScript {
+function script(
+  name: string,
+  patch: Partial<DiscoveredScript> = {},
+): DiscoveredScript {
   return {
     name,
     displayName: name,
@@ -72,9 +78,30 @@ const NOTIFY = script("notify.sh", {
   kinds: ["POST_PROCESSING", "QUEUE"],
   queueEvents: ["NZB_ADDED"],
   options: [
-    { name: "Url", optionType: "STRING", description: [], select: [], required: true, defaultValue: "http://127.0.0.1" },
-    { name: "Token", optionType: "SECRET", description: [], select: [], required: false, defaultValue: null },
-    { name: "Verbose", optionType: "BOOLEAN", description: [], select: ["yes", "no"], required: false, defaultValue: "no" },
+    {
+      name: "Url",
+      optionType: "STRING",
+      description: [],
+      select: [],
+      required: true,
+      defaultValue: "http://127.0.0.1",
+    },
+    {
+      name: "Token",
+      optionType: "SECRET",
+      description: [],
+      select: [],
+      required: false,
+      defaultValue: null,
+    },
+    {
+      name: "Verbose",
+      optionType: "BOOLEAN",
+      description: [],
+      select: ["yes", "no"],
+      required: false,
+      defaultValue: "no",
+    },
   ],
   preset: {
     triggers: [
@@ -93,11 +120,23 @@ const NOTIFY = script("notify.sh", {
 test("instances are grouped by trigger, and the queue's by event, each in run order", () => {
   const groups = groupInstances([
     instance("feed", { trigger: "FEED", runOrder: 0 }),
-    instance("added-late", { trigger: "QUEUE", queueEvent: "NZB_ADDED", runOrder: 3 }),
+    instance("added-late", {
+      trigger: "QUEUE",
+      queueEvent: "NZB_ADDED",
+      runOrder: 3,
+    }),
     instance("post-second", { runOrder: 2 }),
-    instance("deleted", { trigger: "QUEUE", queueEvent: "NZB_DELETED", runOrder: 1 }),
+    instance("deleted", {
+      trigger: "QUEUE",
+      queueEvent: "NZB_DELETED",
+      runOrder: 1,
+    }),
     instance("post-first", { runOrder: 1 }),
-    instance("added-early", { trigger: "QUEUE", queueEvent: "NZB_ADDED", runOrder: 0 }),
+    instance("added-early", {
+      trigger: "QUEUE",
+      queueEvent: "NZB_ADDED",
+      runOrder: 0,
+    }),
     instance("nightly", { trigger: "SCHEDULER", runOrder: 0 }),
   ]);
   assert.deepEqual(
@@ -118,7 +157,10 @@ test("a trigger nothing runs on has no group, and an unknown queue event still h
     instance("odd", { trigger: "QUEUE", queueEvent: "NZB_ARCHIVED" as never }),
     instance("scan", { trigger: "SCAN" }),
   ]);
-  assert.deepEqual(groups.map((group) => group.id), ["QUEUE:NZB_ARCHIVED", "SCAN"]);
+  assert.deepEqual(
+    groups.map((group) => group.id),
+    ["QUEUE:NZB_ARCHIVED", "SCAN"],
+  );
 });
 
 test("a group's heading names the trigger, and the event for the queue", () => {
@@ -131,9 +173,21 @@ test("a group's heading names the trigger, and the event for the queue", () => {
 
 test("a move trades places with the next row of the same group and sends the whole trigger", () => {
   const instances = [
-    instance("added-a", { trigger: "QUEUE", queueEvent: "NZB_ADDED", runOrder: 0 }),
-    instance("deleted-a", { trigger: "QUEUE", queueEvent: "NZB_DELETED", runOrder: 1 }),
-    instance("added-b", { trigger: "QUEUE", queueEvent: "NZB_ADDED", runOrder: 2 }),
+    instance("added-a", {
+      trigger: "QUEUE",
+      queueEvent: "NZB_ADDED",
+      runOrder: 0,
+    }),
+    instance("deleted-a", {
+      trigger: "QUEUE",
+      queueEvent: "NZB_DELETED",
+      runOrder: 1,
+    }),
+    instance("added-b", {
+      trigger: "QUEUE",
+      queueEvent: "NZB_ADDED",
+      runOrder: 2,
+    }),
     instance("post-a", { runOrder: 0 }),
     instance("post-b", { runOrder: 1 }),
   ];
@@ -142,11 +196,17 @@ test("a move trades places with the next row of the same group and sends the who
     trigger: "QUEUE",
     ids: ["added-b", "deleted-a", "added-a"],
   });
-  assert.deepEqual(reorderedIds(instances, "post-b", -1), { trigger: "POST_PROCESSING", ids: ["post-b", "post-a"] });
+  assert.deepEqual(reorderedIds(instances, "post-b", -1), {
+    trigger: "POST_PROCESSING",
+    ids: ["post-b", "post-a"],
+  });
 });
 
 test("a move past the end of its group, or of an instance that is gone, asks for nothing", () => {
-  const instances = [instance("post-a", { runOrder: 0 }), instance("post-b", { runOrder: 1 })];
+  const instances = [
+    instance("post-a", { runOrder: 0 }),
+    instance("post-b", { runOrder: 1 }),
+  ];
   assert.equal(reorderedIds(instances, "post-a", -1), null);
   assert.equal(reorderedIds(instances, "post-b", 1), null);
   assert.equal(reorderedIds(instances, "missing", 1), null);
@@ -154,18 +214,27 @@ test("a move past the end of its group, or of an instance that is gone, asks for
 
 test("the header's triggers stay unwired until an instance of that script runs on each", () => {
   assert.deepEqual(unwiredTriggers(NOTIFY, []), NOTIFY.preset.triggers);
-  assert.deepEqual(unwiredTriggers(NOTIFY, [instance("post")]), [{ trigger: "QUEUE", queueEvent: "NZB_ADDED" }]);
+  assert.deepEqual(unwiredTriggers(NOTIFY, [instance("post")]), [
+    { trigger: "QUEUE", queueEvent: "NZB_ADDED" },
+  ]);
   // Another event, and another script's instance, wire nothing of this header's.
   assert.deepEqual(
     unwiredTriggers(NOTIFY, [
       instance("post"),
       instance("deleted", { trigger: "QUEUE", queueEvent: "NZB_DELETED" }),
-      instance("other", { script: "cleanup.py", trigger: "QUEUE", queueEvent: "NZB_ADDED" }),
+      instance("other", {
+        script: "cleanup.py",
+        trigger: "QUEUE",
+        queueEvent: "NZB_ADDED",
+      }),
     ]),
     [{ trigger: "QUEUE", queueEvent: "NZB_ADDED" }],
   );
   assert.deepEqual(
-    unwiredTriggers(NOTIFY, [instance("post"), instance("added", { trigger: "QUEUE", queueEvent: "NZB_ADDED" })]),
+    unwiredTriggers(NOTIFY, [
+      instance("post"),
+      instance("added", { trigger: "QUEUE", queueEvent: "NZB_ADDED" }),
+    ]),
     [],
   );
 });
@@ -178,9 +247,30 @@ test("a new instance is filled from the header, and a secret never is", () => {
   assert.equal(form.queueEvent, "NZB_ADDED");
   assert.equal(form.timeoutSeconds, 0);
   assert.deepEqual(form.inputs, [
-    { name: "Url", value: "http://127.0.0.1", secret: false, secretId: null, own: false, held: false },
-    { name: "Token", value: "", secret: true, secretId: null, own: false, held: false },
-    { name: "Verbose", value: "no", secret: false, secretId: null, own: false, held: false },
+    {
+      name: "Url",
+      value: "http://127.0.0.1",
+      secret: false,
+      secretId: null,
+      own: false,
+      held: false,
+    },
+    {
+      name: "Token",
+      value: "",
+      secret: true,
+      secretId: null,
+      own: false,
+      held: false,
+    },
+    {
+      name: "Verbose",
+      value: "no",
+      secret: false,
+      secretId: null,
+      own: false,
+      held: false,
+    },
   ]);
   // A secret slot with no secret chosen is not sent: there is nothing to give the script.
   assert.deepEqual(inputFromForm(form).inputs, [
@@ -197,7 +287,12 @@ test("a new instance of no script yet has nothing to fill it", () => {
 });
 
 test("picking another script starts a new instance again and leaves a saved one as it is", () => {
-  const typed = { ...newInstanceForm(undefined), name: "Notify the family", blocking: false, timeoutSeconds: 90 };
+  const typed = {
+    ...newInstanceForm(undefined),
+    name: "Notify the family",
+    blocking: false,
+    timeoutSeconds: 90,
+  };
   const picked = withScript(typed, NOTIFY, true);
   assert.equal(picked.script, "notify.sh");
   assert.equal(picked.name, "Notify the family");
@@ -205,7 +300,13 @@ test("picking another script starts a new instance again and leaves a saved one 
   assert.equal(picked.timeoutSeconds, 90);
   assert.equal(picked.inputs.length, 3);
 
-  const saved = formFromInstance(instance("one", { script: "cleanup.py", inputs: [{ name: "Path", value: "/data", secret: null }] }), undefined);
+  const saved = formFromInstance(
+    instance("one", {
+      script: "cleanup.py",
+      inputs: [{ name: "Path", value: "/data", secret: null }],
+    }),
+    undefined,
+  );
   const moved = withScript(saved, NOTIFY, false);
   assert.equal(moved.script, "notify.sh");
   assert.deepEqual(moved.inputs, saved.inputs);
@@ -222,8 +323,22 @@ test("a secret input opens on the secret it links and is sent as that link", () 
   });
   const form = formFromInstance(saved, NOTIFY);
   assert.deepEqual(form.inputs, [
-    { name: "Url", value: "http://127.0.0.1/hook", secret: false, secretId: null, own: false, held: false },
-    { name: "Token", value: "", secret: true, secretId: "s1", own: false, held: false },
+    {
+      name: "Url",
+      value: "http://127.0.0.1/hook",
+      secret: false,
+      secretId: null,
+      own: false,
+      held: false,
+    },
+    {
+      name: "Token",
+      value: "",
+      secret: true,
+      secretId: "s1",
+      own: false,
+      held: false,
+    },
   ]);
   assert.equal(form.timeoutSeconds, 120);
 
@@ -232,8 +347,16 @@ test("a secret input opens on the secret it links and is sent as that link", () 
     { name: "Token", secretId: "s1" },
   ]);
 
-  const relinked = { ...form, inputs: form.inputs.map((input) => (input.secret ? withLinkedSecret(input, "s2") : input)) };
-  assert.deepEqual(inputFromForm(relinked).inputs[1], { name: "Token", secretId: "s2" });
+  const relinked = {
+    ...form,
+    inputs: form.inputs.map((input) =>
+      input.secret ? withLinkedSecret(input, "s2") : input,
+    ),
+  };
+  assert.deepEqual(inputFromForm(relinked).inputs[1], {
+    name: "Token",
+    secretId: "s2",
+  });
 });
 
 test("clearing a secret input's link keeps the slot and leaves it out of what is sent", () => {
@@ -244,64 +367,165 @@ test("clearing a secret input's link keeps the slot and leaves it out of what is
     ],
   });
   const form = formFromInstance(saved, NOTIFY);
-  const cleared = { ...form, inputs: form.inputs.map((input) => (input.secret ? withLinkedSecret(input, null) : input)) };
-  assert.deepEqual(cleared.inputs[1], { name: "Token", value: "", secret: true, secretId: null, own: false, held: false });
-  assert.deepEqual(inputFromForm(cleared).inputs, [{ name: "Url", value: "http://127.0.0.1/hook" }]);
+  const cleared = {
+    ...form,
+    inputs: form.inputs.map((input) =>
+      input.secret ? withLinkedSecret(input, null) : input,
+    ),
+  };
+  assert.deepEqual(cleared.inputs[1], {
+    name: "Token",
+    value: "",
+    secret: true,
+    secretId: null,
+    own: false,
+    held: false,
+  });
+  assert.deepEqual(inputFromForm(cleared).inputs, [
+    { name: "Url", value: "http://127.0.0.1/hook" },
+  ]);
   // Linking it again sends the link once more.
-  const relinked = { ...cleared, inputs: cleared.inputs.map((input) => (input.secret ? withLinkedSecret(input, "s1") : input)) };
+  const relinked = {
+    ...cleared,
+    inputs: cleared.inputs.map((input) =>
+      input.secret ? withLinkedSecret(input, "s1") : input,
+    ),
+  };
   assert.deepEqual(inputFromForm(relinked).inputs, inputFromForm(form).inputs);
 });
 
 test("ticking or clearing an input's secret box empties it either way", () => {
-  const plain = { name: "Password", value: "typed", secret: false, secretId: null, own: false, held: false };
+  const plain = {
+    name: "Password",
+    value: "typed",
+    secret: false,
+    secretId: null,
+    own: false,
+    held: false,
+  };
   // A value typed in clear never becomes a secret's value.
-  assert.deepEqual(withSecret(plain, true), { name: "Password", value: "", secret: true, secretId: null, own: false, held: false });
+  assert.deepEqual(withSecret(plain, true), {
+    name: "Password",
+    value: "",
+    secret: true,
+    secretId: null,
+    own: false,
+    held: false,
+  });
   // A header's hint is not a lock: a secret slot can be made plain again, and its link goes.
-  const linked = { name: "Password", value: "", secret: true, secretId: "s1", own: false, held: false };
-  assert.deepEqual(withSecret(linked, false), { name: "Password", value: "", secret: false, secretId: null, own: false, held: false });
+  const linked = {
+    name: "Password",
+    value: "",
+    secret: true,
+    secretId: "s1",
+    own: false,
+    held: false,
+  };
+  assert.deepEqual(withSecret(linked, false), {
+    name: "Password",
+    value: "",
+    secret: false,
+    secretId: null,
+    own: false,
+    held: false,
+  });
 });
 
 test("a job's own secret is never read back: blank keeps it, a typed value replaces it", () => {
   const saved = instance("one", {
     inputs: [
-      { name: "Url", value: "http://127.0.0.1/hook", secret: null, sealed: false },
+      {
+        name: "Url",
+        value: "http://127.0.0.1/hook",
+        secret: null,
+        sealed: false,
+      },
       { name: "ApiKey", value: "", secret: null, sealed: true },
     ],
   });
   const form = formFromInstance(saved, undefined);
-  assert.deepEqual(form.inputs[1], { name: "ApiKey", value: "", secret: false, secretId: null, own: true, held: true });
+  assert.deepEqual(form.inputs[1], {
+    name: "ApiKey",
+    value: "",
+    secret: false,
+    secretId: null,
+    own: true,
+    held: true,
+  });
   // Left as it opened, it is sent by name alone, which keeps what is saved.
   assert.deepEqual(inputFromForm(form).inputs, [
     { name: "Url", value: "http://127.0.0.1/hook" },
     { name: "ApiKey", secret: true },
   ]);
   // The switch in a job's row sends the job back as it is, its own secret kept the same way.
-  assert.deepEqual(inputFromInstance(saved, { enabled: false }).inputs[1], { name: "ApiKey", secret: true });
+  assert.deepEqual(inputFromInstance(saved, { enabled: false }).inputs[1], {
+    name: "ApiKey",
+    secret: true,
+  });
   // What is typed over it is what is sent.
-  const replaced = { ...form, inputs: form.inputs.map((input) => (input.own ? { ...input, value: "typed" } : input)) };
-  assert.deepEqual(inputFromForm(replaced).inputs[1], { name: "ApiKey", value: "typed", secret: true });
+  const replaced = {
+    ...form,
+    inputs: form.inputs.map((input) =>
+      input.own ? { ...input, value: "typed" } : input,
+    ),
+  };
+  assert.deepEqual(inputFromForm(replaced).inputs[1], {
+    name: "ApiKey",
+    value: "typed",
+    secret: true,
+  });
   // One added in the editor is sent with what was typed, and one with nothing typed is not sent at all.
-  const fresh = { name: "Extra", value: "typed", secret: false, secretId: null, own: true, held: false };
-  assert.deepEqual(inputFromForm({ ...form, inputs: [fresh] }).inputs, [{ name: "Extra", value: "typed", secret: true }]);
-  assert.deepEqual(inputFromForm({ ...form, inputs: [{ ...fresh, value: "" }] }).inputs, []);
+  const fresh = {
+    name: "Extra",
+    value: "typed",
+    secret: false,
+    secretId: null,
+    own: true,
+    held: false,
+  };
+  assert.deepEqual(inputFromForm({ ...form, inputs: [fresh] }).inputs, [
+    { name: "Extra", value: "typed", secret: true },
+  ]);
+  assert.deepEqual(
+    inputFromForm({ ...form, inputs: [{ ...fresh, value: "" }] }).inputs,
+    [],
+  );
   // Made a linked secret, it is the job's own no longer.
   assert.deepEqual(withLinkedSecret(form.inputs[1], "s1"), {
-    name: "ApiKey", value: "", secret: true, secretId: "s1", own: false, held: false,
+    name: "ApiKey",
+    value: "",
+    secret: true,
+    secretId: "s1",
+    own: false,
+    held: false,
   });
 });
 
 test("a secret the header declares and the instance was never given is offered", () => {
-  const form = formFromInstance(instance("one", { inputs: [{ name: "Url", value: "x", secret: null }] }), NOTIFY);
-  assert.deepEqual(form.inputs.map((input) => [input.name, input.secret, input.secretId]), [
-    ["Url", false, null],
-    ["Token", true, null],
-  ]);
-  // The header's name matches whatever case the instance holds it in.
-  const held = formFromInstance(
-    instance("two", { inputs: [{ name: "token", value: "", secret: { id: "s1", name: "Token" } }] }),
+  const form = formFromInstance(
+    instance("one", { inputs: [{ name: "Url", value: "x", secret: null }] }),
     NOTIFY,
   );
-  assert.deepEqual(held.inputs.map((input) => input.name), ["token"]);
+  assert.deepEqual(
+    form.inputs.map((input) => [input.name, input.secret, input.secretId]),
+    [
+      ["Url", false, null],
+      ["Token", true, null],
+    ],
+  );
+  // The header's name matches whatever case the instance holds it in.
+  const held = formFromInstance(
+    instance("two", {
+      inputs: [
+        { name: "token", value: "", secret: { id: "s1", name: "Token" } },
+      ],
+    }),
+    NOTIFY,
+  );
+  assert.deepEqual(
+    held.inputs.map((input) => input.name),
+    ["token"],
+  );
 });
 
 test("what is sent leaves out what the trigger has no use for", () => {
@@ -324,7 +548,11 @@ test("what is sent leaves out what the trigger has no use for", () => {
   assert.deepEqual(feed.categories, []);
   assert.equal(feed.timeoutSeconds, null);
 
-  assert.equal(inputFromForm({ ...form, timeoutSeconds: MAX_TIMEOUT_SECONDS * 2 }).timeoutSeconds, MAX_TIMEOUT_SECONDS);
+  assert.equal(
+    inputFromForm({ ...form, timeoutSeconds: MAX_TIMEOUT_SECONDS * 2 })
+      .timeoutSeconds,
+    MAX_TIMEOUT_SECONDS,
+  );
 });
 
 test("only a download's triggers can be narrowed to a category", () => {
@@ -368,12 +596,30 @@ test("an input's name is checked before it is added", () => {
   const inputs = newInstanceForm(NOTIFY).inputs;
   assert.equal(inputNameProblem("Extra", inputs), null);
   assert.equal(inputNameProblem("  Section.Extra_1-b  ", inputs), null);
-  assert.equal(inputNameProblem("", inputs), "next.postProcessing.inputNameInvalid");
-  assert.equal(inputNameProblem("1st", inputs), "next.postProcessing.inputNameInvalid");
-  assert.equal(inputNameProblem("has space", inputs), "next.postProcessing.inputNameInvalid");
-  assert.equal(inputNameProblem("a..b", inputs), "next.postProcessing.inputNameInvalid");
-  assert.equal(inputNameProblem("x".repeat(129), inputs), "next.postProcessing.inputNameInvalid");
-  assert.equal(inputNameProblem("url", inputs), "next.postProcessing.inputNameTaken");
+  assert.equal(
+    inputNameProblem("", inputs),
+    "next.postProcessing.inputNameInvalid",
+  );
+  assert.equal(
+    inputNameProblem("1st", inputs),
+    "next.postProcessing.inputNameInvalid",
+  );
+  assert.equal(
+    inputNameProblem("has space", inputs),
+    "next.postProcessing.inputNameInvalid",
+  );
+  assert.equal(
+    inputNameProblem("a..b", inputs),
+    "next.postProcessing.inputNameInvalid",
+  );
+  assert.equal(
+    inputNameProblem("x".repeat(129), inputs),
+    "next.postProcessing.inputNameInvalid",
+  );
+  assert.equal(
+    inputNameProblem("url", inputs),
+    "next.postProcessing.inputNameTaken",
+  );
 });
 
 test("an input finds what the header says about it, whatever its case", () => {
@@ -402,12 +648,28 @@ test("a timeout reads exactly as it was set", () => {
 });
 
 test("a new job's schedule starts from the times its script's header asks for", () => {
-  assert.deepEqual(scheduleFromHeader(undefined), { times: "", days: [], startup: false });
-  const timed = script("nightly.py", { preset: { triggers: [], taskTimes: ["04:00", "*:20"], inputs: [] } });
-  assert.deepEqual(scheduleFromHeader(timed), { times: "04:00, *:20", days: [], startup: false });
+  assert.deepEqual(scheduleFromHeader(undefined), {
+    times: "",
+    days: [],
+    startup: false,
+  });
+  const timed = script("nightly.py", {
+    preset: { triggers: [], taskTimes: ["04:00", "*:20"], inputs: [] },
+  });
+  assert.deepEqual(scheduleFromHeader(timed), {
+    times: "04:00, *:20",
+    days: [],
+    startup: false,
+  });
   // A run at startup is its switch, not one of the times.
-  const atStartup = script("boot.sh", { preset: { triggers: [], taskTimes: ["*", "06:00"], inputs: [] } });
-  assert.deepEqual(scheduleFromHeader(atStartup), { times: "06:00", days: [], startup: true });
+  const atStartup = script("boot.sh", {
+    preset: { triggers: [], taskTimes: ["*", "06:00"], inputs: [] },
+  });
+  assert.deepEqual(scheduleFromHeader(atStartup), {
+    times: "06:00",
+    days: [],
+    startup: true,
+  });
 });
 
 test("a schedule job's run times are its times, its days and whether it runs at startup", () => {
@@ -417,51 +679,100 @@ test("a schedule job's run times are its times, its days and whether it runs at 
     days: [],
     runAtStartup: false,
   });
-  assert.deepEqual(jobSchedule({ times: "03:30", days: ["sat", "sun"], startup: true }), {
-    times: ["03:30"],
-    days: ["sat", "sun"],
+  assert.deepEqual(
+    jobSchedule({ times: "03:30", days: ["sat", "sun"], startup: true }),
+    {
+      times: ["03:30"],
+      days: ["sat", "sun"],
+      runAtStartup: true,
+    },
+  );
+  // Startup alone, by its switch or typed among the times, is enough.
+  for (const alone of [
+    { ...form, startup: true },
+    { ...form, times: "*" },
+  ]) {
+    assert.deepEqual(jobSchedule(alone), {
+      times: [],
+      days: [],
+      runAtStartup: true,
+    });
+  }
+  assert.deepEqual(jobSchedule({ ...form, times: "*, 01:00" }), {
+    times: ["01:00"],
+    days: [],
     runAtStartup: true,
   });
-  // Startup alone, by its switch or typed among the times, is enough.
-  for (const alone of [{ ...form, startup: true }, { ...form, times: "*" }]) {
-    assert.deepEqual(jobSchedule(alone), { times: [], days: [], runAtStartup: true });
-  }
-  assert.deepEqual(jobSchedule({ ...form, times: "*, 01:00" }), { times: ["01:00"], days: [], runAtStartup: true });
   // A job with nothing to run at is named, and so is a time the daemon would refuse.
   assert.deepEqual(jobSchedule(form), { problem: "none" });
   assert.deepEqual(jobSchedule({ ...form, times: " , " }), { problem: "none" });
-  for (const bad of ["24:00", "12:60", "noon", "1:2:3", "*:", ":30", "**", "012:00"]) {
-    assert.deepEqual(jobSchedule({ ...form, times: `01:00, ${bad}` }), { problem: "invalid", time: bad }, bad);
+  for (const bad of [
+    "24:00",
+    "12:60",
+    "noon",
+    "1:2:3",
+    "*:",
+    ":30",
+    "**",
+    "012:00",
+  ]) {
+    assert.deepEqual(
+      jobSchedule({ ...form, times: `01:00, ${bad}` }),
+      { problem: "invalid", time: bad },
+      bad,
+    );
   }
 });
 
 test("a schedule job is saved with its run times and a job of any other trigger with none", () => {
   const nightly = script("nightly.py", {
-    preset: { triggers: [{ trigger: "SCHEDULER", queueEvent: null }], taskTimes: ["*", "04:00"], inputs: [] },
+    preset: {
+      triggers: [{ trigger: "SCHEDULER", queueEvent: null }],
+      taskTimes: ["*", "04:00"],
+      inputs: [],
+    },
   });
   const form = newInstanceForm(nightly);
   assert.equal(form.trigger, "SCHEDULER");
-  assert.deepEqual(inputFromForm(form).schedule, { days: [], times: ["04:00"], runAtStartup: true });
-  assert.deepEqual(inputFromForm({ ...form, trigger: "SCAN" }).schedule, NO_SCHEDULE);
+  assert.deepEqual(inputFromForm(form).schedule, {
+    days: [],
+    times: ["04:00"],
+    runAtStartup: true,
+  });
+  assert.deepEqual(
+    inputFromForm({ ...form, trigger: "SCAN" }).schedule,
+    NO_SCHEDULE,
+  );
   // A saved job opens on what is saved in it, not on its header.
   const saved = instance("job", {
     script: "nightly.py",
     trigger: "SCHEDULER",
     schedule: { days: ["mon"], times: ["*:15", "23:00"], runAtStartup: false },
   });
-  assert.deepEqual(formFromInstance(saved, nightly).schedule, { times: "*:15, 23:00", days: ["mon"], startup: false });
+  assert.deepEqual(formFromInstance(saved, nightly).schedule, {
+    times: "*:15, 23:00",
+    days: ["mon"],
+    startup: false,
+  });
   assert.deepEqual(inputFromInstance(saved).schedule, saved.schedule);
 });
 
 test("the events a server without torrents offers leave out the torrents' own, and only those", () => {
   const offered = withoutTorrentOnly(QUEUE_EVENTS, false, isTorrentQueueEvent);
   assert.ok(offered.length > 0);
-  assert.ok(offered.every((event) => !event.startsWith("TORRENT_") && !event.startsWith("SEEDING_")));
+  assert.ok(
+    offered.every(
+      (event) => !event.startsWith("TORRENT_") && !event.startsWith("SEEDING_"),
+    ),
+  );
   assert.deepEqual(
     QUEUE_EVENTS.filter((event) => !offered.includes(event)),
     QUEUE_EVENTS.filter((event) => isTorrentQueueEvent(event)),
   );
   assert.ok(QUEUE_EVENTS.some((event) => isTorrentQueueEvent(event)));
   // With torrents, every event is offered.
-  assert.deepEqual(withoutTorrentOnly(QUEUE_EVENTS, true, isTorrentQueueEvent), [...QUEUE_EVENTS]);
+  assert.deepEqual(
+    withoutTorrentOnly(QUEUE_EVENTS, true, isTorrentQueueEvent),
+    [...QUEUE_EVENTS],
+  );
 });

@@ -41,7 +41,9 @@ test("crumbs treat a UNC share as the root", () => {
 });
 
 test("a relative or blank path has nothing to walk", () => {
-  assert.deepEqual(pathCrumbs("downloads"), [{ label: "downloads", path: "downloads" }]);
+  assert.deepEqual(pathCrumbs("downloads"), [
+    { label: "downloads", path: "downloads" },
+  ]);
   assert.deepEqual(pathCrumbs("  "), []);
 });
 

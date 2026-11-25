@@ -25,7 +25,13 @@ import { useTranslate, type Translate } from "@/lib/context/translate-context";
 import { LoadingMark } from "@/lib/loading-mark";
 import { cn } from "@/lib/utils";
 import { Eyebrow, Square } from "../components/chrome";
-import { NumberField, PrimaryButton, SecondaryButton, TextField, Toggle } from "../components/controls";
+import {
+  NumberField,
+  PrimaryButton,
+  SecondaryButton,
+  TextField,
+  Toggle,
+} from "../components/controls";
 import { Icon } from "../components/icons";
 import { ConfirmDialog } from "../components/ConfirmDialog";
 import { HardwareProfilePicker } from "../components/HardwareProfilePicker";
@@ -87,7 +93,11 @@ interface ProviderForm {
   username: string;
   password: string;
   connections: number;
-  certificate: { derBase64: string; fingerprint: string; names?: string[] } | null;
+  certificate: {
+    derBase64: string;
+    fingerprint: string;
+    names?: string[];
+  } | null;
 }
 
 /**
@@ -130,7 +140,10 @@ function normalizeHost(host: string): string {
     .replace(/\/+$/, "");
 }
 
-function errorMessage(error: { graphQLErrors: { message: string }[]; message: string }): string {
+function errorMessage(error: {
+  graphQLErrors: { message: string }[];
+  message: string;
+}): string {
   return error.graphQLErrors[0]?.message ?? error.message;
 }
 
@@ -145,7 +158,9 @@ function errorMessage(error: { graphQLErrors: { message: string }[]; message: st
  * cannot be answered the interface opens as usual.
  */
 export function FirstRunGate({ children }: { children: ReactNode }) {
-  const [decision, setDecision] = useState<"pending" | "wizard" | "app">("pending");
+  const [decision, setDecision] = useState<"pending" | "wizard" | "app">(
+    "pending",
+  );
   const [{ data, error, fetching }] = useQuery<FirstRunSetupState>({
     query: FIRST_RUN_SETUP_QUERY,
     requestPolicy: "network-only",
@@ -165,7 +180,10 @@ export function FirstRunGate({ children }: { children: ReactNode }) {
 
   if (decision === "pending") {
     return (
-      <div className="flex h-dvh items-center justify-center bg-wv-app" aria-hidden="true">
+      <div
+        className="flex h-dvh items-center justify-center bg-wv-app"
+        aria-hidden="true"
+      >
         <LoadingMark className="h-10" reveal />
       </div>
     );
@@ -185,7 +203,9 @@ function FirstRunWizard({ onDone }: { onDone: () => void }) {
   const [, finishSetup] = useMutation(FINISH_FIRST_RUN_SETUP_MUTATION);
   // Asked once, here rather than in the step: whether the machine has anything
   // to choose decides how many steps the rail draws.
-  const [{ data: profileData }] = useQuery<{ hardwareProfile: HardwareProfileSettings }>({
+  const [{ data: profileData }] = useQuery<{
+    hardwareProfile: HardwareProfileSettings;
+  }>({
     query: HARDWARE_PROFILE_QUERY,
     requestPolicy: "network-only",
   });
@@ -205,7 +225,11 @@ function FirstRunWizard({ onDone }: { onDone: () => void }) {
     const result = await finishSetup({});
     if (result.error) {
       setFinishing(false);
-      setFinishError(t("next.firstRun.finishFailed", { message: errorMessage(result.error) }));
+      setFinishError(
+        t("next.firstRun.finishFailed", {
+          message: errorMessage(result.error),
+        }),
+      );
       return;
     }
     onDone();
@@ -233,9 +257,14 @@ function FirstRunWizard({ onDone }: { onDone: () => void }) {
         <main className="relative flex flex-col border border-wv-control bg-wv-chrome shadow-wv-menu">
           <div className="flex flex-col gap-4 border-b border-wv-hairline px-5 pt-5 pb-4 sm:px-7">
             <div className="flex items-center gap-3">
-              <Eyebrow className="min-w-0 truncate">{t("next.firstRun.title")}</Eyebrow>
+              <Eyebrow className="min-w-0 truncate">
+                {t("next.firstRun.title")}
+              </Eyebrow>
               <span className="hidden flex-none font-wv-mono text-[11px] whitespace-nowrap text-wv-note sm:inline">
-                {t("next.firstRun.step", { step: index + 1, total: steps.length })}
+                {t("next.firstRun.step", {
+                  step: index + 1,
+                  total: steps.length,
+                })}
               </span>
               {step === "done" ? null : (
                 <button
@@ -248,14 +277,24 @@ function FirstRunWizard({ onDone }: { onDone: () => void }) {
                 </button>
               )}
             </div>
-            <ol className={cn("grid gap-1.5", steps.length === 4 ? "grid-cols-4" : "grid-cols-3")}>
+            <ol
+              className={cn(
+                "grid gap-1.5",
+                steps.length === 4 ? "grid-cols-4" : "grid-cols-3",
+              )}
+            >
               {steps.map((entry, position) => (
                 <li
                   key={entry}
                   aria-current={entry === step ? "step" : undefined}
                   className="flex flex-col gap-1.5"
                 >
-                  <span className={cn("h-[3px]", position <= index ? "bg-wv-accent" : "bg-wv-control")} />
+                  <span
+                    className={cn(
+                      "h-[3px]",
+                      position <= index ? "bg-wv-accent" : "bg-wv-control",
+                    )}
+                  />
                   <span
                     className={cn(
                       "font-wv-title text-[10.5px] font-semibold uppercase tracking-[0.12em]",
@@ -274,7 +313,9 @@ function FirstRunWizard({ onDone }: { onDone: () => void }) {
           ) : step === "folders" ? (
             <FoldersStep
               onBack={() => setStep("provider")}
-              onContinue={() => setStep(steps.includes("performance") ? "performance" : "done")}
+              onContinue={() =>
+                setStep(steps.includes("performance") ? "performance" : "done")
+              }
             />
           ) : step === "performance" ? (
             <PerformanceStep
@@ -284,14 +325,21 @@ function FirstRunWizard({ onDone }: { onDone: () => void }) {
             />
           ) : (
             <DoneStep
-              onBack={() => setStep(steps.includes("performance") ? "performance" : "folders")}
+              onBack={() =>
+                setStep(
+                  steps.includes("performance") ? "performance" : "folders",
+                )
+              }
               onOpen={() => void finish()}
               finishing={finishing}
             />
           )}
 
           {finishError ? (
-            <div role="alert" className="border-t border-wv-hairline px-5 py-3 text-[12.5px] text-wv-error-text sm:px-7">
+            <div
+              role="alert"
+              className="border-t border-wv-hairline px-5 py-3 text-[12.5px] text-wv-error-text sm:px-7"
+            >
               {finishError}
             </div>
           ) : null}
@@ -318,8 +366,12 @@ function StepBody({
     <>
       <div className="flex flex-col gap-5 px-5 py-6 sm:px-7">
         <div className="flex flex-col gap-1.5">
-          <h1 className="font-wv-title text-[19px] font-semibold text-wv-strong">{title}</h1>
-          {body ? <p className="text-[13px] leading-[1.55] text-wv-muted">{body}</p> : null}
+          <h1 className="font-wv-title text-[19px] font-semibold text-wv-strong">
+            {title}
+          </h1>
+          {body ? (
+            <p className="text-[13px] leading-[1.55] text-wv-muted">{body}</p>
+          ) : null}
         </div>
         {children}
       </div>
@@ -345,14 +397,21 @@ function FormField({
     <div className={cn("flex min-w-0 flex-col gap-[7px]", className)}>
       <span className="text-[12px] font-medium text-wv-secondary">{label}</span>
       {children}
-      {help ? <span className="text-[11.5px] leading-[1.45] text-wv-muted">{help}</span> : null}
+      {help ? (
+        <span className="text-[11.5px] leading-[1.45] text-wv-muted">
+          {help}
+        </span>
+      ) : null}
     </div>
   );
 }
 
 function ErrorLine({ children }: { children: ReactNode }) {
   return (
-    <div role="alert" className="text-[12.5px] leading-[1.45] text-wv-error-text">
+    <div
+      role="alert"
+      className="text-[12.5px] leading-[1.45] text-wv-error-text"
+    >
       {children}
     </div>
   );
@@ -374,7 +433,8 @@ function ProviderStep({ onContinue }: { onContinue: () => void }) {
   const [testResult, setTestResult] = useState<TestResult | null>(null);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [confirmTrust, setConfirmTrust] = useState<ProviderForm["certificate"]>(null);
+  const [confirmTrust, setConfirmTrust] =
+    useState<ProviderForm["certificate"]>(null);
 
   const servers = data?.servers ?? [];
   const loaded = data !== undefined || !fetching;
@@ -397,7 +457,8 @@ function ProviderStep({ onContinue }: { onContinue: () => void }) {
     priority: 0,
     backfill: false,
     retentionDays: 0,
-    tlsNameMismatchCertificateDerBase64: provider.certificate?.derBase64 ?? null,
+    tlsNameMismatchCertificateDerBase64:
+      provider.certificate?.derBase64 ?? null,
   });
 
   const runTest = async (provider: ProviderForm = form) => {
@@ -434,7 +495,11 @@ function ProviderStep({ onContinue }: { onContinue: () => void }) {
     setSaving(false);
     if (result.error) {
       const message = errorMessage(result.error);
-      if (form.tls && !form.certificate && message.includes(CERTIFICATE_NAME_MISMATCH)) {
+      if (
+        form.tls &&
+        !form.certificate &&
+        message.includes(CERTIFICATE_NAME_MISMATCH)
+      ) {
         // Show the certificate the way a test does, so it can be trusted here.
         await runTest();
         return;
@@ -475,8 +540,14 @@ function ProviderStep({ onContinue }: { onContinue: () => void }) {
         footer={
           editing ? (
             <>
-              <SecondaryButton icon="test" onClick={() => void runTest()} disabled={testing || saving}>
-                {testing ? t("next.providers.testing") : t("next.providers.test")}
+              <SecondaryButton
+                icon="test"
+                onClick={() => void runTest()}
+                disabled={testing || saving}
+              >
+                {testing
+                  ? t("next.providers.testing")
+                  : t("next.providers.test")}
               </SecondaryButton>
               {servers.length > 0 ? (
                 <SecondaryButton
@@ -490,7 +561,9 @@ function ProviderStep({ onContinue }: { onContinue: () => void }) {
                   {t("action.cancel")}
                 </SecondaryButton>
               ) : (
-                <SecondaryButton onClick={onContinue}>{t("next.firstRun.provider.skip")}</SecondaryButton>
+                <SecondaryButton onClick={onContinue}>
+                  {t("next.firstRun.provider.skip")}
+                </SecondaryButton>
               )}
               <PrimaryButton
                 icon="add"
@@ -498,15 +571,25 @@ function ProviderStep({ onContinue }: { onContinue: () => void }) {
                 disabled={saving || !normalizeHost(form.host)}
                 className="ml-auto"
               >
-                {saving ? t("next.firstRun.saving") : t("next.firstRun.provider.save")}
+                {saving
+                  ? t("next.firstRun.saving")
+                  : t("next.firstRun.provider.save")}
               </PrimaryButton>
             </>
           ) : (
             <>
-              <SecondaryButton icon="add" onClick={() => setAddingAnother(true)} disabled={!loaded}>
+              <SecondaryButton
+                icon="add"
+                onClick={() => setAddingAnother(true)}
+                disabled={!loaded}
+              >
                 {t("next.firstRun.provider.addAnother")}
               </SecondaryButton>
-              <PrimaryButton onClick={onContinue} disabled={!loaded} className="ml-auto">
+              <PrimaryButton
+                onClick={onContinue}
+                disabled={!loaded}
+                className="ml-auto"
+              >
                 {t("next.firstRun.continue")}
               </PrimaryButton>
             </>
@@ -514,7 +597,10 @@ function ProviderStep({ onContinue }: { onContinue: () => void }) {
         }
       >
         {!loaded ? (
-          <div role="status" className="flex items-center gap-3 font-wv-mono text-[12px] text-wv-muted">
+          <div
+            role="status"
+            className="flex items-center gap-3 font-wv-mono text-[12px] text-wv-muted"
+          >
             <LoadingMark className="h-5" />
           </div>
         ) : null}
@@ -570,18 +656,26 @@ function ProviderStep({ onContinue }: { onContinue: () => void }) {
 
             <div className="flex items-start justify-between gap-4">
               <div className="flex min-w-0 flex-col gap-[7px]">
-                <span className="text-[12px] font-medium text-wv-secondary">{t("next.firstRun.provider.tls")}</span>
-                <span className="text-[11.5px] leading-[1.45] text-wv-muted">{t("next.firstRun.provider.tlsHint")}</span>
+                <span className="text-[12px] font-medium text-wv-secondary">
+                  {t("next.firstRun.provider.tls")}
+                </span>
+                <span className="text-[11.5px] leading-[1.45] text-wv-muted">
+                  {t("next.firstRun.provider.tlsHint")}
+                </span>
               </div>
               <Toggle
                 label={t("next.firstRun.provider.tls")}
                 checked={form.tls}
-                onChange={(tls) => patch({ tls, port: tls ? 563 : 119, certificate: null })}
+                onChange={(tls) =>
+                  patch({ tls, port: tls ? 563 : 119, certificate: null })
+                }
               />
             </div>
 
             <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
-              <FormField label={`${t("next.providers.username")} (${t("next.common.optional")})`}>
+              <FormField
+                label={`${t("next.providers.username")} (${t("next.common.optional")})`}
+              >
                 <TextField
                   label={t("next.providers.username")}
                   value={form.username}
@@ -590,7 +684,9 @@ function ProviderStep({ onContinue }: { onContinue: () => void }) {
                   className="w-full"
                 />
               </FormField>
-              <FormField label={`${t("next.providers.password")} (${t("next.common.optional")})`}>
+              <FormField
+                label={`${t("next.providers.password")} (${t("next.common.optional")})`}
+              >
                 <TextField
                   type="password"
                   label={t("next.providers.password")}
@@ -656,9 +752,17 @@ function ProviderStep({ onContinue }: { onContinue: () => void }) {
             <span>{t("next.providers.trustBody")}</span>
             <span className="flex flex-col gap-1 font-wv-mono text-[11px] break-all text-wv-muted">
               {confirmTrust?.names?.length ? (
-                <span>{t("next.providers.certNames", { names: formatHostnames(confirmTrust.names) })}</span>
+                <span>
+                  {t("next.providers.certNames", {
+                    names: formatHostnames(confirmTrust.names),
+                  })}
+                </span>
               ) : null}
-              <span>{t("next.providers.certFingerprint", { fingerprint: confirmTrust?.fingerprint ?? "" })}</span>
+              <span>
+                {t("next.providers.certFingerprint", {
+                  fingerprint: confirmTrust?.fingerprint ?? "",
+                })}
+              </span>
             </span>
           </span>
         }
@@ -685,36 +789,56 @@ function TestOutcome({
 }) {
   // A certificate on offer is the whole story: say whose certificate it is
   // instead of repeating the server's failure above the same warning.
-  const certificate = trusted ? null : result.adoptableTlsNameMismatchCertificate;
+  const certificate = trusted
+    ? null
+    : result.adoptableTlsNameMismatchCertificate;
   return (
-    <div role="status" className="flex flex-col gap-1.5 border border-wv-hairline bg-wv-input px-3 py-3">
+    <div
+      role="status"
+      className="flex flex-col gap-1.5 border border-wv-hairline bg-wv-input px-3 py-3"
+    >
       {certificate ? (
         <div className="flex items-start gap-[9px] text-[13px] leading-[1.45]">
           <Square color={WV.warn} className="mt-[6px] flex-none" />
           <span className="text-wv-warn">
             {certificate.names.length
-              ? t("next.providers.certIssuedFor", { names: formatHostnames(certificate.names), host })
+              ? t("next.providers.certIssuedFor", {
+                  names: formatHostnames(certificate.names),
+                  host,
+                })
               : t("next.providers.certMismatch")}
           </span>
         </div>
       ) : (
         <div className="flex items-center gap-[9px] text-[13px]">
           <Square color={result.success ? WV.green : WV.error} />
-          <span className={result.success ? "text-wv-fg" : "text-wv-error-text"}>{result.message}</span>
+          <span
+            className={result.success ? "text-wv-fg" : "text-wv-error-text"}
+          >
+            {result.message}
+          </span>
         </div>
       )}
       {result.latencyMs === null ? null : (
         <div className="font-wv-mono text-[11.5px] text-wv-muted">
           {formatLatency(result.latencyMs)}
-          {result.supportsPipelining ? ` · ${t("next.providers.pipelining")}` : ""}
+          {result.supportsPipelining
+            ? ` · ${t("next.providers.pipelining")}`
+            : ""}
         </div>
       )}
       {certificate ? (
         <div className="flex flex-col gap-2 pt-1.5">
           <span className="font-wv-mono text-[11px] break-all text-wv-muted">
-            {t("next.providers.certFingerprint", { fingerprint: certificate.sha256Fingerprint })}
+            {t("next.providers.certFingerprint", {
+              fingerprint: certificate.sha256Fingerprint,
+            })}
           </span>
-          <SecondaryButton icon="trust" onClick={onTrust} className="self-start">
+          <SecondaryButton
+            icon="trust"
+            onClick={onTrust}
+            className="self-start"
+          >
             {t("next.providers.trustCert")}
           </SecondaryButton>
         </div>
@@ -726,7 +850,9 @@ function TestOutcome({
 /* ------------------------------------------------------------- folders step */
 
 function useStorageCheck() {
-  const [{ data }, reexecute] = useQuery<{ systemInfo: { configuredStorage: StorageVolume[] } }>({
+  const [{ data }, reexecute] = useQuery<{
+    systemInfo: { configuredStorage: StorageVolume[] };
+  }>({
     query: SYSTEM_INFO_QUERY,
     requestPolicy: "network-only",
   });
@@ -756,12 +882,19 @@ function usePickedStorage(paths: readonly string[]): StorageVolume[] {
     const timer = window.setTimeout(() => {
       for (const path of key.split("\n")) {
         void client
-          .query<{ pathStorage: StorageVolume }>(PATH_STORAGE_QUERY, { path }, { requestPolicy: "network-only" })
+          .query<{ pathStorage: StorageVolume }>(
+            PATH_STORAGE_QUERY,
+            { path },
+            { requestPolicy: "network-only" },
+          )
           .toPromise()
           .then((result) => {
             const storage = result.data?.pathStorage;
             if (!cancelled && storage?.capacity) {
-              setProbed((previous) => ({ ...previous, [path]: { ...storage, path } }));
+              setProbed((previous) => ({
+                ...previous,
+                [path]: { ...storage, path },
+              }));
             }
           })
           .catch(() => undefined);
@@ -776,13 +909,21 @@ function usePickedStorage(paths: readonly string[]): StorageVolume[] {
   return paths.flatMap((path) => (probed[path] ? [probed[path]] : []));
 }
 
-function FoldersStep({ onBack, onContinue }: { onBack: () => void; onContinue: () => void }) {
+function FoldersStep({
+  onBack,
+  onContinue,
+}: {
+  onBack: () => void;
+  onContinue: () => void;
+}) {
   const t = useTranslate();
   const [{ data: settingsData }] = useQuery<FolderSettings>({
     query: SETTINGS_QUERY,
     requestPolicy: "network-only",
   });
-  const [{ data: categoryData }, reexecuteCategories] = useQuery<{ categories: Category[] }>({
+  const [{ data: categoryData }, reexecuteCategories] = useQuery<{
+    categories: Category[];
+  }>({
     query: CATEGORIES_QUERY,
     requestPolicy: "network-only",
   });
@@ -791,7 +932,10 @@ function FoldersStep({ onBack, onContinue }: { onBack: () => void; onContinue: (
   const [, removeCategory] = useMutation(REMOVE_CATEGORY_MUTATION);
   const storage = useStorageCheck();
 
-  const [folders, setFolders] = useState<{ intermediateDir: string; completeDir: string } | null>(null);
+  const [folders, setFolders] = useState<{
+    intermediateDir: string;
+    completeDir: string;
+  } | null>(null);
   const [savingFolders, setSavingFolders] = useState(false);
   const [folderError, setFolderError] = useState<string | null>(null);
   const [categoryName, setCategoryName] = useState("");
@@ -802,7 +946,10 @@ function FoldersStep({ onBack, onContinue }: { onBack: () => void; onContinue: (
   const settings = settingsData?.settings;
   useEffect(() => {
     if (settings && folders === null) {
-      setFolders({ intermediateDir: settings.intermediateDir ?? "", completeDir: settings.completeDir ?? "" });
+      setFolders({
+        intermediateDir: settings.intermediateDir ?? "",
+        completeDir: settings.completeDir ?? "",
+      });
     }
   }, [settings, folders]);
 
@@ -811,9 +958,18 @@ function FoldersStep({ onBack, onContinue }: { onBack: () => void; onContinue: (
   );
   // A folder changed here stands in for the saved one until the step saves it.
   const edited = [
-    { saved: settings?.intermediateDir ?? "", picked: folders?.intermediateDir.trim() ?? "" },
-    { saved: settings?.completeDir ?? "", picked: folders?.completeDir.trim() ?? "" },
-  ].filter((folder) => settings && folders && folder.picked && folder.picked !== folder.saved);
+    {
+      saved: settings?.intermediateDir ?? "",
+      picked: folders?.intermediateDir.trim() ?? "",
+    },
+    {
+      saved: settings?.completeDir ?? "",
+      picked: folders?.completeDir.trim() ?? "",
+    },
+  ].filter(
+    (folder) =>
+      settings && folders && folder.picked && folder.picked !== folder.saved,
+  );
   const pickedStorage = usePickedStorage(edited.map((folder) => folder.picked));
   const replaced = new Set(edited.map((folder) => folder.saved));
   const savedComplete = settings?.completeDir ?? "";
@@ -827,12 +983,16 @@ function FoldersStep({ onBack, onContinue }: { onBack: () => void; onContinue: (
   }
   const volumes = storage.volumes
     ? [
-        ...storage.volumes.filter((volume) => !(volume.labels.length === 1 && replaced.has(volume.path))),
+        ...storage.volumes.filter(
+          (volume) =>
+            !(volume.labels.length === 1 && replaced.has(volume.path)),
+        ),
         ...pickedStorage,
       ]
     : null;
   const dataDir = settings?.dataDir ?? "";
-  const completeDir = folders?.completeDir.trim() || (dataDir ? `${dataDir}/complete` : "");
+  const completeDir =
+    folders?.completeDir.trim() || (dataDir ? `${dataDir}/complete` : "");
 
   const continueStep = async () => {
     if (!folders || !settings) {
@@ -840,15 +1000,25 @@ function FoldersStep({ onBack, onContinue }: { onBack: () => void; onContinue: (
     }
     const intermediateDir = folders.intermediateDir.trim();
     const completed = folders.completeDir.trim();
-    if (intermediateDir !== (settings.intermediateDir ?? "") || completed !== (settings.completeDir ?? "")) {
+    if (
+      intermediateDir !== (settings.intermediateDir ?? "") ||
+      completed !== (settings.completeDir ?? "")
+    ) {
       setSavingFolders(true);
       setFolderError(null);
       const result = await updateSettings({
-        input: { intermediateDir: intermediateDir || null, completeDir: completed || null },
+        input: {
+          intermediateDir: intermediateDir || null,
+          completeDir: completed || null,
+        },
       });
       setSavingFolders(false);
       if (result.error) {
-        setFolderError(t("next.firstRun.folders.saveFailed", { message: errorMessage(result.error) }));
+        setFolderError(
+          t("next.firstRun.folders.saveFailed", {
+            message: errorMessage(result.error),
+          }),
+        );
         return;
       }
     }
@@ -868,7 +1038,11 @@ function FoldersStep({ onBack, onContinue }: { onBack: () => void; onContinue: (
     });
     setCategoryBusy(false);
     if (result.error) {
-      setCategoryError(t("next.firstRun.categories.saveFailed", { message: errorMessage(result.error) }));
+      setCategoryError(
+        t("next.firstRun.categories.saveFailed", {
+          message: errorMessage(result.error),
+        }),
+      );
       return;
     }
     setCategoryName("");
@@ -883,7 +1057,11 @@ function FoldersStep({ onBack, onContinue }: { onBack: () => void; onContinue: (
     const result = await removeCategory({ id: category.id });
     setCategoryBusy(false);
     if (result.error) {
-      setCategoryError(t("next.firstRun.categories.saveFailed", { message: errorMessage(result.error) }));
+      setCategoryError(
+        t("next.firstRun.categories.saveFailed", {
+          message: errorMessage(result.error),
+        }),
+      );
       return;
     }
     reexecuteCategories({ requestPolicy: "network-only" });
@@ -895,13 +1073,17 @@ function FoldersStep({ onBack, onContinue }: { onBack: () => void; onContinue: (
       title={t("next.firstRun.folders.title")}
       footer={
         <>
-          <SecondaryButton onClick={onBack}>{t("next.firstRun.back")}</SecondaryButton>
+          <SecondaryButton onClick={onBack}>
+            {t("next.firstRun.back")}
+          </SecondaryButton>
           <PrimaryButton
             onClick={() => void continueStep()}
             disabled={folders === null || savingFolders}
             className="ml-auto"
           >
-            {savingFolders ? t("next.firstRun.saving") : t("next.firstRun.continue")}
+            {savingFolders
+              ? t("next.firstRun.saving")
+              : t("next.firstRun.continue")}
           </PrimaryButton>
         </>
       }
@@ -912,16 +1094,24 @@ function FoldersStep({ onBack, onContinue }: { onBack: () => void; onContinue: (
         </div>
       ) : (
         <div className="flex flex-col gap-4">
-          <FormField label={t("next.general.workingDir")} help={t("next.general.workingDirHelp")}>
+          <FormField
+            label={t("next.general.workingDir")}
+            help={t("next.general.workingDirHelp")}
+          >
             <PathField
               label={t("next.general.workingDir")}
               value={folders.intermediateDir}
               placeholder={dataDir ? `${dataDir}/intermediate` : undefined}
-              onChange={(intermediateDir) => setFolders({ ...folders, intermediateDir })}
+              onChange={(intermediateDir) =>
+                setFolders({ ...folders, intermediateDir })
+              }
               className="w-full"
             />
           </FormField>
-          <FormField label={t("next.general.completeDir")} help={t("next.general.completeDirHelp")}>
+          <FormField
+            label={t("next.general.completeDir")}
+            help={t("next.general.completeDirHelp")}
+          >
             <PathField
               label={t("next.general.completeDir")}
               value={folders.completeDir}
@@ -939,11 +1129,15 @@ function FoldersStep({ onBack, onContinue }: { onBack: () => void; onContinue: (
       <div className="flex flex-col gap-3 border-t border-wv-hairline pt-5">
         <div className="flex flex-col gap-1.5">
           <Eyebrow tone="rail">{t("next.firstRun.categories.title")}</Eyebrow>
-          <p className="text-[12.5px] leading-[1.55] text-wv-muted">{t("next.firstRun.categories.body")}</p>
+          <p className="text-[12.5px] leading-[1.55] text-wv-muted">
+            {t("next.firstRun.categories.body")}
+          </p>
         </div>
 
         {categories.length === 0 ? (
-          <div className="text-[12px] text-wv-muted">{t("next.categories.empty")}</div>
+          <div className="text-[12px] text-wv-muted">
+            {t("next.categories.empty")}
+          </div>
         ) : (
           <ul className="flex flex-col border border-wv-hairline">
             {categories.map((category) => (
@@ -959,8 +1153,12 @@ function FoldersStep({ onBack, onContinue }: { onBack: () => void; onContinue: (
                 </span>
                 <button
                   type="button"
-                  aria-label={t("next.firstRun.categories.remove", { name: category.name })}
-                  title={t("next.firstRun.categories.remove", { name: category.name })}
+                  aria-label={t("next.firstRun.categories.remove", {
+                    name: category.name,
+                  })}
+                  title={t("next.firstRun.categories.remove", {
+                    name: category.name,
+                  })}
                   disabled={categoryBusy}
                   onClick={() => void remove(category)}
                   className="flex size-7 flex-none cursor-pointer items-center justify-center text-wv-muted hover:text-wv-error-text disabled:cursor-default"
@@ -1053,7 +1251,11 @@ function PerformanceStep({
     const result = await setProfile({ profile: selected });
     setSaving(false);
     if (result.error) {
-      setError(t("next.performance.saveFailed", { message: errorMessage(result.error) }));
+      setError(
+        t("next.performance.saveFailed", {
+          message: errorMessage(result.error),
+        }),
+      );
       return;
     }
     onContinue();
@@ -1136,8 +1338,14 @@ function DoneStep({
           <SecondaryButton onClick={onBack} disabled={finishing}>
             {t("next.firstRun.back")}
           </SecondaryButton>
-          <PrimaryButton onClick={onOpen} disabled={finishing} className="ml-auto">
-            {finishing ? t("next.firstRun.saving") : t("next.firstRun.done.open")}
+          <PrimaryButton
+            onClick={onOpen}
+            disabled={finishing}
+            className="ml-auto"
+          >
+            {finishing
+              ? t("next.firstRun.saving")
+              : t("next.firstRun.done.open")}
           </PrimaryButton>
         </>
       }
@@ -1145,26 +1353,36 @@ function DoneStep({
       <dl className="flex flex-col border border-wv-hairline">
         <SummaryRow label={t("next.firstRun.done.providers")}>
           {serverData === undefined ? null : servers.length === 0 ? (
-            <span className="text-wv-warn">{t("next.firstRun.done.noProvider")}</span>
+            <span className="text-wv-warn">
+              {t("next.firstRun.done.noProvider")}
+            </span>
           ) : (
             <span className="font-wv-mono text-[12px]">
-              {servers.map((server) => `${server.host}:${server.port}`).join(", ")}
+              {servers
+                .map((server) => `${server.host}:${server.port}`)
+                .join(", ")}
             </span>
           )}
         </SummaryRow>
         <SummaryRow label={t("next.general.workingDir")}>
           <span className="font-wv-mono text-[12px] break-all">
-            {settings ? settings.intermediateDir || `${settings.dataDir}/intermediate` : null}
+            {settings
+              ? settings.intermediateDir || `${settings.dataDir}/intermediate`
+              : null}
           </span>
         </SummaryRow>
         <SummaryRow label={t("next.general.completeDir")}>
           <span className="font-wv-mono text-[12px] break-all">
-            {settings ? settings.completeDir || `${settings.dataDir}/complete` : null}
+            {settings
+              ? settings.completeDir || `${settings.dataDir}/complete`
+              : null}
           </span>
         </SummaryRow>
         <SummaryRow label={t("next.firstRun.categories.title")}>
           {categoryData === undefined ? null : categories.length === 0 ? (
-            <span className="text-wv-muted">{t("next.firstRun.done.categoriesNone")}</span>
+            <span className="text-wv-muted">
+              {t("next.firstRun.done.categoriesNone")}
+            </span>
           ) : (
             categories.join(", ")
           )}
@@ -1176,7 +1394,13 @@ function DoneStep({
   );
 }
 
-function SummaryRow({ label, children }: { label: string; children: ReactNode }) {
+function SummaryRow({
+  label,
+  children,
+}: {
+  label: string;
+  children: ReactNode;
+}) {
   return (
     <div className="grid grid-cols-1 gap-1 border-b border-wv-hairline px-3 py-2.5 last:border-b-0 sm:grid-cols-[150px_minmax(0,1fr)] sm:gap-3">
       <dt className="text-[12px] text-wv-muted">{label}</dt>

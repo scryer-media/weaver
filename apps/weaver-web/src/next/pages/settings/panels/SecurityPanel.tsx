@@ -29,7 +29,12 @@ import { ConfirmDialog } from "../../../components/ConfirmDialog";
 import { Dialog } from "../../../components/Dialog";
 import { Icon } from "../../../components/icons";
 import { RecordEditor } from "../../../components/RecordEditor";
-import { DangerButton, PrimaryButton, SecondaryButton, TextField } from "../../../components/controls";
+import {
+  DangerButton,
+  PrimaryButton,
+  SecondaryButton,
+  TextField,
+} from "../../../components/controls";
 import { Cell } from "../../../components/rows";
 import { settingsIds, testIds } from "../../../testids";
 import { WV } from "../../../data/palette";
@@ -148,12 +153,18 @@ function lines(text: string): string[] {
 }
 
 export function SecurityPanel() {
-  const [{ data, error }, refetchNetwork] = useQuery<{ networkAccess: NetworkAccessStatus }>({
+  const [{ data, error }, refetchNetwork] = useQuery<{
+    networkAccess: NetworkAccessStatus;
+  }>({
     query: NETWORK_ACCESS_QUERY,
     requestPolicy: "network-only",
   });
   if (error) {
-    return <p role="alert" className="p-6 text-wv-error-text">{cleanMessage(error.message)}</p>;
+    return (
+      <p role="alert" className="p-6 text-wv-error-text">
+        {cleanMessage(error.message)}
+      </p>
+    );
   }
   if (!data) return null;
   return (
@@ -168,13 +179,18 @@ export function SecurityPanel() {
  * Ends every session, this browser's too: "password" when the server wants a
  * recent password check first. Outside the panel, so the panel itself compiles.
  */
-async function signOutEverywhere(): Promise<"signedOut" | "password" | "failed"> {
+async function signOutEverywhere(): Promise<
+  "signedOut" | "password" | "failed"
+> {
   try {
-    const response = await fetch(new URL("api/auth/signout-all", document.baseURI), {
-      method: "POST",
-      headers: { "Content-Type": "application/json", ...authHeaders() },
-      credentials: "include",
-    });
+    const response = await fetch(
+      new URL("api/auth/signout-all", document.baseURI),
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json", ...authHeaders() },
+        credentials: "include",
+      },
+    );
     if (response.status === 428) return "password";
     return response.ok ? "signedOut" : "failed";
   } catch {
@@ -194,22 +210,28 @@ function SecurityPanelBody({
   const authenticated = network.authenticatedAccess;
   const passwordCheck = usePasswordCheck();
 
-  const [{ data: loginData, fetching: loginFetching }, refetchLogin] = useQuery<{ adminLoginStatus: LoginStatus }>({
-    query: LOGIN_STATUS_QUERY,
-    requestPolicy: "network-only",
-  });
+  const [{ data: loginData, fetching: loginFetching }, refetchLogin] =
+    useQuery<{ adminLoginStatus: LoginStatus }>({
+      query: LOGIN_STATUS_QUERY,
+      requestPolicy: "network-only",
+    });
   // The sign-in model reports its listener with the rest of its network state.
-  const [{ data: bindData, fetching: bindFetching }, refetchBind] = useQuery<{ httpBindAddress: BindAddressStatus }>({
+  const [{ data: bindData, fetching: bindFetching }, refetchBind] = useQuery<{
+    httpBindAddress: BindAddressStatus;
+  }>({
     query: HTTP_BIND_ADDRESS_QUERY,
     requestPolicy: "network-only",
     pause: authenticated,
   });
-  const [{ data: policyData, fetching: policyFetching }, refetchPolicy] = useQuery<{ accessPolicy: AccessPolicyStatus }>({
-    query: ACCESS_POLICY_QUERY,
-    requestPolicy: "network-only",
-    pause: authenticated,
-  });
-  const [{ data: keysData, fetching: keysFetching }, refetchKeys] = useQuery<{ apiKeys: ApiKey[] }>({
+  const [{ data: policyData, fetching: policyFetching }, refetchPolicy] =
+    useQuery<{ accessPolicy: AccessPolicyStatus }>({
+      query: ACCESS_POLICY_QUERY,
+      requestPolicy: "network-only",
+      pause: authenticated,
+    });
+  const [{ data: keysData, fetching: keysFetching }, refetchKeys] = useQuery<{
+    apiKeys: ApiKey[];
+  }>({
     query: API_KEYS_QUERY,
   });
 
@@ -245,10 +267,17 @@ function SecurityPanelBody({
   const [failed, setFailed] = useState(false);
 
   const storedNetworks = useMemo(
-    () => (authenticated ? network.trustedNetworks : (policy?.trustedNetworks ?? [])).join("\n"),
+    () =>
+      (authenticated
+        ? network.trustedNetworks
+        : (policy?.trustedNetworks ?? [])
+      ).join("\n"),
     [authenticated, network.trustedNetworks, policy],
   );
-  const storedProxies = useMemo(() => network.trustedProxies.join("\n"), [network.trustedProxies]);
+  const storedProxies = useMemo(
+    () => network.trustedProxies.join("\n"),
+    [network.trustedProxies],
+  );
 
   // The address draft mirrors the STORED value only: an empty box means "not
   // configured", and re-proposing the running address would let Save quietly
@@ -297,8 +326,12 @@ function SecurityPanelBody({
 
   const networkInput = (): NetworkAccessInput => {
     // Both lists always go together: that is what repairs an invalid stored policy.
-    const input: NetworkAccessInput = { trustedNetworks: lines(networks), trustedProxies: lines(proxies) };
-    return bind?.editable && address.trim() !== (bind.storedAddress ?? "").trim()
+    const input: NetworkAccessInput = {
+      trustedNetworks: lines(networks),
+      trustedProxies: lines(proxies),
+    };
+    return bind?.editable &&
+      address.trim() !== (bind.storedAddress ?? "").trim()
       ? { ...input, bindAddress: address.trim() }
       : input;
   };
@@ -307,7 +340,8 @@ function SecurityPanelBody({
   // would drop this browser's remembered session shows before Save.
   const [preview, setPreview] = useState<NetworkAccessPreview | null>(null);
   const [previewError, setPreviewError] = useState<string | null>(null);
-  const draftKey = authenticated && dirty ? JSON.stringify(networkInput()) : null;
+  const draftKey =
+    authenticated && dirty ? JSON.stringify(networkInput()) : null;
   useEffect(() => {
     setPreview(null);
     setPreviewError(null);
@@ -317,9 +351,13 @@ function SecurityPanelBody({
     let cancelled = false;
     const timer = window.setTimeout(() => {
       void client
-        .query<{ previewNetworkAccess: NetworkAccessPreview }>(PREVIEW_NETWORK_ACCESS_QUERY, {
-          input: JSON.parse(draftKey) as NetworkAccessInput,
-        }, { requestPolicy: "network-only" })
+        .query<{ previewNetworkAccess: NetworkAccessPreview }>(
+          PREVIEW_NETWORK_ACCESS_QUERY,
+          {
+            input: JSON.parse(draftKey) as NetworkAccessInput,
+          },
+          { requestPolicy: "network-only" },
+        )
         .toPromise()
         .then((result) => {
           if (cancelled) return;
@@ -361,9 +399,13 @@ function SecurityPanelBody({
     setBusy(true);
     setFailed(false);
     const result = await client
-      .query<{ previewNetworkAccess: NetworkAccessPreview }>(PREVIEW_NETWORK_ACCESS_QUERY, {
-        input: networkInput(),
-      }, { requestPolicy: "network-only" })
+      .query<{ previewNetworkAccess: NetworkAccessPreview }>(
+        PREVIEW_NETWORK_ACCESS_QUERY,
+        {
+          input: networkInput(),
+        },
+        { requestPolicy: "network-only" },
+      )
       .toPromise();
     if (result.error) {
       fail(cleanMessage(result.error.message));
@@ -393,13 +435,22 @@ function SecurityPanelBody({
         fail(cleanMessage(result.error.message));
         return "done";
       }
-      messages.push(address.trim() ? t("next.security.listenSaved") : t("next.security.listenCleared"));
+      messages.push(
+        address.trim()
+          ? t("next.security.listenSaved")
+          : t("next.security.listenCleared"),
+      );
       void refetchBind({ requestPolicy: "network-only" });
     }
-    if (policy && !policy.envPinned && (mode !== policy.mode || networks !== storedNetworks)) {
+    if (
+      policy &&
+      !policy.envPinned &&
+      (mode !== policy.mode || networks !== storedNetworks)
+    ) {
       const result = await setAccessPolicy({
         mode,
-        trustedNetworks: mode === "login_except_local" ? lines(networks) : undefined,
+        trustedNetworks:
+          mode === "login_except_local" ? lines(networks) : undefined,
       });
       if (needsPasswordCheck(result.error)) {
         setBusy(false);
@@ -432,11 +483,19 @@ function SecurityPanelBody({
   /* ------------------------------------------------------------- dialogs */
 
   const [enableOpen, setEnableOpen] = useState(false);
-  const [enableForm, setEnableForm] = useState({ username: "", password: "", confirm: "" });
+  const [enableForm, setEnableForm] = useState({
+    username: "",
+    password: "",
+    confirm: "",
+  });
   const [enableError, setEnableError] = useState<string | null>(null);
 
   const [passwordOpen, setPasswordOpen] = useState(false);
-  const [passwordForm, setPasswordForm] = useState({ current: "", next: "", confirm: "" });
+  const [passwordForm, setPasswordForm] = useState({
+    current: "",
+    next: "",
+    confirm: "",
+  });
   const [passwordError, setPasswordError] = useState<string | null>(null);
 
   const [disableOpen, setDisableOpen] = useState(false);
@@ -446,7 +505,11 @@ function SecurityPanelBody({
   const [keyOpen, setKeyOpen] = useState(false);
   const [keyForm, setKeyForm] = useState({ name: "", scope: "CONTROL" });
   const [keyError, setKeyError] = useState<string | null>(null);
-  const [createdKey, setCreatedKey] = useState<{ name: string; scope: string; rawKey: string } | null>(null);
+  const [createdKey, setCreatedKey] = useState<{
+    name: string;
+    scope: string;
+    rawKey: string;
+  } | null>(null);
   const [copied, setCopied] = useState<"idle" | "copied" | "failed">("idle");
   const [removeKey, setRemoveKey] = useState<ApiKey | null>(null);
   const keyFieldRef = useRef<HTMLInputElement | null>(null);
@@ -530,7 +593,10 @@ function SecurityPanelBody({
    * in `keyError` still needs somewhere to be read: the form dialog shows it,
    * a deep link has to open that dialog itself.
    */
-  const mintKey = async (name: string, scope: string): Promise<CheckedOutcome | "failed"> => {
+  const mintKey = async (
+    name: string,
+    scope: string,
+  ): Promise<CheckedOutcome | "failed"> => {
     const trimmed = name.trim();
     if (!trimmed) {
       setKeyError(t("next.security.keyNameRequired"));
@@ -541,11 +607,19 @@ function SecurityPanelBody({
     setBusy(false);
     if (needsPasswordCheck(result.error)) return "password";
     if (result.error || !result.data?.createApiKey?.rawKey) {
-      setKeyError(result.error ? cleanMessage(result.error.message) : t("next.security.keyCreateFailed"));
+      setKeyError(
+        result.error
+          ? cleanMessage(result.error.message)
+          : t("next.security.keyCreateFailed"),
+      );
       return "failed";
     }
     setKeyOpen(false);
-    setCreatedKey({ name: trimmed, scope, rawKey: result.data.createApiKey.rawKey });
+    setCreatedKey({
+      name: trimmed,
+      scope,
+      rawKey: result.data.createApiKey.rawKey,
+    });
     setCopied("idle");
     setKeyForm({ name: "", scope: "CONTROL" });
     void refetchKeys({ requestPolicy: "network-only" });
@@ -639,13 +713,17 @@ function SecurityPanelBody({
     label: t("next.security.listenAddress"),
     help: bind?.editable
       ? t("next.security.listenHelp")
-      : t("next.security.listenPinnedHelp", { variable: "WEAVER_HTTP_BIND_ADDRESS" }),
+      : t("next.security.listenPinnedHelp", {
+          variable: "WEAVER_HTTP_BIND_ADDRESS",
+        }),
     keywords: `${bind?.address ?? ""} bind interface host port`,
     control: bind?.editable
       ? {
           kind: "text",
           value: address,
-          placeholder: t("next.security.listenPlaceholder", { address: "127.0.0.1" }),
+          placeholder: t("next.security.listenPlaceholder", {
+            address: "127.0.0.1",
+          }),
           onChange: (next) => edit(() => setAddress(next)),
         }
       : { kind: "static", value: bind?.address ?? "—" },
@@ -657,15 +735,23 @@ function SecurityPanelBody({
       id: "accessMode",
       label: t("next.security.browserAccess"),
       help: policy?.envPinned
-        ? t("next.security.accessPinnedHelp", { variable: "WEAVER_TRUSTED_CIDRS" })
+        ? t("next.security.accessPinnedHelp", {
+            variable: "WEAVER_TRUSTED_CIDRS",
+          })
         : t("next.security.accessHelp"),
       keywords: "login policy trusted network cidr",
       control: policy?.envPinned
-        ? { kind: "static", value: policy.trustedNetworks.join(", ") || t("next.job.none") }
+        ? {
+            kind: "static",
+            value: policy.trustedNetworks.join(", ") || t("next.job.none"),
+          }
         : {
             kind: "select",
             value: mode,
-            options: ACCESS_MODES.map((option) => ({ ...option, label: t(option.label) })),
+            options: ACCESS_MODES.map((option) => ({
+              ...option,
+              label: t(option.label),
+            })),
             className: "min-w-0 sm:min-w-[320px]",
             onChange: (next) => edit(() => setMode(next)),
           },
@@ -691,25 +777,37 @@ function SecurityPanelBody({
 
   const draftSummary = (() => {
     if (previewError) {
-      return <span className="text-wv-error-text [word-break:normal] break-words">{previewError}</span>;
+      return (
+        <span className="text-wv-error-text [word-break:normal] break-words">
+          {previewError}
+        </span>
+      );
     }
     if (!preview) {
-      return <span className="text-wv-muted">{t("next.security.checking")}</span>;
+      return (
+        <span className="text-wv-muted">{t("next.security.checking")}</span>
+      );
     }
     return (
       // Sentences, not an address: wrap between words.
       <span className="flex flex-col gap-1 [word-break:normal] break-words">
         <span>
           {t("next.security.draftResolves", {
-            networks: preview.trustedNetworks.join(", ") || t("next.security.anyClient"),
+            networks:
+              preview.trustedNetworks.join(", ") ||
+              t("next.security.anyClient"),
             proxies: preview.trustedProxies.join(", ") || t("next.job.none"),
           })}
         </span>
         {preview.restartRequired ? (
-          <span className="text-wv-muted">{t("next.security.draftRestart")}</span>
+          <span className="text-wv-muted">
+            {t("next.security.draftRestart")}
+          </span>
         ) : null}
         {preview.currentClientAllowed === false ? (
-          <span className="text-wv-warn">{t("next.security.draftLocksOut")}</span>
+          <span className="text-wv-warn">
+            {t("next.security.draftLocksOut")}
+          </span>
         ) : null}
       </span>
     );
@@ -735,7 +833,9 @@ function SecurityPanelBody({
       label: t("next.security.rememberedNetworks"),
       help: network.editable
         ? t("next.security.rememberedNetworksHelp")
-        : t("next.security.accessPinnedHelp", { variable: "WEAVER_TRUSTED_CIDRS" }),
+        : t("next.security.accessPinnedHelp", {
+            variable: "WEAVER_TRUSTED_CIDRS",
+          }),
       keywords: "cidr subnet lan remember me session trusted networks",
       control: network.editable
         ? {
@@ -745,14 +845,21 @@ function SecurityPanelBody({
             placeholder: "192.168.1.0/24",
             onChange: (next) => edit(() => setNetworks(next)),
           }
-        : { kind: "static", value: network.trustedNetworks.join(", ") || t("next.security.anyClient") },
+        : {
+            kind: "static",
+            value:
+              network.trustedNetworks.join(", ") ||
+              t("next.security.anyClient"),
+          },
     },
     {
       id: "trustedProxies",
       label: t("next.security.trustedProxies"),
       help: network.proxiesEditable
         ? t("next.security.trustedProxiesHelp")
-        : t("next.security.accessPinnedHelp", { variable: "WEAVER_TRUSTED_PROXIES" }),
+        : t("next.security.accessPinnedHelp", {
+            variable: "WEAVER_TRUSTED_PROXIES",
+          }),
       keywords: "reverse proxy forwarded x-forwarded-for headers",
       control: network.proxiesEditable
         ? {
@@ -762,7 +869,10 @@ function SecurityPanelBody({
             placeholder: "172.18.0.2",
             onChange: (next) => edit(() => setProxies(next)),
           }
-        : { kind: "static", value: network.trustedProxies.join(", ") || t("next.job.none") },
+        : {
+            kind: "static",
+            value: network.trustedProxies.join(", ") || t("next.job.none"),
+          },
     },
     ...(dirty
       ? [
@@ -807,7 +917,11 @@ function SecurityPanelBody({
           kind: "custom",
           control: (
             <>
-              <SecondaryButton icon="password" onClick={() => setPasswordOpen(true)} testId={settingsIds.passwordChange}>
+              <SecondaryButton
+                icon="password"
+                onClick={() => setPasswordOpen(true)}
+                testId={settingsIds.passwordChange}
+              >
                 {t("next.security.changePassword")}
               </SecondaryButton>
               <DangerButton
@@ -827,21 +941,35 @@ function SecurityPanelBody({
     : {
         id: "loginEnabled",
         label: t("next.security.requireLogin"),
-        help: login?.enabled ? undefined : t("next.security.requireLoginOffHelp"),
+        help: login?.enabled
+          ? undefined
+          : t("next.security.requireLoginOffHelp"),
         keywords: "password admin authentication",
         control: {
           kind: "custom",
           control: login?.enabled ? (
             <>
-              <SecondaryButton icon="password" onClick={() => setPasswordOpen(true)} testId={settingsIds.passwordChange}>
+              <SecondaryButton
+                icon="password"
+                onClick={() => setPasswordOpen(true)}
+                testId={settingsIds.passwordChange}
+              >
                 {t("next.security.changePassword")}
               </SecondaryButton>
-              <SecondaryButton icon="unlock" onClick={() => setDisableOpen(true)} testId={settingsIds.loginOff}>
+              <SecondaryButton
+                icon="unlock"
+                onClick={() => setDisableOpen(true)}
+                testId={settingsIds.loginOff}
+              >
                 {t("next.security.turnOff")}
               </SecondaryButton>
             </>
           ) : (
-            <PrimaryButton icon="lock" onClick={() => setEnableOpen(true)} testId={settingsIds.loginSetup}>
+            <PrimaryButton
+              icon="lock"
+              onClick={() => setEnableOpen(true)}
+              testId={settingsIds.loginSetup}
+            >
               {t("next.security.setUpLogin")}
             </PrimaryButton>
           ),
@@ -878,22 +1006,38 @@ function SecurityPanelBody({
         "",
       ],
       empty: t("next.security.keysEmpty"),
-      add: { label: t("next.security.addKey"), onClick: () => setKeyOpen(true) },
+      add: {
+        label: t("next.security.addKey"),
+        onClick: () => setKeyOpen(true),
+      },
       rows: keys.map((key) => ({
         id: String(key.id),
         searchText: `${key.name} ${key.scope} ${scopeLabel(key.scope)}`,
         cells: [
           <Cell key="name">{key.name}</Cell>,
-          <Cell key="scope" mono className="text-wv-secondary" testId={settingsIds.keyScope(key.scope)}>
+          <Cell
+            key="scope"
+            mono
+            className="text-wv-secondary"
+            testId={settingsIds.keyScope(key.scope)}
+          >
             {scopeLabel(key.scope)}
           </Cell>,
           <Cell key="created" mono className="text-wv-muted">
             {formatDate(key.createdAt)}
           </Cell>,
           <Cell key="used" mono className="text-wv-muted">
-            {key.lastUsedAt ? formatDate(key.lastUsedAt) : t("next.security.never")}
+            {key.lastUsedAt
+              ? formatDate(key.lastUsedAt)
+              : t("next.security.never")}
           </Cell>,
-          <SecondaryButton icon="remove" key="revoke" className="h-7 px-2" onClick={() => setRemoveKey(key)} testId={settingsIds.keyRevoke}>
+          <SecondaryButton
+            icon="remove"
+            key="revoke"
+            className="h-7 px-2"
+            onClick={() => setRemoveKey(key)}
+            testId={settingsIds.keyRevoke}
+          >
             {t("next.security.revoke")}
           </SecondaryButton>,
         ],
@@ -913,9 +1057,15 @@ function SecurityPanelBody({
   return (
     <>
       {authenticated && !network.rememberedPolicyValid
-        ? banner(t("next.security.policyInvalid"), WV.error, "text-wv-error-text")
+        ? banner(
+            t("next.security.policyInvalid"),
+            WV.error,
+            "text-wv-error-text",
+          )
         : null}
-      {bind?.bindFallback ? banner(bind.bindFallback, WV.warn, "text-wv-warn") : null}
+      {bind?.bindFallback
+        ? banner(bind.bindFallback, WV.warn, "text-wv-warn")
+        : null}
       {!authenticated && bind?.exposedWithoutLogin && !login?.enabled
         ? banner(t("next.security.exposedWarning"), WV.warn, "text-wv-warn")
         : null}
@@ -923,10 +1073,10 @@ function SecurityPanelBody({
       <SettingsBlocks
         blocks={blocks}
         loading={
-          (loginFetching && !loginData)
-          || (!authenticated && bindFetching && !bindData)
-          || (!authenticated && policyFetching && !policyData)
-          || (keysFetching && !keysData)
+          (loginFetching && !loginData) ||
+          (!authenticated && bindFetching && !bindData) ||
+          (!authenticated && policyFetching && !policyData) ||
+          (keysFetching && !keysData)
         }
       />
 
@@ -954,7 +1104,10 @@ function SecurityPanelBody({
                   secret: true,
                   value: enableForm.username,
                   onChange: (next) =>
-                    setEnableForm((current) => ({ ...current, username: next })),
+                    setEnableForm((current) => ({
+                      ...current,
+                      username: next,
+                    })),
                 },
               },
               {
@@ -966,7 +1119,10 @@ function SecurityPanelBody({
                   secret: true,
                   value: enableForm.password,
                   onChange: (next) =>
-                    setEnableForm((current) => ({ ...current, password: next })),
+                    setEnableForm((current) => ({
+                      ...current,
+                      password: next,
+                    })),
                 },
               },
               {
@@ -977,7 +1133,8 @@ function SecurityPanelBody({
                   type: "password",
                   secret: true,
                   value: enableForm.confirm,
-                  onChange: (next) => setEnableForm((current) => ({ ...current, confirm: next })),
+                  onChange: (next) =>
+                    setEnableForm((current) => ({ ...current, confirm: next })),
                 },
               },
             ],
@@ -1008,7 +1165,10 @@ function SecurityPanelBody({
                   secret: true,
                   value: passwordForm.current,
                   onChange: (next) =>
-                    setPasswordForm((current) => ({ ...current, current: next })),
+                    setPasswordForm((current) => ({
+                      ...current,
+                      current: next,
+                    })),
                 },
               },
               {
@@ -1019,7 +1179,8 @@ function SecurityPanelBody({
                   type: "password",
                   secret: true,
                   value: passwordForm.next,
-                  onChange: (next) => setPasswordForm((current) => ({ ...current, next })),
+                  onChange: (next) =>
+                    setPasswordForm((current) => ({ ...current, next })),
                 },
               },
               {
@@ -1031,7 +1192,10 @@ function SecurityPanelBody({
                   secret: true,
                   value: passwordForm.confirm,
                   onChange: (next) =>
-                    setPasswordForm((current) => ({ ...current, confirm: next })),
+                    setPasswordForm((current) => ({
+                      ...current,
+                      confirm: next,
+                    })),
                 },
               },
             ],
@@ -1061,7 +1225,8 @@ function SecurityPanelBody({
                   kind: "text",
                   mono: false,
                   value: keyForm.name,
-                  onChange: (next) => setKeyForm((current) => ({ ...current, name: next })),
+                  onChange: (next) =>
+                    setKeyForm((current) => ({ ...current, name: next })),
                 },
               },
               {
@@ -1071,8 +1236,12 @@ function SecurityPanelBody({
                 control: {
                   kind: "select",
                   value: keyForm.scope,
-                  options: KEY_SCOPES.map((option) => ({ ...option, label: t(option.label) })),
-                  onChange: (next) => setKeyForm((current) => ({ ...current, scope: next })),
+                  options: KEY_SCOPES.map((option) => ({
+                    ...option,
+                    label: t(option.label),
+                  })),
+                  onChange: (next) =>
+                    setKeyForm((current) => ({ ...current, scope: next })),
                 },
               },
             ],
@@ -1084,15 +1253,27 @@ function SecurityPanelBody({
         open={createdKey !== null}
         testId={testIds.dialog("key-created")}
         title={t("next.security.keyCreated")}
-        note={createdKey ? `${createdKey.name} · ${scopeLabel(createdKey.scope)}` : undefined}
+        note={
+          createdKey
+            ? `${createdKey.name} · ${scopeLabel(createdKey.scope)}`
+            : undefined
+        }
         width={560}
         onDismiss={() => setCreatedKey(null)}
         footer={
           <>
-            <SecondaryButton icon={copied === "copied" ? "copied" : "copy"} onClick={() => void copyCreatedKey()}>
+            <SecondaryButton
+              icon={copied === "copied" ? "copied" : "copy"}
+              onClick={() => void copyCreatedKey()}
+            >
               {copyLabel}
             </SecondaryButton>
-            <PrimaryButton onClick={() => setCreatedKey(null)} testId={settingsIds.keyCreatedDone}>{t("next.security.done")}</PrimaryButton>
+            <PrimaryButton
+              onClick={() => setCreatedKey(null)}
+              testId={settingsIds.keyCreatedDone}
+            >
+              {t("next.security.done")}
+            </PrimaryButton>
           </>
         }
       >
@@ -1146,7 +1327,9 @@ function SecurityPanelBody({
           signOutAllError ? (
             <>
               {t("next.security.signOutEverywhereBody")}
-              <span role="alert" className="mt-2 block text-wv-error-text">{signOutAllError}</span>
+              <span role="alert" className="mt-2 block text-wv-error-text">
+                {signOutAllError}
+              </span>
             </>
           ) : (
             t("next.security.signOutEverywhereBody")
@@ -1176,7 +1359,9 @@ function SecurityPanelBody({
         note={removeKey?.name}
         busy={busy}
         confirmLabel={t("next.security.revokeKey")}
-        body={t("next.security.revokeBody", { name: removeKey?.name ?? t("next.security.thisKey") })}
+        body={t("next.security.revokeBody", {
+          name: removeKey?.name ?? t("next.security.thisKey"),
+        })}
         onConfirm={() => {
           if (removeKey) {
             void passwordCheck.run(() => submitRemoveKey(removeKey));

@@ -22,13 +22,17 @@ export function useUpdateCheck(): {
   check: () => void;
 } {
   const t = useTranslate();
-  const [{ data }] = useQuery<{ updateStatus: UpdateStatus }>({ query: UPDATE_STATUS_QUERY });
-  const [{ data: live }] = useSubscription<{ updateStatusUpdates: UpdateStatus }>({
+  const [{ data }] = useQuery<{ updateStatus: UpdateStatus }>({
+    query: UPDATE_STATUS_QUERY,
+  });
+  const [{ data: live }] = useSubscription<{
+    updateStatusUpdates: UpdateStatus;
+  }>({
     query: UPDATE_STATUS_SUBSCRIPTION,
   });
-  const [checkState, checkForUpdates] = useMutation<{ checkForUpdates: UpdateStatus }>(
-    CHECK_FOR_UPDATES_MUTATION,
-  );
+  const [checkState, checkForUpdates] = useMutation<{
+    checkForUpdates: UpdateStatus;
+  }>(CHECK_FOR_UPDATES_MUTATION);
   const [checked, setChecked] = useState<UpdateStatus | null>(null);
   const [failure, setFailure] = useState<string | null>(null);
 

@@ -55,7 +55,9 @@ const BODY_KEY: Record<HardwareProfileName, string> = {
  * setup step and the settings section are both left out rather than shown with
  * a single card nobody can decline.
  */
-export function offersProfileChoice(settings: HardwareProfileSettings | null | undefined): boolean {
+export function offersProfileChoice(
+  settings: HardwareProfileSettings | null | undefined,
+): boolean {
   return (settings?.available.length ?? 0) > 1;
 }
 
@@ -64,18 +66,26 @@ export function offersProfileChoice(settings: HardwareProfileSettings | null | u
  * recommendation. A choice this machine no longer offers is not what runs, so
  * it opens on the recommendation too.
  */
-export function initialProfile(settings: HardwareProfileSettings): HardwareProfileName {
+export function initialProfile(
+  settings: HardwareProfileSettings,
+): HardwareProfileName {
   const selected = settings.selected;
   return selected !== null && settings.available.includes(selected)
     ? selected
     : settings.recommended;
 }
 
-export function profileName(t: Translate, profile: HardwareProfileName): string {
+export function profileName(
+  t: Translate,
+  profile: HardwareProfileName,
+): string {
   return t(NAME_KEY[profile]);
 }
 
-export function profileBody(t: Translate, profile: HardwareProfileName): string {
+export function profileBody(
+  t: Translate,
+  profile: HardwareProfileName,
+): string {
   return t(BODY_KEY[profile]);
 }
 
@@ -83,7 +93,10 @@ export function profileBody(t: Translate, profile: HardwareProfileName): string 
  * The two or three concrete lines under a card's name, so a name means
  * something before it is picked.
  */
-export function profileFacts(t: Translate, option: HardwareProfileOption): string[] {
+export function profileFacts(
+  t: Translate,
+  option: HardwareProfileOption,
+): string[] {
   const facts = [
     t("next.performance.factDecodeMemory", {
       size: formatSize(option.sevenzDecodeMemoryBytes),
@@ -94,7 +107,11 @@ export function profileFacts(t: Translate, option: HardwareProfileOption): strin
     }),
   ];
   if (option.maxConcurrentDownloads !== null) {
-    facts.push(t("next.performance.factDownloads", { count: option.maxConcurrentDownloads }));
+    facts.push(
+      t("next.performance.factDownloads", {
+        count: option.maxConcurrentDownloads,
+      }),
+    );
   }
   return facts;
 }
@@ -108,11 +125,16 @@ export function scheduledProfileNotice(
   settings: HardwareProfileSettings,
 ): string | null {
   if (settings.scheduled === null) return null;
-  return t("next.performance.scheduled", { profile: profileName(t, settings.scheduled) });
+  return t("next.performance.scheduled", {
+    profile: profileName(t, settings.scheduled),
+  });
 }
 
 /** "16 GB RAM, 8 cores" — what the recommendation was judged against. */
-export function detectedHardware(t: Translate, settings: HardwareProfileSettings): string {
+export function detectedHardware(
+  t: Translate,
+  settings: HardwareProfileSettings,
+): string {
   return t("next.performance.detected", {
     memory: formatSize(settings.detected.memoryBytes),
     cores: settings.detected.cores,

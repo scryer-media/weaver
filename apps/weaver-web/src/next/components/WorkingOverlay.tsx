@@ -18,7 +18,9 @@ export function WorkingOverlay({ label }: { label: string }) {
       style={{ animation: "weaver-loading-reveal 160ms ease-out both" }}
     >
       <LoadingMark className="h-20" />
-      <span className="font-wv-mono text-[12px] text-wv-secondary">{label}</span>
+      <span className="font-wv-mono text-[12px] text-wv-secondary">
+        {label}
+      </span>
     </div>
   );
 }

@@ -93,7 +93,9 @@ const EMPTY_IMPORT: WireguardConfigImport = {
  * Returns `null` when nothing in the text was recognisable, which is how the
  * caller tells "not a WireGuard configuration" from "a sparse one".
  */
-export function parseWireguardConfig(text: string): WireguardConfigImport | null {
+export function parseWireguardConfig(
+  text: string,
+): WireguardConfigImport | null {
   const result: WireguardConfigImport = { ...EMPTY_IMPORT, ignored: [] };
   const addresses: string[] = [];
   const dnsServers: string[] = [];
@@ -201,7 +203,10 @@ function joinConfigList(values: readonly string[]): string {
  * multi-line value is a PEM block rather than an assignment, and is returned as
  * it arrived.
  */
-export function stripConfigAssignment(raw: string, keys: readonly string[]): string {
+export function stripConfigAssignment(
+  raw: string,
+  keys: readonly string[],
+): string {
   const trimmed = raw.trim();
   if (trimmed.includes("\n")) {
     return trimmed;
@@ -235,9 +240,16 @@ function validPort(port: string): boolean {
  * field of the form answers to a single pasted line; it is a file handed over
  * whole that has to stand on its own.
  */
-export function wireguardConfigProblems(config: WireguardConfigImport): WireguardConfigProblem[] {
+export function wireguardConfigProblems(
+  config: WireguardConfigImport,
+): WireguardConfigProblem[] {
   const problems: WireguardConfigProblem[] = [];
-  const key = (name: string, section: "Interface" | "Peer", value: string, required: boolean) => {
+  const key = (
+    name: string,
+    section: "Interface" | "Peer",
+    value: string,
+    required: boolean,
+  ) => {
     if (value === "") {
       if (required) problems.push({ kind: "missing", key: name, section });
     } else if (!WIREGUARD_KEY.test(value)) {

@@ -1,10 +1,21 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
-import { Component, useContext, useEffect, useRef, useState, type CSSProperties, type ReactNode } from "react";
+import {
+  Component,
+  useContext,
+  useEffect,
+  useRef,
+  useState,
+  type CSSProperties,
+  type ReactNode,
+} from "react";
 import { isRouteErrorResponse, useNavigate, useRouteError } from "react-router";
 import { BrandLockup } from "@/lib/brand";
-import { TranslateContext, type Translate } from "@/lib/context/translate-context";
+import {
+  TranslateContext,
+  type Translate,
+} from "@/lib/context/translate-context";
 import { interpolate } from "@/lib/i18n/types";
 
 /**
@@ -26,13 +37,16 @@ import { interpolate } from "@/lib/i18n/types";
  */
 const ENGLISH: Record<string, string> = {
   "next.errorPage.title": "Something went wrong",
-  "next.errorPage.renderBody": "Weaver hit an unexpected error while rendering this screen.",
+  "next.errorPage.renderBody":
+    "Weaver hit an unexpected error while rendering this screen.",
   "next.errorPage.notFound": "Page not found",
   "next.errorPage.requestFailed": "Request failed ({{status}})",
-  "next.errorPage.routingBody": "Weaver hit a routing error before the page could finish loading.",
+  "next.errorPage.routingBody":
+    "Weaver hit a routing error before the page could finish loading.",
   "next.errorPage.retry": "Retry",
   "next.errorPage.checking": "Checking…",
-  "next.errorPage.unreachable": "Weaver isn't responding. This page opens it as soon as it answers.",
+  "next.errorPage.unreachable":
+    "Weaver isn't responding. This page opens it as soon as it answers.",
   "next.errorPage.goBack": "Go back",
   "next.errorPage.details": "Technical details",
 };
@@ -44,12 +58,15 @@ const TITLE_FONT: CSSProperties = {
   fontFamily: '"Sora Variable", ui-sans-serif, system-ui, sans-serif',
 };
 const UI_FONT: CSSProperties = {
-  fontFamily: '"Fira Code Variable", ui-monospace, "SFMono-Regular", Menlo, monospace',
+  fontFamily:
+    '"Fira Code Variable", ui-monospace, "SFMono-Regular", Menlo, monospace',
 };
 
 function useErrorTranslate(): Translate {
   const context = useContext(TranslateContext);
-  return context?.t ?? ((key, values) => interpolate(ENGLISH[key] ?? key, values));
+  return (
+    context?.t ?? ((key, values) => interpolate(ENGLISH[key] ?? key, values))
+  );
 }
 
 async function weaverAnswers(): Promise<boolean> {
@@ -71,7 +88,9 @@ async function weaverAnswers(): Promise<boolean> {
  * in the background, so the page opens Weaver by itself when it comes back.
  */
 function useRetry() {
-  const [state, setState] = useState<"idle" | "checking" | "unreachable">("idle");
+  const [state, setState] = useState<"idle" | "checking" | "unreachable">(
+    "idle",
+  );
   const timer = useRef<number | null>(null);
   const mounted = useRef(true);
   // Only the latest check may schedule the next, so pressing Retry during a
@@ -105,7 +124,10 @@ function useRetry() {
       return;
     }
     setState("unreachable");
-    timer.current = window.setTimeout(() => void check(false), RECHECK_INTERVAL_MS);
+    timer.current = window.setTimeout(
+      () => void check(false),
+      RECHECK_INTERVAL_MS,
+    );
   };
 
   return { state, retry: () => void check(true) };
@@ -141,7 +163,9 @@ export function ErrorPage({
         >
           {title}
         </h1>
-        <p className="mt-2 text-[13px] leading-[1.6] break-words text-[#a09d96]">{body}</p>
+        <p className="mt-2 text-[13px] leading-[1.6] break-words text-[#a09d96]">
+          {body}
+        </p>
         <div className="mt-6 flex flex-wrap justify-center gap-[10px]">
           <button
             type="button"
@@ -149,7 +173,9 @@ export function ErrorPage({
             disabled={state === "checking"}
             className={`h-[34px] cursor-pointer bg-[#3fb39c] px-4 text-[13px] font-medium text-[#10201c] hover:bg-[#52c4ad] disabled:cursor-default disabled:bg-[#2f8a78] ${focusRing}`}
           >
-            {state === "checking" ? t("next.errorPage.checking") : t("next.errorPage.retry")}
+            {state === "checking"
+              ? t("next.errorPage.checking")
+              : t("next.errorPage.retry")}
           </button>
           {onBack ? (
             <button
@@ -161,12 +187,18 @@ export function ErrorPage({
             </button>
           ) : null}
         </div>
-        <p role="status" aria-live="polite" className="mt-3 min-h-[1.6em] text-[12px] leading-[1.6] text-[#84817a]">
+        <p
+          role="status"
+          aria-live="polite"
+          className="mt-3 min-h-[1.6em] text-[12px] leading-[1.6] text-[#84817a]"
+        >
           {state === "unreachable" ? t("next.errorPage.unreachable") : ""}
         </p>
         {detail ? (
           <details className="mt-5 w-full text-left">
-            <summary className={`cursor-pointer text-center text-[12px] text-[#84817a] hover:text-[#a09d96] ${focusRing}`}>
+            <summary
+              className={`cursor-pointer text-center text-[12px] text-[#84817a] hover:text-[#a09d96] ${focusRing}`}
+            >
               {t("next.errorPage.details")}
             </summary>
             <pre className="mt-3 max-h-[240px] overflow-auto border border-[#2a2b30] bg-[#1f2024] px-3 py-2 text-[11.5px] leading-[1.55] break-words whitespace-pre-wrap text-[#a09d96]">
@@ -205,7 +237,9 @@ export function RouteErrorPage() {
       error.status === 404
         ? t("next.errorPage.notFound")
         : t("next.errorPage.requestFailed", { status: error.status });
-    body = error.statusText?.trim() ? error.statusText : t("next.errorPage.routingBody");
+    body = error.statusText?.trim()
+      ? error.statusText
+      : t("next.errorPage.routingBody");
   } else if (error instanceof Error && error.message) {
     body = error.message;
   }
@@ -215,7 +249,9 @@ export function RouteErrorPage() {
       title={title}
       body={body}
       detail={detailOf(error)}
-      onBack={() => void (window.history.length > 1 ? navigate(-1) : navigate("/"))}
+      onBack={() =>
+        void (window.history.length > 1 ? navigate(-1) : navigate("/"))
+      }
     />
   );
 }
@@ -224,7 +260,10 @@ export function RouteErrorPage() {
  * Catches whatever no router caught: a crash in a gate, the sign-in page, or
  * anything else outside a route.
  */
-export class AppErrorBoundary extends Component<{ children: ReactNode }, { failed: boolean; error: unknown }> {
+export class AppErrorBoundary extends Component<
+  { children: ReactNode },
+  { failed: boolean; error: unknown }
+> {
   state = { failed: false, error: null as unknown };
 
   static getDerivedStateFromError(error: unknown) {
@@ -244,7 +283,11 @@ function CrashPage({ error }: { error: unknown }) {
   return (
     <ErrorPage
       title={t("next.errorPage.title")}
-      body={error instanceof Error && error.message ? error.message : t("next.errorPage.renderBody")}
+      body={
+        error instanceof Error && error.message
+          ? error.message
+          : t("next.errorPage.renderBody")
+      }
       detail={detailOf(error)}
     />
   );

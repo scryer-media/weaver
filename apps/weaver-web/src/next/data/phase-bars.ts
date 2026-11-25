@@ -22,7 +22,12 @@ import type { JobPhase, JobPhaseProgressData } from "@/lib/job-types";
 export const PHASE_SETTLE_MS = 2_000;
 
 /** Pipeline order, which is also the order the bars stack in. */
-export const PHASE_ORDER: readonly JobPhase[] = ["DOWNLOADING", "REPAIRING", "EXTRACTING", "MOVING"];
+export const PHASE_ORDER: readonly JobPhase[] = [
+  "DOWNLOADING",
+  "REPAIRING",
+  "EXTRACTING",
+  "MOVING",
+];
 
 /**
  * The phases doing work right now.
@@ -31,17 +36,25 @@ export const PHASE_ORDER: readonly JobPhase[] = ["DOWNLOADING", "REPAIRING", "EX
  * 100% while it waits for the next one. That wait is the download's time, not
  * the extraction's, so it does not count as a running extraction.
  */
-export function runningPhases(phases: readonly JobPhaseProgressData[]): JobPhaseProgressData[] {
+export function runningPhases(
+  phases: readonly JobPhaseProgressData[],
+): JobPhaseProgressData[] {
   const downloading = runningDownload(phases) !== undefined;
   return phases.filter(
     (phase) =>
-      phase.totalBytes > 0
-      && !(phase.phase === "EXTRACTING" && downloading && phase.completedBytes >= phase.totalBytes),
+      phase.totalBytes > 0 &&
+      !(
+        phase.phase === "EXTRACTING" &&
+        downloading &&
+        phase.completedBytes >= phase.totalBytes
+      ),
   );
 }
 
 /** The phase that last reported progress; ties go to the one that started later. */
-export function latestPhase(phases: readonly JobPhaseProgressData[]): JobPhaseProgressData | null {
+export function latestPhase(
+  phases: readonly JobPhaseProgressData[],
+): JobPhaseProgressData | null {
   let latest: JobPhaseProgressData | null = null;
   for (const phase of phases) {
     if (!latest || phase.updatedAtEpochMs >= latest.updatedAtEpochMs) {
@@ -59,14 +72,18 @@ export function latestPhase(phases: readonly JobPhaseProgressData[]): JobPhasePr
  * mid-download would win, and it has no download rate to give. While a download
  * is running, its rate is the one that means something.
  */
-export function ratePhase(phases: readonly JobPhaseProgressData[]): JobPhaseProgressData | null {
+export function ratePhase(
+  phases: readonly JobPhaseProgressData[],
+): JobPhaseProgressData | null {
   return runningDownload(phases) ?? latestPhase(phases);
 }
 
 function runningDownload(phases: readonly JobPhaseProgressData[]) {
   return phases.find(
     (phase) =>
-      phase.phase === "DOWNLOADING" && phase.totalBytes > 0 && phase.completedBytes < phase.totalBytes,
+      phase.phase === "DOWNLOADING" &&
+      phase.totalBytes > 0 &&
+      phase.completedBytes < phase.totalBytes,
   );
 }
 
@@ -111,7 +128,8 @@ export function settlePhases(
     if (current) {
       // A held bar whose phase comes back keeps its bar; anything else that was
       // not already running starts its settling time now.
-      const since = clock && (clock.endedAt === null || clock.shown) ? clock.since : now;
+      const since =
+        clock && (clock.endedAt === null || clock.shown) ? clock.since : now;
       const shown = (clock?.shown ?? false) || now - since >= PHASE_SETTLE_MS;
       clocks.set(phase, { since, endedAt: null, shown, last: current });
       if (shown) {
@@ -184,17 +202,23 @@ export function settleStatus(
   settled = false,
 ): { clock: StatusClock; nextChangeAt: number | null } {
   if (
-    previous === null
-    || settled
-    || status === previous.shown
-    || !WORKING_STATUSES.has(status)
-    || !WORKING_STATUSES.has(previous.shown)
+    previous === null ||
+    settled ||
+    status === previous.shown ||
+    !WORKING_STATUSES.has(status) ||
+    !WORKING_STATUSES.has(previous.shown)
   ) {
-    return { clock: { shown: status, pending: null, since: now }, nextChangeAt: null };
+    return {
+      clock: { shown: status, pending: null, since: now },
+      nextChangeAt: null,
+    };
   }
   const since = status === previous.pending ? previous.since : now;
   if (now - since >= PHASE_SETTLE_MS) {
-    return { clock: { shown: status, pending: null, since: now }, nextChangeAt: null };
+    return {
+      clock: { shown: status, pending: null, since: now },
+      nextChangeAt: null,
+    };
   }
   return {
     clock: { shown: previous.shown, pending: status, since },
@@ -232,7 +256,11 @@ function withDownloadBar(
   status: string,
 ): JobPhaseProgressData[] {
   let stack = bars;
-  if (download !== null && bars.length > 0 && !bars.some((bar) => bar.phase === "DOWNLOADING")) {
+  if (
+    download !== null &&
+    bars.length > 0 &&
+    !bars.some((bar) => bar.phase === "DOWNLOADING")
+  ) {
     const at = bars[0].updatedAtEpochMs;
     stack = [
       {
@@ -250,13 +278,24 @@ function withDownloadBar(
   }
   // Publishing the delivery means its download is done, even when recovery
   // stayed parked. The byte counts keep saying what actually arrived.
-  const complete = (download?.progressPercent ?? 0) >= 100
-    || status === "MOVING" || status === "FINALIZING" || status === "POST_PROCESSING"
-    || status === "COMPLETE" || status === "COMPLETED";
+  const complete =
+    (download?.progressPercent ?? 0) >= 100 ||
+    status === "MOVING" ||
+    status === "FINALIZING" ||
+    status === "POST_PROCESSING" ||
+    status === "COMPLETE" ||
+    status === "COMPLETED";
   return complete
-    ? stack.map((bar) => bar.phase === "DOWNLOADING"
-      ? { ...bar, progressPercent: 100, rateBps: null, estimatedRemainingMs: null }
-      : bar)
+    ? stack.map((bar) =>
+        bar.phase === "DOWNLOADING"
+          ? {
+              ...bar,
+              progressPercent: 100,
+              rateBps: null,
+              estimatedRemainingMs: null,
+            }
+          : bar,
+      )
     : stack;
 }
 
@@ -303,16 +342,22 @@ export function advanceJobProgress(
   // Weaver reports an archive that is extracting while the rest of the release
   // downloads as EXTRACTING. Until that extraction has a bar of its own, the
   // download is what the job is visibly doing, so that is what the label says.
-  const extractionShown = settled.bars.some((bar) => bar.phase === "EXTRACTING");
+  const extractionShown = settled.bars.some(
+    (bar) => bar.phase === "EXTRACTING",
+  );
   const downloading = phases.some(
     (phase) =>
-      phase.phase === "DOWNLOADING" && phase.totalBytes > 0 && phase.completedBytes < phase.totalBytes,
+      phase.phase === "DOWNLOADING" &&
+      phase.totalBytes > 0 &&
+      phase.completedBytes < phase.totalBytes,
   );
   // The other way round, weaver keeps a job DOWNLOADING for as long as any
   // download-side work lingers, which can outlast the last article while an
   // archive is still being unpacked. Once the download's own bar has gone, the
   // label names the phase the job is visibly in.
-  const later = settled.bars.filter((bar) => bar.phase !== "DOWNLOADING").at(-1);
+  const later = settled.bars
+    .filter((bar) => bar.phase !== "DOWNLOADING")
+    .at(-1);
   const presented =
     status === "EXTRACTING" && !extractionShown && downloading
       ? "DOWNLOADING"
@@ -326,7 +371,9 @@ export function advanceJobProgress(
     settled.bars.some((bar) => bar.phase === presented),
   );
 
-  const due = [settled.nextChangeAt, label.nextChangeAt].filter((at): at is number => at !== null);
+  const due = [settled.nextChangeAt, label.nextChangeAt].filter(
+    (at): at is number => at !== null,
+  );
   return {
     phases: settled.clocks,
     status: label.clock,

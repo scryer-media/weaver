@@ -70,7 +70,12 @@ export function SectionHeader({
         <span className="font-wv-mono text-[11px] text-wv-note">{count}</span>
       )}
       {note === undefined ? null : (
-        <span data-testid={noteTestId} className="ml-auto truncate font-wv-mono text-[11px] text-wv-note">{note}</span>
+        <span
+          data-testid={noteTestId}
+          className="ml-auto truncate font-wv-mono text-[11px] text-wv-note"
+        >
+          {note}
+        </span>
       )}
     </div>
   );
@@ -84,7 +89,13 @@ export function SectionHeader({
  * crushing. `min` is the width a cell refuses to go below: 146px on a list
  * screen's metric strip, 168px on a job's stat strip.
  */
-export function MetricStrip({ min = 146, children }: { min?: number; children: ReactNode }) {
+export function MetricStrip({
+  min = 146,
+  children,
+}: {
+  min?: number;
+  children: ReactNode;
+}) {
   return (
     <div
       className="grid flex-none border-b border-wv-line-strong bg-wv-chrome"
@@ -134,32 +145,55 @@ export function MetricCell({
       data-testid={testId}
       className={cn(
         "relative flex min-w-0 flex-col",
-        wide && "flex-1 gap-2 border-t border-wv-hairline px-4 py-4 sm:px-6 lg:border-t-0",
-        variant === "strip" && "gap-2 border-t border-wv-hairline px-4 sm:px-[22px] py-[15px]",
-        variant === "stat" && "gap-[7px] border-t border-wv-hairline px-5 py-[14px]",
-        variant === "hero" && "gap-[10px] border-t border-wv-hairline px-5 py-5 sm:px-6",
+        wide &&
+          "flex-1 gap-2 border-t border-wv-hairline px-4 py-4 sm:px-6 lg:border-t-0",
+        variant === "strip" &&
+          "gap-2 border-t border-wv-hairline px-4 sm:px-[22px] py-[15px]",
+        variant === "stat" &&
+          "gap-[7px] border-t border-wv-hairline px-5 py-[14px]",
+        variant === "hero" &&
+          "gap-[10px] border-t border-wv-hairline px-5 py-5 sm:px-6",
         (!wide || !last) && "border-r border-wv-hairline",
       )}
     >
-      {typeof eyebrow === "string" ? <Eyebrow tone="rail">{eyebrow}</Eyebrow> : eyebrow}
+      {typeof eyebrow === "string" ? (
+        <Eyebrow tone="rail">{eyebrow}</Eyebrow>
+      ) : (
+        eyebrow
+      )}
       <div className="flex items-baseline gap-1.5 whitespace-nowrap">
         <span
           className={cn(
             "truncate font-semibold leading-none tracking-[-0.02em]",
-            wide ? "text-[25px]" : variant === "strip" ? "text-[24px]" : variant === "hero" ? "text-[44px] tracking-[-0.03em] tabular-nums sm:text-[56px]" : "text-[21px]",
+            wide
+              ? "text-[25px]"
+              : variant === "strip"
+                ? "text-[24px]"
+                : variant === "hero"
+                  ? "text-[44px] tracking-[-0.03em] tabular-nums sm:text-[56px]"
+                  : "text-[21px]",
             valueClassName ?? "text-wv-fg",
           )}
         >
           {value}
         </span>
         {unit === undefined ? null : (
-          <span className={cn("min-w-0 truncate text-wv-muted", variant === "hero" ? "text-[16px]" : "text-[12px]")}>{unit}</span>
+          <span
+            className={cn(
+              "min-w-0 truncate text-wv-muted",
+              variant === "hero" ? "text-[16px]" : "text-[12px]",
+            )}
+          >
+            {unit}
+          </span>
         )}
       </div>
       <div
         className={cn(
           "truncate font-wv-mono",
-          variant === "stat" || variant === "hero" ? "text-[10.5px] text-wv-faint" : "text-[11px] text-wv-muted",
+          variant === "stat" || variant === "hero"
+            ? "text-[10.5px] text-wv-faint"
+            : "text-[11px] text-wv-muted",
         )}
       >
         {note ?? " "}
@@ -175,7 +209,13 @@ export function MetricCell({
  * Two grounds only, because history speaks in two outcomes: the accent-tinted
  * one for anything that is fine, the danger one for a failure.
  */
-export function StateChip({ label, tone }: { label: string; tone: "ok" | "bad" }) {
+export function StateChip({
+  label,
+  tone,
+}: {
+  label: string;
+  tone: "ok" | "bad";
+}) {
   return (
     <span
       className={cn(
@@ -244,7 +284,9 @@ export function DetailBlock({
           </span>
         )}
       </div>
-      <div className={cn("flex min-w-0 flex-col", bodyClassName)}>{children}</div>
+      <div className={cn("flex min-w-0 flex-col", bodyClassName)}>
+        {children}
+      </div>
     </section>
   );
 }
@@ -254,7 +296,13 @@ export function DetailBlock({
  * cells as fit, folding rather than crushing. 272px is the width the narrowest
  * of them — a two-column key/value list — stops being readable below.
  */
-export function PanelGrid({ min = 272, children }: { min?: number; children: ReactNode }) {
+export function PanelGrid({
+  min = 272,
+  children,
+}: {
+  min?: number;
+  children: ReactNode;
+}) {
   return (
     <div
       className="grid min-w-0"
@@ -287,7 +335,9 @@ export function Field({
   if (variant === "inline") {
     return (
       <div className="flex min-w-0 items-baseline gap-3">
-        <span className="w-[92px] flex-none text-[12.5px] text-wv-muted">{label}</span>
+        <span className="w-[92px] flex-none text-[12.5px] text-wv-muted">
+          {label}
+        </span>
         <span
           title={title}
           className="min-w-0 truncate font-wv-mono text-[11.5px] text-wv-fg"
@@ -312,7 +362,10 @@ export function Field({
       <span className="truncate text-[10px] tracking-[0.1em] text-wv-faint uppercase">
         {label}
       </span>
-      <span title={title} className="truncate text-[13px] font-medium text-wv-fg">
+      <span
+        title={title}
+        className="truncate text-[13px] font-medium text-wv-fg"
+      >
         {value}
       </span>
     </div>
@@ -335,7 +388,11 @@ export function BetaTag({ className }: { className?: string }) {
 }
 
 /** A torrent's chip before its name, in the beta marker's shape; an NZB job carries none. */
-export const ProtocolTag = memo(function ProtocolTag({ protocol }: { protocol: "NZB" | "TORRENT" | undefined }) {
+export const ProtocolTag = memo(function ProtocolTag({
+  protocol,
+}: {
+  protocol: "NZB" | "TORRENT" | undefined;
+}) {
   const t = useTranslate();
   if (protocol !== "TORRENT") return null;
   const label = t("next.protocol.torrent");
@@ -459,7 +516,11 @@ function useSteppedValue(target: number, quantum: number): number {
     };
     const reduced =
       window.matchMedia?.("(prefers-reduced-motion: reduce)").matches === true;
-    if (!(quantum > 0) || reduced || Math.abs(target - shownRef.current) < quantum) {
+    if (
+      !(quantum > 0) ||
+      reduced ||
+      Math.abs(target - shownRef.current) < quantum
+    ) {
       settle();
       return;
     }
@@ -538,11 +599,16 @@ export function Bar({
    */
   live?: boolean;
 }) {
-  const clamped = Number.isFinite(percent) ? Math.max(0, Math.min(100, percent)) : 0;
+  const clamped = Number.isFinite(percent)
+    ? Math.max(0, Math.min(100, percent))
+    : 0;
   const cell = period ?? blockPeriod(height);
   const [ref, width] = useTrackWidth();
   const cells = Math.max(1, Math.floor(width / cell));
-  const stepped = useSteppedValue(clamped, live ? 0 : 100 / (cells * BAR_LEVELS));
+  const stepped = useSteppedValue(
+    clamped,
+    live ? 0 : 100 / (cells * BAR_LEVELS),
+  );
   const shown = live ? clamped : stepped;
 
   // Whole cells first, then the level the next one has reached. The epsilon
@@ -580,7 +646,10 @@ export function Bar({
       {filled === 0 ? null : (
         <div
           className="absolute inset-y-0 left-0"
-          style={{ width: filled * cell, backgroundImage: blockFill(color, cell) }}
+          style={{
+            width: filled * cell,
+            backgroundImage: blockFill(color, cell),
+          }}
         />
       )}
       {level === 0 ? null : (
@@ -617,7 +686,9 @@ export function Pie({
   size?: number;
   className?: string;
 }) {
-  const filled = Number.isFinite(percent) ? Math.max(0, Math.min(100, percent)) : 0;
+  const filled = Number.isFinite(percent)
+    ? Math.max(0, Math.min(100, percent))
+    : 0;
   return (
     <div
       role="img"
@@ -673,7 +744,10 @@ export function blockFill(color: string, cell = 6): string {
 export const LOADER_DELAY_MS = 200;
 
 /** `active`, once it has stayed true for `delayMs`; false again the moment it drops. */
-export function useSettledFlag(active: boolean, delayMs = LOADER_DELAY_MS): boolean {
+export function useSettledFlag(
+  active: boolean,
+  delayMs = LOADER_DELAY_MS,
+): boolean {
   const [settled, setSettled] = useState(false);
   useEffect(() => {
     if (!active) {
@@ -714,13 +788,22 @@ export function EmptyState({
       role={loading ? "status" : undefined}
       className={cn(
         "flex gap-4 px-4 sm:px-6 py-10",
-        centered ? "flex-1 flex-col items-center justify-center text-center" : "items-center",
+        centered
+          ? "flex-1 flex-col items-center justify-center text-center"
+          : "items-center",
         loading && !revealed && "invisible",
       )}
     >
       {loading ? <LoadingMark className="h-8" /> : null}
-      <div className={cn("flex min-w-0 flex-col gap-1.5", centered && "items-center")}>
-        <div className="font-wv-title text-[14px] font-semibold text-wv-fg">{title}</div>
+      <div
+        className={cn(
+          "flex min-w-0 flex-col gap-1.5",
+          centered && "items-center",
+        )}
+      >
+        <div className="font-wv-title text-[14px] font-semibold text-wv-fg">
+          {title}
+        </div>
         <div className="text-[13px] text-wv-muted">{body}</div>
       </div>
       {action}
@@ -740,8 +823,13 @@ export function KeyValueRow({
 }) {
   return (
     <div className="flex flex-wrap items-baseline gap-x-6 gap-y-1.5 border-b border-wv-hairline px-4 sm:px-6 py-[11px] hover:bg-wv-cell-hover">
-      <div className="min-w-0 flex-[1_1_260px] text-[13px] text-wv-muted">{label}</div>
-      <div data-testid={testId} className="ml-auto flex-none text-right font-wv-mono text-[12.5px] text-wv-fg">
+      <div className="min-w-0 flex-[1_1_260px] text-[13px] text-wv-muted">
+        {label}
+      </div>
+      <div
+        data-testid={testId}
+        className="ml-auto flex-none text-right font-wv-mono text-[12.5px] text-wv-fg"
+      >
         {value}
       </div>
     </div>

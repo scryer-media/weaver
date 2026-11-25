@@ -7,12 +7,22 @@ import { useQuery } from "urql";
 import { MONITORING_COMPUTE_QUERY } from "@/graphql/queries";
 import { useTranslate, type Translate } from "@/lib/context/translate-context";
 import type { MetricsHistoryRange } from "@/lib/metrics";
-import { Bar, Eyebrow, MetricCell, SectionHeader, Square } from "../components/chrome";
+import {
+  Bar,
+  Eyebrow,
+  MetricCell,
+  SectionHeader,
+  Square,
+} from "../components/chrome";
 import { runtimeIds } from "../testids";
 import { Segmented } from "../components/controls";
 import { Chart, type ChartSeries } from "../components/Chart";
 import { columnStyle } from "../components/columns";
-import { useNextData, useNextDataSelector, type ProviderHealth } from "../data/next-data";
+import {
+  useNextData,
+  useNextDataSelector,
+  type ProviderHealth,
+} from "../data/next-data";
 import { shallowEqual, useSettled } from "../data/settled";
 import {
   EM_DASH,
@@ -51,13 +61,14 @@ import {
 
 type RangeId = "10m" | "1h" | "6h" | "24h" | "7d";
 
-const RANGES: { value: RangeId; label: string; range: MetricsHistoryRange }[] = [
-  { value: "10m", label: "10m", range: "TEN_MINUTES" },
-  { value: "1h", label: "1h", range: "ONE_HOUR" },
-  { value: "6h", label: "6h", range: "SIX_HOURS" },
-  { value: "24h", label: "24h", range: "TWENTY_FOUR_HOURS" },
-  { value: "7d", label: "7d", range: "SEVEN_DAYS" },
-];
+const RANGES: { value: RangeId; label: string; range: MetricsHistoryRange }[] =
+  [
+    { value: "10m", label: "10m", range: "TEN_MINUTES" },
+    { value: "1h", label: "1h", range: "ONE_HOUR" },
+    { value: "6h", label: "6h", range: "SIX_HOURS" },
+    { value: "24h", label: "24h", range: "TWENTY_FOUR_HOURS" },
+    { value: "7d", label: "7d", range: "SEVEN_DAYS" },
+  ];
 
 interface SystemInfoResponse {
   systemInfo: {
@@ -90,8 +101,14 @@ interface FailureTotals {
   segmentsFailedPermanent: number;
 }
 
-function sameTotals(left: FailureTotals | null, right: FailureTotals | null): boolean {
-  return left === right || (left !== null && right !== null && shallowEqual(left, right));
+function sameTotals(
+  left: FailureTotals | null,
+  right: FailureTotals | null,
+): boolean {
+  return (
+    left === right ||
+    (left !== null && right !== null && shallowEqual(left, right))
+  );
 }
 
 /**
@@ -106,7 +123,9 @@ export function MonitoringPage() {
 
   const series = useMetricsSeries(range);
   const metrics = useMetricsSnapshot();
-  const [{ data: systemInfo }] = useQuery<SystemInfoResponse>({ query: MONITORING_COMPUTE_QUERY });
+  const [{ data: systemInfo }] = useQuery<SystemInfoResponse>({
+    query: MONITORING_COMPUTE_QUERY,
+  });
 
   const compute = systemInfo?.systemInfo?.compute ?? null;
   const failureTotals = useSettled<FailureTotals | null>(
@@ -149,8 +168,14 @@ const MonitoringScreen = memo(function MonitoringScreen({
   compute: { decoderTier: string; logicalCores: number } | null;
 }) {
   const t = useTranslate();
-  const labels = useMemo(() => axisLabels(series.timestamps), [series.timestamps]);
-  const { throughput, segments, depths } = useMemo(() => chartSeries(t, series), [t, series]);
+  const labels = useMemo(
+    () => axisLabels(series.timestamps),
+    [series.timestamps],
+  );
+  const { throughput, segments, depths } = useMemo(
+    () => chartSeries(t, series),
+    [t, series],
+  );
 
   return (
     <>
@@ -242,22 +267,34 @@ function chartSeries(t: Translate, series: MetricsSeries) {
   ];
 
   const segments: ChartSeries[] = [
-    line(series.rate("weaver_pipeline_segments_downloaded_total"), formatPerSecond, {
-      key: "downloaded",
-      label: t("next.monitoring.series.downloaded"),
-      color: WV.info,
-      fill: WV_FILL.info,
-    }),
-    line(series.rate("weaver_pipeline_segments_decoded_total"), formatPerSecond, {
-      key: "decoded",
-      label: t("next.monitoring.series.decoded"),
-      color: WV.accent,
-    }),
-    line(series.rate("weaver_pipeline_segments_retried_total"), formatPerSecond, {
-      key: "retried",
-      label: t("next.monitoring.series.retried"),
-      color: WV.warn,
-    }),
+    line(
+      series.rate("weaver_pipeline_segments_downloaded_total"),
+      formatPerSecond,
+      {
+        key: "downloaded",
+        label: t("next.monitoring.series.downloaded"),
+        color: WV.info,
+        fill: WV_FILL.info,
+      },
+    ),
+    line(
+      series.rate("weaver_pipeline_segments_decoded_total"),
+      formatPerSecond,
+      {
+        key: "decoded",
+        label: t("next.monitoring.series.decoded"),
+        color: WV.accent,
+      },
+    ),
+    line(
+      series.rate("weaver_pipeline_segments_retried_total"),
+      formatPerSecond,
+      {
+        key: "retried",
+        label: t("next.monitoring.series.retried"),
+        color: WV.warn,
+      },
+    ),
   ];
 
   const depths: ChartSeries[] = [
@@ -285,9 +322,13 @@ function chartSeries(t: Translate, series: MetricsSeries) {
 /** Every provider's open connections, against what each may open. */
 function connectionTotals(providers: readonly ProviderHealth[]) {
   return {
-    active: providers.reduce((total, provider) => total + provider.connectionsActive, 0),
+    active: providers.reduce(
+      (total, provider) => total + provider.connectionsActive,
+      0,
+    ),
     max: providers.reduce(
-      (total, provider) => total + (provider.connectionsMax || provider.connectionsConfigured),
+      (total, provider) =>
+        total + (provider.connectionsMax || provider.connectionsConfigured),
       0,
     ),
   };
@@ -304,11 +345,20 @@ const MonitoringStrip = memo(function MonitoringStrip({
 }) {
   const t = useTranslate();
   const metrics = useContext(MetricsSnapshotContext);
-  const { speed, peakSpeed, providers } = useNextData("speed", "peakSpeed", "providers");
-  const activeItems = useNextDataSelector((data) => data.queue.summary.activeItems);
+  const { speed, peakSpeed, providers } = useNextData(
+    "speed",
+    "peakSpeed",
+    "providers",
+  );
+  const activeItems = useNextDataSelector(
+    (data) => data.queue.summary.activeItems,
+  );
 
-  const { active: connectionsActive, max: connectionsMax } = connectionTotals(providers);
-  const activeProviders = providers.filter((provider) => provider.connectionsActive > 0).length;
+  const { active: connectionsActive, max: connectionsMax } =
+    connectionTotals(providers);
+  const activeProviders = providers.filter(
+    (provider) => provider.connectionsActive > 0,
+  ).length;
 
   const throughputNow = splitSpeed(speed);
   const peak = splitSpeed(peakSpeed);
@@ -328,9 +378,14 @@ const MonitoringStrip = memo(function MonitoringStrip({
       <MetricCell
         testId={runtimeIds.monitoringPipeline}
         eyebrow={t("next.monitoring.pipeline")}
-        value={pipelineBusy ? t("next.monitoring.active") : t("next.monitoring.idle")}
+        value={
+          pipelineBusy ? t("next.monitoring.active") : t("next.monitoring.idle")
+        }
         valueClassName={pipelineBusy ? "text-wv-accent" : "text-wv-idle"}
-        note={t("next.monitoring.pipelineNote", { downloads: activeItems, repairs })}
+        note={t("next.monitoring.pipelineNote", {
+          downloads: activeItems,
+          repairs,
+        })}
       />
       <MetricCell
         eyebrow={t("next.shell.throughput")}
@@ -366,7 +421,9 @@ const MonitoringStrip = memo(function MonitoringStrip({
         eyebrow={t("next.monitoring.writeQueue")}
         value={buffered.value}
         unit={t("next.monitoring.buffered", { unit: buffered.unit })}
-        valueClassName={(metrics?.writeBufferedBytes ?? 0) > 0 ? "text-wv-warn" : undefined}
+        valueClassName={
+          (metrics?.writeBufferedBytes ?? 0) > 0 ? "text-wv-warn" : undefined
+        }
       />
     </div>
   );
@@ -379,7 +436,10 @@ const ProvidersSection = memo(function ProvidersSection() {
   const { active: connectionsActive } = connectionTotals(providers);
 
   return (
-    <section data-testid={runtimeIds.monitoringProviders} className="flex flex-none flex-col">
+    <section
+      data-testid={runtimeIds.monitoringProviders}
+      className="flex flex-none flex-col"
+    >
       <SectionHeader
         label={t("next.rail.providers")}
         note={t("next.monitoring.providersNote")}
@@ -394,11 +454,14 @@ const ProvidersSection = memo(function ProvidersSection() {
           const max = provider.connectionsMax || provider.connectionsConfigured;
           const share =
             connectionsActive > 0
-              ? Math.round((provider.connectionsActive / connectionsActive) * 100)
+              ? Math.round(
+                  (provider.connectionsActive / connectionsActive) * 100,
+                )
               : 0;
           const degraded = provider.state !== "healthy";
           const sequential =
-            provider.bodyPipeliningPinnedSequential || provider.bodyPipelineDepth <= 1;
+            provider.bodyPipeliningPinnedSequential ||
+            provider.bodyPipelineDepth <= 1;
           return (
             <div
               key={`${provider.host}:${provider.port}`}
@@ -409,7 +472,10 @@ const ProvidersSection = memo(function ProvidersSection() {
                 <span className="truncate font-wv-mono text-[12.5px] text-wv-fg">
                   {provider.host}
                 </span>
-                <Eyebrow tone="rail" className="flex-none font-wv-mono tracking-[0.12em]">
+                <Eyebrow
+                  tone="rail"
+                  className="flex-none font-wv-mono tracking-[0.12em]"
+                >
                   {provider.tier}
                 </Eyebrow>
                 {provider.pinnedAddress ? (
@@ -466,7 +532,11 @@ const ProvidersSection = memo(function ProvidersSection() {
 });
 
 /** Each kind of failure: its rate now and its total since the start. */
-const FailuresSection = memo(function FailuresSection({ series }: { series: MetricsSeries }) {
+const FailuresSection = memo(function FailuresSection({
+  series,
+}: {
+  series: MetricsSeries;
+}) {
   const t = useTranslate();
   const totals = useContext(FailureTotalsContext);
 
@@ -496,7 +566,9 @@ const FailuresSection = memo(function FailuresSection({ series }: { series: Metr
       key: "permanent",
       label: t("next.monitoring.failure.permanent"),
       color: WV.error,
-      rate: last(series.rate("weaver_pipeline_segments_failed_permanent_total")),
+      rate: last(
+        series.rate("weaver_pipeline_segments_failed_permanent_total"),
+      ),
       total: totals?.segmentsFailedPermanent ?? 0,
     },
   ];
@@ -515,7 +587,9 @@ const FailuresSection = memo(function FailuresSection({ series }: { series: Metr
         >
           <div className="flex min-w-0 flex-[1_1_240px] items-center gap-[9px]">
             <Square color={failure.color} />
-            <span className="truncate text-[13px] text-wv-fg">{failure.label}</span>
+            <span className="truncate text-[13px] text-wv-fg">
+              {failure.label}
+            </span>
           </div>
           <div className="ml-auto flex flex-wrap items-center justify-end gap-x-5 gap-y-1">
             <span className="w-[74px] text-right font-wv-mono text-[12.5px] text-wv-secondary">
@@ -543,13 +617,24 @@ function EgressQuotaSection() {
   const meteredRows = rows.filter(metered);
 
   if (meteredRows.length === 0) {
-    const [before, after] = aroundSlot(t, "next.monitoring.noEgressQuota", "link");
+    const [before, after] = aroundSlot(
+      t,
+      "next.monitoring.noEgressQuota",
+      "link",
+    );
     return (
       <section className="flex flex-none flex-col">
-        <SectionHeader label={t("next.monitoring.egressQuotas")} note={t("next.monitoring.quotaNotEnforced")} sticky={false} />
+        <SectionHeader
+          label={t("next.monitoring.egressQuotas")}
+          note={t("next.monitoring.quotaNotEnforced")}
+          sticky={false}
+        />
         <div className="px-4 py-5 text-[13px] text-wv-muted sm:px-6">
           {before}
-          <Link to="/settings/networking/egress" className="text-wv-accent hover:text-wv-accent-hover">
+          <Link
+            to="/settings/networking/egress"
+            className="text-wv-accent hover:text-wv-accent-hover"
+          >
             {t("next.monitoring.egressLink")}
           </Link>
           {after}
@@ -562,33 +647,59 @@ function EgressQuotaSection() {
     <section className="flex flex-none flex-col">
       <SectionHeader label={t("next.monitoring.egressQuotas")} sticky={false} />
       {meteredRows.map((egress) => (
-        <div key={egress.id} className="flex flex-col gap-2 border-b border-wv-hairline px-4 py-[14px] sm:px-6">
+        <div
+          key={egress.id}
+          className="flex flex-col gap-2 border-b border-wv-hairline px-4 py-[14px] sm:px-6"
+        >
           <div className="flex items-baseline justify-between gap-3 text-[13px]">
             <span className="truncate text-wv-fg">{egress.name}</span>
             <span className="font-wv-mono text-[11.5px] text-wv-muted">
-              {t("next.monitoring.resetsAt", { time: formatDayClock(egress.quotaUsage?.periodEndEpochMs ?? null) })}
+              {t("next.monitoring.resetsAt", {
+                time: formatDayClock(
+                  egress.quotaUsage?.periodEndEpochMs ?? null,
+                ),
+              })}
             </span>
           </div>
           {cappedDirections(egress).map((direction) => {
             const state = usageOf(egress, direction)?.state ?? "NORMAL";
             const percent = directionPercent(egress, direction);
             const used = usageOf(egress, direction)?.usedBytes ?? 0;
-            const label = t(direction === "down" ? "next.quota.download" : "next.quota.upload");
+            const label = t(
+              direction === "down"
+                ? "next.quota.download"
+                : "next.quota.upload",
+            );
             return (
               <div key={direction} className="flex flex-col gap-[6px]">
                 <div className="flex items-baseline justify-between gap-3 font-wv-mono text-[11.5px] text-wv-muted">
                   <span>{label}</span>
-                  {quotaHolding(state) ? <span className="text-wv-warn">{quotaStateLabel(t, state)}</span> : null}
+                  {quotaHolding(state) ? (
+                    <span className="text-wv-warn">
+                      {quotaStateLabel(t, state)}
+                    </span>
+                  ) : null}
                 </div>
                 <Bar
                   percent={percent}
                   color={usageColor(state, percent)}
-                  label={t("next.monitoring.quotaUsed", { name: `${egress.name} ${label}` })}
+                  label={t("next.monitoring.quotaUsed", {
+                    name: `${egress.name} ${label}`,
+                  })}
                 />
                 <div className="flex flex-wrap items-baseline justify-between gap-x-4 font-wv-mono text-[11.5px] text-wv-muted">
-                  <span>{t("next.monitoring.usedPercent", { size: formatSize(used), percent: Math.round(percent) })}</span>
                   <span>
-                    {t("next.monitoring.allowance", { size: formatSize(directionCap(egress.quota, direction) ?? 0) })}
+                    {t("next.monitoring.usedPercent", {
+                      size: formatSize(used),
+                      percent: Math.round(percent),
+                    })}
+                  </span>
+                  <span>
+                    {t("next.monitoring.allowance", {
+                      size: formatSize(
+                        directionCap(egress.quota, direction) ?? 0,
+                      ),
+                    })}
                   </span>
                 </div>
               </div>
@@ -610,7 +721,9 @@ function bodyDepthTitle(t: Translate, provider: ProviderHealth): string {
     parts.push(t(`metrics.serverLatencyBand.${provider.bodyLatencyBand}`));
   }
   if (provider.bodyLatencyMs != null && provider.bodyTransferMs != null) {
-    parts.push(`${Math.round(provider.bodyLatencyMs)}/${Math.round(provider.bodyTransferMs)} ms`);
+    parts.push(
+      `${Math.round(provider.bodyLatencyMs)}/${Math.round(provider.bodyTransferMs)} ms`,
+    );
   }
   return parts.join(" · ");
 }

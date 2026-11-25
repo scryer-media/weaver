@@ -1957,8 +1957,16 @@ export const PREVIEW_TRACKER_FILE_MUTATION = gql`
 `;
 
 export const APPLY_TRACKER_FILE_MUTATION = gql`
-  mutation ApplyTrackerFile($file: String!, $password: String, $fingerprint: String!) {
-    applyTrackerFile(file: $file, password: $password, fingerprint: $fingerprint) {
+  mutation ApplyTrackerFile(
+    $file: String!
+    $password: String
+    $fingerprint: String!
+  ) {
+    applyTrackerFile(
+      file: $file
+      password: $password
+      fingerprint: $fingerprint
+    ) {
       ...TrackerRuleFields
     }
   }
@@ -2206,7 +2214,10 @@ export const ADD_TORRENT_TRACKERS_MUTATION = gql`
 `;
 
 export const REPLACE_TORRENT_TRACKERS_MUTATION = gql`
-  mutation ReplaceTorrentTrackers($id: Int!, $trackers: [TorrentTrackerInput!]!) {
+  mutation ReplaceTorrentTrackers(
+    $id: Int!
+    $trackers: [TorrentTrackerInput!]!
+  ) {
     replaceTorrentTrackers(id: $id, trackers: $trackers)
   }
 `;
@@ -2232,7 +2243,10 @@ export const SET_TORRENT_SEEDING_MUTATION = gql`
 
 /** Set each named file's level; the torrent's other files keep theirs. */
 export const SET_TORRENT_FILE_PRIORITIES_MUTATION = gql`
-  mutation SetTorrentFilePriorities($id: Int!, $priorities: [TorrentFilePriorityInput!]!) {
+  mutation SetTorrentFilePriorities(
+    $id: Int!
+    $priorities: [TorrentFilePriorityInput!]!
+  ) {
     setTorrentFilePriorities(id: $id, priorities: $priorities)
   }
 `;
@@ -2244,8 +2258,14 @@ export const SET_TORRENT_SEQUENTIAL_MUTATION = gql`
 `;
 
 export const SET_TORRENT_FIRST_LAST_PIECE_FIRST_MUTATION = gql`
-  mutation SetTorrentFirstLastPieceFirst($id: Int!, $firstLastPieceFirst: Boolean!) {
-    setTorrentFirstLastPieceFirst(id: $id, firstLastPieceFirst: $firstLastPieceFirst)
+  mutation SetTorrentFirstLastPieceFirst(
+    $id: Int!
+    $firstLastPieceFirst: Boolean!
+  ) {
+    setTorrentFirstLastPieceFirst(
+      id: $id
+      firstLastPieceFirst: $firstLastPieceFirst
+    )
   }
 `;
 
@@ -2725,10 +2745,21 @@ export const SCHEDULES_QUERY = gql`
       serverActive
       quotaMeteringEnabled
       quotaEgressId
-      pruneFailed { deleteFiles }
-      pruneCompleted { deleteFiles }
-      pruneCancelled { deleteFiles }
-      speedLimits { kind id download upload }
+      pruneFailed {
+        deleteFiles
+      }
+      pruneCompleted {
+        deleteFiles
+      }
+      pruneCancelled {
+        deleteFiles
+      }
+      speedLimits {
+        kind
+        id
+        download
+        upload
+      }
       hardwareProfile
       splitUsenetPct
     }
@@ -2752,10 +2783,21 @@ export const CREATE_SCHEDULE_MUTATION = gql`
       serverActive
       quotaMeteringEnabled
       quotaEgressId
-      pruneFailed { deleteFiles }
-      pruneCompleted { deleteFiles }
-      pruneCancelled { deleteFiles }
-      speedLimits { kind id download upload }
+      pruneFailed {
+        deleteFiles
+      }
+      pruneCompleted {
+        deleteFiles
+      }
+      pruneCancelled {
+        deleteFiles
+      }
+      speedLimits {
+        kind
+        id
+        download
+        upload
+      }
       hardwareProfile
       splitUsenetPct
     }
@@ -2779,10 +2821,21 @@ export const UPDATE_SCHEDULE_MUTATION = gql`
       serverActive
       quotaMeteringEnabled
       quotaEgressId
-      pruneFailed { deleteFiles }
-      pruneCompleted { deleteFiles }
-      pruneCancelled { deleteFiles }
-      speedLimits { kind id download upload }
+      pruneFailed {
+        deleteFiles
+      }
+      pruneCompleted {
+        deleteFiles
+      }
+      pruneCancelled {
+        deleteFiles
+      }
+      speedLimits {
+        kind
+        id
+        download
+        upload
+      }
       hardwareProfile
       splitUsenetPct
     }
@@ -2806,10 +2859,21 @@ export const DELETE_SCHEDULE_MUTATION = gql`
       serverActive
       quotaMeteringEnabled
       quotaEgressId
-      pruneFailed { deleteFiles }
-      pruneCompleted { deleteFiles }
-      pruneCancelled { deleteFiles }
-      speedLimits { kind id download upload }
+      pruneFailed {
+        deleteFiles
+      }
+      pruneCompleted {
+        deleteFiles
+      }
+      pruneCancelled {
+        deleteFiles
+      }
+      speedLimits {
+        kind
+        id
+        download
+        upload
+      }
       hardwareProfile
       splitUsenetPct
     }
@@ -2833,10 +2897,21 @@ export const TOGGLE_SCHEDULE_MUTATION = gql`
       serverActive
       quotaMeteringEnabled
       quotaEgressId
-      pruneFailed { deleteFiles }
-      pruneCompleted { deleteFiles }
-      pruneCancelled { deleteFiles }
-      speedLimits { kind id download upload }
+      pruneFailed {
+        deleteFiles
+      }
+      pruneCompleted {
+        deleteFiles
+      }
+      pruneCancelled {
+        deleteFiles
+      }
+      speedLimits {
+        kind
+        id
+        download
+        upload
+      }
       hardwareProfile
       splitUsenetPct
     }
@@ -3167,7 +3242,14 @@ export const SCRIPT_RUNS_QUERY = gql`
     $jobId: Int
     $status: ScriptStatusGql
   ) {
-    scriptRuns(limit: $limit, before: $before, kind: $kind, script: $script, jobId: $jobId, status: $status) {
+    scriptRuns(
+      limit: $limit
+      before: $before
+      kind: $kind
+      script: $script
+      jobId: $jobId
+      status: $status
+    ) {
       runs {
         id
         jobId
@@ -3212,15 +3294,59 @@ export const CANCEL_JOB_POST_PROCESSING_MUTATION = gql`
 
 export const BACKUP_LIBRARY_QUERY = gql`
   query BackupLibrary {
-    backups { filename sizeBytes createdAt formatVersion sourceWeaverVersion sourceEngine encrypted rowCounts trigger status error }
-    backupSettings { customBackupPath backupPath }
-    autoBackupSettings { enabled dailyTimeLocal autoBackupKeyPresent nextRunAt }
+    backups {
+      filename
+      sizeBytes
+      createdAt
+      formatVersion
+      sourceWeaverVersion
+      sourceEngine
+      encrypted
+      rowCounts
+      trigger
+      status
+      error
+    }
+    backupSettings {
+      customBackupPath
+      backupPath
+    }
+    autoBackupSettings {
+      enabled
+      dailyTimeLocal
+      autoBackupKeyPresent
+      nextRunAt
+    }
   }
 `;
-export const UPDATE_BACKUP_SETTINGS_MUTATION = gql`mutation UpdateBackupSettings($path: String) { updateBackupSettings(customBackupPath: $path) { customBackupPath backupPath } }`;
-export const UPDATE_AUTO_BACKUP_SETTINGS_MUTATION = gql`mutation UpdateAutoBackupSettings($input: AutoBackupSettingsInput!) { updateAutoBackupSettings(input: $input) { enabled dailyTimeLocal autoBackupKeyPresent nextRunAt } }`;
-export const DELETE_BACKUP_MUTATION = gql`mutation DeleteBackup($filename: String!) { deleteBackup(filename: $filename) }`;
-export const BACKUP_DOWNLOAD_TOKEN_MUTATION = gql`mutation BackupDownloadToken($filename: String!) { createBackupDownloadToken(filename: $filename) }`;
+export const UPDATE_BACKUP_SETTINGS_MUTATION = gql`
+  mutation UpdateBackupSettings($path: String) {
+    updateBackupSettings(customBackupPath: $path) {
+      customBackupPath
+      backupPath
+    }
+  }
+`;
+export const UPDATE_AUTO_BACKUP_SETTINGS_MUTATION = gql`
+  mutation UpdateAutoBackupSettings($input: AutoBackupSettingsInput!) {
+    updateAutoBackupSettings(input: $input) {
+      enabled
+      dailyTimeLocal
+      autoBackupKeyPresent
+      nextRunAt
+    }
+  }
+`;
+export const DELETE_BACKUP_MUTATION = gql`
+  mutation DeleteBackup($filename: String!) {
+    deleteBackup(filename: $filename)
+  }
+`;
+export const BACKUP_DOWNLOAD_TOKEN_MUTATION = gql`
+  mutation BackupDownloadToken($filename: String!) {
+    createBackupDownloadToken(filename: $filename)
+  }
+`;
 
 export const JOB_SUPPORT_REPORT_QUERY = gql`
   query JobSupportReport($jobId: Int!) {
@@ -3270,8 +3396,14 @@ export const UPDATE_ARCHIVE_PASSWORD_LIST_MUTATION = gql`
 `;
 
 export const UPDATE_ARCHIVE_PASSWORD_SETTINGS_MUTATION = gql`
-  mutation UpdateArchivePasswordSettings($passwords: [String!], $passwordFile: String) {
-    updateArchivePasswordSettings(passwords: $passwords, passwordFile: $passwordFile) {
+  mutation UpdateArchivePasswordSettings(
+    $passwords: [String!]
+    $passwordFile: String
+  ) {
+    updateArchivePasswordSettings(
+      passwords: $passwords
+      passwordFile: $passwordFile
+    ) {
       hasPasswords
       passwordFile
     }

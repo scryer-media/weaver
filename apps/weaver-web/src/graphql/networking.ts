@@ -19,9 +19,44 @@ export const EGRESS_QUOTAS_QUERY = gql`
   }
 `;
 /** The limits over every egress together. */
-export const BANDWIDTH_QUERY = gql`query Bandwidth { networking { bandwidth { downloadBps uploadBps split { usenetPct } } } }`;
-export const SET_BANDWIDTH = gql`mutation SetBandwidth($input:BandwidthInput!) { setBandwidth(input:$input) { downloadBps uploadBps split { usenetPct } } }`;
-export const BANDWIDTH_SPLIT_QUERY = gql`query BandwidthSplit { networking { bandwidthSplit { inForce { usenetPct } needsDownloadLimit usenetBps torrentBps } } }`;
+export const BANDWIDTH_QUERY = gql`
+  query Bandwidth {
+    networking {
+      bandwidth {
+        downloadBps
+        uploadBps
+        split {
+          usenetPct
+        }
+      }
+    }
+  }
+`;
+export const SET_BANDWIDTH = gql`
+  mutation SetBandwidth($input: BandwidthInput!) {
+    setBandwidth(input: $input) {
+      downloadBps
+      uploadBps
+      split {
+        usenetPct
+      }
+    }
+  }
+`;
+export const BANDWIDTH_SPLIT_QUERY = gql`
+  query BandwidthSplit {
+    networking {
+      bandwidthSplit {
+        inForce {
+          usenetPct
+        }
+        needsDownloadLimit
+        usenetBps
+        torrentBps
+      }
+    }
+  }
+`;
 export const NETWORKING_QUERY = gql`
   query Networking {
     egressInterfaces { ${EGRESS_FIELDS} }
@@ -36,29 +71,158 @@ export const NETWORKING_QUERY = gql`
 /** What a route drafted for a test is made of: the egresses, proxies and pools it may use, as the route editor reads them. */
 export const DRAFT_ROUTE_QUERY = gql`
   query DraftRoute {
-    egressInterfaces { id name enabled }
-    proxyProfiles { id name kind enabled dnsServers }
-    proxyPools { id name kind memberIds enabled }
+    egressInterfaces {
+      id
+      name
+      enabled
+    }
+    proxyProfiles {
+      id
+      name
+      kind
+      enabled
+      dnsServers
+    }
+    proxyPools {
+      id
+      name
+      kind
+      memberIds
+      enabled
+    }
   }
 `;
-const FLOW_FIELDS =`sampledAt consumers { key id name kind cap route { legs { egressId weight path { kind directFallback rungs { kind proxyId poolId chainIds } } } failover dnsProfileId } } proxies { id name kind enabled host port dnsServers } proxyPools { id name kind memberIds enabled } egresses { ${EGRESS_FIELDS} } legs { consumer position egressId weight target open opening state reason pinnedAddress sourceAddress bytesPerSecond selectedRung selectedProxyId rungStates failingHops { rung proxyId reason code params } path { kind directFallback rungs { kind proxyId poolId chainIds } } }
+const FLOW_FIELDS = `sampledAt consumers { key id name kind cap route { legs { egressId weight path { kind directFallback rungs { kind proxyId poolId chainIds } } } failover dnsProfileId } } proxies { id name kind enabled host port dnsServers } proxyPools { id name kind memberIds enabled } egresses { ${EGRESS_FIELDS} } legs { consumer position egressId weight target open opening state reason pinnedAddress sourceAddress bytesPerSecond selectedRung selectedProxyId rungStates failingHops { rung proxyId reason code params } path { kind directFallback rungs { kind proxyId poolId chainIds } } }
   pools { poolId egressId pinnedMember members { id state open opening warmed blocked connectMs bytesPerSecond liveBytesPerSecond samples failures } }`;
 export const NETWORK_FLOW_QUERY = gql`query NetworkFlow { networkFlow { ${FLOW_FIELDS} } }`;
 export const NETWORK_FLOW_SUBSCRIPTION = gql`subscription NetworkFlowUpdates { networkFlow { ${FLOW_FIELDS} } }`;
-export const CREATE_EGRESS = gql`mutation CreateEgress($input:EgressInterfaceInput!) { createEgressInterface(input:$input) { id } }`;
-export const UPDATE_EGRESS = gql`mutation UpdateEgress($id:Int!,$input:EgressInterfaceInput!) { updateEgressInterface(id:$id,input:$input) { id } }`;
-export const DELETE_EGRESS = gql`mutation DeleteEgress($id:Int!) { deleteEgressInterface(id:$id) }`;
-export const SET_EGRESS_QUOTA = gql`mutation SetEgressQuota($id:Int!,$input:EgressQuotaInput!) { setEgressQuota(id:$id,input:$input) { id } }`;
-export const RESET_EGRESS_USAGE = gql`mutation ResetEgressUsage($id:Int!) { resetEgressDownloadQuotaUsage(id:$id) { id } }`;
-export const CREATE_POOL = gql`mutation CreatePool($input:ProxyPoolInput!) { createProxyPool(input:$input) { id } }`;
-export const UPDATE_POOL = gql`mutation UpdatePool($id:Int!,$input:ProxyPoolInput!) { updateProxyPool(id:$id,input:$input) { id } }`;
-export const DELETE_POOL = gql`mutation DeletePool($id:Int!) { deleteProxyPool(id:$id) }`;
-export const SAVE_ROUTE = gql`mutation SaveNetworkRoute($kind:NetworkConsumerKind!,$id:Int!,$input:RouteInput!) { saveNetworkRoute(kind:$kind,id:$id,input:$input) { consumer } }`;
+export const CREATE_EGRESS = gql`
+  mutation CreateEgress($input: EgressInterfaceInput!) {
+    createEgressInterface(input: $input) {
+      id
+    }
+  }
+`;
+export const UPDATE_EGRESS = gql`
+  mutation UpdateEgress($id: Int!, $input: EgressInterfaceInput!) {
+    updateEgressInterface(id: $id, input: $input) {
+      id
+    }
+  }
+`;
+export const DELETE_EGRESS = gql`
+  mutation DeleteEgress($id: Int!) {
+    deleteEgressInterface(id: $id)
+  }
+`;
+export const SET_EGRESS_QUOTA = gql`
+  mutation SetEgressQuota($id: Int!, $input: EgressQuotaInput!) {
+    setEgressQuota(id: $id, input: $input) {
+      id
+    }
+  }
+`;
+export const RESET_EGRESS_USAGE = gql`
+  mutation ResetEgressUsage($id: Int!) {
+    resetEgressDownloadQuotaUsage(id: $id) {
+      id
+    }
+  }
+`;
+export const CREATE_POOL = gql`
+  mutation CreatePool($input: ProxyPoolInput!) {
+    createProxyPool(input: $input) {
+      id
+    }
+  }
+`;
+export const UPDATE_POOL = gql`
+  mutation UpdatePool($id: Int!, $input: ProxyPoolInput!) {
+    updateProxyPool(id: $id, input: $input) {
+      id
+    }
+  }
+`;
+export const DELETE_POOL = gql`
+  mutation DeletePool($id: Int!) {
+    deleteProxyPool(id: $id)
+  }
+`;
+export const SAVE_ROUTE = gql`
+  mutation SaveNetworkRoute(
+    $kind: NetworkConsumerKind!
+    $id: Int!
+    $input: RouteInput!
+  ) {
+    saveNetworkRoute(kind: $kind, id: $id, input: $input) {
+      consumer
+    }
+  }
+`;
 /** Every path through a drafted route, with a proxy or a pool on top. Nothing is saved. */
-export const TEST_VIA = gql`mutation TestVia($route:RouteInput!,$subject:TestSubjectInput,$target:TestTargetInput,$torrent:Boolean) { testVia(route:$route,subject:$subject,target:$target,torrent:$torrent) { leg egressId carrierIds proxyId poolId success code message params failingProxyId sourceAddress connectMillis
-  resolution { host resolvedBy proxyId dnsServers wire answeredBy trust addresses cached connectedAddress error { code detail } }
-  p2p { rungs { step outcome message } mappedPort exposure { resolvedBy address announcedPort inbound udpTrackers dht utp } } } }`;
-const PATH_FIELDS = "kind directFallback rungs { kind proxyId poolId chainIds }";
+export const TEST_VIA = gql`
+  mutation TestVia(
+    $route: RouteInput!
+    $subject: TestSubjectInput
+    $target: TestTargetInput
+    $torrent: Boolean
+  ) {
+    testVia(
+      route: $route
+      subject: $subject
+      target: $target
+      torrent: $torrent
+    ) {
+      leg
+      egressId
+      carrierIds
+      proxyId
+      poolId
+      success
+      code
+      message
+      params
+      failingProxyId
+      sourceAddress
+      connectMillis
+      resolution {
+        host
+        resolvedBy
+        proxyId
+        dnsServers
+        wire
+        answeredBy
+        trust
+        addresses
+        cached
+        connectedAddress
+        error {
+          code
+          detail
+        }
+      }
+      p2p {
+        rungs {
+          step
+          outcome
+          message
+        }
+        mappedPort
+        exposure {
+          resolvedBy
+          address
+          announcedPort
+          inbound
+          udpTrackers
+          dht
+          utp
+        }
+      }
+    }
+  }
+`;
+const PATH_FIELDS =
+  "kind directFallback rungs { kind proxyId poolId chainIds }";
 /** A speed test run as every speed test screen reads it: the route it took and what it measured. */
 const SPEED_TEST_RUN_FIELDS = `id consumer consumerName kind status phase startedAt finishedAt failure { code message params }
   request { bandwidth { providerId server customUrl uploadMib } usenet { sabSize nzbUrl nzbFilename nzbRunId connections maxDurationSeconds } torrent { maxDurationSeconds } }
@@ -73,6 +237,23 @@ const SPEED_TEST_RUN_FIELDS = `id consumer consumerName kind status phase starte
     samples { atMs leg bytes decodedBytes } }`;
 export const SPEED_TEST_QUERY = gql`query SpeedTest { bandwidthProviders { id name host needsServer } speedTestRuns { ${SPEED_TEST_RUN_FIELDS} } }`;
 export const SPEED_TEST_RUN_QUERY = gql`query SpeedTestRun($id:Int!) { speedTestRun(id:$id) { ${SPEED_TEST_RUN_FIELDS} } }`;
-export const BANDWIDTH_PROVIDER_SERVERS_QUERY = gql`query BandwidthProviderServers($providerId:String!,$kind:NetworkConsumerKind!,$id:Int!) { bandwidthProviderServers(providerId:$providerId,kind:$kind,id:$id) { id name location host } }`;
+export const BANDWIDTH_PROVIDER_SERVERS_QUERY = gql`
+  query BandwidthProviderServers(
+    $providerId: String!
+    $kind: NetworkConsumerKind!
+    $id: Int!
+  ) {
+    bandwidthProviderServers(providerId: $providerId, kind: $kind, id: $id) {
+      id
+      name
+      location
+      host
+    }
+  }
+`;
 export const START_SPEED_TEST = gql`mutation StartSpeedTest($input:SpeedTestInput!) { startSpeedTest(input:$input) { ${SPEED_TEST_RUN_FIELDS} } }`;
-export const CANCEL_SPEED_TEST = gql`mutation CancelSpeedTest($id:Int!) { cancelSpeedTest(id:$id) }`;
+export const CANCEL_SPEED_TEST = gql`
+  mutation CancelSpeedTest($id: Int!) {
+    cancelSpeedTest(id: $id)
+  }
+`;

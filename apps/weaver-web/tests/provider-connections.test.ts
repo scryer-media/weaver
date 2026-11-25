@@ -33,7 +33,10 @@ function provider(label: string, active: number, max = 20): ProviderHealth {
 }
 
 test("live counts replace the ones server health last read", () => {
-  const providers = [provider("news.example.test:563", 2), provider("backup.example.test:563", 0, 10)];
+  const providers = [
+    provider("news.example.test:563", 2),
+    provider("backup.example.test:563", 0, 10),
+  ];
   const merged = withLiveConnections(providers, [
     { label: "news.example.test:563", active: 17, open: 19, busy: 17, max: 20 },
     { label: "backup.example.test:563", active: 0, open: 0, busy: 0, max: 10 },

@@ -32,7 +32,10 @@ export function DownloadSummaryPanel({
 }) {
   const t = useTranslate();
   const state = downloadPanelState(inQueue, summary);
-  const tree = useMemo(() => (summary ? downloadTree(summary.nodes) : []), [summary]);
+  const tree = useMemo(
+    () => (summary ? downloadTree(summary.nodes) : []),
+    [summary],
+  );
   return (
     <DetailBlock
       id="download"
@@ -40,13 +43,22 @@ export function DownloadSummaryPanel({
       tone="panel"
       bodyClassName="gap-[13px]"
     >
-      <div data-testid={jobIds.jobDownload} className="flex min-w-0 flex-col gap-[13px]">
+      <div
+        data-testid={jobIds.jobDownload}
+        className="flex min-w-0 flex-col gap-[13px]"
+      >
         {state === "queued" ? (
-          <span data-testid={jobIds.jobDownloadPending} className="text-[12.5px] text-wv-muted">
+          <span
+            data-testid={jobIds.jobDownloadPending}
+            className="text-[12.5px] text-wv-muted"
+          >
             {t("next.download.pending")}
           </span>
         ) : state === "unrecorded" || !summary ? (
-          <span data-testid={jobIds.jobDownloadUnrecorded} className="text-[12.5px] text-wv-muted">
+          <span
+            data-testid={jobIds.jobDownloadUnrecorded}
+            className="text-[12.5px] text-wv-muted"
+          >
             {t("next.download.unrecorded")}
           </span>
         ) : (
@@ -70,7 +82,10 @@ export function DownloadSummaryPanel({
               </div>
             ) : null}
             {summary.recovery.length === 0 ? null : (
-              <div data-testid={jobIds.jobDownloadRecovery} className="flex min-w-0 flex-col gap-[6px]">
+              <div
+                data-testid={jobIds.jobDownloadRecovery}
+                className="flex min-w-0 flex-col gap-[6px]"
+              >
                 <Field
                   variant="inline"
                   label={t("next.download.recovery")}
@@ -110,8 +125,13 @@ function RecoveryObject({ object }: { object: DownloadRecoveryData }) {
           repaired: formatCount(set.slicesRepaired),
         });
         return (
-          <span key={setIndex} className="font-wv-mono text-[11px] text-wv-tertiary">
-            {set.outcome ? `${serverWord(t, "outcome", set.outcome)} · ${line}` : line}
+          <span
+            key={setIndex}
+            className="font-wv-mono text-[11px] text-wv-tertiary"
+          >
+            {set.outcome
+              ? `${serverWord(t, "outcome", set.outcome)} · ${line}`
+              : line}
           </span>
         );
       })}
@@ -142,23 +162,44 @@ function PostFacts({ summary }: { summary: DownloadSummaryData }) {
       style={{ gridTemplateColumns: "repeat(auto-fit, minmax(104px, 1fr))" }}
     >
       {summary.layout ? (
-        <Field label={t("next.download.layout")} value={t(`next.download.layout.${summary.layout}`)} />
+        <Field
+          label={t("next.download.layout")}
+          value={t(`next.download.layout.${summary.layout}`)}
+        />
       ) : null}
       <Field label={t("next.download.files")} value={formatCount(post.files)} />
-      <Field label={t("next.download.articles")} value={formatCount(post.articles)} />
+      <Field
+        label={t("next.download.articles")}
+        value={formatCount(post.articles)}
+      />
       {post.missingArticles > 0 ? (
-        <Field label={t("next.download.missing")} value={formatCount(post.missingArticles)} />
+        <Field
+          label={t("next.download.missing")}
+          value={formatCount(post.missingArticles)}
+        />
       ) : null}
       {post.failedArticles > 0 ? (
-        <Field label={t("next.download.failed")} value={formatCount(post.failedArticles)} />
+        <Field
+          label={t("next.download.failed")}
+          value={formatCount(post.failedArticles)}
+        />
       ) : null}
       <Field label={t("next.download.posted")} value={posted} title={posted} />
-      <Field label={t("next.download.groups")} value={formatCount(post.groups)} />
+      <Field
+        label={t("next.download.groups")}
+        value={formatCount(post.groups)}
+      />
     </div>
   );
 }
 
-function Label({ children, tone = "plain" }: { children: string; tone?: "plain" | "warn" }) {
+function Label({
+  children,
+  tone = "plain",
+}: {
+  children: string;
+  tone?: "plain" | "warn";
+}) {
   return (
     <span
       className={
@@ -173,7 +214,13 @@ function Label({ children, tone = "plain" }: { children: string; tone?: "plain" 
 }
 
 /** One level of the tree; each node's children are a list nested in its item. */
-function NodeList({ branches, nested = false }: { branches: DownloadTreeNode[]; nested?: boolean }) {
+function NodeList({
+  branches,
+  nested = false,
+}: {
+  branches: DownloadTreeNode[];
+  nested?: boolean;
+}) {
   return (
     <ul
       className={
@@ -185,7 +232,9 @@ function NodeList({ branches, nested = false }: { branches: DownloadTreeNode[]; 
       {branches.map((branch) => (
         <li key={branch.node.id} className="min-w-0">
           <NodeLine branch={branch} />
-          {branch.children.length > 0 ? <NodeList branches={branch.children} nested /> : null}
+          {branch.children.length > 0 ? (
+            <NodeList branches={branch.children} nested />
+          ) : null}
         </li>
       ))}
     </ul>
@@ -201,18 +250,33 @@ function NodeLine({ branch: { node } }: { branch: DownloadTreeNode }) {
       data-testid={jobIds.jobDownloadNode(node.id)}
       className="inline-flex min-w-0 max-w-full flex-wrap items-baseline gap-x-[6px] gap-y-[3px] align-baseline"
     >
-      <span className="min-w-0 truncate font-wv-mono text-[11.5px] text-wv-fg" title={node.name ?? undefined}>
+      <span
+        className="min-w-0 truncate font-wv-mono text-[11.5px] text-wv-fg"
+        title={node.name ?? undefined}
+      >
         {node.name ?? kind}
       </span>
       <Label>{kind}</Label>
       {node.volumes > 1 ? (
-        <Label>{countLabel(t, "next.download.volumes", node.volumes, { count: formatCount(node.volumes) })}</Label>
+        <Label>
+          {countLabel(t, "next.download.volumes", node.volumes, {
+            count: formatCount(node.volumes),
+          })}
+        </Label>
       ) : null}
       {node.givenUp ? null : (
-        <Label>{node.extracted ? t("next.download.extracted") : t("next.download.streamed")}</Label>
+        <Label>
+          {node.extracted
+            ? t("next.download.extracted")
+            : t("next.download.streamed")}
+        </Label>
       )}
-      {node.encrypted || password?.state === "opened" ? <Label>{t("next.download.encrypted")}</Label> : null}
-      {node.encryptedHeaders ? <Label>{t("next.download.encryptedHeaders")}</Label> : null}
+      {node.encrypted || password?.state === "opened" ? (
+        <Label>{t("next.download.encrypted")}</Label>
+      ) : null}
+      {node.encryptedHeaders ? (
+        <Label>{t("next.download.encryptedHeaders")}</Label>
+      ) : null}
       {password?.state === "origin" ? (
         <span data-testid={jobIds.jobDownloadPasswordOrigin(password.group)}>
           <Label>{t(`next.download.password.${password.group}`)}</Label>

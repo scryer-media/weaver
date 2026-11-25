@@ -1,10 +1,20 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
-import { useEffect, useEffectEvent, useMemo, useRef, useState, type ReactNode } from "react";
+import {
+  useEffect,
+  useEffectEvent,
+  useMemo,
+  useRef,
+  useState,
+  type ReactNode,
+} from "react";
 import { useQuery } from "urql";
 import { StoredBackups } from "./StoredBackups";
-import { createStoredBackup, useBackupAdminAction } from "./useBackupAdminAction";
+import {
+  createStoredBackup,
+  useBackupAdminAction,
+} from "./useBackupAdminAction";
 import { authHeaders } from "@/graphql/client";
 import { SETTINGS_QUERY } from "@/graphql/queries";
 import { useTranslate, type Translate } from "@/lib/context/translate-context";
@@ -50,15 +60,25 @@ interface BackupManifest {
   source_engine?: string;
   weaver_schema_version: number;
   included_tables: string[];
-  tables?: Record<string, { rows: number; columns: string[]; checksum: string }>;
-  source_paths: { data_dir: string; intermediate_dir: string; complete_dir: string };
+  tables?: Record<
+    string,
+    { rows: number; columns: string[]; checksum: string }
+  >;
+  source_paths: {
+    data_dir: string;
+    intermediate_dir: string;
+    complete_dir: string;
+  };
   encrypted: boolean;
   notes: string[];
 }
 
 interface InspectResult {
   manifest: BackupManifest;
-  required_category_remaps: { category_name: string; current_dest_dir: string }[];
+  required_category_remaps: {
+    category_name: string;
+    current_dest_dir: string;
+  }[];
   key_compatible: boolean;
   warnings: string[];
 }
@@ -75,14 +95,20 @@ function endpoint(path: string): string {
   return new URL(path, document.baseURI).href;
 }
 
-async function readJsonOrThrow(t: Translate, response: Response): Promise<unknown> {
+async function readJsonOrThrow(
+  t: Translate,
+  response: Response,
+): Promise<unknown> {
   if (!response.ok) {
     await throwJsonError(t, response);
   }
   return response.json();
 }
 
-async function throwJsonError(t: Translate, response: Response): Promise<never> {
+async function throwJsonError(
+  t: Translate,
+  response: Response,
+): Promise<never> {
   const fallback = t("next.backup.requestFailed", { status: response.status });
   try {
     const payload = (await response.json()) as { error?: string };
@@ -107,9 +133,12 @@ type Outcome<T> = { done: T } | { failure: string };
 async function readStatus(t: Translate): Promise<Outcome<BackupStatus>> {
   try {
     return {
-      done: (await readJsonOrThrow(t, await fetch(endpoint("api/backup/status"), {
-        headers: authHeaders(),
-      }))) as BackupStatus,
+      done: (await readJsonOrThrow(
+        t,
+        await fetch(endpoint("api/backup/status"), {
+          headers: authHeaders(),
+        }),
+      )) as BackupStatus,
     };
   } catch (failure) {
     return { failure: message(failure) };
@@ -117,7 +146,10 @@ async function readStatus(t: Translate): Promise<Outcome<BackupStatus>> {
 }
 
 /** Builds an archive and saves it; resolves to the name it was saved under. */
-async function exportBackup(t: Translate, password: string): Promise<Outcome<string>> {
+async function exportBackup(
+  t: Translate,
+  password: string,
+): Promise<Outcome<string>> {
   try {
     const response = await fetch(endpoint("api/backup/export"), {
       method: "POST",
@@ -127,7 +159,10 @@ async function exportBackup(t: Translate, password: string): Promise<Outcome<str
     if (!response.ok) {
       await throwJsonError(t, response);
     }
-    const filename = await saveResponseAsDownload(response, `weaver_backup_${Date.now()}.enc`);
+    const filename = await saveResponseAsDownload(
+      response,
+      `weaver_backup_${Date.now()}.enc`,
+    );
     return { done: filename };
   } catch (failure) {
     return { failure: message(failure) };
@@ -147,13 +182,27 @@ function savedNote(t: Translate, filename: string): ReactNode {
 }
 
 /** What a restore did, staged or applied, with its history count in its own element. */
-function restoreNote(t: Translate, staged: boolean, historyJobs: number): ReactNode {
+function restoreNote(
+  t: Translate,
+  staged: boolean,
+  historyJobs: number,
+): ReactNode {
   const key = staged ? "next.backup.staged" : "next.backup.restored";
-  const [before, after] = aroundSlot(t, `${key}.${historyJobs === 1 ? "one" : "other"}`, "count");
+  const [before, after] = aroundSlot(
+    t,
+    `${key}.${historyJobs === 1 ? "one" : "other"}`,
+    "count",
+  );
   return (
-    <span data-testid={settingsIds.backupRestoreOutcome(staged ? "staged" : "restored")}>
+    <span
+      data-testid={settingsIds.backupRestoreOutcome(
+        staged ? "staged" : "restored",
+      )}
+    >
       {before}
-      <span data-testid={settingsIds.backupRestoreHistoryJobs}>{historyJobs}</span>
+      <span data-testid={settingsIds.backupRestoreHistoryJobs}>
+        {historyJobs}
+      </span>
       {after}
     </span>
   );
@@ -165,7 +214,13 @@ async function inspectBackup(
   file: File,
   password: string,
   dataDir: string,
-): Promise<Outcome<{ result: InspectResult; remaps: Record<string, string>; note: string }>> {
+): Promise<
+  Outcome<{
+    result: InspectResult;
+    remaps: Record<string, string>;
+    note: string;
+  }>
+> {
   try {
     const form = new FormData();
     form.append("file", file);
@@ -186,7 +241,12 @@ async function inspectBackup(
     return {
       done: {
         result,
-        remaps: Object.fromEntries(result.required_category_remaps.map((entry) => [entry.category_name, ""])),
+        remaps: Object.fromEntries(
+          result.required_category_remaps.map((entry) => [
+            entry.category_name,
+            "",
+          ]),
+        ),
         note:
           result.required_category_remaps.length > 0
             ? t("next.backup.readNeedsRemaps")
@@ -211,7 +271,15 @@ async function restoreBackup(
     remaps: Record<string, string>;
   },
 ): Promise<Outcome<ReactNode>> {
-  const { file, password, dataDir, intermediateDir, completeDir, inspected, remaps } = request;
+  const {
+    file,
+    password,
+    dataDir,
+    intermediateDir,
+    completeDir,
+    inspected,
+    remaps,
+  } = request;
   try {
     const form = new FormData();
     form.append("file", file);
@@ -247,7 +315,9 @@ async function restoreBackup(
         body: form,
       }),
     )) as RestoreReport;
-    return { done: restoreNote(t, report.restart_required, report.history_jobs) };
+    return {
+      done: restoreNote(t, report.restart_required, report.history_jobs),
+    };
   } catch (failure) {
     return { failure: message(failure) };
   }
@@ -255,7 +325,9 @@ async function restoreBackup(
 
 export function BackupPanel() {
   const t = useTranslate();
-  const [{ data, fetching }] = useQuery<{ settings: { dataDir: string } }>({ query: SETTINGS_QUERY });
+  const [{ data, fetching }] = useQuery<{ settings: { dataDir: string } }>({
+    query: SETTINGS_QUERY,
+  });
   const currentDataDir = data?.settings?.dataDir ?? "";
 
   const [status, setStatus] = useState<BackupStatus | null>(null);
@@ -279,10 +351,16 @@ export function BackupPanel() {
   const [confirmRestore, setConfirmRestore] = useState(false);
 
   const errorLine = useMemo(
-    () => (error === null ? null : <span data-testid={settingsIds.backupError}>{error}</span>),
+    () =>
+      error === null ? null : (
+        <span data-testid={settingsIds.backupError}>{error}</span>
+      ),
     [error],
   );
-  usePanelStatus(errorLine ?? createAction.error ?? note, error !== null || createAction.error !== null);
+  usePanelStatus(
+    errorLine ?? createAction.error ?? note,
+    error !== null || createAction.error !== null,
+  );
 
   useEffect(() => {
     setDataDir((current) => current || currentDataDir);
@@ -325,7 +403,8 @@ export function BackupPanel() {
   };
 
   const create = () => {
-    setError(null); setNote(null);
+    setError(null);
+    setNote(null);
     void createAction.run(async () => {
       await createStoredBackup(password, t);
       setNote(t("next.backup.building"));
@@ -384,13 +463,13 @@ export function BackupPanel() {
     (entry) => !(remaps[entry.category_name] ?? "").trim(),
   );
   const restoreBlocked =
-    !file
-    || !inspected
-    || !inspected.key_compatible
-    || !dataDir.trim()
-    || !status?.can_restore
-    || missingRemaps.length > 0
-    || busy;
+    !file ||
+    !inspected ||
+    !inspected.key_compatible ||
+    !dataDir.trim() ||
+    !status?.can_restore ||
+    missingRemaps.length > 0 ||
+    busy;
 
   const manifest = inspected?.manifest;
   const exportedRows = Object.values(manifest?.tables ?? {}).reduce(
@@ -398,7 +477,8 @@ export function BackupPanel() {
     0,
   );
 
-  const baseDir = dataDir || currentDataDir || t("next.backup.theDataDirectory");
+  const baseDir =
+    dataDir || currentDataDir || t("next.backup.theDataDirectory");
 
   const restoreFields: FieldSpec[] = [
     {
@@ -486,7 +566,11 @@ export function BackupPanel() {
         control: (
           <div className="flex min-w-0 flex-wrap items-center gap-3">
             <span
-              data-testid={status === null ? settingsIds.backupStatusChecking : settingsIds.backupStatus}
+              data-testid={
+                status === null
+                  ? settingsIds.backupStatusChecking
+                  : settingsIds.backupStatus
+              }
               className="min-w-0 font-wv-mono text-[11.5px] text-wv-muted"
             >
               {status === null
@@ -538,7 +622,12 @@ export function BackupPanel() {
           id: "password",
           label: t("next.backup.password"),
           help: t("next.backup.passwordHelp"),
-          control: { kind: "text", type: "password", value: password, onChange: setPassword },
+          control: {
+            kind: "text",
+            type: "password",
+            value: password,
+            onChange: setPassword,
+          },
         },
         {
           id: "passwordConfirm",
@@ -564,13 +653,17 @@ export function BackupPanel() {
             <div className="flex flex-col">
               <KeyValueRow
                 label={t("next.backup.waitingRestart")}
-                value={<span className="text-wv-warn">{status.pending_restore}</span>}
+                value={
+                  <span className="text-wv-warn">{status.pending_restore}</span>
+                }
               />
               {status.pending_restore_error ? (
                 <KeyValueRow
                   label={t("next.backup.lastAttemptFailed")}
                   value={
-                    <span className="text-wv-error-text">{status.pending_restore_error}</span>
+                    <span className="text-wv-error-text">
+                      {status.pending_restore_error}
+                    </span>
                   }
                 />
               ) : null}
@@ -590,20 +683,41 @@ export function BackupPanel() {
           kind: "custom",
           id: "manifest",
           title: t("next.backup.holds"),
-          note: inspected?.key_compatible ? undefined : t("next.backup.keyIncompatibleNote"),
+          note: inspected?.key_compatible
+            ? undefined
+            : t("next.backup.keyIncompatibleNote"),
           searchText: "manifest archive contents preview",
           body: (
             <div className="flex flex-col">
-              <KeyValueRow label={t("next.backup.taken")} value={formatDate(manifest.created_at_epoch_ms)} />
-              <KeyValueRow label={t("next.backup.rows")} value={exportedRows.toLocaleString()} />
-              <KeyValueRow label={t("next.backup.tables")} value={manifest.included_tables.length} />
-              <KeyValueRow label={t("next.backup.schema")} value={manifest.weaver_schema_version} />
+              <KeyValueRow
+                label={t("next.backup.taken")}
+                value={formatDate(manifest.created_at_epoch_ms)}
+              />
+              <KeyValueRow
+                label={t("next.backup.rows")}
+                value={exportedRows.toLocaleString()}
+              />
+              <KeyValueRow
+                label={t("next.backup.tables")}
+                value={manifest.included_tables.length}
+              />
+              <KeyValueRow
+                label={t("next.backup.schema")}
+                value={manifest.weaver_schema_version}
+              />
               <KeyValueRow
                 label={t("next.backup.encrypted")}
-                value={manifest.encrypted ? t("next.common.yes") : t("next.common.no")}
+                value={
+                  manifest.encrypted
+                    ? t("next.common.yes")
+                    : t("next.common.no")
+                }
               />
               {manifest.source_weaver_version ? (
-                <KeyValueRow label={t("next.backup.takenBy")} value={manifest.source_weaver_version} />
+                <KeyValueRow
+                  label={t("next.backup.takenBy")}
+                  value={manifest.source_weaver_version}
+                />
               ) : null}
               {manifest.source_engine ? (
                 <KeyValueRow
@@ -615,19 +729,25 @@ export function BackupPanel() {
               <KeyValueRow
                 label={t("next.backup.sourceDataDir")}
                 value={
-                  <span className="break-all">{manifest.source_paths.data_dir}</span>
+                  <span className="break-all">
+                    {manifest.source_paths.data_dir}
+                  </span>
                 }
               />
               <KeyValueRow
                 label={t("next.backup.sourceCompleteDir")}
                 value={
-                  <span className="break-all">{manifest.source_paths.complete_dir}</span>
+                  <span className="break-all">
+                    {manifest.source_paths.complete_dir}
+                  </span>
                 }
               />
               <KeyValueRow
                 label={t("next.backup.sourceIntermediateDir")}
                 value={
-                  <span className="break-all">{manifest.source_paths.intermediate_dir}</span>
+                  <span className="break-all">
+                    {manifest.source_paths.intermediate_dir}
+                  </span>
                 }
               />
               {manifest.notes.map((entry) => (
@@ -662,7 +782,11 @@ export function BackupPanel() {
           title: t("next.backup.categoryDestinations"),
           note: t("next.backup.categoryDestinationsNote"),
           columns: "minmax(0, 1fr) minmax(0, 1.2fr) 280px",
-          headers: [t("next.categories.category"), t("next.backup.was"), t("next.backup.now")],
+          headers: [
+            t("next.categories.category"),
+            t("next.backup.was"),
+            t("next.backup.now"),
+          ],
           rows: (inspected?.required_category_remaps ?? []).map((entry) => ({
             id: entry.category_name,
             searchText: `${entry.category_name} ${entry.current_dest_dir}`,
@@ -670,19 +794,29 @@ export function BackupPanel() {
               <Cell key="name" className="text-wv-fg">
                 {entry.category_name}
               </Cell>,
-              <Cell key="was" mono className="text-wv-muted" title={entry.current_dest_dir}>
+              <Cell
+                key="was"
+                mono
+                className="text-wv-muted"
+                title={entry.current_dest_dir}
+              >
                 {entry.current_dest_dir}
               </Cell>,
               <PathField
                 key="now"
                 testId={settingsIds.backupRemap}
                 compact
-                label={t("next.backup.destinationFor", { name: entry.category_name })}
+                label={t("next.backup.destinationFor", {
+                  name: entry.category_name,
+                })}
                 value={remaps[entry.category_name] ?? ""}
                 className="w-full"
                 placeholder="/media/library"
                 onChange={(next) =>
-                  setRemaps((current) => ({ ...current, [entry.category_name]: next }))
+                  setRemaps((current) => ({
+                    ...current,
+                    [entry.category_name]: next,
+                  }))
                 }
               />,
             ],
@@ -702,7 +836,14 @@ export function BackupPanel() {
         >
           {t("next.backup.download")}
         </SecondaryButton>
-        <SecondaryButton testId={settingsIds.backupCreate} icon="add" disabled={busy || createAction.busy || !password.trim() || mismatch} onClick={() => void create()}>{t("next.backup.createStored")}</SecondaryButton>
+        <SecondaryButton
+          testId={settingsIds.backupCreate}
+          icon="add"
+          disabled={busy || createAction.busy || !password.trim() || mismatch}
+          onClick={() => void create()}
+        >
+          {t("next.backup.createStored")}
+        </SecondaryButton>
       </PanelControls>
 
       <SettingsBlocks blocks={blocks} loading={fetching && !data} />

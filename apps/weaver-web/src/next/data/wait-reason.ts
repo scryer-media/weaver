@@ -14,7 +14,9 @@ const LOGIN_REFUSED = "login_refused:";
 /** What the inspector says a download is waiting for, from its wait reason. */
 export function waitReasonDetail(t: Translate, reason: string): string {
   if (reason.startsWith(LOGIN_REFUSED)) {
-    return t("next.status.wait.login_refused", { server: reason.slice(LOGIN_REFUSED.length) });
+    return t("next.status.wait.login_refused", {
+      server: reason.slice(LOGIN_REFUSED.length),
+    });
   }
   // Any other reason is either a code the screen names, or the daemon's own
   // sentence, shown as it came.
@@ -39,10 +41,16 @@ export function diskWaitDetail(
   if (reason === "disk_space") {
     return free == null
       ? t("next.status.wait.disk_space_unread", { need: formatSize(need) })
-      : t("next.status.wait.disk_space_need", { need: formatSize(need), free: formatSize(free) });
+      : t("next.status.wait.disk_space_need", {
+          need: formatSize(need),
+          free: formatSize(free),
+        });
   }
   if (reason === "disk_too_small" && free != null) {
-    return t("next.status.wait.disk_too_small_need", { need: formatSize(need), most: formatSize(free) });
+    return t("next.status.wait.disk_too_small_need", {
+      need: formatSize(need),
+      most: formatSize(free),
+    });
   }
   return null;
 }

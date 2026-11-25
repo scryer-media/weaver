@@ -3,12 +3,22 @@
 
 import test from "node:test";
 import assert from "node:assert/strict";
-import { appendProxy, chainHopProfiles, moveProxy, directRouting, proxyLabels, withChainHop } from "../src/lib/proxies.ts";
+import {
+  appendProxy,
+  chainHopProfiles,
+  moveProxy,
+  directRouting,
+  proxyLabels,
+  withChainHop,
+} from "../src/lib/proxies.ts";
 
 test("first proxy blocks direct fallback, subsequent additions preserve the explicit choice", () => {
   const first = appendProxy(directRouting, 3);
   assert.deepEqual(first, { proxyIds: [3], allowDirect: false });
-  assert.deepEqual(appendProxy({ ...first, allowDirect: true }, 7), { proxyIds: [3, 7], allowDirect: true });
+  assert.deepEqual(appendProxy({ ...first, allowDirect: true }, 7), {
+    proxyIds: [3, 7],
+    allowDirect: true,
+  });
   assert.deepEqual(directRouting, { proxyIds: [], allowDirect: true });
 });
 test("ladder enforces eight distinct alternatives without changing order", () => {
@@ -20,13 +30,22 @@ test("ladder enforces eight distinct alternatives without changing order", () =>
 });
 test("moving a proxy changes priority and preserves blocked/direct policy", () => {
   const policy = { proxyIds: [1, 2, 3], allowDirect: false };
-  assert.deepEqual(moveProxy(policy, 2, -1), { proxyIds: [1, 3, 2], allowDirect: false });
+  assert.deepEqual(moveProxy(policy, 2, -1), {
+    proxyIds: [1, 3, 2],
+    allowDirect: false,
+  });
   assert.equal(moveProxy(policy, 0, -1), policy);
   assert.equal(moveProxy(policy, 2, 1), policy);
   assert.deepEqual(policy.proxyIds, [1, 2, 3]);
 });
 test("every API profile type has its settings label", () => {
-  assert.deepEqual(proxyLabels, { HTTP_CONNECT: "HTTP CONNECT", HTTP3_CONNECT: "HTTP/3 CONNECT", SOCKS5: "SOCKS5", SSH: "SSH", WIRE_GUARD: "WireGuard" });
+  assert.deepEqual(proxyLabels, {
+    HTTP_CONNECT: "HTTP CONNECT",
+    HTTP3_CONNECT: "HTTP/3 CONNECT",
+    SOCKS5: "SOCKS5",
+    SSH: "SSH",
+    WIRE_GUARD: "WireGuard",
+  });
 });
 test("a later chain hop offers WireGuard only on a WireGuard hop and never HTTP/3", () => {
   const profiles = [
@@ -59,8 +78,14 @@ test("a chain hop never offers a proxy the chain or its ladder already uses", ()
   // Nothing rides SSH but a proxy that needs no UDP.
   assert.deepEqual(ids(chainHopProfiles(profiles, [5], 1)), [3]);
   // Another rung's proxy, or a pool's member, is the ladder's already.
-  assert.deepEqual(ids(chainHopProfiles(profiles, [1], 1, { taken: new Set([2, 5]) })), [3]);
-  assert.deepEqual(ids(chainHopProfiles(profiles, [], 0, { taken: new Set([1]) })), [2, 3, 5]);
+  assert.deepEqual(
+    ids(chainHopProfiles(profiles, [1], 1, { taken: new Set([2, 5]) })),
+    [3],
+  );
+  assert.deepEqual(
+    ids(chainHopProfiles(profiles, [], 0, { taken: new Set([1]) })),
+    [2, 3, 5],
+  );
 });
 test("changing a chain hop keeps the hops above it only while they can still follow", () => {
   const profiles = [

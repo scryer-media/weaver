@@ -3,7 +3,10 @@
 
 import assert from "node:assert/strict";
 import test from "node:test";
-import { formatRunDuration, triggerLabel } from "../src/next/data/script-runs.ts";
+import {
+  formatRunDuration,
+  triggerLabel,
+} from "../src/next/data/script-runs.ts";
 import { englishTranslate as t } from "./english-translate.ts";
 
 test("a trigger reads in words, whatever it was for", () => {
@@ -15,7 +18,10 @@ test("a trigger reads in words, whatever it was for", () => {
 
 test("a queue trigger keeps the event that fired it", () => {
   assert.equal(triggerLabel(t, "queue:NZB_ADDED"), "Queue · NZB_ADDED");
-  assert.equal(triggerLabel(t, "queue:FILE_DOWNLOADED"), "Queue · FILE_DOWNLOADED");
+  assert.equal(
+    triggerLabel(t, "queue:FILE_DOWNLOADED"),
+    "Queue · FILE_DOWNLOADED",
+  );
   assert.equal(triggerLabel(t, "queue"), "Queue");
   assert.equal(triggerLabel(t, "queue:"), "Queue");
 });

@@ -28,7 +28,15 @@ export function outputLines(output: string): string[] {
   return lines;
 }
 
-export function ScriptOutputLog({ output, label, testId }: { output: string; label: string; testId?: string }) {
+export function ScriptOutputLog({
+  output,
+  label,
+  testId,
+}: {
+  output: string;
+  label: string;
+  testId?: string;
+}) {
   const lines = useMemo(
     () => outputLines(output).map((raw, index) => parseLogLine(index, raw)),
     [output],
@@ -50,7 +58,10 @@ export function ScriptOutputLog({ output, label, testId }: { output: string; lab
       tabIndex={0}
       className="max-h-[420px] min-h-0 overflow-y-auto border border-wv-hairline bg-wv-list"
     >
-      <div className="relative w-full" style={{ height: virtualizer.getTotalSize() }}>
+      <div
+        className="relative w-full"
+        style={{ height: virtualizer.getTotalSize() }}
+      >
         {virtualizer.getVirtualItems().map((item) => {
           const line = lines[item.index]!;
           return (
@@ -62,7 +73,10 @@ export function ScriptOutputLog({ output, label, testId }: { output: string; lab
               style={{ transform: `translateY(${item.start}px)` }}
             >
               {/* A line the parser did not take for a log record has no stamp or level to show. */}
-              <LogRow line={line} bare={line.time === "" && line.target === ""} />
+              <LogRow
+                line={line}
+                bare={line.time === "" && line.target === ""}
+              />
             </div>
           );
         })}

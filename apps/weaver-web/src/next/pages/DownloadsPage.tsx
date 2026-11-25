@@ -1,9 +1,24 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
-import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type DragEvent } from "react";
+import {
+  memo,
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+  type DragEvent,
+} from "react";
 import { useNavigate } from "react-router";
-import { useClient, useMutation, useQuery, useSubscription, type TypedDocumentNode } from "urql";
+import {
+  useClient,
+  useMutation,
+  useQuery,
+  useSubscription,
+  type TypedDocumentNode,
+} from "urql";
 import {
   CANCEL_JOB_MUTATION,
   CANCEL_QUEUE_ITEMS_MUTATION,
@@ -21,16 +36,38 @@ import {
   SET_QUEUE_ITEMS_PRIORITY_MUTATION,
   STORAGE_VOLUMES_QUERY,
 } from "@/graphql/queries";
-import { formatJobReleaseName, type JobData, type JobProtocol } from "@/lib/job-types";
+import {
+  formatJobReleaseName,
+  type JobData,
+  type JobProtocol,
+} from "@/lib/job-types";
 import { cn } from "@/lib/utils";
-import { formatEtaFromRemainingBytes, useStableEtaSpeed } from "@/lib/hooks/use-stable-queue-eta";
+import {
+  formatEtaFromRemainingBytes,
+  useStableEtaSpeed,
+} from "@/lib/hooks/use-stable-queue-eta";
 import { useTranslate } from "@/lib/context/translate-context";
 import { statusToken } from "@/lib/status-tokens";
-import { showsSeeding, torrentErrorText, torrentStateLabelKey, type TorrentSummaryData } from "@/lib/torrents";
-import { BulkBar, BulkButton, BulkCluster, BulkMenu } from "../components/BulkBar";
+import {
+  showsSeeding,
+  torrentErrorText,
+  torrentStateLabelKey,
+  type TorrentSummaryData,
+} from "@/lib/torrents";
+import {
+  BulkBar,
+  BulkButton,
+  BulkCluster,
+  BulkMenu,
+} from "../components/BulkBar";
 import { EmptyState, MetricCell, SectionHeader } from "../components/chrome";
 import { ConfirmDialog } from "../components/ConfirmDialog";
-import { CheckBox, PrimaryButton, SecondaryButton, TextField } from "../components/controls";
+import {
+  CheckBox,
+  PrimaryButton,
+  SecondaryButton,
+  TextField,
+} from "../components/controls";
 import { Icon } from "../components/icons";
 import { Menu, MenuItem } from "../components/Menu";
 import { Pagination } from "../components/Pagination";
@@ -38,7 +75,13 @@ import { StorageMounts, type StorageVolume } from "../components/storage";
 import { Tabs } from "../components/Tabs";
 import { useNextData } from "../data/next-data";
 import { testIds, torrentIds as torrentTestIds } from "../testids";
-import { sameElements, sameEntries, sameItems, shallowEqual, useSettled } from "../data/settled";
+import {
+  sameElements,
+  sameEntries,
+  sameItems,
+  shallowEqual,
+  useSettled,
+} from "../data/settled";
 import {
   batchTarget,
   conflictCount,
@@ -88,11 +131,21 @@ import {
 } from "../shell/rail-blocks";
 import { AddNzbDialog } from "../features/AddNzbDialog";
 import { ScheduleSeedingNote } from "../features/torrents/ScheduleSeedingNote";
-import { FilesMissingDialog, isFilesMissing, stillFilesMissing } from "../features/torrents/FilesMissingDialog";
+import {
+  FilesMissingDialog,
+  isFilesMissing,
+  stillFilesMissing,
+} from "../features/torrents/FilesMissingDialog";
 import { TorrentRemoveDialog } from "../features/torrents/TorrentRemoveDialog";
 import { useTorrentSummaries } from "../data/use-torrents";
-import { useTorrentAddsOffered, useTorrentsShown } from "../data/use-torrents-shown";
-import { SpeedLimitControl, useSpeedLimitInForce } from "../features/SpeedLimitDialog";
+import {
+  useTorrentAddsOffered,
+  useTorrentsShown,
+} from "../data/use-torrents-shown";
+import {
+  SpeedLimitControl,
+  useSpeedLimitInForce,
+} from "../features/SpeedLimitDialog";
 import { DownloadInspector } from "./downloads/DownloadInspector";
 import { DownloadRow } from "./downloads/DownloadRow";
 import { QueueEtaContext } from "./downloads/queue-eta";
@@ -137,10 +190,13 @@ function sortJobs(
     return jobs;
   }
   // Rows without an estimate sort last.
-  const rank = new Map([...(etaById ?? NO_ETAS).keys()].map((id, index) => [id, index]));
+  const rank = new Map(
+    [...(etaById ?? NO_ETAS).keys()].map((id, index) => [id, index]),
+  );
   return [...jobs].sort(
     (left, right) =>
-      (rank.get(left.id) ?? Number.MAX_SAFE_INTEGER) - (rank.get(right.id) ?? Number.MAX_SAFE_INTEGER),
+      (rank.get(left.id) ?? Number.MAX_SAFE_INTEGER) -
+      (rank.get(right.id) ?? Number.MAX_SAFE_INTEGER),
   );
 }
 
@@ -152,19 +208,39 @@ const PAUSE_FOR_OPTIONS: { seconds: number; label: string }[] = [
 ];
 
 /** Pause all, split with a menu of timed pauses that resume on their own. */
-function PauseAllControl({ paused, resumeAt }: { paused: boolean; resumeAt: number | null }) {
+function PauseAllControl({
+  paused,
+  resumeAt,
+}: {
+  paused: boolean;
+  resumeAt: number | null;
+}) {
   const t = useTranslate();
   const [, pauseAll] = useMutation(PAUSE_ALL_MUTATION);
   const [, resumeAll] = useMutation(RESUME_ALL_MUTATION);
   const [open, setOpen] = useState(false);
 
   if (paused && resumeAt !== null) {
-    return <TimedResumeButton resumeAt={resumeAt} onResume={() => void resumeAll({})} />;
+    return (
+      <TimedResumeButton
+        resumeAt={resumeAt}
+        onResume={() => void resumeAll({})}
+      />
+    );
   }
   if (paused) {
     return (
-      <button type="button" data-testid={testIds.queueResumeAll} onClick={() => void resumeAll({})} className={PAUSED_BUTTON}>
-        <Icon name="resume" size={14} className="-ml-[2px] mr-[7px] flex-none" />
+      <button
+        type="button"
+        data-testid={testIds.queueResumeAll}
+        onClick={() => void resumeAll({})}
+        className={PAUSED_BUTTON}
+      >
+        <Icon
+          name="resume"
+          size={14}
+          className="-ml-[2px] mr-[7px] flex-none"
+        />
         {t("next.downloads.resumeAll")}
       </button>
     );
@@ -172,7 +248,11 @@ function PauseAllControl({ paused, resumeAt }: { paused: boolean; resumeAt: numb
 
   return (
     <div className="relative flex">
-      <SecondaryButton icon="pause" onClick={() => void pauseAll({})} testId={testIds.queuePauseAll}>
+      <SecondaryButton
+        icon="pause"
+        onClick={() => void pauseAll({})}
+        testId={testIds.queuePauseAll}
+      >
         {t("next.downloads.pauseAll")}
       </SecondaryButton>
       <button
@@ -223,14 +303,22 @@ function formatResumeCountdown(msLeft: number): string {
  * "Resume now" while hovered or focused. Both labels share one grid cell so
  * the button keeps its width when the text swaps.
  */
-function TimedResumeButton({ resumeAt, onResume }: { resumeAt: number; onResume: () => void }) {
+function TimedResumeButton({
+  resumeAt,
+  onResume,
+}: {
+  resumeAt: number;
+  onResume: () => void;
+}) {
   const t = useTranslate();
   const [now, setNow] = useState(() => Date.now());
   useEffect(() => {
     const timer = window.setInterval(() => setNow(Date.now()), 1000);
     return () => window.clearInterval(timer);
   }, []);
-  const countdown = t("next.downloads.resumingIn", { time: formatResumeCountdown(resumeAt - now) });
+  const countdown = t("next.downloads.resumingIn", {
+    time: formatResumeCountdown(resumeAt - now),
+  });
   const resumeNow = t("next.downloads.resumeNow");
 
   return (
@@ -255,8 +343,16 @@ function TimedResumeButton({ resumeAt, onResume }: { resumeAt: number; onResume:
 }
 
 export function DownloadsPage() {
-  const { queue, categories: configured, speed, isPaused, pausedClasses, resumeAt, downloadBlock, diskVolumes } =
-    useNextData();
+  const {
+    queue,
+    categories: configured,
+    speed,
+    isPaused,
+    pausedClasses,
+    resumeAt,
+    downloadBlock,
+    diskVolumes,
+  } = useNextData();
   // The ETA's cap; 0 is none.
   const speedLimit = useSpeedLimitInForce().inForce ?? 0;
   const statusLabel = useStatusLabel();
@@ -281,13 +377,17 @@ export function DownloadsPage() {
   const [sortOpen, setSortOpen] = useState(false);
   const [uploadOpen, setUploadOpen] = useState(false);
   // NZBs dropped on the list, handed to the dialog so it opens with them staged.
-  const [droppedFiles, setDroppedFiles] = useState<readonly File[] | null>(null);
+  const [droppedFiles, setDroppedFiles] = useState<readonly File[] | null>(
+    null,
+  );
   const [dropping, setDropping] = useState(false);
   // dragenter and dragleave fire for every child the pointer crosses, so the
   // highlight tracks how deep inside the pane the drag is, not the last event.
   const dragDepth = useRef(0);
   // Cancelling is not instant; hide the row until the daemon's next page drops it.
-  const [removedIds, setRemovedIds] = useState<ReadonlySet<number>>(() => new Set());
+  const [removedIds, setRemovedIds] = useState<ReadonlySet<number>>(
+    () => new Set(),
+  );
   // Ticked for a bulk action; separate from the one row the inspector shows.
   const [picked, setPicked] = useState<ReadonlySet<number>>(() => new Set());
   // Every job the filters match, on every page, rather than the ticked rows.
@@ -303,10 +403,16 @@ export function DownloadsPage() {
   const [, recheckTorrent] = useMutation(RECHECK_TORRENT_MUTATION);
   const navigate = useNavigate();
   // A double-clicked row opens the job's own screen, where the inspector's detail link goes.
-  const openJob = useCallback((id: number) => void navigate(`/jobs/${id}`), [navigate]);
+  const openJob = useCallback(
+    (id: number) => void navigate(`/jobs/${id}`),
+    [navigate],
+  );
   // A selection batch the daemon refused because the queue moved since the
   // operator confirmed it: the count it matches now, and the batch to run again.
-  const [reconfirm, setReconfirm] = useState<{ matched: number; run: () => void } | null>(null);
+  const [reconfirm, setReconfirm] = useState<{
+    matched: number;
+    run: () => void;
+  } | null>(null);
   const [report, setReport] = useState<string | null>(null);
 
   const client = useClient();
@@ -316,13 +422,22 @@ export function DownloadsPage() {
   const torrentsPaused = pausedClasses.includes("TORRENT");
   const [, pauseJob] = useMutation(PAUSE_JOB_MUTATION);
   const [, resumeJob] = useMutation(RESUME_JOB_MUTATION);
-  const [, cancelJob] = useMutation<{ cancelJob: boolean }>(CANCEL_JOB_MUTATION);
+  const [, cancelJob] = useMutation<{ cancelJob: boolean }>(
+    CANCEL_JOB_MUTATION,
+  );
   const [{ data: systemInfo }] = useQuery<{
     systemInfo: { configuredStorage: StorageVolume[] };
   }>({ query: STORAGE_VOLUMES_QUERY });
 
   const selection = useMemo(
-    () => queueSelection({ tab: tab === "all" ? null : tab, facets, query, protocol, tag }),
+    () =>
+      queueSelection({
+        tab: tab === "all" ? null : tab,
+        facets,
+        query,
+        protocol,
+        tag,
+      }),
     [facets, protocol, query, tab, tag],
   );
   const input = useMemo(
@@ -361,7 +476,9 @@ export function DownloadsPage() {
     [jobs],
   );
   const torrents = useTorrentSummaries(torrentIds);
-  const seedingColumn = torrentsOn && [...torrents.values()].some((torrent) => showsSeeding(torrent.state));
+  const seedingColumn =
+    torrentsOn &&
+    [...torrents.values()].some((torrent) => showsSeeding(torrent.state));
   // The row handlers read a job's protocol by id, so they keep their identity while the rows move.
   const jobsRef = useRef(jobs);
   const torrentsRef = useRef(torrents);
@@ -369,8 +486,11 @@ export function DownloadsPage() {
     jobsRef.current = jobs;
     torrentsRef.current = torrents;
   });
-  const isTorrent = useCallback((id: number) => jobsRef.current.find((job) => job.id === id)?.protocol === "TORRENT", []);
-
+  const isTorrent = useCallback(
+    (id: number) =>
+      jobsRef.current.find((job) => job.id === id)?.protocol === "TORRENT",
+    [],
+  );
 
   // The time-left speed samples the bytes the estimate counts across the whole
   // queue, which the daemon totals; the page holds only its own rows.
@@ -389,7 +509,10 @@ export function DownloadsPage() {
         : [],
     [page.etaDownloadedBytes, page.etaTotalBytes],
   );
-  const idle = useMemo(() => nothingDownloading(page.stateCounts), [page.stateCounts]);
+  const idle = useMemo(
+    () => nothingDownloading(page.stateCounts),
+    [page.stateCounts],
+  );
   const diskRate = useMemo(() => slowDiskRate(diskVolumes), [diskVolumes]);
   const etaConditions = useMemo(
     () => ({ paused: isPaused, speedLimit, idle, diskRate }),
@@ -399,7 +522,8 @@ export function DownloadsPage() {
   // A row a slow disk holds back runs at that disk's rate, not the download speed.
   const pace = useMemo(() => diskPace(jobs, diskVolumes), [jobs, diskVolumes]);
   const estimates = useMemo(
-    () => etaByIdFrom(page.etaThrough, etaSpeed, formatEtaFromRemainingBytes, pace),
+    () =>
+      etaByIdFrom(page.etaThrough, etaSpeed, formatEtaFromRemainingBytes, pace),
     [etaSpeed, page.etaThrough, pace],
   );
   // Kept while every estimate reads the same, so the rows' time-left text is
@@ -422,7 +546,8 @@ export function DownloadsPage() {
   const protocolCounts = useSettled(
     useMemo(() => {
       const count = (protocol: JobProtocol) =>
-        page.protocolCounts.find((entry) => entry.protocol === protocol)?.count ?? 0;
+        page.protocolCounts.find((entry) => entry.protocol === protocol)
+          ?.count ?? 0;
       const torrents = count("TORRENT");
       const usenet = count("NZB");
       return { ALL: torrents + usenet, TORRENT: torrents, NZB: usenet };
@@ -459,7 +584,9 @@ export function DownloadsPage() {
     pickedRef.current = picked;
   });
 
-  const visibleGroups = DOWNLOAD_GROUP_ORDER.filter((group) => grouped.get(group)!.length > 0);
+  const visibleGroups = DOWNLOAD_GROUP_ORDER.filter(
+    (group) => grouped.get(group)!.length > 0,
+  );
 
   const selected = jobs.find((job) => job.id === selectedId) ?? null;
 
@@ -515,16 +642,20 @@ export function DownloadsPage() {
   const pickedCount = allMatching ? page.totalCount : picked.size;
   // Every row on the page is ticked and more match than are ticked.
   const canSelectAllMatching =
-    !allMatching
-    && !showingStale
-    && jobs.length > 0
-    && jobs.every((job) => picked.has(job.id))
-    && page.totalCount > picked.size;
+    !allMatching &&
+    !showingStale &&
+    jobs.length > 0 &&
+    jobs.every((job) => picked.has(job.id)) &&
+    page.totalCount > picked.size;
 
   const bulkReport = (kind: BulkReport, total: number, refused: number) =>
     refused === 0
       ? countLabel(t, `next.downloads.bulk.${kind}`, total)
-      : t(`next.downloads.bulk.${kind}Partial`, { done: total - refused, total, refused });
+      : t(`next.downloads.bulk.${kind}Partial`, {
+          done: total - refused,
+          total,
+          refused,
+        });
 
   /**
    * One batch for the whole selection: the ticked rows by id, or every job
@@ -537,7 +668,10 @@ export function DownloadsPage() {
    */
   const runBatch = async (
     kind: BulkReport,
-    mutation: TypedDocumentNode<Record<string, BatchResult>, Record<string, unknown>>,
+    mutation: TypedDocumentNode<
+      Record<string, BatchResult>,
+      Record<string, unknown>
+    >,
     field: string,
     extra: Record<string, unknown> = {},
     before?: (target: QueueBatchTarget) => void,
@@ -546,28 +680,40 @@ export function DownloadsPage() {
     const target = batchTarget(allMatching, picked, selection, confirmed);
     setBulkBusy(true);
     before?.(target);
-    const result = await client.mutation(mutation, { target, ...extra }).toPromise();
+    const result = await client
+      .mutation(mutation, { target, ...extra })
+      .toPromise();
     setBulkBusy(false);
     const answer = result.data?.[field];
     if (!answer) {
-      const matched = "selection" in target ? conflictCount(result.error) : null;
+      const matched =
+        "selection" in target ? conflictCount(result.error) : null;
       if (matched !== null) {
         setReconfirm({
           matched,
-          run: () => void runBatch(kind, mutation, field, extra, before, matched),
+          run: () =>
+            void runBatch(kind, mutation, field, extra, before, matched),
         });
         refreshQueue();
         return null;
       }
-      setReport(t("next.downloads.bulk.failed", { message: result.error?.message ?? "" }));
+      setReport(
+        t("next.downloads.bulk.failed", {
+          message: result.error?.message ?? "",
+        }),
+      );
       refreshQueue();
       return null;
     }
     const refused = new Set(
-      answer.refused.filter((entry) => entry.code !== "NOT_FOUND").map((entry) => entry.id),
+      answer.refused
+        .filter((entry) => entry.code !== "NOT_FOUND")
+        .map((entry) => entry.id),
     );
     if ("ids" in target) {
-      setPicked((current) => new Set([...current].filter((id) => refused.has(id))));
+      setPicked(
+        (current) => new Set([...current].filter((id) => refused.has(id))),
+      );
     } else {
       setPicked(new Set());
     }
@@ -577,27 +723,49 @@ export function DownloadsPage() {
     return refused;
   };
 
-  const pausePicked = () => runBatch("paused", PAUSE_QUEUE_ITEMS_MUTATION, "pauseQueueItems");
-  const resumePicked = () => runBatch("resumed", RESUME_QUEUE_ITEMS_MUTATION, "resumeQueueItems");
+  const pausePicked = () =>
+    runBatch("paused", PAUSE_QUEUE_ITEMS_MUTATION, "pauseQueueItems");
+  const resumePicked = () =>
+    runBatch("resumed", RESUME_QUEUE_ITEMS_MUTATION, "resumeQueueItems");
   const setPickedPriority = (priority: string) =>
-    runBatch("priority", SET_QUEUE_ITEMS_PRIORITY_MUTATION, "setQueueItemsPriority", { priority });
+    runBatch(
+      "priority",
+      SET_QUEUE_ITEMS_PRIORITY_MUTATION,
+      "setQueueItemsPriority",
+      { priority },
+    );
   const setPickedCategory = (category: string) =>
-    runBatch("category", SET_QUEUE_ITEMS_CATEGORY_MUTATION, "setQueueItemsCategory", { category });
+    runBatch(
+      "category",
+      SET_QUEUE_ITEMS_CATEGORY_MUTATION,
+      "setQueueItemsCategory",
+      { category },
+    );
 
   // Ticked rows leave the list the moment the cancel is sent, and any the
   // daemon refuses come back once it answers.
   const cancelPicked = async () => {
     let hidden: number[] = [];
-    const refused = await runBatch("cancelled", CANCEL_QUEUE_ITEMS_MUTATION, "cancelQueueItems", {}, (target) => {
-      if ("ids" in target) {
-        hidden = target.ids;
-        setRemovedIds((current) => new Set([...current, ...target.ids]));
-        setSelectedId((current) => (current !== null && target.ids.includes(current) ? null : current));
-      }
-    });
+    const refused = await runBatch(
+      "cancelled",
+      CANCEL_QUEUE_ITEMS_MUTATION,
+      "cancelQueueItems",
+      {},
+      (target) => {
+        if ("ids" in target) {
+          hidden = target.ids;
+          setRemovedIds((current) => new Set([...current, ...target.ids]));
+          setSelectedId((current) =>
+            current !== null && target.ids.includes(current) ? null : current,
+          );
+        }
+      },
+    );
     const back = refused === null ? new Set(hidden) : refused;
     if (back.size > 0) {
-      setRemovedIds((current) => new Set([...current].filter((id) => !back.has(id))));
+      setRemovedIds(
+        (current) => new Set([...current].filter((id) => !back.has(id))),
+      );
     }
     setConfirmCancel(false);
   };
@@ -610,7 +778,10 @@ export function DownloadsPage() {
 
   const categoryOptions = [
     { value: "", label: t("next.categories.uncategorised") },
-    ...configured.map((category) => ({ value: category.name, label: category.name })),
+    ...configured.map((category) => ({
+      value: category.name,
+      label: category.name,
+    })),
   ];
 
   // One set of actions, shown in the tab row where it fits and in its own bar where it does not.
@@ -621,10 +792,18 @@ export function DownloadsPage() {
           {t("next.downloads.selectAllMatching", { count: page.totalCount })}
         </BulkButton>
       ) : null}
-      <BulkButton icon="pause" disabled={bulkBusy} onClick={() => void pausePicked()}>
+      <BulkButton
+        icon="pause"
+        disabled={bulkBusy}
+        onClick={() => void pausePicked()}
+      >
         {t("action.pause")}
       </BulkButton>
-      <BulkButton icon="resume" disabled={bulkBusy} onClick={() => void resumePicked()}>
+      <BulkButton
+        icon="resume"
+        disabled={bulkBusy}
+        onClick={() => void resumePicked()}
+      >
         {t("action.resume")}
       </BulkButton>
       <BulkMenu
@@ -645,7 +824,12 @@ export function DownloadsPage() {
       >
         {t("table.category")}
       </BulkMenu>
-      <BulkButton icon="cancelDownload" tone="danger" disabled={bulkBusy} onClick={() => setConfirmCancel(true)}>
+      <BulkButton
+        icon="cancelDownload"
+        tone="danger"
+        disabled={bulkBusy}
+        onClick={() => setConfirmCancel(true)}
+      >
         {t("action.cancel")}
       </BulkButton>
     </>
@@ -662,17 +846,26 @@ export function DownloadsPage() {
 
   const pauseRow = useCallback(
     (id: number, paused: boolean) => {
-      const wasMissing = !paused && isFilesMissing(torrentsRef.current.get(id)?.state);
-      void (paused ? pauseJob({ id }) : resumeJob({ id })).then(async (result) => {
-        if (result.error) setReport(torrentErrorText(result.error));
-        refreshQueue();
-        if (!result.error && wasMissing && (await stillFilesMissing(client, id))) setFilesMissingId(id);
-      });
+      const wasMissing =
+        !paused && isFilesMissing(torrentsRef.current.get(id)?.state);
+      void (paused ? pauseJob({ id }) : resumeJob({ id })).then(
+        async (result) => {
+          if (result.error) setReport(torrentErrorText(result.error));
+          refreshQueue();
+          if (
+            !result.error &&
+            wasMissing &&
+            (await stillFilesMissing(client, id))
+          )
+            setFilesMissingId(id);
+        },
+      );
     },
     [client, pauseJob, refreshQueue, resumeJob],
   );
   const askCancelRow = useCallback(
-    (id: number) => (isTorrent(id) ? setRemoveTorrentId(id) : setConfirmRowCancel(id)),
+    (id: number) =>
+      isTorrent(id) ? setRemoveTorrentId(id) : setConfirmRowCancel(id),
     [isTorrent],
   );
 
@@ -697,38 +890,51 @@ export function DownloadsPage() {
     refreshQueue();
   };
   const rowCancelJob =
-    confirmRowCancel === null ? null : (jobs.find((job) => job.id === confirmRowCancel) ?? null);
+    confirmRowCancel === null
+      ? null
+      : (jobs.find((job) => job.id === confirmRowCancel) ?? null);
 
   // An egress or a provider quota stops every download that would otherwise
   // be fetching, whatever its own status says; so does pausing everything.
-  const blocked = downloadBlock.kind === "EGRESS_QUOTA" || downloadBlock.kind === "SERVER_QUOTA";
+  const blocked =
+    downloadBlock.kind === "EGRESS_QUOTA" ||
+    downloadBlock.kind === "SERVER_QUOTA";
   const blockEta =
     downloadBlock.kind === "SERVER_QUOTA"
       ? t("jobs.serverQuotaEta")
-      : t("jobs.egressQuotaEta", { resetAt: formatDayClock(downloadBlock.windowEndsAtEpochMs) });
+      : t("jobs.egressQuotaEta", {
+          resetAt: formatDayClock(downloadBlock.windowEndsAtEpochMs),
+        });
   const blockLabel =
-    downloadBlock.kind === "SERVER_QUOTA" ? t("jobs.serverQuotaBadge") : t("jobs.egressQuotaBadge");
+    downloadBlock.kind === "SERVER_QUOTA"
+      ? t("jobs.serverQuotaBadge")
+      : t("jobs.egressQuotaBadge");
 
   // A speed test holds the queue on its own, apart from a pause.
   const heldBy =
-    downloadBlock.kind === "SPEED_TEST" ? t("jobs.speedTestBadge") : t("next.downloads.waitPaused");
+    downloadBlock.kind === "SPEED_TEST"
+      ? t("jobs.speedTestBadge")
+      : t("next.downloads.waitPaused");
 
   /** What stands in for time left while a download is held; null when it is not. */
   const heldValue = useCallback(
     (job: JobData): string | null => {
-      if (statusToken(job.status) === "paused") return t("next.downloads.waitPaused");
+      if (statusToken(job.status) === "paused")
+        return t("next.downloads.waitPaused");
       if (HELD_BACK_STATUSES.has(job.status)) {
         if (blocked) return blockEta;
         if (isPaused) return heldBy;
         // The torrents' own hold reads on its rows as the queue's pause does.
-        if (torrentsPaused && job.protocol === "TORRENT") return t("next.downloads.waitPaused");
+        if (torrentsPaused && job.protocol === "TORRENT")
+          return t("next.downloads.waitPaused");
       }
       return null;
     },
     [blockEta, blocked, heldBy, isPaused, t, torrentsPaused],
   );
   const holdValue = useCallback(
-    (job: JobData): string | null => (blocked && HELD_BACK_STATUSES.has(job.status) ? blockLabel : null),
+    (job: JobData): string | null =>
+      blocked && HELD_BACK_STATUSES.has(job.status) ? blockLabel : null,
     [blockLabel, blocked],
   );
   /** What the download is doing with its disk, in full; null when the row shows nothing of it. */
@@ -756,17 +962,31 @@ export function DownloadsPage() {
               <ScheduleSeedingNote torrents={torrents} />
               <SecondaryButton
                 icon={torrentsPaused ? "resume" : "pause"}
-                testId={torrentsPaused ? torrentTestIds.resumeTorrents : torrentTestIds.pauseTorrents}
+                testId={
+                  torrentsPaused
+                    ? torrentTestIds.resumeTorrents
+                    : torrentTestIds.pauseTorrents
+                }
                 onClick={() => {
-                  void (torrentsPaused ? resumeClass({ class: "TORRENT" }) : pauseClass({ class: "TORRENT" }));
+                  void (torrentsPaused
+                    ? resumeClass({ class: "TORRENT" })
+                    : pauseClass({ class: "TORRENT" }));
                 }}
               >
-                {torrentsPaused ? t("next.downloads.resumeTorrents") : t("next.downloads.pauseTorrents")}
+                {torrentsPaused
+                  ? t("next.downloads.resumeTorrents")
+                  : t("next.downloads.pauseTorrents")}
               </SecondaryButton>
             </>
           ) : null}
           <SpeedLimitControl />
-          <PrimaryButton icon="add" onClick={() => setUploadOpen(true)} testId={torrentTestIds.addOpen}>{t("next.addNzb.title")}</PrimaryButton>
+          <PrimaryButton
+            icon="add"
+            onClick={() => setUploadOpen(true)}
+            testId={torrentTestIds.addOpen}
+          >
+            {t("next.addNzb.title")}
+          </PrimaryButton>
         </>
       }
       railMiddle={
@@ -785,10 +1005,15 @@ export function DownloadsPage() {
           <CategoryListBlock
             items={categories}
             selected={facets}
-            onToggle={(key) => reset(() => setFacets((current) => toggleFacet(current, key)))}
+            onToggle={(key) =>
+              reset(() => setFacets((current) => toggleFacet(current, key)))
+            }
             onClear={() => reset(() => setFacets(NO_FACETS))}
           />
-          <TagFilterBlock selected={tag} onSelect={(next) => reset(() => setTag(next))} />
+          <TagFilterBlock
+            selected={tag}
+            onSelect={(next) => reset(() => setTag(next))}
+          />
         </>
       }
       railFooter={<ProvidersBlock />}
@@ -804,7 +1029,9 @@ export function DownloadsPage() {
               }
               note={
                 remainingBytes > 0
-                  ? t("next.downloads.leftToFetch", { size: formatSize(remainingBytes) })
+                  ? t("next.downloads.leftToFetch", {
+                      size: formatSize(remainingBytes),
+                    })
                   : page.isLoading
                     ? t("next.downloads.fetchingQueue")
                     : t("next.downloads.queueClear")
@@ -818,13 +1045,35 @@ export function DownloadsPage() {
 
           <Tabs
             tabs={[
-              { id: "all" as const, label: t("history.filterAll"), count: tabCounts.all },
-              { id: "downloading" as const, label: t("next.downloads.tabDownloading"), count: tabCounts.downloading },
+              {
+                id: "all" as const,
+                label: t("history.filterAll"),
+                count: tabCounts.all,
+              },
+              {
+                id: "downloading" as const,
+                label: t("next.downloads.tabDownloading"),
+                count: tabCounts.downloading,
+              },
               ...(torrentsOn
-                ? [{ id: "seeding" as const, label: t("next.downloads.tabSeeding"), count: tabCounts.seeding }]
+                ? [
+                    {
+                      id: "seeding" as const,
+                      label: t("next.downloads.tabSeeding"),
+                      count: tabCounts.seeding,
+                    },
+                  ]
                 : []),
-              { id: "queued" as const, label: t("status.queued"), count: tabCounts.queued },
-              { id: "paused" as const, label: t("status.paused"), count: tabCounts.paused },
+              {
+                id: "queued" as const,
+                label: t("status.queued"),
+                count: tabCounts.queued,
+              },
+              {
+                id: "paused" as const,
+                label: t("status.paused"),
+                count: tabCounts.paused,
+              },
             ]}
             active={tab}
             onSelect={(next) => reset(() => setTab(next))}
@@ -848,7 +1097,10 @@ export function DownloadsPage() {
                 >
                   {t("next.downloads.sortBy")}
                   <span className="font-semibold text-wv-fg">
-                    {t(SORT_OPTIONS.find((option) => option.value === sort)!.label)}
+                    {t(
+                      SORT_OPTIONS.find((option) => option.value === sort)!
+                        .label,
+                    )}
                   </span>
                   <Icon name="dropdown" size={12} />
                 </button>
@@ -877,7 +1129,11 @@ export function DownloadsPage() {
 
           {/* From xl the actions sit in the tab row instead; below it there is no room. */}
           {pickedCount === 0 ? null : (
-            <BulkBar count={pickedCount} onClear={clearPicked} className="xl:hidden">
+            <BulkBar
+              count={pickedCount}
+              onClear={clearPicked}
+              className="xl:hidden"
+            >
               {bulkActions}
             </BulkBar>
           )}
@@ -887,7 +1143,9 @@ export function DownloadsPage() {
         <Pagination
           pageIndex={clampedPage}
           pageCount={pageCount}
-          onPage={(next) => setPageIndex(Math.max(0, Math.min(pageCount - 1, next)))}
+          onPage={(next) =>
+            setPageIndex(Math.max(0, Math.min(pageCount - 1, next)))
+          }
           pageSize={pageSize}
           pageSizes={PAGE_SIZES}
           onPageSize={(next) => reset(() => setPageSize(next))}
@@ -897,8 +1155,14 @@ export function DownloadsPage() {
       statusNote={report ?? undefined}
       statusRight={
         pageCount > 1
-          ? t("next.downloads.showingPage", { shown: jobs.length, total: page.totalCount })
-          : t("next.downloads.shown", { shown: jobs.length, total: queue.summary.totalItems })
+          ? t("next.downloads.showingPage", {
+              shown: jobs.length,
+              total: page.totalCount,
+            })
+          : t("next.downloads.shown", {
+              shown: jobs.length,
+              total: queue.summary.totalItems,
+            })
       }
       // The list and the inspector are side by side only where both fit; below
       // that the inspector becomes a panel under the list rather than squeezing
@@ -940,14 +1204,26 @@ export function DownloadsPage() {
           className={`@container flex min-h-0 flex-1 flex-col overflow-y-auto bg-wv-list${showingStale ? " opacity-60" : ""}`}
         >
           {page.isLoading ? (
-            <EmptyState loading title={t("next.common.loading")} body={t("next.downloads.loadingBody")} />
+            <EmptyState
+              loading
+              title={t("next.common.loading")}
+              body={t("next.downloads.loadingBody")}
+            />
           ) : queue.summary.totalItems === 0 && jobs.length === 0 ? (
             <EmptyState
               centered
               testId={testIds.queueEmpty}
               title={t("next.downloads.emptyTitle")}
-              body={t(torrentAdds ? "next.downloads.emptyBody" : "next.downloads.emptyBodyNzb")}
-              action={<PrimaryButton icon="add" onClick={() => setUploadOpen(true)}>{t("next.addNzb.title")}</PrimaryButton>}
+              body={t(
+                torrentAdds
+                  ? "next.downloads.emptyBody"
+                  : "next.downloads.emptyBodyNzb",
+              )}
+              action={
+                <PrimaryButton icon="add" onClick={() => setUploadOpen(true)}>
+                  {t("next.addNzb.title")}
+                </PrimaryButton>
+              }
             />
           ) : jobs.length === 0 ? (
             <EmptyState
@@ -985,7 +1261,13 @@ export function DownloadsPage() {
         </div>
         {dropping ? (
           <div className="pointer-events-none absolute inset-0 flex items-center justify-center border border-dashed border-wv-accent bg-wv-selected">
-            <span className="text-[13px] font-medium text-wv-strong">{t(torrentAdds ? "next.downloads.dropHint" : "next.downloads.dropHintNzb")}</span>
+            <span className="text-[13px] font-medium text-wv-strong">
+              {t(
+                torrentAdds
+                  ? "next.downloads.dropHint"
+                  : "next.downloads.dropHintNzb",
+              )}
+            </span>
           </div>
         ) : null}
       </div>
@@ -1059,16 +1341,23 @@ export function DownloadsPage() {
         other={{
           label: t("next.inspector.openDetail"),
           onConfirm: () => {
-            if (filesMissingId !== null) void navigate(`/jobs/${filesMissingId}`);
+            if (filesMissingId !== null)
+              void navigate(`/jobs/${filesMissingId}`);
           },
         }}
       />
 
       <TorrentRemoveDialog
         id={removeTorrentId}
-        goalLeft={removeTorrentId === null ? null : (torrents.get(removeTorrentId)?.seedingGoalLeft ?? null)}
+        goalLeft={
+          removeTorrentId === null
+            ? null
+            : (torrents.get(removeTorrentId)?.seedingGoalLeft ?? null)
+        }
         name={(() => {
-          const job = jobs.find((candidate) => candidate.id === removeTorrentId);
+          const job = jobs.find(
+            (candidate) => candidate.id === removeTorrentId,
+          );
           return job ? formatJobReleaseName(job) : undefined;
         })()}
         onRemoved={(id) => {
@@ -1095,11 +1384,15 @@ export function DownloadsPage() {
   );
 }
 
-
 /** Whether every prop is the same, the rows compared one by one. */
-function sameGroupProps(left: QueueGroupProps, right: QueueGroupProps): boolean {
+function sameGroupProps(
+  left: QueueGroupProps,
+  right: QueueGroupProps,
+): boolean {
   return (Object.keys(right) as (keyof QueueGroupProps)[]).every((key) =>
-    key === "rows" ? sameElements(left.rows, right.rows) : Object.is(left[key], right[key]),
+    key === "rows"
+      ? sameElements(left.rows, right.rows)
+      : Object.is(left[key], right[key]),
   );
 }
 
@@ -1167,14 +1460,20 @@ const QueueGroup = memo(function QueueGroup({
       <SectionHeader
         lead={
           <CheckBox
-            label={t("next.downloads.selectGroup", { group: t(DOWNLOAD_GROUP_LABEL[group]) })}
+            label={t("next.downloads.selectGroup", {
+              group: t(DOWNLOAD_GROUP_LABEL[group]),
+            })}
             checked={rows.every((job) => picked.has(job.id))}
             onChange={() => onToggleGroup(group)}
           />
         }
         label={t(DOWNLOAD_GROUP_LABEL[group])}
         count={count}
-        note={DOWNLOAD_GROUP_NOTE[group] === null ? undefined : t(DOWNLOAD_GROUP_NOTE[group])}
+        note={
+          DOWNLOAD_GROUP_NOTE[group] === null
+            ? undefined
+            : t(DOWNLOAD_GROUP_NOTE[group])
+        }
       />
       {sorted.map((job) => {
         const disk = diskOf(job);
@@ -1191,7 +1490,11 @@ const QueueGroup = memo(function QueueGroup({
             onPause={onPause}
             onCancel={onCancel}
             held={heldOf(job)}
-            hold={stateLabel(torrents.get(job.id)) ?? holdOf(job) ?? (disk ? t("next.status.diskShort") : null)}
+            hold={
+              stateLabel(torrents.get(job.id)) ??
+              holdOf(job) ??
+              (disk ? t("next.status.diskShort") : null)
+            }
             seeding={seedingOf(torrents.get(job.id))}
             seedingColumn={seedingColumn}
             statusTitle={
@@ -1209,7 +1512,9 @@ const QueueGroup = memo(function QueueGroup({
 }, sameGroupProps);
 
 /** A torrent's figures for the seeding column, while it seeds or has stopped. */
-function seedingOf(torrent: TorrentSummaryData | undefined): TorrentSummaryData | null {
+function seedingOf(
+  torrent: TorrentSummaryData | undefined,
+): TorrentSummaryData | null {
   return torrent && showsSeeding(torrent.state) ? torrent : null;
 }
 

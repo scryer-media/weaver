@@ -12,7 +12,12 @@ export type DuplicatePolicy = {
   normalizedName: DuplicateAction;
 };
 
-export const DUPLICATE_ACTIONS: DuplicateAction[] = ["ACCEPT", "WARN", "PAUSE", "BLOCK"];
+export const DUPLICATE_ACTIONS: DuplicateAction[] = [
+  "ACCEPT",
+  "WARN",
+  "PAUSE",
+  "BLOCK",
+];
 
 export const DEFAULT_DUPLICATE_POLICY: DuplicatePolicy = {
   strictActiveOrSuccess: "BLOCK",
@@ -23,6 +28,8 @@ export const DEFAULT_DUPLICATE_POLICY: DuplicatePolicy = {
   normalizedName: "WARN",
 };
 
-export function normalizeDuplicatePolicy(value?: Partial<DuplicatePolicy> | null): DuplicatePolicy {
+export function normalizeDuplicatePolicy(
+  value?: Partial<DuplicatePolicy> | null,
+): DuplicatePolicy {
   return { ...DEFAULT_DUPLICATE_POLICY, ...value };
 }

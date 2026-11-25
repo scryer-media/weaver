@@ -17,7 +17,11 @@ import type { Consumer } from "./data";
 import { NetworkFlow, type FlowEndpoint } from "./NetworkFlow";
 
 /** One leg while a test measures: its connections, the rung they went by (null for direct), and its rate now. */
-export type LiveLeg = { connections: number; rung: number | null | undefined; bytesPerSecond: number };
+export type LiveLeg = {
+  connections: number;
+  rung: number | null | undefined;
+  bytesPerSecond: number;
+};
 
 /**
  * A route as a speed test takes it: the overview's flow of one consumer, drawn
@@ -65,7 +69,8 @@ export function RoutePlanView({
       const rungs = leg.path.kind === "DIRECT" ? [] : leg.path.rungs;
       const now = down[position] ? undefined : live?.[position];
       const open = now?.connections ?? 0;
-      const firstUp = plan.rungDown[position]?.findIndex((rungDown) => !rungDown) ?? 0;
+      const firstUp =
+        plan.rungDown[position]?.findIndex((rungDown) => !rungDown) ?? 0;
       return {
         ...leg,
         consumer: consumer.key,
@@ -75,19 +80,37 @@ export function RoutePlanView({
         opening: 0,
         bytesPerSecond: now?.bytesPerSecond ?? 0,
         // Unknown until a connection says, so the first rung still up stands in, then going direct.
-        selectedRung: now?.rung !== undefined ? now.rung : rungs.length && firstUp >= 0 ? firstUp : null,
-        state: down[position] ? "DOWN" : closedPath(leg.path) ? "BLOCKED" : open > 0 ? "ACTIVE" : "IDLE",
+        selectedRung:
+          now?.rung !== undefined
+            ? now.rung
+            : rungs.length && firstUp >= 0
+              ? firstUp
+              : null,
+        state: down[position]
+          ? "DOWN"
+          : closedPath(leg.path)
+            ? "BLOCKED"
+            : open > 0
+              ? "ACTIVE"
+              : "IDLE",
         reason: null,
         pinnedAddress: null,
         // The rungs, then going direct.
         rungStates: down[position]
           ? [...rungs, null].map(() => "DOWN")
-          : [...rungs.map((_, rung) => (plan.rungDown[position]?.[rung] ? "DOWN" : "STANDBY")), "STANDBY"],
+          : [
+              ...rungs.map((_, rung) =>
+                plan.rungDown[position]?.[rung] ? "DOWN" : "STANDBY",
+              ),
+              "STANDBY",
+            ],
       };
     }),
   };
   const drawn = egresses.map((egress) =>
-    overrides.downEgresses.includes(egress.id) ? { ...egress, health: "DOWN", reason: null } : egress,
+    overrides.downEgresses.includes(egress.id)
+      ? { ...egress, health: "DOWN", reason: null }
+      : egress,
   );
   return (
     <NetworkFlow

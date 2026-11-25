@@ -128,15 +128,18 @@ export function isActiveStatus(status: string | null | undefined): boolean {
  * - `empty`: queued — empty track, no fill.
  * - `complete`: full fill.
  */
-export type ProgressKind = "determinate" | "indeterminate" | "empty" | "complete";
+export type ProgressKind =
+  "determinate" | "indeterminate" | "empty" | "complete";
 
 export function progressDisplayKind(
   status: string | null | undefined,
   progressFraction: number,
 ): ProgressKind {
   const value = normalizeStatus(status);
-  if (value === "COMPLETE" || value === "COMPLETED" || value === "SEEDING") return "complete";
+  if (value === "COMPLETE" || value === "COMPLETED" || value === "SEEDING")
+    return "complete";
   if (value === "QUEUED" || value === "PROPAGATING") return "empty";
-  if (INDETERMINATE_STATUSES.has(value) && progressFraction <= 0) return "indeterminate";
+  if (INDETERMINATE_STATUSES.has(value) && progressFraction <= 0)
+    return "indeterminate";
   return "determinate";
 }

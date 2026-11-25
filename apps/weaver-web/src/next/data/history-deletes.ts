@@ -40,7 +40,9 @@ export interface RowDeleteOperation {
 }
 
 /** Whether the server already reports a delete on this row. */
-function showsDelete(row: { deleteOperation: RowDeleteOperation | null }): boolean {
+function showsDelete(row: {
+  deleteOperation: RowDeleteOperation | null;
+}): boolean {
   return row.deleteOperation?.action === "DELETE";
 }
 
@@ -57,16 +59,18 @@ export interface DeleteProgress {
  * queued for deletion until the server's own page shows the delete. A failed
  * archive the row still carries is replaced, as the delete replaces it.
  */
-export function withDeleteLocks<T extends { id: number; deleteOperation: RowDeleteOperation | null }>(
-  rows: readonly T[],
-  locks: ReadonlyMap<number, DeleteLock>,
-): T[] {
+export function withDeleteLocks<
+  T extends { id: number; deleteOperation: RowDeleteOperation | null },
+>(rows: readonly T[], locks: ReadonlyMap<number, DeleteLock>): T[] {
   if (locks.size === 0) {
     return rows as T[];
   }
   return rows.map((row) =>
     !showsDelete(row) && locks.has(row.id)
-      ? { ...row, deleteOperation: { state: "QUEUED", locked: true, action: "DELETE" } }
+      ? {
+          ...row,
+          deleteOperation: { state: "QUEUED", locked: true, action: "DELETE" },
+        }
       : row,
   );
 }
@@ -115,15 +119,25 @@ export function deleteProgress(
   if (summary.total > 0) {
     return summary;
   }
-  return { total: pendingTargets, queued: pendingTargets, running: 0, completed: 0, failed: 0 };
+  return {
+    total: pendingTargets,
+    queued: pendingTargets,
+    running: 0,
+    completed: 0,
+    failed: 0,
+  };
 }
 
 /** `Deleting history items · 12 tracked · 3 running · 8 queued · 1 failed`. */
-export function describeDeleteProgress(t: Translate, progress: DeleteProgress): string {
+export function describeDeleteProgress(
+  t: Translate,
+  progress: DeleteProgress,
+): string {
   return [
     t("next.deletes.title"),
     t("next.deletes.tracked", { count: progress.total }),
-    progress.running > 0 && t("next.deletes.running", { count: progress.running }),
+    progress.running > 0 &&
+      t("next.deletes.running", { count: progress.running }),
     progress.queued > 0 && t("next.deletes.queued", { count: progress.queued }),
     progress.failed > 0 && t("next.deletes.failed", { count: progress.failed }),
   ]

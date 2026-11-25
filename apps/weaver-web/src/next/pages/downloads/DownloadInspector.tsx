@@ -15,20 +15,43 @@ import {
   UPDATE_JOBS_MUTATION,
 } from "@/graphql/queries";
 import { useTranslate } from "@/lib/context/translate-context";
-import { criticalHealthMilli, HEALTH_TONE_CLASS, healthTone } from "@/lib/health-tone";
+import {
+  criticalHealthMilli,
+  HEALTH_TONE_CLASS,
+  healthTone,
+} from "@/lib/health-tone";
 import type { JobData } from "@/lib/job-types";
 import { statusToken } from "@/lib/status-tokens";
-import { torrentErrorText, torrentStateLabelKey, type TorrentSummaryData } from "@/lib/torrents";
+import {
+  torrentErrorText,
+  torrentStateLabelKey,
+  type TorrentSummaryData,
+} from "@/lib/torrents";
 import { Eyebrow } from "@/next/components/chrome";
-import { DangerButton, SecondaryButton, Select, Toggle } from "@/next/components/controls";
+import {
+  DangerButton,
+  SecondaryButton,
+  Select,
+  Toggle,
+} from "@/next/components/controls";
 import { Icon } from "@/next/components/icons";
 import { PhaseBars, useJobProgress } from "@/next/components/PhaseBars";
-import { EM_DASH, formatCount, formatDuration, formatRate, formatSize } from "@/next/data/format";
+import {
+  EM_DASH,
+  formatCount,
+  formatDuration,
+  formatRate,
+  formatSize,
+} from "@/next/data/format";
 import { LIST_PAGE_SIZE } from "@/next/data/list-pages";
 import { useNextData } from "@/next/data/next-data";
 import { statusDetail, useStatusLabel } from "@/next/data/status";
 import { SupportReportActions } from "@/next/features/SupportReportActions";
-import { FilesMissingDialog, isFilesMissing, stillFilesMissing } from "@/next/features/torrents/FilesMissingDialog";
+import {
+  FilesMissingDialog,
+  isFilesMissing,
+  stillFilesMissing,
+} from "@/next/features/torrents/FilesMissingDialog";
 import { TorrentRemoveDialog } from "@/next/features/torrents/TorrentRemoveDialog";
 import { torrentIds } from "@/next/testids";
 
@@ -50,14 +73,24 @@ type Priority = "HIGH" | "NORMAL" | "LOW";
 
 /** Priority rides in the job's metadata; anything unset or unknown is Normal. */
 function jobPriority(job: JobData): Priority {
-  const raw = job.metadata.find((entry) => entry.key === "priority")?.value?.toUpperCase();
+  const raw = job.metadata
+    .find((entry) => entry.key === "priority")
+    ?.value?.toUpperCase();
   return raw === "HIGH" || raw === "LOW" ? raw : "NORMAL";
 }
 
-function EditField({ label, children }: { label: string; children: ReactNode }) {
+function EditField({
+  label,
+  children,
+}: {
+  label: string;
+  children: ReactNode;
+}) {
   return (
     <div className="flex items-center gap-3">
-      <span className="w-[104px] flex-none text-[12.5px] text-wv-muted">{label}</span>
+      <span className="w-[104px] flex-none text-[12.5px] text-wv-muted">
+        {label}
+      </span>
       <div className="min-w-0 flex-1">{children}</div>
     </div>
   );
@@ -79,7 +112,9 @@ function Field({
 }) {
   return (
     <div className="flex gap-3">
-      <span className="w-[104px] flex-none text-[12.5px] text-wv-muted">{label}</span>
+      <span className="w-[104px] flex-none text-[12.5px] text-wv-muted">
+        {label}
+      </span>
       <span
         title={title ?? value}
         className={`min-w-0 flex-1 text-[12.5px] ${wrap ? "leading-[1.35] [overflow-wrap:anywhere]" : "truncate"} ${tone}`}
@@ -99,21 +134,35 @@ function againstGoal(value: string, goal: string | null): string {
  * A usenet job's own figures: what came of what was posted, and its
  * integrity once its checks have read it.
  */
-function UsenetFields({ job, rate, eta }: { job: JobData; rate: number; eta: string }) {
+function UsenetFields({
+  job,
+  rate,
+  eta,
+}: {
+  job: JobData;
+  rate: number;
+  eta: string;
+}) {
   const t = useTranslate();
   const token = statusToken(job.status);
   // Damage is known once the job is past its download.
-  const checked = token !== "downloading" && token !== "queued" && token !== "paused";
+  const checked =
+    token !== "downloading" && token !== "queued" && token !== "paused";
   const integrity = !checked
     ? { value: t("next.job.verifiesAfter"), tone: "text-wv-muted" }
     : {
         value: `${(job.health / 10).toFixed(1)}% — ${
           job.failedBytes > 0
-            ? t("next.job.neverRecovered", { size: formatSize(job.failedBytes) })
+            ? t("next.job.neverRecovered", {
+                size: formatSize(job.failedBytes),
+              })
             : t("next.job.noDamage")
         }`,
         tone: HEALTH_TONE_CLASS[
-          healthTone(job.health, criticalHealthMilli(job.totalBytes, job.optionalRecoveryBytes))
+          healthTone(
+            job.health,
+            criticalHealthMilli(job.totalBytes, job.optionalRecoveryBytes),
+          )
         ],
       };
   return (
@@ -122,8 +171,15 @@ function UsenetFields({ job, rate, eta }: { job: JobData; rate: number; eta: str
         label={t("next.job.downloaded")}
         value={`${formatSize(job.downloadedBytes)} ${t("next.job.ofPosted", { size: formatSize(job.totalBytes) })}`}
       />
-      <Field label={t("next.job.integrity")} value={integrity.value} tone={integrity.tone} />
-      <Field label={t("next.inspector.rate")} value={rate > 0 ? formatRate(rate) : EM_DASH} />
+      <Field
+        label={t("next.job.integrity")}
+        value={integrity.value}
+        tone={integrity.tone}
+      />
+      <Field
+        label={t("next.inspector.rate")}
+        value={rate > 0 ? formatRate(rate) : EM_DASH}
+      />
       <Field label={t("next.common.timeLeft")} value={eta} />
     </>
   );
@@ -147,9 +203,10 @@ function TorrentFields({
   const t = useTranslate();
   const whole = job.progress >= 1;
   const upload = torrent?.uploadBps ?? 0;
-  const rates = [rate > 0 ? `↓ ${formatRate(rate)}` : null, upload > 0 ? `↑ ${formatRate(upload)}` : null].filter(
-    (part) => part !== null,
-  );
+  const rates = [
+    rate > 0 ? `↓ ${formatRate(rate)}` : null,
+    upload > 0 ? `↑ ${formatRate(upload)}` : null,
+  ].filter((part) => part !== null);
   const policy = torrent?.seedingPolicy;
   const seeded =
     torrent === null
@@ -165,12 +222,18 @@ function TorrentFields({
           value={`${formatSize(job.downloadedBytes)} ${t("next.job.ofTotal", { size: formatSize(job.totalBytes) })}`}
         />
       )}
-      <Field label={t("next.inspector.rate")} value={rates.length > 0 ? rates.join(" · ") : EM_DASH} />
+      <Field
+        label={t("next.inspector.rate")}
+        value={rates.length > 0 ? rates.join(" · ") : EM_DASH}
+      />
       {whole ? null : <Field label={t("next.common.timeLeft")} value={eta} />}
       {torrent === null ? null : (
         <Field
           label={t("next.torrent.shareRatio")}
-          value={againstGoal(torrent.ratio.toFixed(2), policy?.ratioGoal == null ? null : policy.ratioGoal.toFixed(2))}
+          value={againstGoal(
+            torrent.ratio.toFixed(2),
+            policy?.ratioGoal == null ? null : policy.ratioGoal.toFixed(2),
+          )}
         />
       )}
       {torrent === null || !whole ? null : (
@@ -178,7 +241,9 @@ function TorrentFields({
           label={t("next.inspector.seedingTime")}
           value={againstGoal(
             formatDuration(seeded),
-            policy?.seedTimeGoalMinutes == null ? null : formatDuration(policy.seedTimeGoalMinutes * 60),
+            policy?.seedTimeGoalMinutes == null
+              ? null
+              : formatDuration(policy.seedTimeGoalMinutes * 60),
           )}
         />
       )}
@@ -218,18 +283,29 @@ export function DownloadInspector({
   const [, resumeJob] = useMutation(RESUME_JOB_MUTATION);
   const [cancelState, cancelJob] = useMutation(CANCEL_JOB_MUTATION);
   const [, updateJobs] = useMutation(UPDATE_JOBS_MUTATION);
-  const [stopState, cancelPostProcessing] = useMutation(CANCEL_JOB_POST_PROCESSING_MUTATION);
-  const [forceState, setTorrentForced] = useMutation(SET_TORRENT_FORCED_MUTATION);
+  const [stopState, cancelPostProcessing] = useMutation(
+    CANCEL_JOB_POST_PROCESSING_MUTATION,
+  );
+  const [forceState, setTorrentForced] = useMutation(
+    SET_TORRENT_FORCED_MUTATION,
+  );
   const [removingTorrent, setRemovingTorrent] = useState(false);
   const [, recheckTorrent] = useMutation(RECHECK_TORRENT_MUTATION);
   const [filesMissing, setFilesMissing] = useState(false);
   const navigate = useNavigate();
   const client = useClient();
-  const { categories, queue, diskVolumes } = useNextData("categories", "queue", "diskVolumes");
+  const { categories, queue, diskVolumes } = useNextData(
+    "categories",
+    "queue",
+    "diskVolumes",
+  );
   // What was just picked, shown until the queue carries it back; the daemon's
   // answer can take a refresh to arrive, and a select that snaps back to the
   // old value in the meantime reads as a refusal.
-  const [pending, setPending] = useState<{ priority?: Priority; category?: string }>({});
+  const [pending, setPending] = useState<{
+    priority?: Priority;
+    category?: string;
+  }>({});
   const [notice, setNotice] = useState<string | null>(null);
   const [failure, setFailure] = useState<string | null>(null);
 
@@ -238,7 +314,10 @@ export function DownloadInspector({
   if (pending.priority !== undefined && pending.priority === jobPriority(job)) {
     setPending(({ priority: _settled, ...rest }) => rest);
   }
-  if (pending.category !== undefined && pending.category === (job.category || "")) {
+  if (
+    pending.category !== undefined &&
+    pending.category === (job.category || "")
+  ) {
     setPending(({ category: _settled, ...rest }) => rest);
   }
 
@@ -262,7 +341,9 @@ export function DownloadInspector({
   };
 
   /** An action's answer: the daemon's refusal, or a fresh queue. */
-  const settle = (result: { error?: Parameters<typeof torrentErrorText>[0] }) => {
+  const settle = (result: {
+    error?: Parameters<typeof torrentErrorText>[0];
+  }) => {
     if (result.error) {
       setFailure(torrentErrorText(result.error));
       return;
@@ -293,7 +374,9 @@ export function DownloadInspector({
   const detail = statusDetail(
     t,
     job,
-    progress.bars.find((bar) => bar.phase === progress.status) ?? progress.bars.at(-1) ?? null,
+    progress.bars.find((bar) => bar.phase === progress.status) ??
+      progress.bars.at(-1) ??
+      null,
     progress.status,
     diskVolumes,
   );
@@ -376,13 +459,20 @@ export function DownloadInspector({
           {failure === null ? null : (
             <div className="text-[12px] text-wv-error-text">{failure}</div>
           )}
-          <Field label={t("next.inspector.totalSize")} value={formatSize(job.totalBytes)} />
+          <Field
+            label={t("next.inspector.totalSize")}
+            value={formatSize(job.totalBytes)}
+          />
           {isTorrent ? (
             <TorrentFields job={job} torrent={torrent} rate={rate} eta={eta} />
           ) : (
             <UsenetFields job={job} rate={rate} eta={eta} />
           )}
-          <Field label={t("next.inspector.destination")} value={data?.jobOutputFiles?.outputDir || EM_DASH} wrap />
+          <Field
+            label={t("next.inspector.destination")}
+            value={data?.jobOutputFiles?.outputDir || EM_DASH}
+            wrap
+          />
         </div>
 
         <div className="flex flex-none flex-col gap-[13px] px-5 py-[18px]">
@@ -431,7 +521,9 @@ export function DownloadInspector({
             className="h-auto min-h-[34px] min-w-0 w-full justify-center py-2 whitespace-normal [overflow-wrap:anywhere]"
           />
         </div>
-        {notice === null ? null : <div className="text-[12px] text-wv-muted">{notice}</div>}
+        {notice === null ? null : (
+          <div className="text-[12px] text-wv-muted">{notice}</div>
+        )}
         <div className="flex flex-wrap gap-[10px]">
           <SecondaryButton
             icon={isPaused ? "resume" : "pause"}
@@ -439,9 +531,16 @@ export function DownloadInspector({
             onClick={() => {
               setFailure(null);
               const wasMissing = isPaused && isFilesMissing(torrent?.state);
-              void (isPaused ? resumeJob({ id: job.id }) : pauseJob({ id: job.id })).then(async (result) => {
+              void (
+                isPaused ? resumeJob({ id: job.id }) : pauseJob({ id: job.id })
+              ).then(async (result) => {
                 settle(result);
-                if (!result.error && wasMissing && (await stillFilesMissing(client, job.id))) setFilesMissing(true);
+                if (
+                  !result.error &&
+                  wasMissing &&
+                  (await stillFilesMissing(client, job.id))
+                )
+                  setFilesMissing(true);
               });
             }}
           >
@@ -490,7 +589,9 @@ export function DownloadInspector({
             // The row leaves the queue only once the daemon has accepted the removal.
             void cancelJob({ id: job.id }).then((result) => {
               if (result.error || result.data?.cancelJob !== true) {
-                setFailure(result.error?.message ?? t("next.inspector.removeFailed"));
+                setFailure(
+                  result.error?.message ?? t("next.inspector.removeFailed"),
+                );
                 return;
               }
               onRemoved(job.id);
@@ -509,7 +610,10 @@ export function DownloadInspector({
           setFailure(null);
           void recheckTorrent({ id: job.id }).then(settle);
         }}
-        other={{ label: t("next.inspector.openDetail"), onConfirm: () => void navigate(`/jobs/${job.id}`) }}
+        other={{
+          label: t("next.inspector.openDetail"),
+          onConfirm: () => void navigate(`/jobs/${job.id}`),
+        }}
       />
       <TorrentRemoveDialog
         id={removingTorrent ? job.id : null}

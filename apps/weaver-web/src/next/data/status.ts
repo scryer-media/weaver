@@ -68,8 +68,12 @@ export function statusDetail(
   }
   if (job.downloadWaitReason) {
     return (
-      diskWaitDetail(t, job.downloadWaitReason, job.diskNeedBytes, job.diskFreeBytes)
-      ?? waitReasonDetail(t, job.downloadWaitReason)
+      diskWaitDetail(
+        t,
+        job.downloadWaitReason,
+        job.diskNeedBytes,
+        job.diskFreeBytes,
+      ) ?? waitReasonDetail(t, job.downloadWaitReason)
     );
   }
   const disk = diskDetail(t, job, diskVolumes);
@@ -78,7 +82,9 @@ export function statusDetail(
   }
   if (phase && phase.totalBytes > 0) {
     const percent = `${Math.round(phase.progressPercent)}%`;
-    return phase.phase === shownStatus ? percent : t(`next.status.percentOf.${phase.phase}`, { percent });
+    return phase.phase === shownStatus
+      ? percent
+      : t(`next.status.percentOf.${phase.phase}`, { percent });
   }
   return null;
 }

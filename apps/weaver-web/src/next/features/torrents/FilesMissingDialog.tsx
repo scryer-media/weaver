@@ -10,7 +10,9 @@ import { ConfirmDialog } from "@/next/components/ConfirmDialog";
 import { torrentIds } from "@/next/testids";
 
 /** Whether a torrent in `state` is held because its files are gone. */
-export function isFilesMissing(state: TorrentState | null | undefined): boolean {
+export function isFilesMissing(
+  state: TorrentState | null | undefined,
+): boolean {
   return state === "FILES_MISSING";
 }
 
@@ -19,9 +21,16 @@ export function isFilesMissing(state: TorrentState | null | undefined): boolean 
  * answered. The resume itself looks for them again, so files put back let it
  * go; only a torrent still held is explained.
  */
-export async function stillFilesMissing(client: Client, id: number): Promise<boolean> {
+export async function stillFilesMissing(
+  client: Client,
+  id: number,
+): Promise<boolean> {
   const result = await client
-    .query<{ torrent: { state: TorrentState } | null }>(TORRENT_STATE_QUERY, { id }, { requestPolicy: "network-only" })
+    .query<{ torrent: { state: TorrentState } | null }>(
+      TORRENT_STATE_QUERY,
+      { id },
+      { requestPolicy: "network-only" },
+    )
     .toPromise();
   return isFilesMissing(result.data?.torrent?.state);
 }

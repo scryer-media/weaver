@@ -28,7 +28,8 @@ export function trackerHost(url: string): string | null {
 }
 
 /** Whether a rule can name `host`: labels of letters, digits, `-` and `_`. */
-const nameable = (host: string): boolean => host !== "" && host.split(".").every((label) => LABEL.test(label));
+const nameable = (host: string): boolean =>
+  host !== "" && host.split(".").every((label) => LABEL.test(label));
 
 /**
  * The patterns that name `host`: the host itself, then the wildcard over its
@@ -60,15 +61,25 @@ export function domainPattern(host: string): string {
  */
 export function typedPattern(typed: string): string {
   const text = typed.trim().toLowerCase().replace(/\.+$/, "");
-  if (text === "" || text.startsWith("*.") || IPV4.test(text) || !text.includes(".")) {
+  if (
+    text === "" ||
+    text.startsWith("*.") ||
+    IPV4.test(text) ||
+    !text.includes(".")
+  ) {
     return text;
   }
   return `*.${text}`;
 }
 
 /** What a pattern names as the editor shows it: the domain or host, and whether hosts under it count. */
-export function patternParts(pattern: string): { host: string; under: boolean } {
-  return pattern.startsWith("*.") ? { host: pattern.slice(2), under: true } : { host: pattern, under: false };
+export function patternParts(pattern: string): {
+  host: string;
+  under: boolean;
+} {
+  return pattern.startsWith("*.")
+    ? { host: pattern.slice(2), under: true }
+    : { host: pattern, under: false };
 }
 
 /** The patterns that name `hosts`, each once, in the order the hosts come. */
@@ -78,7 +89,9 @@ export function patternsOf(hosts: readonly string[]): string[] {
 
 /** The hosts announce URLs name, each once. */
 export const announceHosts = (urls: readonly string[]): string[] => [
-  ...new Set(urls.map(trackerHost).filter((host): host is string => host !== null)),
+  ...new Set(
+    urls.map(trackerHost).filter((host): host is string => host !== null),
+  ),
 ];
 
 /* ------------------------------------------------------------------ bencode */
@@ -119,7 +132,8 @@ function decode(bytes: Uint8Array, at: number): [Bencoded, number] {
   let next = at;
   while (bytes[next] !== COLON) {
     const digit = bytes[next] - DIGIT_0;
-    if (next >= bytes.length || digit < 0 || digit > 9) throw new Error("string");
+    if (next >= bytes.length || digit < 0 || digit > 9)
+      throw new Error("string");
     length = length * 10 + digit;
     next += 1;
   }
@@ -158,7 +172,9 @@ export function torrentTrackers(
     return null;
   }
   const tiers = root.get("announce-list");
-  const listed = Array.isArray(tiers) ? tiers.flatMap((tier) => (Array.isArray(tier) ? tier.flatMap(text) : [])) : [];
+  const listed = Array.isArray(tiers)
+    ? tiers.flatMap((tier) => (Array.isArray(tier) ? tier.flatMap(text) : []))
+    : [];
   const announce = text(root.get("announce"));
   const info = root.get("info") as Map<string, Bencoded>;
   return {

@@ -6,7 +6,11 @@ import { barHeights } from "../../data/dashboards";
 import { WV } from "../../data/palette";
 
 /** One measure drawn per day: its name, its colour, and a value for each day. */
-export type DailySeries = { label: string; color: string; values: readonly number[] };
+export type DailySeries = {
+  label: string;
+  color: string;
+  values: readonly number[];
+};
 
 /**
  * One slot per day, oldest first, with a bar for each series side by side.
@@ -27,7 +31,9 @@ export const DailyBars = memo(function DailyBars({
 }) {
   // Every series on one scale: each day's values in series order, then
   // each series' run of days, read back by series and day.
-  const all = series.flatMap((one) => days.map((_, index) => one.values[index] ?? 0));
+  const all = series.flatMap((one) =>
+    days.map((_, index) => one.values[index] ?? 0),
+  );
   const heights = barHeights(all);
   const tallest = all.reduce((max, value) => Math.max(max, value), 0);
   const middle = days.length > 2 ? Math.floor((days.length - 1) / 2) : -1;
@@ -38,8 +44,14 @@ export const DailyBars = memo(function DailyBars({
         {series.length > 1 ? (
           <span className="flex gap-4">
             {series.map((one) => (
-              <span key={one.label} className="inline-flex items-center gap-[6px]">
-                <span className="inline-block size-[8px]" style={{ backgroundColor: one.color }} />
+              <span
+                key={one.label}
+                className="inline-flex items-center gap-[6px]"
+              >
+                <span
+                  className="inline-block size-[8px]"
+                  style={{ backgroundColor: one.color }}
+                />
                 {one.label}
               </span>
             ))}
@@ -50,7 +62,11 @@ export const DailyBars = memo(function DailyBars({
         role="img"
         aria-label={label}
         className="flex h-[120px] items-end gap-[3px] border-t border-b border-dashed"
-        style={{ borderTopColor: WV.trackDash, borderBottomColor: WV.track, borderBottomStyle: "solid" }}
+        style={{
+          borderTopColor: WV.trackDash,
+          borderBottomColor: WV.track,
+          borderBottomStyle: "solid",
+        }}
       >
         {days.map((day, index) => (
           <div
@@ -66,7 +82,10 @@ export const DailyBars = memo(function DailyBars({
                   key={one.label}
                   title={`${day} · ${one.label} ${format(value)}`}
                   className="min-w-0 flex-1"
-                  style={{ height: `${Math.max(height, value > 0 ? 2 : 0)}%`, backgroundColor: one.color }}
+                  style={{
+                    height: `${Math.max(height, value > 0 ? 2 : 0)}%`,
+                    backgroundColor: one.color,
+                  }}
                 />
               );
             })}
@@ -76,7 +95,10 @@ export const DailyBars = memo(function DailyBars({
       <div className="relative flex justify-between font-wv-mono text-[10.5px] text-wv-faint">
         <span>{days[0] ?? ""}</span>
         {middle > 0 ? (
-          <span className="absolute -translate-x-1/2" style={{ left: `${((middle + 0.5) / days.length) * 100}%` }}>
+          <span
+            className="absolute -translate-x-1/2"
+            style={{ left: `${((middle + 0.5) / days.length) * 100}%` }}
+          >
             {days[middle]}
           </span>
         ) : null}

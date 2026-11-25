@@ -46,7 +46,11 @@ export type SearchableBlock =
 
 /** The lower-cased terms of a query; none for a blank one. */
 export function searchTerms(query: string): string[] {
-  return query.trim().toLowerCase().split(/\s+/).filter((term) => term !== "");
+  return query
+    .trim()
+    .toLowerCase()
+    .split(/\s+/)
+    .filter((term) => term !== "");
 }
 
 /** Whether every term occurs in `text`. No terms match everything. */
@@ -64,7 +68,10 @@ function fieldText(field: SearchableField): string {
  * the toggle above it is off; once the search found it, hiding it again would
  * leave a result that cannot be seen.
  */
-function revealMatches<F extends SearchableField>(fields: readonly F[], terms: readonly string[]): F[] {
+function revealMatches<F extends SearchableField>(
+  fields: readonly F[],
+  terms: readonly string[],
+): F[] {
   return fields.map((field) =>
     field.collapsed === true && matchesTerms(fieldText(field), terms)
       ? { ...field, collapsed: false }
@@ -78,7 +85,10 @@ function revealMatches<F extends SearchableField>(fields: readonly F[], terms: r
  * The block comes back as the same kind with fewer fields, rows or groups and
  * every other property untouched, so the renderer draws it unchanged.
  */
-export function filterBlock<B extends SearchableBlock>(block: B, terms: readonly string[]): B | null {
+export function filterBlock<B extends SearchableBlock>(
+  block: B,
+  terms: readonly string[],
+): B | null {
   if (terms.length === 0) {
     return block;
   }
@@ -89,15 +99,21 @@ export function filterBlock<B extends SearchableBlock>(block: B, terms: readonly
         return { ...block, fields: revealMatches(block.fields, terms) };
       }
       const fields = block.fields
-        .filter((field) => matchesTerms(`${block.title} ${fieldText(field)}`, terms))
-        .map((field) => (field.collapsed === true ? { ...field, collapsed: false } : field));
+        .filter((field) =>
+          matchesTerms(`${block.title} ${fieldText(field)}`, terms),
+        )
+        .map((field) =>
+          field.collapsed === true ? { ...field, collapsed: false } : field,
+        );
       return fields.length > 0 ? { ...block, fields } : null;
     }
     case "table": {
       if (titleMatches) {
         return block;
       }
-      const rows = block.rows.filter((row) => matchesTerms(`${block.title} ${row.searchText}`, terms));
+      const rows = block.rows.filter((row) =>
+        matchesTerms(`${block.title} ${row.searchText}`, terms),
+      );
       // A group's heading answers for its rows, as a block's title does.
       const groups = (block.groups ?? []).map((group) =>
         matchesTerms(`${block.title} ${group.title}`, terms)
@@ -105,7 +121,10 @@ export function filterBlock<B extends SearchableBlock>(block: B, terms: readonly
           : {
               ...group,
               rows: group.rows.filter((row) =>
-                matchesTerms(`${block.title} ${group.title} ${row.searchText}`, terms),
+                matchesTerms(
+                  `${block.title} ${group.title} ${row.searchText}`,
+                  terms,
+                ),
               ),
             },
       );
@@ -114,12 +133,18 @@ export function filterBlock<B extends SearchableBlock>(block: B, terms: readonly
         : null;
     }
     case "custom":
-      return titleMatches || matchesTerms(`${block.title} ${block.searchText}`, terms) ? block : null;
+      return titleMatches ||
+        matchesTerms(`${block.title} ${block.searchText}`, terms)
+        ? block
+        : null;
   }
 }
 
 /** The blocks a query leaves, in their order; all of them for a blank query. */
-export function filterBlocks<B extends SearchableBlock>(blocks: readonly B[], query: string): B[] {
+export function filterBlocks<B extends SearchableBlock>(
+  blocks: readonly B[],
+  query: string,
+): B[] {
   const terms = searchTerms(query);
   return blocks.flatMap((block) => {
     const kept = filterBlock(block, terms);
@@ -148,20 +173,27 @@ const NOTHING: SearchReport = { count: 0, loading: false };
  * to it to decide what to show.
  */
 export class SearchRegistry {
-  private readonly entries = new Map<string, SearchReport & { panel: string }>();
+  private readonly entries = new Map<
+    string,
+    SearchReport & { panel: string }
+  >();
   private readonly listeners = new Set<() => void>();
 
   report(key: string, panel: string, report: SearchReport): void {
     const previous = this.entries.get(key);
     if (
-      previous !== undefined
-      && previous.panel === panel
-      && previous.count === report.count
-      && previous.loading === report.loading
+      previous !== undefined &&
+      previous.panel === panel &&
+      previous.count === report.count &&
+      previous.loading === report.loading
     ) {
       return;
     }
-    this.entries.set(key, { panel, count: report.count, loading: report.loading });
+    this.entries.set(key, {
+      panel,
+      count: report.count,
+      loading: report.loading,
+    });
     this.emit();
   }
 

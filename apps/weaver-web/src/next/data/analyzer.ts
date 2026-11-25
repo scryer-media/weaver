@@ -32,7 +32,10 @@ const DICT = 0x64; // "d"
  */
 export function fileKind(head: Uint8Array): "nzb" | "torrent" {
   const second = head[1];
-  return head[0] === DICT && second !== undefined && second >= DIGIT_0 && second <= DIGIT_9
+  return head[0] === DICT &&
+    second !== undefined &&
+    second >= DIGIT_0 &&
+    second <= DIGIT_9
     ? "torrent"
     : "nzb";
 }

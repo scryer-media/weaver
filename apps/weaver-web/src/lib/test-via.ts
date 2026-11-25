@@ -2,9 +2,19 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 import type { Translate } from "@/lib/context/translate-context";
-import { directLeg, type Egress, type NetworkRoute, type ProxyPool } from "./networking.ts";
+import {
+  directLeg,
+  type Egress,
+  type NetworkRoute,
+  type ProxyPool,
+} from "./networking.ts";
 import { proxyTestSentence } from "./proxy-fault.ts";
-import { dnsWireKey, lookupTrustKey, type DnsWire, type LookupTrust } from "./dns.ts";
+import {
+  dnsWireKey,
+  lookupTrustKey,
+  type DnsWire,
+  type LookupTrust,
+} from "./dns.ts";
 import { codedSentence } from "./refusal.ts";
 import type { TorrentExposure } from "./torrents.ts";
 
@@ -43,13 +53,23 @@ export type PathTestResult = {
 };
 
 /** The test torrent's steps, in the order a path takes them. */
-export type P2pStep = "TORRENT" | "ANNOUNCE" | "HANDSHAKE" | "PIECE" | "INBOUND";
-export type P2pRung = { step: P2pStep; outcome: "PASSED" | "FAILED" | "NOT_REACHED"; message: string | null };
+export type P2pStep =
+  "TORRENT" | "ANNOUNCE" | "HANDSHAKE" | "PIECE" | "INBOUND";
+export type P2pRung = {
+  step: P2pStep;
+  outcome: "PASSED" | "FAILED" | "NOT_REACHED";
+  message: string | null;
+};
 /** `mappedPort` is the port a gateway mapped to the test session's listener. */
-export type P2pTestResult = { rungs: P2pRung[]; mappedPort: number | null; exposure: TorrentExposure | null };
+export type P2pTestResult = {
+  rungs: P2pRung[];
+  mappedPort: number | null;
+  exposure: TorrentExposure | null;
+};
 
 /** Who turned a test's host into addresses. */
-export type ResolvedBy = "LITERAL" | "HOST" | "SERVERS" | "PROXY" | "PROXY_SERVERS";
+export type ResolvedBy =
+  "LITERAL" | "HOST" | "SERVERS" | "PROXY" | "PROXY_SERVERS";
 
 /** How a test's host was resolved, as the daemon reports it. */
 export type HostResolution = {
@@ -92,19 +112,31 @@ export function resolutionParts(
   resolution: HostResolution,
   names: { egress: string; proxy: (id: number) => string },
 ): ResolutionParts {
-  const proxy = resolution.proxyId === null ? "" : names.proxy(resolution.proxyId);
+  const proxy =
+    resolution.proxyId === null ? "" : names.proxy(resolution.proxyId);
   // The server that answered, else every server asked.
   const servers = resolution.answeredBy ?? resolution.dnsServers.join(", ");
   const by: Record<ResolvedBy, string> = {
     LITERAL: t("next.networking.testVia.resolvedLiteral"),
     HOST: t("next.networking.testVia.resolvedSystem"),
-    SERVERS: t("next.networking.testVia.resolvedWeaver", { servers, name: names.egress }),
+    SERVERS: t("next.networking.testVia.resolvedWeaver", {
+      servers,
+      name: names.egress,
+    }),
     PROXY: t("next.networking.testVia.resolvedProxy", { name: proxy }),
     // Asked through the proxy: Weaver's listed servers, or a WireGuard tunnel's own.
-    PROXY_SERVERS: t("next.networking.testVia.resolvedServers", { servers, name: proxy }),
+    PROXY_SERVERS: t("next.networking.testVia.resolvedServers", {
+      servers,
+      name: proxy,
+    }),
   };
   const error = resolution.error
-    ? codedSentence(t, lookupErrorKey(resolution.error.code), undefined, resolution.error.detail)
+    ? codedSentence(
+        t,
+        lookupErrorKey(resolution.error.code),
+        undefined,
+        resolution.error.detail,
+      )
     : null;
   // Who answered, then how the query went and what its answer was taken as.
   const answered = [
@@ -137,11 +169,16 @@ export function resolutionParts(
 /** A resolution line as plain text. */
 export function resolutionText(parts: ResolutionParts): string {
   const addresses = parts.addresses.map((part) => part.address).join(", ");
-  return [addresses ? `${parts.host} → ${addresses}` : parts.host, parts.said].filter(Boolean).join(" · ");
+  return [addresses ? `${parts.host} → ${addresses}` : parts.host, parts.said]
+    .filter(Boolean)
+    .join(" · ");
 }
 
 /** The proxies the subject puts on top of the route: a proxy, or a pool's members. */
-export function subjectProxyIds(subject: TestSubject, pools: ProxyPool[]): number[] {
+export function subjectProxyIds(
+  subject: TestSubject,
+  pools: ProxyPool[],
+): number[] {
   if (subject === null) return [];
   if ("proxy" in subject) return [subject.proxy];
   return pools.find((pool) => pool.id === subject.pool)?.memberIds ?? [];
@@ -160,18 +197,33 @@ export function routeChoices<P extends { id: number }>(
   const ownPool = subject !== null && "pool" in subject ? subject.pool : null;
   return {
     profiles: profiles.filter((profile) => !tested.has(profile.id)),
-    pools: pools.filter((pool) => pool.id !== ownPool && !pool.memberIds.some((id) => tested.has(id))),
+    pools: pools.filter(
+      (pool) =>
+        pool.id !== ownPool && !pool.memberIds.some((id) => tested.has(id)),
+    ),
   };
 }
 
 /** The route a test starts on: one direct leg, on `egressId` when given, else on the first enabled egress. */
-export function draftRoute(egresses: Pick<Egress, "id" | "enabled">[], egressId?: number): NetworkRoute {
-  const start = egressId ?? egresses.find((egress) => egress.enabled)?.id ?? directLeg().egressId;
-  return { legs: [{ ...directLeg(), egressId: start }], failover: "REDISTRIBUTE" };
+export function draftRoute(
+  egresses: Pick<Egress, "id" | "enabled">[],
+  egressId?: number,
+): NetworkRoute {
+  const start =
+    egressId ??
+    egresses.find((egress) => egress.enabled)?.id ??
+    directLeg().egressId;
+  return {
+    legs: [{ ...directLeg(), egressId: start }],
+    failover: "REDISTRIBUTE",
+  };
 }
 
 /** A run in one sentence: its first failing path's, else its first path's. */
-export function testSummary(t: Translate, results: readonly PathTestResult[]): string | null {
+export function testSummary(
+  t: Translate,
+  results: readonly PathTestResult[],
+): string | null {
   const shown = results.find((result) => !result.success) ?? results[0];
   return shown ? proxyTestSentence(t, shown) : null;
 }
