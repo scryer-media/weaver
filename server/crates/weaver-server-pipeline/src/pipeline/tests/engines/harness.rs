@@ -1165,7 +1165,23 @@ pub struct GraphView {
     pub held: u64,
     // Every name a root member carried at any look.
     pub names: BTreeSet<String>,
+    // At each look that differed from the one before: what a run could read
+    // off every object's envelopes then, and the members objects announced.
+    pub shelf_looks: Vec<ShelfLook>,
 }
+
+// What the shelves held at one look: every envelope's runs with how they
+// arrived, by node and volume, and the names root members carried. A run
+// reads only the verified ones.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ShelfLook {
+    pub kept: BTreeMap<
+        (weaver_graph::NodeId, u32),
+        Vec<(weaver_graph::ByteRange, weaver_graph::Provenance)>,
+    >,
+    pub names: BTreeSet<String>,
+}
+
 impl GraphView {
     pub fn checkpoint_counts(&self) -> (usize, usize, usize) {
         (
@@ -2072,6 +2088,35 @@ pub(in crate::pipeline::tests) fn observe(
         entry.1 = entry.1.max(kept);
         view.shelf_files.entry(node).or_default().extend(files);
     }
+    let mut look = ShelfLook::default();
+    for node in job.writer().kept_nodes() {
+        let Some(shelf) = job.writer().shelf_of(node) else {
+            continue;
+        };
+        let state = shelf.lock();
+        for (&envelope, kept) in &state.kept {
+            let runs: Vec<_> = kept
+                .coverage
+                .runs()
+                .map(|run| (run.range, run.provenance))
+                .collect();
+            if !runs.is_empty() {
+                look.kept.insert((node, envelope), runs);
+            }
+        }
+    }
+    if !look.kept.is_empty() {
+        look.names = tree
+            .live()
+            .into_iter()
+            .filter(|&node| node != weaver_graph::NodeId::ROOT)
+            .filter_map(|node| tree.namespace(node))
+            .flat_map(|namespace| namespace.members().map(|member| member.name.clone()))
+            .collect();
+        if view.shelf_looks.last() != Some(&look) {
+            view.shelf_looks.push(look);
+        }
+    }
     view.checkpoints = job.pending().tally();
     view.delivery = pipeline.graph_delivery(JOB).unwrap_or_default();
     view.health = pipeline.graph_failure_is_health(JOB);
@@ -2248,7 +2293,7 @@ pub async fn run_holding(scenario: &Scenario, held: u32) -> Held {
 
 // [`run_holding`], holding every article `held` names, and showing
 // `at_hold` the pipeline once nothing moves while they are held.
-pub(in crate::pipeline::tests) async fn run_holding_where(
+pub async fn run_holding_where(
     scenario: &Scenario,
     held: impl Fn((u32, u32)) -> bool,
     at_hold: impl FnOnce(&Pipeline),
@@ -2303,6 +2348,18 @@ pub(in crate::pipeline::tests) async fn run_holding_where(
                         pipeline.graph_run_said(said);
                     }
                     () = blocked.notified() => {}
+                }
+                continue;
+            }
+            // What a run said before it came to wait on its shelf is heard
+            // before the job is looked at.
+            let waiting = pipeline.graph_runs.waiting();
+            if !waiting.is_empty() {
+                for said in waiting {
+                    if let Some(heard) = &scenario.heard {
+                        heard(&said);
+                    }
+                    pipeline.graph_run_said(said);
                 }
                 continue;
             }
