@@ -1,0 +1,8 @@
+metrics:
+  serviceMonitor:
+    enabled: true
+    interval: 30s
+    labels:
+      release: prometheus
+    apiKeySecret:
+      name: weaver-metrics

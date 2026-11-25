@@ -1,0 +1,153 @@
+# Weaver runs as one pod: it is a single writer to its database, so the
+# Deployment always has one replica and replaces the pod on upgrade.
+
+nameOverride: ""
+fullnameOverride: ""
+# Added to every object the chart makes.
+commonLabels: {}
+commonAnnotations: {}
+
+image:
+  repository: ghcr.io/scryer-media/weaver
+  # Defaults to the chart's appVersion.
+  tag: ""
+  # "sha256:..." pins the image and wins over the tag.
+  digest: ""
+  pullPolicy: IfNotPresent
+imagePullSecrets: []
+
+# The user, group and volume group the pod runs as.
+securityContext:
+  runAsUser: 1000
+  runAsGroup: 1000
+  fsGroup: 1000
+
+# Time Weaver has after SIGTERM to stop its work and flush its state.
+terminationGracePeriodSeconds: 60
+
+# Time zone of the pod, for logs and schedules.
+timezone: Etc/UTC
+
+# Serve the web UI and API under a path, for example "/weaver".
+basePath: ""
+
+# Weaver answers only requests whose Host it knows. The chart allows the
+# Service's names and every Ingress and HTTPRoute host; add others here, for
+# example the name a reverse proxy outside the cluster sends.
+extraAllowedHosts: []
+clusterDomain: cluster.local
+
+service:
+  type: ClusterIP
+  port: 9090
+  annotations: {}
+
+ingress:
+  enabled: false
+  className: ""
+  annotations: {}
+  # Host names, for example [weaver.example.com].
+  hosts: []
+  # Standard Ingress TLS entries: [{secretName: ..., hosts: [...]}].
+  tls: []
+
+# Gateway API HTTPRoute.
+httpRoute:
+  enabled: false
+  annotations: {}
+  # For example [{name: my-gateway, namespace: gateway-system}].
+  parentRefs: []
+  hostnames: []
+
+persistence:
+  # The database, the encryption key file and Weaver's own state.
+  config:
+    # Use an existing PersistentVolumeClaim instead of making one.
+    existingClaim: ""
+    # "" uses the cluster's default class; "-" asks for no class.
+    storageClass: ""
+    accessModes:
+      - ReadWriteOnce
+    size: 1Gi
+    # Keep the claim when the release is uninstalled.
+    retain: true
+  # One volume for the intermediate and the complete folder, so a finished
+  # job is moved by a rename, not a copy.
+  downloads:
+    # emptyDir, pvc, existingClaim, hostPath or nfs. An emptyDir is lost
+    # with the pod; a pvc is deleted on uninstall; hostPath needs a
+    # privileged Pod Security namespace.
+    type: emptyDir
+    existingClaim: ""
+    storageClass: ""
+    accessModes:
+      - ReadWriteOnce
+    size: 100Gi
+    hostPath: ""
+    nfs:
+      server: ""
+      path: ""
+
+# Extra volumes and mounts, passed through as written.
+extraVolumes: []
+extraVolumeMounts: []
+
+torrents:
+  # Makes torrents available (WEAVER_TORRENTS=1). Turn them on in Weaver's
+  # settings afterwards.
+  enabled: false
+  # Must equal the listen port saved in Weaver's torrent settings.
+  port: 6881
+  service:
+    # LoadBalancer or NodePort.
+    type: LoadBalancer
+    # With NodePort: the node port. Set Weaver's announce port to it.
+    nodePort: null
+    annotations: {}
+
+# Secrets the chart reads but never makes.
+encryptionKey:
+  # Secret holding a base64 32-byte key (WEAVER_ENCRYPTION_KEY). Without it
+  # Weaver makes /config/encryption.key on first start.
+  existingSecret: ""
+  key: encryption-key
+bootstrapLogin:
+  # Secret holding the first login. Used only while no login is stored.
+  existingSecret: ""
+  usernameKey: username
+  passwordKey: password
+database:
+  # Secret holding a postgres:// URL (WEAVER_DATABASE_URL). Without it
+  # Weaver uses SQLite under /config.
+  existingSecret: ""
+  key: database-url
+
+metrics:
+  serviceMonitor:
+    enabled: false
+    interval: ""
+    labels: {}
+    # Secret holding a Weaver API key with read access, sent as a bearer
+    # token. Leave empty only when WEAVER_METRICS_AUTH_REQUIRED=false.
+    apiKeySecret:
+      name: ""
+      key: api-key
+
+# Plain environment variables, as name: value.
+env: {}
+# Environment entries passed through as written (valueFrom and so on).
+extraEnv: []
+envFrom: []
+
+serviceAccount:
+  create: true
+  name: ""
+  annotations: {}
+
+podLabels: {}
+podAnnotations: {}
+resources: {}
+nodeSelector: {}
+tolerations: []
+affinity: {}
+priorityClassName: ""

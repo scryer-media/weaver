@@ -1,0 +1,7 @@
+# Weaver's saved listen port and announce port must be set to 30881 too.
+torrents:
+  enabled: true
+  port: 30881
+  service:
+    type: NodePort
+    nodePort: 30881

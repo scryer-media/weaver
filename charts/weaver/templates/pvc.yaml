@@ -1,0 +1,39 @@
+{{- $config := .Values.persistence.config }}
+{{- if not $config.existingClaim }}
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ printf "%s-config" (include "weaver.fullname" .) }}
+  labels:
+    {{- include "weaver.labels" . | nindent 4 }}
+  {{- $keep := dict }}
+  {{- if $config.retain }}
+  {{- $keep = dict "helm.sh/resource-policy" "keep" }}
+  {{- end }}
+  {{- with include "weaver.annotations" (dict "root" . "extra" $keep) }}{{ . | nindent 2 }}{{- end }}
+spec:
+  accessModes:
+    {{- toYaml $config.accessModes | nindent 4 }}
+  {{- include "weaver.storageClass" $config.storageClass | nindent 2 }}
+  resources:
+    requests:
+      storage: {{ $config.size }}
+{{- end }}
+{{- $downloads := .Values.persistence.downloads }}
+{{- if eq $downloads.type "pvc" }}
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ printf "%s-downloads" (include "weaver.fullname" .) }}
+  labels:
+    {{- include "weaver.labels" . | nindent 4 }}
+  {{- with include "weaver.annotations" (dict "root" .) }}{{ . | nindent 2 }}{{- end }}
+spec:
+  accessModes:
+    {{- toYaml $downloads.accessModes | nindent 4 }}
+  {{- include "weaver.storageClass" $downloads.storageClass | nindent 2 }}
+  resources:
+    requests:
+      storage: {{ $downloads.size }}
+{{- end }}

@@ -1,0 +1,278 @@
+{
+  "$schema": "https://json-schema.org/draft-07/schema#",
+  "type": "object",
+  "additionalProperties": false,
+  "definitions": {
+    "stringMap": {
+      "type": "object",
+      "additionalProperties": { "type": "string" }
+    },
+    "exactHost": {
+      "type": "string",
+      "description": "An exact host name, as Weaver's Host allowlist takes it: no wildcard, scheme, path or port.",
+      "pattern": "^[^*/:@?# ]+$"
+    },
+    "storageClass": {
+      "type": "string",
+      "description": "Empty for the cluster's default class, \"-\" for no class."
+    },
+    "accessModes": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "string",
+        "enum": ["ReadWriteOnce", "ReadOnlyMany", "ReadWriteMany", "ReadWriteOncePod"]
+      }
+    },
+    "quantity": {
+      "type": "string",
+      "pattern": "^[0-9]+(\\.[0-9]+)?([EPTGMK]i?|[mkMGTPE])?$"
+    },
+    "port": { "type": "integer", "minimum": 1, "maximum": 65535 },
+    "id": { "type": "integer", "minimum": 1 },
+    "secretRef": {
+      "type": "string",
+      "description": "Name of a Secret in the release's namespace."
+    }
+  },
+  "properties": {
+    "nameOverride": { "type": "string" },
+    "fullnameOverride": { "type": "string" },
+    "commonLabels": { "$ref": "#/definitions/stringMap" },
+    "commonAnnotations": { "$ref": "#/definitions/stringMap" },
+    "image": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "repository": { "type": "string", "minLength": 1 },
+        "tag": { "type": "string" },
+        "digest": {
+          "type": "string",
+          "pattern": "^(sha256:[0-9a-f]{64})?$"
+        },
+        "pullPolicy": { "type": "string", "enum": ["Always", "IfNotPresent", "Never"] }
+      }
+    },
+    "imagePullSecrets": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["name"],
+        "additionalProperties": false,
+        "properties": { "name": { "type": "string", "minLength": 1 } }
+      }
+    },
+    "securityContext": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "runAsUser": { "$ref": "#/definitions/id" },
+        "runAsGroup": { "$ref": "#/definitions/id" },
+        "fsGroup": { "$ref": "#/definitions/id" }
+      }
+    },
+    "terminationGracePeriodSeconds": { "type": "integer", "minimum": 0 },
+    "timezone": { "type": "string", "minLength": 1 },
+    "basePath": {
+      "type": "string",
+      "description": "Path the UI and API are served under, for example /weaver.",
+      "pattern": "^(/?[A-Za-z0-9._~!$&'()*+,;=:@%-]+)*/?$"
+    },
+    "extraAllowedHosts": {
+      "type": "array",
+      "items": { "$ref": "#/definitions/exactHost" }
+    },
+    "clusterDomain": { "type": "string", "minLength": 1 },
+    "service": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "type": { "type": "string", "enum": ["ClusterIP", "NodePort", "LoadBalancer"] },
+        "port": { "$ref": "#/definitions/port" },
+        "annotations": { "$ref": "#/definitions/stringMap" }
+      }
+    },
+    "ingress": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "className": { "type": "string" },
+        "annotations": { "$ref": "#/definitions/stringMap" },
+        "hosts": { "type": "array", "items": { "$ref": "#/definitions/exactHost" } },
+        "tls": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "secretName": { "type": "string" },
+              "hosts": { "type": "array", "items": { "type": "string" } }
+            }
+          }
+        }
+      }
+    },
+    "httpRoute": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "annotations": { "$ref": "#/definitions/stringMap" },
+        "parentRefs": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["name"],
+            "additionalProperties": false,
+            "properties": {
+              "group": { "type": "string" },
+              "kind": { "type": "string" },
+              "name": { "type": "string", "minLength": 1 },
+              "namespace": { "type": "string" },
+              "sectionName": { "type": "string" },
+              "port": { "$ref": "#/definitions/port" }
+            }
+          }
+        },
+        "hostnames": { "type": "array", "items": { "$ref": "#/definitions/exactHost" } }
+      }
+    },
+    "persistence": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "config": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "existingClaim": { "type": "string" },
+            "storageClass": { "$ref": "#/definitions/storageClass" },
+            "accessModes": { "$ref": "#/definitions/accessModes" },
+            "size": { "$ref": "#/definitions/quantity" },
+            "retain": { "type": "boolean" }
+          }
+        },
+        "downloads": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "type": {
+              "type": "string",
+              "enum": ["emptyDir", "pvc", "existingClaim", "hostPath", "nfs"]
+            },
+            "existingClaim": { "type": "string" },
+            "storageClass": { "$ref": "#/definitions/storageClass" },
+            "accessModes": { "$ref": "#/definitions/accessModes" },
+            "size": { "$ref": "#/definitions/quantity" },
+            "hostPath": { "type": "string" },
+            "nfs": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "server": { "type": "string" },
+                "path": { "type": "string" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "extraVolumes": { "type": "array", "items": { "type": "object" } },
+    "extraVolumeMounts": { "type": "array", "items": { "type": "object" } },
+    "torrents": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "port": { "$ref": "#/definitions/port" },
+        "service": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "type": { "type": "string", "enum": ["LoadBalancer", "NodePort"] },
+            "nodePort": {
+              "oneOf": [{ "type": "null" }, { "$ref": "#/definitions/port" }]
+            },
+            "annotations": { "$ref": "#/definitions/stringMap" }
+          }
+        }
+      }
+    },
+    "encryptionKey": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "existingSecret": { "$ref": "#/definitions/secretRef" },
+        "key": { "type": "string", "minLength": 1 }
+      }
+    },
+    "bootstrapLogin": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "existingSecret": { "$ref": "#/definitions/secretRef" },
+        "usernameKey": { "type": "string", "minLength": 1 },
+        "passwordKey": { "type": "string", "minLength": 1 }
+      }
+    },
+    "database": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "existingSecret": { "$ref": "#/definitions/secretRef" },
+        "key": { "type": "string", "minLength": 1 }
+      }
+    },
+    "metrics": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "serviceMonitor": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "enabled": { "type": "boolean" },
+            "interval": { "type": "string", "pattern": "^([0-9]+(ms|s|m|h))*$" },
+            "labels": { "$ref": "#/definitions/stringMap" },
+            "apiKeySecret": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "name": { "type": "string" },
+                "key": { "type": "string", "minLength": 1 }
+              }
+            }
+          }
+        }
+      }
+    },
+    "env": {
+      "type": "object",
+      "description": "Environment variables as name: value.",
+      "propertyNames": { "pattern": "^[A-Za-z_][A-Za-z0-9_]*$" },
+      "additionalProperties": { "type": "string" }
+    },
+    "extraEnv": {
+      "type": "array",
+      "items": { "type": "object", "required": ["name"] }
+    },
+    "envFrom": { "type": "array", "items": { "type": "object" } },
+    "serviceAccount": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "create": { "type": "boolean" },
+        "name": { "type": "string" },
+        "annotations": { "$ref": "#/definitions/stringMap" }
+      }
+    },
+    "podLabels": { "$ref": "#/definitions/stringMap" },
+    "podAnnotations": { "$ref": "#/definitions/stringMap" },
+    "resources": { "type": "object" },
+    "nodeSelector": { "$ref": "#/definitions/stringMap" },
+    "tolerations": { "type": "array", "items": { "type": "object" } },
+    "affinity": { "type": "object" },
+    "priorityClassName": { "type": "string" }
+  }
+}
