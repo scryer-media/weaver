@@ -1443,25 +1443,28 @@ impl Tree {
         self.object(node)?.engine()
     }
 
-    // Whether the object at `node` places members itself beside those its
-    // run makes, as a 7z store that codes some folders does: some member of
-    // its namespace is its own, by the tree's record. It answers while the
-    // object is out on loan.
+    // Whether the object at `node` places members itself, by the tree's
+    // record: beside those its run makes, where it runs, as a 7z store that
+    // codes some folders does. Every member of an object that never runs is
+    // its own. It answers while the object is out on loan.
     pub fn places_own(&self, node: NodeId) -> bool {
         self.namespace(node)
             .is_some_and(|namespace| namespace.members().any(|member| member.own))
     }
 
     // The object's word on whether it places `member` itself, when it is in
-    // its node: an object with an engine face places what its run does not
-    // make, and any other object has no run. `None` for an object out of
-    // its node, which says nothing: only its run speaks then, and a run
-    // announces only members it makes, so the record stands as it is; a
-    // member the object placed itself was marked when the object said it,
-    // and a stale run's word does not unmark it.
+    // its node: every member a run of its engine face does not make, so
+    // every member of an object with no such face. The word does not turn
+    // on whether the face is up: an object that gains or loses it, as a RAR
+    // store does with its first and last made member, said nothing wrong of
+    // the members it placed before. `None` for an object out of its node,
+    // which says nothing: only its run speaks then, and a run announces
+    // only members it makes, so the record stands as it is; a member the
+    // object placed itself was marked when the object said it, and a stale
+    // run's word does not unmark it.
     pub(crate) fn own_word(object: Option<&dyn Object>, member: MemberId) -> Option<bool> {
         let object = object?;
-        Some(object.engine().is_some_and(|engine| !engine.makes(member)))
+        Some(object.engine().is_none_or(|engine| !engine.makes(member)))
     }
 
     // A run of the engine at `node`, from its object's present state. A

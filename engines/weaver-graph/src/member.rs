@@ -54,12 +54,12 @@ pub struct Member {
     // no answer to who owns it, now or after a restart: its bytes say
     // (`said`). Only a retraction takes it back.
     pub refuted: Option<Kind>,
-    // Its object places it itself beside the members its run makes, as
-    // that object said when it was in its node and announced it
-    // (`Tree::own_word`). False for every member of an object with no
-    // engine face and of an engine that makes every member. Not kept: a
-    // restore asks the rebuilt object again. Only a retraction takes it
-    // back.
+    // Its object places it itself, and no run of that object makes it, as
+    // the object said when it was in its node and announced it
+    // (`Tree::own_word`). False for every member of an engine that makes
+    // every member, and for one a run named while its object was out. Not
+    // kept: a restore asks the rebuilt object again. Only a retraction
+    // takes it back.
     pub own: bool,
     // How far its own articles reached, when their producer said so: past
     // what arrived where it lost bytes, short of its length where they
