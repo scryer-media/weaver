@@ -43,7 +43,7 @@ pub(crate) async fn reload_tracker_rules(ctx: &Context<'_>) -> Result<()> {
         torrents
             .reload_tracker_rules()
             .await
-            .map_err(async_graphql::Error::new)?;
+            .map_err(|error| crate::auth::graphql_error("INTERNAL", error))?;
     }
     Ok(())
 }

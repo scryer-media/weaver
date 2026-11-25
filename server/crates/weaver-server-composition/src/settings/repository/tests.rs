@@ -785,7 +785,7 @@ fn a_bound_rule_refuses_a_change_to_a_locked_field() {
             .unwrap()
             .unwrap_err();
         assert_eq!(
-            refusal,
+            refusal.to_string(),
             format!(
                 "{field} is locked by Example Tracker's tracker file; unbind the rule to change it."
             )
@@ -888,7 +888,9 @@ fn a_tracker_file_fills_and_locks_a_rules_encryption_and_transports() {
             .unwrap()
             .unwrap_err();
         assert!(
-            refusal.starts_with(&format!("{field} is locked")),
+            refusal
+                .to_string()
+                .starts_with(&format!("{field} is locked")),
             "{refusal}"
         );
     }
@@ -953,7 +955,7 @@ fn a_bound_rule_refuses_dropping_its_files_hosts() {
         .unwrap()
         .unwrap_err();
     assert_eq!(
-        refusal,
+        refusal.to_string(),
         "*.tracker.example is locked by Example Tracker's tracker file; unbind the rule to remove it."
     );
     assert_eq!(
@@ -1029,7 +1031,7 @@ fn a_rule_holds_its_name_and_patterns_alone() {
         .save_tracker_rule(None, made("ipt", &["*.other.example"]), true, true, 2)
         .unwrap()
         .unwrap_err();
-    assert_eq!(refusal, "a rule named IPT exists");
+    assert_eq!(refusal.to_string(), "a rule named IPT exists");
     let refusal = db
         .save_tracker_rule(
             None,
@@ -1040,7 +1042,7 @@ fn a_rule_holds_its_name_and_patterns_alone() {
         )
         .unwrap()
         .unwrap_err();
-    assert_eq!(refusal, "ssl.empirehost.me is covered by IPT");
+    assert_eq!(refusal.to_string(), "ssl.empirehost.me is covered by IPT");
     assert_eq!(db.list_tracker_rules().unwrap(), std::slice::from_ref(&ipt));
 
     // The rule's own name and patterns are no collision with itself.

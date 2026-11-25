@@ -20,6 +20,8 @@ pub use persistence::ProxiesPersistenceQueries;
 pub use weaver_server_net::proxies::pool_stage;
 pub use weaver_server_net::proxies::refusal;
 pub use weaver_server_net::proxies::route_health;
+pub mod route_error;
+pub use route_error::RouteError;
 pub mod routed_http;
 pub mod runtime;
 pub mod socket_ledger;

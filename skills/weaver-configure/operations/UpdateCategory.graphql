@@ -1,0 +1,13 @@
+# Write. Replaces a category's name, folder and aliases: send all three.
+# Left out, destDir is cleared and aliases become "". Torrent settings are
+# not sent and keep their value. Moves no files. Needs the operator's yes.
+# Scope: ADMIN.
+# Variables: {"id": 2, "input": {"name": "tv", "destDir": "/media/tv", "aliases": "tv*"}}
+mutation UpdateCategory($id: Int!, $input: CategoryInput!) {
+  updateCategory(id: $id, input: $input) {
+    id
+    name
+    destDir
+    aliases
+  }
+}

@@ -2111,6 +2111,7 @@ fn compress_request_body(encoding: &str, payload: &[u8]) -> Vec<u8> {
 mod graphql_handler_tests;
 mod graphql_socket_tests;
 mod nzbget_version_uses_jsonrpc;
+mod refusal_tests;
 mod renders_prometheus_metrics_for;
 mod restart_handler_tests;
 mod setup_handler_tests;
@@ -2159,12 +2160,13 @@ async fn stored_backup_create_challenges_only_expired_administrators() {
     };
     let unauthenticated = router.clone().oneshot(request(None, None)).await.unwrap();
     assert_eq!(unauthenticated.status(), StatusCode::UNAUTHORIZED);
-    assert!(
-        to_bytes(unauthenticated.into_body(), usize::MAX)
+    let payload: serde_json::Value = serde_json::from_slice(
+        &to_bytes(unauthenticated.into_body(), usize::MAX)
             .await
-            .unwrap()
-            .is_empty()
-    );
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(payload["code"], "AUTHENTICATION_REQUIRED", "{payload}");
 
     db.insert_api_key(
         "fixture-readonly",
@@ -2178,12 +2180,9 @@ async fn stored_backup_create_challenges_only_expired_administrators() {
         .await
         .unwrap();
     assert_eq!(readonly.status(), StatusCode::FORBIDDEN);
-    assert!(
-        to_bytes(readonly.into_body(), usize::MAX)
-            .await
-            .unwrap()
-            .is_empty()
-    );
+    let payload: serde_json::Value =
+        serde_json::from_slice(&to_bytes(readonly.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(payload["code"], "FORBIDDEN", "{payload}");
 
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

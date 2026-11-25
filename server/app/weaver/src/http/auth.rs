@@ -563,7 +563,11 @@ pub(super) async fn enforce_browser_csrf(
         && !matches!(explicit_api_key(request.headers()), Ok(Some(_)))
         && let Err(status) = validate_browser_csrf(&db, &security, request.headers()).await
     {
-        return super::error_response(status, "browser verification required");
+        return super::coded_error_response(
+            status,
+            super::graphql::refusal::BROWSER_VERIFICATION_REQUIRED,
+            "browser verification required",
+        );
     }
     next.run(request).await
 }
@@ -634,12 +638,22 @@ pub(super) async fn login_handler(
         let origin = match canonical_browser_origin(&headers) {
             Ok(origin) => origin,
             Err(status) => {
-                return super::error_response(status, "a single valid Origin is required");
+                return super::coded_error_response(
+                    status,
+                    "INVALID_BROWSER_REQUEST",
+                    "a single valid Origin is required",
+                );
             }
         };
         let secure = match browser_cookie_secure(&security, peer_addr, &headers, &origin) {
             Ok(secure) => secure,
-            Err(status) => return super::error_response(status, "invalid proxy protocol header"),
+            Err(status) => {
+                return super::coded_error_response(
+                    status,
+                    "INVALID_PROXY_PROTOCOL",
+                    "invalid proxy protocol header",
+                );
+            }
         };
         Some((origin, secure))
     } else {
@@ -648,13 +662,20 @@ pub(super) async fn login_handler(
     let creds = match auth_cache.snapshot() {
         Some(creds) => creds,
         None => {
-            return super::error_response(StatusCode::BAD_REQUEST, "login is not enabled");
+            return super::coded_error_response(
+                StatusCode::BAD_REQUEST,
+                "LOGIN_NOT_ENABLED",
+                "login is not enabled",
+            );
         }
     };
     let client_id = login_client_id(&security, &headers, Some(peer_addr));
 
     if login_limiter.too_many_failures(&body.username, &client_id) {
-        return super::error_response(StatusCode::TOO_MANY_REQUESTS, "too many login attempts");
+        return super::status_error_response(
+            StatusCode::TOO_MANY_REQUESTS,
+            "too many login attempts",
+        );
     }
 
     let username_matches = body.username == creds.username;
@@ -663,7 +684,7 @@ pub(super) async fn login_handler(
     let password_valid = match verify_password_bounded(password, hash).await {
         Ok(valid) => valid,
         Err(status) => {
-            return super::error_response(
+            return super::status_error_response(
                 status,
                 "Password verification is busy. Try again shortly.",
             );
@@ -672,7 +693,11 @@ pub(super) async fn login_handler(
 
     if !username_matches || !password_valid {
         login_limiter.record_failure(&body.username, &client_id);
-        return super::error_response(StatusCode::UNAUTHORIZED, "invalid credentials");
+        return super::coded_error_response(
+            StatusCode::UNAUTHORIZED,
+            "INVALID_PASSWORD",
+            "invalid credentials",
+        );
     }
 
     login_limiter.record_success(&body.username, &client_id);
@@ -701,7 +726,7 @@ pub(super) async fn login_handler(
             .and_then(Result::ok)
             .is_none()
         {
-            return super::error_response(
+            return super::status_error_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "could not create browser session",
             );
@@ -781,7 +806,11 @@ pub(super) async fn setup_handler(
     };
 
     if auth_cache.snapshot().is_some() {
-        return super::error_response(StatusCode::CONFLICT, "setup is already complete");
+        return super::coded_error_response(
+            StatusCode::CONFLICT,
+            "SETUP_COMPLETE",
+            "setup is already complete",
+        );
     }
     if security.authenticated_access_mode() {
         use super::setup_code::SetupCodeError;
@@ -1042,7 +1071,7 @@ pub(super) async fn setup_handler(
             .into_response();
     }
     if !legacy_setup_available(&security) {
-        return super::error_response(
+        return super::status_error_response(
             StatusCode::CONFLICT,
             "Login recovery requires an explicit WEAVER_RESET_LOGIN override",
         );
@@ -1053,12 +1082,22 @@ pub(super) async fn setup_handler(
         let origin = match canonical_browser_origin(&headers) {
             Ok(origin) => origin,
             Err(status) => {
-                return super::error_response(status, "a single valid Origin is required");
+                return super::coded_error_response(
+                    status,
+                    "INVALID_BROWSER_REQUEST",
+                    "a single valid Origin is required",
+                );
             }
         };
         let secure = match browser_cookie_secure(&security, peer_addr, &headers, &origin) {
             Ok(secure) => secure,
-            Err(status) => return super::error_response(status, "invalid proxy protocol header"),
+            Err(status) => {
+                return super::coded_error_response(
+                    status,
+                    "INVALID_PROXY_PROTOCOL",
+                    "invalid proxy protocol header",
+                );
+            }
         };
         Some((origin, secure))
     } else {
@@ -1072,28 +1111,30 @@ pub(super) async fn setup_handler(
     if !client_ip.is_some_and(ip_is_loopback)
         && !security.is_trusted_client(Some(peer_addr), &headers)
     {
-        return super::error_response(
+        return super::coded_error_response(
             StatusCode::FORBIDDEN,
+            "SETUP_LOCAL_ONLY",
             "setup must be completed from the machine Weaver runs on",
         );
     }
 
     let Some(mode) = AccessMode::parse_setting_value(&body.mode) else {
-        return super::error_response(StatusCode::BAD_REQUEST, "unknown access mode");
+        return super::status_error_response(StatusCode::BAD_REQUEST, "unknown access mode");
     };
     // With the trust list pinned by the environment, the wizard's only real
     // effect is creating credentials. No-login creates none and stores
     // nothing, which would complete setup as a total no-op and leave this
     // browser exactly where it started — refuse it instead of pretending.
     if security.trust_env_pinned && matches!(mode, AccessMode::NoLogin) {
-        return super::error_response(
+        return super::coded_error_response(
             StatusCode::BAD_REQUEST,
+            "ENV_PINNED",
             "WEAVER_TRUSTED_CIDRS pins the browser-access policy in this deployment's \
              environment; choose a login mode",
         );
     }
     if security.authenticated_access_mode() && matches!(mode, AccessMode::NoLogin) {
-        return super::error_response(
+        return super::status_error_response(
             StatusCode::BAD_REQUEST,
             "authenticated access requires administrator credentials",
         );
@@ -1106,19 +1147,23 @@ pub(super) async fn setup_handler(
             let username = body.username.as_deref().unwrap_or("").trim().to_string();
             let password = body.password.clone().unwrap_or_default();
             if username.is_empty() || password.is_empty() {
-                return super::error_response(
+                return super::status_error_response(
                     StatusCode::BAD_REQUEST,
                     "username and password are required for this access mode",
                 );
             }
             if let Err(error) = jwt::check_password_length(&password) {
-                return super::error_response(StatusCode::BAD_REQUEST, &error);
+                return super::coded_error_response(
+                    StatusCode::BAD_REQUEST,
+                    "INVALID_PASSWORD",
+                    &error,
+                );
             }
             Some((username, password))
         }
         AccessMode::NoLogin => {
             if body.username.is_some() || body.password.is_some() {
-                return super::error_response(
+                return super::status_error_response(
                     StatusCode::BAD_REQUEST,
                     "no-login mode does not take credentials",
                 );
@@ -1138,7 +1183,7 @@ pub(super) async fn setup_handler(
                 .filter(|entry| !entry.is_empty())
                 .collect();
             if cleaned.is_empty() {
-                return super::error_response(
+                return super::status_error_response(
                     StatusCode::BAD_REQUEST,
                     "trusted networks must not be empty for this access mode",
                 );
@@ -1157,7 +1202,11 @@ pub(super) async fn setup_handler(
         match weaver_server_core::security::parse_trusted_networks_json(&networks_json) {
             Ok(parsed) => parsed,
             Err(error) => {
-                return super::error_response(StatusCode::BAD_REQUEST, &error.to_string());
+                return super::coded_error_response(
+                    StatusCode::BAD_REQUEST,
+                    "INVALID_TRUSTED_NETWORKS",
+                    &error.to_string(),
+                );
             }
         };
 
@@ -1176,7 +1225,11 @@ pub(super) async fn setup_handler(
         Some(value) => match resolve_bind_address(None, Some(value)) {
             Ok(_) => Some(value.to_string()),
             Err(error) => {
-                return super::error_response(StatusCode::BAD_REQUEST, &error.to_string());
+                return super::coded_error_response(
+                    StatusCode::BAD_REQUEST,
+                    "INVALID_BIND_ADDRESS",
+                    &error.to_string(),
+                );
             }
         },
     };
@@ -1189,10 +1242,10 @@ pub(super) async fn setup_handler(
             match hash_result {
                 Ok(Ok(hash)) => Some((username, hash)),
                 Ok(Err(error)) => {
-                    return super::error_response(StatusCode::INTERNAL_SERVER_ERROR, &error);
+                    return super::status_error_response(StatusCode::INTERNAL_SERVER_ERROR, &error);
                 }
                 Err(error) => {
-                    return super::error_response(
+                    return super::status_error_response(
                         StatusCode::INTERNAL_SERVER_ERROR,
                         &error.to_string(),
                     );
@@ -1252,10 +1305,16 @@ pub(super) async fn setup_handler(
     let login = match write_result {
         Ok(Ok(login)) => login,
         Ok(Err(error)) => {
-            return super::error_response(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string());
+            return super::status_error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &error.to_string(),
+            );
         }
         Err(error) => {
-            return super::error_response(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string());
+            return super::status_error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &error.to_string(),
+            );
         }
     };
 
@@ -1307,7 +1366,7 @@ pub(super) async fn setup_handler(
                 .and_then(Result::ok)
                 .is_none()
             {
-                return super::error_response(
+                return super::status_error_response(
                     StatusCode::INTERNAL_SERVER_ERROR,
                     "could not create browser session",
                 );
@@ -1372,7 +1431,11 @@ pub(super) async fn logout_handler(
     headers: HeaderMap,
 ) -> Response {
     if let Err(status) = validate_browser_csrf(&db, &security, &headers).await {
-        return super::error_response(status, "browser verification required");
+        return super::coded_error_response(
+            status,
+            super::graphql::refusal::BROWSER_VERIFICATION_REQUIRED,
+            "browser verification required",
+        );
     }
     let mut revoked = true;
     if security.authenticated_access_mode()
@@ -1435,7 +1498,7 @@ pub(super) async fn require_fresh_admin(
     request_auth: &super::RequestAuthContext,
     peer: Option<SocketAddr>,
     headers: &HeaderMap,
-) -> Result<ResolvedCaller, StatusCode> {
+) -> Result<ResolvedCaller, super::Refused> {
     let caller = resolve_caller(
         &request_auth.db,
         &request_auth.auth_cache,
@@ -1445,9 +1508,10 @@ pub(super) async fn require_fresh_admin(
         BrowserSessionPolicy::TrustedPeer(peer),
         headers,
     )
-    .await?;
+    .await
+    .map_err(super::Refused::Caller)?;
     if !caller.scope.is_admin() {
-        return Err(StatusCode::FORBIDDEN);
+        return Err(super::Refused::Scope);
     }
     if !request_auth.security.authenticated_access_mode()
         || matches!(&caller.identity, CallerIdentity::ApiKey(_))
@@ -1455,10 +1519,10 @@ pub(super) async fn require_fresh_admin(
         return Ok(caller);
     }
     let Some(token) = extract_session_cookie(headers) else {
-        return Err(StatusCode::UNAUTHORIZED);
+        return Err(super::Refused::Caller(StatusCode::UNAUTHORIZED));
     };
     if caller.identity != CallerIdentity::Jwt(hash_api_key(&token)) {
-        return Err(StatusCode::UNAUTHORIZED);
+        return Err(super::Refused::Caller(StatusCode::UNAUTHORIZED));
     }
     let token_hash = hash_to_hex(hash_api_key(&token));
     let db = request_auth.db.clone();
@@ -1467,12 +1531,12 @@ pub(super) async fn require_fresh_admin(
         db.browser_session_password_verified_at(&token_hash, now)
     })
     .await
-    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
-    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    .map_err(|_| super::Refused::Caller(StatusCode::INTERNAL_SERVER_ERROR))?
+    .map_err(|_| super::Refused::Caller(StatusCode::INTERNAL_SERVER_ERROR))?;
     if verified_at
         .is_none_or(|verified_at| verified_at > now || now - verified_at >= FRESH_ADMIN_TTL_SECS)
     {
-        return Err(StatusCode::PRECONDITION_REQUIRED);
+        return Err(super::Refused::Caller(StatusCode::PRECONDITION_REQUIRED));
     }
     Ok(caller)
 }
@@ -1493,7 +1557,11 @@ pub(super) async fn verify_password_handler(
         .await
         .is_err()
     {
-        return super::error_response(StatusCode::FORBIDDEN, "browser verification required");
+        return super::coded_error_response(
+            StatusCode::FORBIDDEN,
+            super::graphql::refusal::BROWSER_VERIFICATION_REQUIRED,
+            "browser verification required",
+        );
     }
     let caller = match resolve_caller(
         &request_auth.db,
@@ -1507,17 +1575,21 @@ pub(super) async fn verify_password_handler(
     .await
     {
         Ok(caller) => caller,
-        Err(status) => return status.into_response(),
+        Err(status) => return super::refusal_response(super::Refused::Caller(status), &headers),
     };
     let CallerIdentity::Jwt(_) = caller.identity else {
-        return super::error_response(StatusCode::FORBIDDEN, "browser session required");
+        return super::coded_error_response(
+            StatusCode::FORBIDDEN,
+            super::graphql::refusal::BROWSER_VERIFICATION_REQUIRED,
+            "browser session required",
+        );
     };
     let Some(auth) = request_auth.auth_cache.snapshot() else {
-        return StatusCode::UNAUTHORIZED.into_response();
+        return super::refusal_response(super::Refused::Caller(StatusCode::UNAUTHORIZED), &headers);
     };
     let client_id = login_client_id(&request_auth.security, &headers, Some(peer_addr));
     if login_limiter.too_many_failures(&auth.username, &client_id) {
-        return super::error_response(
+        return super::status_error_response(
             StatusCode::TOO_MANY_REQUESTS,
             "too many verification attempts",
         );
@@ -1525,15 +1597,19 @@ pub(super) async fn verify_password_handler(
     let username = auth.username.clone();
     let valid = match verify_password_bounded(body.password, auth.password_hash).await {
         Ok(valid) => valid,
-        Err(status) => return status.into_response(),
+        Err(status) => return super::coded_status_response(status),
     };
     if !valid {
         login_limiter.record_failure(&username, &client_id);
-        return super::error_response(StatusCode::UNAUTHORIZED, "invalid password");
+        return super::coded_error_response(
+            StatusCode::UNAUTHORIZED,
+            "INVALID_PASSWORD",
+            "invalid password",
+        );
     }
     login_limiter.record_success(&username, &client_id);
     let Some(token) = extract_session_cookie(&headers) else {
-        return StatusCode::UNAUTHORIZED.into_response();
+        return super::refusal_response(super::Refused::Caller(StatusCode::UNAUTHORIZED), &headers);
     };
     let token_hash = hash_to_hex(hash_api_key(&token));
     let db = request_auth.db.clone();
@@ -1545,7 +1621,7 @@ pub(super) async fn verify_password_handler(
     .and_then(Result::ok)
     .is_none()
     {
-        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        return super::coded_status_response(StatusCode::INTERNAL_SERVER_ERROR);
     }
     Json(serde_json::json!({ "ok": true })).into_response()
 }
@@ -1556,8 +1632,14 @@ pub(super) async fn sign_out_all_handler(
     headers: HeaderMap,
 ) -> Response {
     let peer = peer.map(|Extension(ConnectInfo(peer))| peer);
-    if let Err(status) = require_fresh_admin(&request_auth, peer, &headers).await {
-        return super::error_response(status, "recent password verification required");
+    match require_fresh_admin(&request_auth, peer, &headers).await {
+        Ok(_) => {}
+        Err(super::Refused::Caller(
+            status @ (StatusCode::PRECONDITION_REQUIRED | StatusCode::INTERNAL_SERVER_ERROR),
+        )) => {
+            return super::status_error_response(status, "recent password verification required");
+        }
+        Err(refused) => return super::refusal_response(refused, &headers),
     }
     let db = request_auth.db.clone();
     let now = epoch_seconds();
@@ -1580,10 +1662,14 @@ pub(super) async fn csrf_handler(
     headers: HeaderMap,
 ) -> Response {
     if !security.authenticated_access_mode() {
-        return super::error_response(StatusCode::NOT_FOUND, "not available");
+        return super::status_error_response(StatusCode::NOT_FOUND, "not available");
     }
     let Some(token) = extract_session_cookie(&headers) else {
-        return super::error_response(StatusCode::UNAUTHORIZED, "authentication required");
+        return super::coded_error_response(
+            StatusCode::UNAUTHORIZED,
+            super::graphql::refusal::AUTHENTICATION_REQUIRED,
+            "authentication required",
+        );
     };
     let token_hash = hash_to_hex(hash_api_key(&token));
     let session = tokio::task::spawn_blocking(move || {
@@ -1594,20 +1680,36 @@ pub(super) async fn csrf_handler(
     .and_then(Result::ok)
     .flatten();
     let Some(session) = session else {
-        return super::error_response(StatusCode::UNAUTHORIZED, "authentication required");
+        return super::coded_error_response(
+            StatusCode::UNAUTHORIZED,
+            super::graphql::refusal::AUTHENTICATION_REQUIRED,
+            "authentication required",
+        );
     };
     if !browser_session_origin_matches(&headers, &session.origin)
         || (session.remembered && !security.remembered_client_allowed(Some(peer_addr), &headers))
     {
-        return super::error_response(StatusCode::FORBIDDEN, "browser verification required");
+        return super::coded_error_response(
+            StatusCode::FORBIDDEN,
+            super::graphql::refusal::BROWSER_VERIFICATION_REQUIRED,
+            "browser verification required",
+        );
     }
     let Some(auth) = auth_cache.snapshot() else {
-        return super::error_response(StatusCode::UNAUTHORIZED, "authentication required");
+        return super::coded_error_response(
+            StatusCode::UNAUTHORIZED,
+            super::graphql::refusal::AUTHENTICATION_REQUIRED,
+            "authentication required",
+        );
     };
     let csrf = derive_browser_csrf_token(&token, &auth.jwt_secret);
     if !weaver_server_core::auth::service::verify_browser_csrf_token(&csrf, &session.csrf_verifier)
     {
-        return super::error_response(StatusCode::UNAUTHORIZED, "sign in again");
+        return super::coded_error_response(
+            StatusCode::UNAUTHORIZED,
+            super::graphql::refusal::AUTHENTICATION_REQUIRED,
+            "sign in again",
+        );
     }
     (
         [(header::CACHE_CONTROL, "no-store")],
@@ -1725,7 +1827,9 @@ mod tests {
             require_fresh_admin(&request_auth, None, &browser_headers)
                 .await
                 .err(),
-            Some(StatusCode::PRECONDITION_REQUIRED)
+            Some(super::super::Refused::Caller(
+                StatusCode::PRECONDITION_REQUIRED
+            ))
         );
 
         let api_key = "fresh-admin-api-key";

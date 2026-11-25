@@ -28,6 +28,7 @@ use weaver_server_core::operations::instrumentation::{
 pub(crate) enum RouteLabel {
     Graphql,
     GraphqlWs,
+    Mcp,
     JsonRpc,
     XmlRpc,
     Metrics,
@@ -42,9 +43,10 @@ pub(crate) enum RouteLabel {
 }
 
 impl RouteLabel {
-    pub(crate) const ALL: [Self; 13] = [
+    pub(crate) const ALL: [Self; 14] = [
         Self::Graphql,
         Self::GraphqlWs,
+        Self::Mcp,
         Self::JsonRpc,
         Self::XmlRpc,
         Self::Metrics,
@@ -62,6 +64,7 @@ impl RouteLabel {
         match self {
             Self::Graphql => "/graphql",
             Self::GraphqlWs => "/graphql/ws",
+            Self::Mcp => "/mcp",
             Self::JsonRpc => "/jsonrpc",
             Self::XmlRpc => "/xmlrpc",
             Self::Metrics => "/metrics",
@@ -80,17 +83,18 @@ impl RouteLabel {
         match self {
             Self::Graphql => 0,
             Self::GraphqlWs => 1,
-            Self::JsonRpc => 2,
-            Self::XmlRpc => 3,
-            Self::Metrics => 4,
-            Self::JobNzb => 5,
-            Self::JobOutputFile => 6,
-            Self::Backup => 7,
-            Self::Login => 8,
-            Self::Logout => 9,
-            Self::AuthStatus => 10,
-            Self::Static => 11,
-            Self::Other => 12,
+            Self::Mcp => 2,
+            Self::JsonRpc => 3,
+            Self::XmlRpc => 4,
+            Self::Metrics => 5,
+            Self::JobNzb => 6,
+            Self::JobOutputFile => 7,
+            Self::Backup => 8,
+            Self::Login => 9,
+            Self::Logout => 10,
+            Self::AuthStatus => 11,
+            Self::Static => 12,
+            Self::Other => 13,
         }
     }
 
@@ -110,6 +114,7 @@ impl RouteLabel {
         match path {
             "/graphql" => return Self::Graphql,
             "/graphql/ws" => return Self::GraphqlWs,
+            "/mcp" => return Self::Mcp,
             "/jsonrpc" => return Self::JsonRpc,
             "/xmlrpc" => return Self::XmlRpc,
             "/metrics" => return Self::Metrics,
@@ -356,6 +361,11 @@ mod tests {
         assert_eq!(
             RouteLabel::classify("/graphql/ws", ""),
             RouteLabel::GraphqlWs
+        );
+        assert_eq!(RouteLabel::classify("/mcp", ""), RouteLabel::Mcp);
+        assert_eq!(
+            RouteLabel::classify("/weaver/mcp", "/weaver"),
+            RouteLabel::Mcp
         );
         assert_eq!(RouteLabel::classify("/jsonrpc", ""), RouteLabel::JsonRpc);
         assert_eq!(RouteLabel::classify("/xmlrpc", ""), RouteLabel::XmlRpc);

@@ -1,0 +1,82 @@
+# One job's state, outcome, archive layout, recovery and per-server article
+# counts. The job is live (queueItem) or finished (historyItem); the other is
+# null. Events come from JobEvents. Scope: READ.
+# Variables: {"jobId": 42}
+query JobDetail($jobId: Int!) {
+  jobDetailSnapshot(jobId: $jobId) {
+    jobEventCount
+    queueItem {
+      id
+      protocol
+      name
+      state
+      outcome
+      downloadState
+      postState
+      waitReason
+      downloadWaitReason
+      error
+      progressPercent
+      remainingBytes
+      failedBytes
+      health
+      hasPassword
+      attention {
+        code
+        message
+      }
+    }
+    historyItem {
+      id
+      protocol
+      name
+      state
+      outcome
+      error
+      failedBytes
+      health
+      hasPassword
+      failedForMemory
+      completedAt
+      attention {
+        code
+        message
+      }
+    }
+    serverAttribution {
+      serverId
+      articles
+      wireBytes
+    }
+    downloadSummary {
+      layout
+      nodeCount
+      maxDepth
+      nodes {
+        id
+        parentId
+        kind
+        volumes
+        depth
+        givenUp
+        reason
+        encrypted
+        passwordNeeded
+      }
+      recoveryCount
+      recovery {
+        nodeId
+        kind
+        outcome
+        setCount
+      }
+      post {
+        files
+        articles
+        missingArticles
+        failedArticles
+        groups
+      }
+    }
+  }
+}

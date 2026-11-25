@@ -2465,6 +2465,26 @@ export const SET_ACCESS_POLICY_MUTATION = gql`
   }
 `;
 
+export const MCP_SERVER_QUERY = gql`
+  query McpServer {
+    mcpServer {
+      enabled
+      storedEnabled
+      editable
+    }
+  }
+`;
+
+export const SET_MCP_ENABLED_MUTATION = gql`
+  mutation SetMcpEnabled($enabled: Boolean!) {
+    setMcpEnabled(enabled: $enabled) {
+      enabled
+      storedEnabled
+      editable
+    }
+  }
+`;
+
 export const NETWORK_ACCESS_QUERY = gql`
   query NetworkAccess {
     networkAccess {

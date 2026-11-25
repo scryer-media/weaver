@@ -35,14 +35,20 @@ impl TorrentsSubscription {
         ids: Option<Vec<u64>>,
     ) -> Result<impl Stream<Item = TorrentChangesGql>> {
         let follow = match (id, ids) {
-            (Some(_), Some(_)) => return Err("give id or ids, not both".into()),
+            (Some(_), Some(_)) => {
+                return Err(crate::auth::invalid_input("give id or ids, not both"));
+            }
             (Some(id), None) => Follow::One(JobId(id)),
             (None, Some(ids)) if ids.len() > MAX_FOLLOWED => {
-                return Err(format!("at most {MAX_FOLLOWED} ids").into());
+                return Err(crate::auth::invalid_input(format!(
+                    "at most {MAX_FOLLOWED} ids"
+                )));
             }
             (None, Some(ids)) => Follow::Some(ids.into_iter().map(JobId).collect()),
             (None, None) => {
-                return Err("give id, or ids (at most 500): every torrent is not followed".into());
+                return Err(crate::auth::invalid_input(
+                    "give id, or ids (at most 500): every torrent is not followed",
+                ));
             }
         };
         let service = service(ctx)?;

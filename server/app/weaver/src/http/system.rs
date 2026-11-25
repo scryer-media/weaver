@@ -39,12 +39,12 @@ pub(super) async fn restart_handler(
     .await
     {
         Ok(caller) => caller,
-        Err(status) => return status.into_response(),
+        Err(status) => return super::refusal_response(super::Refused::Caller(status), &headers),
     };
     // Taking the server away from everyone else is an administrator's
     // decision: a read or control key drives downloads, not the process.
     if !caller.scope.is_admin() {
-        return super::error_response(StatusCode::FORBIDDEN, "admin scope required");
+        return super::refusal_response(super::Refused::Scope, &headers);
     }
 
     // Settled here as well as in the UI: a deployment that must not exit —
@@ -56,7 +56,7 @@ pub(super) async fn restart_handler(
             .reason
             .unwrap_or_else(|| "this deployment cannot restart Weaver".to_string());
         tracing::warn!(reason, "refused a restart request");
-        return super::error_response(StatusCode::CONFLICT, &reason);
+        return super::coded_error_response(StatusCode::CONFLICT, "CONFLICT", &reason);
     }
 
     tracing::info!(

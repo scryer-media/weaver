@@ -1,0 +1,31 @@
+# Version, uptime, platform, database, memory limit, and update state.
+# Scope: READ.
+# Variables: none.
+query SystemFacts {
+  systemInfo {
+    version
+    uptimeSeconds
+    deployment
+    operatingSystem
+    architecture
+    databaseEngine
+    memory {
+      totalBytes
+      cgroupLimitBytes
+      effectiveLimitBytes
+    }
+  }
+  updateStatus {
+    currentVersion
+    latestVersion
+    updateAvailable
+    lastCheckedAtEpochMs
+    lastError
+  }
+  applicationUpgradeStatus {
+    installationKind
+    managementOwner
+    eligible
+    eligibilityReason
+  }
+}

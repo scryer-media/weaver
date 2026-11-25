@@ -667,6 +667,14 @@ impl From<UnpackedFile> for TorrentUnpackedFileGql {
     }
 }
 
+/// One page of `torrentPage`.
+#[derive(Clone, Debug, SimpleObject)]
+pub struct TorrentPage {
+    pub items: Vec<Torrent>,
+    /// The `after` that asks for the next page; null on the last page.
+    pub next_cursor: Option<String>,
+}
+
 #[derive(Clone, Debug, SimpleObject)]
 #[graphql(complex)]
 pub struct Torrent {

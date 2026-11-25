@@ -1,0 +1,25 @@
+# A test run as it stands. running=false means status and exitCode are set.
+# log is redacted of the job's secrets; still, quote only the lines that
+# matter. Null once the run is no longer kept (the last 16). Scope: ADMIN.
+# Variables: {"id": "<test run id from TestScriptJob>"}
+query ScriptTestResult($id: String!) {
+  scriptTestRun(id: $id) {
+    id
+    instanceName
+    event
+    adapter
+    running
+    status
+    exitCode
+    durationMs
+    errorMessage
+    log
+    logTruncated
+    arguments
+    commands
+    commandsTruncated
+    inputs {
+      name
+    }
+  }
+}

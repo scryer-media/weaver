@@ -23,6 +23,16 @@ pub fn backup_error_status_code(error: &BackupServiceError) -> axum::http::Statu
     }
 }
 
+// The GraphQL code of a backup failure: the same kinds the /api status names.
+pub(crate) fn backup_error(error: BackupServiceError) -> async_graphql::Error {
+    let code = match backup_error_status_code(&error) {
+        axum::http::StatusCode::CONFLICT => "CONFLICT",
+        axum::http::StatusCode::BAD_REQUEST => "INVALID_INPUT",
+        _ => "INTERNAL",
+    };
+    crate::auth::graphql_error(code, error.to_string())
+}
+
 #[derive(async_graphql::SimpleObject)]
 #[graphql(name = "BackupInfo")]
 pub struct BackupInfoGql {
@@ -119,4 +129,34 @@ pub struct AutoBackupSettingsInputGql {
     pub set_auto_backup_key: Option<String>,
     #[graphql(default)]
     pub clear_auto_backup_key: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // The GraphQL code follows the /api status of each kind; the sentence
+    // is unchanged.
+    #[test]
+    fn each_backup_failure_carries_the_code_of_its_kind() {
+        let cases = [
+            (BackupServiceError::Busy, "CONFLICT"),
+            (BackupServiceError::NotPristine, "CONFLICT"),
+            (BackupServiceError::InvalidPassword, "INVALID_INPUT"),
+            (
+                BackupServiceError::Validation("bad".into()),
+                "INVALID_INPUT",
+            ),
+            (BackupServiceError::Io("disk".into()), "INTERNAL"),
+        ];
+        for (error, code) in cases {
+            let message = error.to_string();
+            let refused = backup_error(error);
+            assert_eq!(refused.message, message);
+            assert_eq!(
+                refused.extensions.as_ref().and_then(|ext| ext.get("code")),
+                Some(&async_graphql::Value::from(code))
+            );
+        }
+    }
 }

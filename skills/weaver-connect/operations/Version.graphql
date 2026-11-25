@@ -1,0 +1,5 @@
+# Cheap connection check: the running Weaver version. The request
+# authenticates before it runs, so an answer proves the key works.
+query Version {
+  version
+}

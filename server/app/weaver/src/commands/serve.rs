@@ -87,6 +87,10 @@ pub(crate) async fn run(
         db.get_setting(weaver_server_core::security::SETTING_TRUSTED_PROXIES)?
             .as_deref(),
     );
+    security.apply_stored_mcp_enabled(
+        db.get_setting(weaver_server_core::security::SETTING_MCP_ENABLED)?
+            .as_deref(),
+    );
     if let Some(reason) = security.bind_fallback.as_deref() {
         warn!(reason, "stored bind address could not be honored");
     }
@@ -534,7 +538,7 @@ pub(crate) async fn run(
             update_check: update_check.clone(),
             application_upgrade: application_upgrade.clone(),
             schedules: shared_schedules.clone(),
-            log_buffer: log_ring_buffer,
+            log_buffer: log_ring_buffer.clone(),
             system_runtime: weaver_server_api::SystemRuntimeContext {
                 profile: Arc::clone(&system_profile),
                 started_at,
@@ -621,6 +625,7 @@ pub(crate) async fn run(
         restart: restart_controller.clone(),
         torrents: torrents.clone(),
         torrent_availability,
+        log_buffer: log_ring_buffer,
     };
     let mut server_task = tokio::spawn(http::run_server(server_runtime, listener));
     // Start-up housekeeping nothing serving a request waits on runs once the

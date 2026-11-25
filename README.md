@@ -88,6 +88,17 @@ See [Installation](https://www.scryer.media/weaver/docs/installation/) for insta
 
 Weaver exposes a **GraphQL API** at `/graphql` with full query, mutation, and subscription support. The same API powers the web UI, so anything you can do in the interface is available programmatically.
 
+## For agents
+
+An agent helping someone run Weaver should start from the operator skills in [`skills/`](skills/). Each is a folder with a `SKILL.md`, the GraphQL operations it uses, and helper scripts. Read `weaver-connect` first.
+
+| Skill | Use it to |
+|---|---|
+| [`weaver-connect`](skills/weaver-connect/SKILL.md) | Connect with an API key, over `/graphql` or the MCP endpoint at `/mcp`. Sets the rules the other skills follow. |
+| [`weaver-troubleshoot`](skills/weaver-troubleshoot/SKILL.md) | Diagnose a stuck or failed download, an unreachable server, a full disk or a torrent that will not connect. Read-only. |
+| [`weaver-configure`](skills/weaver-configure/SKILL.md) | Add or change news servers and categories. |
+| [`weaver-migrate`](skills/weaver-migrate/SKILL.md) | Move from SABnzbd, NZBGet or qBittorrent, scripts included. |
+
 ## Metrics & dashboards
 
 Weaver serves comprehensive Prometheus metrics at `/metrics` 

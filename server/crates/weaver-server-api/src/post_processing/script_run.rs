@@ -139,7 +139,7 @@ impl LiveScriptRunGql {
         {
             Ok(info) => Ok(Some(Job::from(&info))),
             Err(weaver_server_core::SchedulerError::JobNotFound(_)) => Ok(None),
-            Err(error) => Err(error.into()),
+            Err(error) => Err(crate::observability::scheduler_error(error)),
         }
     }
 }

@@ -6,7 +6,9 @@ pub use weaver_server_core::operations::{
     CategoryRemapRequirement, RestoreOptions, RestoreReport,
 };
 
-use super::types::{AutoBackupSettingsGql, AutoBackupSettingsInputGql, BackupSettingsGql};
+use super::types::{
+    AutoBackupSettingsGql, AutoBackupSettingsInputGql, BackupSettingsGql, backup_error,
+};
 use crate::auth::FreshAdminGuard;
 use async_graphql::{Context, Object, Result};
 
@@ -23,7 +25,8 @@ impl BackupMutation {
         Ok(ctx
             .data::<BackupService>()?
             .update_backup_settings(custom_backup_path)
-            .await?
+            .await
+            .map_err(backup_error)?
             .into())
     }
     #[graphql(guard = "FreshAdminGuard")]
@@ -42,15 +45,16 @@ impl BackupMutation {
                     clear_auto_backup_key: input.clear_auto_backup_key,
                 },
             )
-            .await?
+            .await
+            .map_err(backup_error)?
             .into())
     }
     #[graphql(guard = "FreshAdminGuard")]
     async fn delete_backup(&self, ctx: &Context<'_>, filename: String) -> Result<bool> {
-        Ok(ctx
-            .data::<BackupService>()?
+        ctx.data::<BackupService>()?
             .delete_backup(&filename)
-            .await?)
+            .await
+            .map_err(backup_error)
     }
     #[graphql(guard = "FreshAdminGuard")]
     async fn create_backup_download_token(
@@ -58,9 +62,9 @@ impl BackupMutation {
         ctx: &Context<'_>,
         filename: String,
     ) -> Result<String> {
-        Ok(ctx
-            .data::<BackupService>()?
+        ctx.data::<BackupService>()?
             .create_download_token(&filename)
-            .await?)
+            .await
+            .map_err(backup_error)
     }
 }

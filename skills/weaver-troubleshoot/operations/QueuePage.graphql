@@ -1,0 +1,43 @@
+# One bounded page of the live queue, usenet and torrent jobs together, with
+# counts per state of the jobs the other filters match. Scope: READ.
+# Variables: {"input": {"pageIndex": 0, "pageSize": 25}}
+# Narrow with "states": ["FAILED", "PAUSED"], "protocol": "NZB" or "TORRENT",
+# "search": "<name words>". pageIndex starts at 0; pageSize at most 500.
+query QueuePage($input: QueuePageInput!) {
+  queuePage(input: $input) {
+    totalCount
+    stateCounts {
+      state
+      count
+    }
+    items {
+      id
+      protocol
+      name
+      state
+      outcome
+      downloadState
+      postState
+      waitReason
+      downloadWaitReason
+      downloadRetryAtEpochMs
+      diskNeedBytes
+      diskFreeBytes
+      error
+      progressPercent
+      remainingBytes
+      failedBytes
+      health
+      category
+      attention {
+        code
+        message
+      }
+      diskWrite {
+        volume
+        slow
+        draining
+      }
+    }
+  }
+}

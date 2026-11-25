@@ -1,0 +1,38 @@
+# Whether the whole queue is held, and why: pause, schedule, speed test,
+# quota or slow disk; plus the queue's counts by phase. Scope: READ.
+# Variables: none.
+query QueueState {
+  globalQueueState {
+    isPaused
+    pausedClasses
+    speedLimitBytesPerSec
+    resumeAtEpochMs
+    downloadBlock {
+      kind
+      egressName
+      usedBytes
+      limitBytes
+      remainingBytes
+      windowEndsAtEpochMs
+      scheduleHoldReason
+      speedLimitInForce
+      diskVolumes {
+        label
+        slow
+        writeRateBytesPerSec
+        waitingBytes
+      }
+    }
+  }
+  queueSummary {
+    totalItems
+    queuedItems
+    activeItems
+    pausedItems
+    failedItems
+    verifyingItems
+    repairingItems
+    extractingItems
+    currentDownloadSpeed
+  }
+}

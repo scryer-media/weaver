@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
+use crate::observability::{spawn_blocking_with, state_error};
+
 use super::*;
 use crate::observability::with_timed_config_read;
 use crate::system::metrics_history::{build_metrics_history, tier_for_range};
@@ -47,16 +49,23 @@ impl SystemQuery {
         let runtime = ctx.data::<crate::context::SystemRuntimeContext>()?;
         let config = ctx.data::<SharedConfig>()?;
         let database = ctx.data::<Database>()?;
-        let storage_inputs = with_timed_config_read(config, "system.query.system_info", |cfg| {
-            configured_storage_inputs(cfg)
-        })
-        .await;
-        // Each folder is answered by the disk owner: a current reading, or a
-        // look of its own, all looked at together.
-        let storage = ctx
-            .data::<weaver_server_core::SharedPipelineState>()?
-            .storage_capacity();
-        let configured_storage = configured_storage(storage.as_deref(), storage_inputs).await;
+        // The folders are read and looked at only when the query asks for
+        // them: a look can wait on a slow disk.
+        let configured_storage = if ctx.look_ahead().field("configuredStorage").exists() {
+            let storage_inputs =
+                with_timed_config_read(config, "system.query.system_info", |cfg| {
+                    configured_storage_inputs(cfg)
+                })
+                .await;
+            // Each folder is answered by the disk owner: a current reading,
+            // or a look of its own, all looked at together.
+            let storage = ctx
+                .data::<weaver_server_core::SharedPipelineState>()?
+                .storage_capacity();
+            configured_storage(storage.as_deref(), storage_inputs).await
+        } else {
+            Vec::new()
+        };
 
         let environment = weaver_server_core::runtime::environment::detect_runtime_environment();
         let profile = runtime
@@ -239,12 +248,11 @@ impl SystemQuery {
         let period = usage_period(&range)
             .map_err(|error| graphql_error("INVALID_INPUT", error.to_string()))?;
         let db = ctx.data::<Database>()?.clone();
-        tokio::task::spawn_blocking(move || {
-            load_usage_history(&db, local_today(), period, kind.map(Into::into))
-        })
+        spawn_blocking_with(
+            move || load_usage_history(&db, local_today(), period, kind.map(Into::into)),
+            state_error,
+        )
         .await
-        .map_err(|error| graphql_error("INTERNAL", error.to_string()))?
-        .map_err(|error| graphql_error("INTERNAL", error.to_string()))
     }
     /// NZB jobs finished and repaired per day, each stage's runs and time,
     /// and, from the history of the jobs that finished in the range, the
@@ -259,10 +267,11 @@ impl SystemQuery {
         let period = usage_period(&range)
             .map_err(|error| graphql_error("INVALID_INPUT", error.to_string()))?;
         let db = ctx.data::<Database>()?.clone();
-        tokio::task::spawn_blocking(move || load_integrity_history(&db, local_today(), period))
-            .await
-            .map_err(|error| graphql_error("INTERNAL", error.to_string()))?
-            .map_err(|error| graphql_error("INTERNAL", error.to_string()))
+        spawn_blocking_with(
+            move || load_integrity_history(&db, local_today(), period),
+            state_error,
+        )
+        .await
     }
     /// Torrent data per day, all together and by tracker: from peers, to
     /// peers and seeding time; and the peers connected now.
@@ -282,10 +291,11 @@ impl SystemQuery {
             .map(|torrents| TorrentPeers::of(&torrents.metrics().published))
             .unwrap_or_default();
         let db = ctx.data::<Database>()?.clone();
-        tokio::task::spawn_blocking(move || load_torrent_history(&db, local_today(), period, peers))
-            .await
-            .map_err(|error| graphql_error("INTERNAL", error.to_string()))?
-            .map_err(|error| graphql_error("INTERNAL", error.to_string()))
+        spawn_blocking_with(
+            move || load_torrent_history(&db, local_today(), period, peers),
+            state_error,
+        )
+        .await
     }
     #[graphql(guard = "AdminGuard")]
     async fn browse_directories(
@@ -318,7 +328,7 @@ impl SystemQuery {
             )
         })
         .await
-        .map_err(|e| async_graphql::Error::new(e.to_string()))?
+        .map_err(crate::observability::join_error)?
         .map_err(|error| match error {
             weaver_server_core::operations::BrowseDirectoryError::InvalidInput(message) => {
                 graphql_error("INVALID_INPUT", message)

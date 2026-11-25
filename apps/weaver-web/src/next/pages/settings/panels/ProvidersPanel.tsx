@@ -134,12 +134,11 @@ interface ServerForm {
 }
 
 /**
- * What a save says when the provider's certificate names another host. Saving
- * probes the connection, and the probe's message is fixed English text, so the
- * editor recognises it and runs a test, whose result carries the certificate
- * to trust.
+ * The code a save answers with when the provider's certificate names another
+ * host. The editor recognises it and runs a test, whose result carries the
+ * certificate to trust.
  */
-const CERTIFICATE_NAME_MISMATCH = "certificate belongs to a different hostname";
+const TLS_NAME_MISMATCH = "TLS_NAME_MISMATCH";
 
 const NEW_SERVER: ServerForm = {
   host: "",
@@ -236,7 +235,9 @@ function serverInput(form: ServerForm) {
     host: normalizeHost(form.host),
     port: form.port,
     tls: form.tls,
-    username: form.username.trim() || null,
+    // Sent as "" when blanked: `updateServer` keeps a username it is not given
+    // and clears one it is given empty.
+    username: form.username.trim(),
     password: form.password.trim() || null,
     connections: form.connections,
     active: form.active,
@@ -320,9 +321,9 @@ export function ProvidersPanel() {
       ? servers.find((s) => s.id === editingId)
       : null;
 
-  // `updateServer` keeps a password it is not given but clears a username it is
-  // not given, so no edit may be sent from the list's copy of a row: the form
-  // is only seeded once the single-server query has returned the stored name.
+  // The form always sends a username, empty to clear it, so no edit may be
+  // sent from the list's copy of a row: the form is only seeded once the
+  // single-server query has returned the stored name.
   useEffect(() => {
     if (details && form === null) {
       setForm(formToState(details, details.username ?? ""));
@@ -430,12 +431,11 @@ export function ProvidersPanel() {
     }
     setBusy(false);
     if (result.error) {
-      const message =
-        result.error.graphQLErrors[0]?.message ?? result.error.message;
+      const code = result.error.graphQLErrors[0]?.extensions?.code;
       if (
         values.tls &&
         !values.certificateDerBase64 &&
-        message.includes(CERTIFICATE_NAME_MISMATCH)
+        code === TLS_NAME_MISMATCH
       ) {
         // Show the certificate the way a test does, so it can be trusted here.
         await runTest();

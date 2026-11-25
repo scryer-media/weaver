@@ -101,12 +101,11 @@ interface ProviderForm {
 }
 
 /**
- * What a save says when the provider's certificate names another host. Saving
- * probes the connection, and the probe's message is fixed English text, so the
- * step recognises it and runs a test, whose result carries the certificate to
- * trust.
+ * The code a save answers with when the provider's certificate names another
+ * host. The step recognises it and runs a test, whose result carries the
+ * certificate to trust.
  */
-const CERTIFICATE_NAME_MISMATCH = "certificate belongs to a different hostname";
+const TLS_NAME_MISMATCH = "TLS_NAME_MISMATCH";
 
 const NEW_PROVIDER: ProviderForm = {
   host: "",
@@ -498,7 +497,7 @@ function ProviderStep({ onContinue }: { onContinue: () => void }) {
       if (
         form.tls &&
         !form.certificate &&
-        message.includes(CERTIFICATE_NAME_MISMATCH)
+        result.error.graphQLErrors[0]?.extensions?.code === TLS_NAME_MISMATCH
       ) {
         // Show the certificate the way a test does, so it can be trusted here.
         await runTest();

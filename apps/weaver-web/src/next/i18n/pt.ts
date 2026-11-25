@@ -1286,6 +1286,9 @@ export const nextPt: LocaleDictionary = {
   "next.security.trustedNetworks": "Redes confiáveis",
   "next.security.trustedNetworksHelp":
     "Um CIDR por linha. Navegadores dentro dessas faixas pulam o login.",
+  "next.security.mcpEnabled": "Permitir o servidor MCP",
+  "next.security.mcpEnabledHelp":
+    "Permite que agentes com uma chave de API executem as operações das skills do operador em /mcp.",
   "next.security.signIn": "Login",
   "next.security.signedInAs": "conectado como {{name}}",
   "next.security.notConfigured": "não configurado",

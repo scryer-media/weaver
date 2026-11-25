@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
+use crate::observability::{spawn_blocking_with, state_error};
+
 use std::collections::HashMap;
 use std::sync::Arc;
 use weaver_server_core::tags::TagsQueries;
@@ -307,11 +309,11 @@ async fn load_duplicate_summary_infos(
         .iter()
         .map(|item| weaver_server_core::jobs::ids::JobId(item.id))
         .collect::<Vec<_>>();
-    let summaries =
-        tokio::task::spawn_blocking(move || load_duplicate_summaries_chunked(&db, job_ids))
-            .await
-            .map_err(|error| graphql_error("INTERNAL", error.to_string()))?
-            .map_err(|error| graphql_error("INTERNAL", error.to_string()))?;
+    let summaries = spawn_blocking_with(
+        move || load_duplicate_summaries_chunked(&db, job_ids),
+        state_error,
+    )
+    .await?;
     Ok(summaries
         .iter()
         .map(|(job_id, summary)| (job_id.0, DuplicateSummaryInfo::from_summary(summary)))

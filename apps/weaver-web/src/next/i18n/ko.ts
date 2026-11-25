@@ -1244,6 +1244,9 @@ export const nextKo: LocaleDictionary = {
   "next.security.trustedNetworks": "신뢰할 수 있는 네트워크",
   "next.security.trustedNetworksHelp":
     "한 줄에 CIDR 하나. 이 범위 안의 브라우저는 로그인을 건너뜁니다.",
+  "next.security.mcpEnabled": "MCP 서버 허용",
+  "next.security.mcpEnabledHelp":
+    "API 키가 있는 에이전트가 /mcp에서 운영자 스킬의 작업을 실행할 수 있게 합니다.",
   "next.security.signIn": "로그인",
   "next.security.signedInAs": "{{name}}(으)로 로그인됨",
   "next.security.notConfigured": "설정되지 않음",

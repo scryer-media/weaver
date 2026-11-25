@@ -415,6 +415,45 @@ fn detect_upload_encoding(upload: &UploadValue) -> UploadEncoding {
     }
 }
 
+// An upload past its size limit. It travels inside the I/O error it is read
+// through, so the answer can name it by type, not by its sentence.
+#[derive(Debug)]
+struct UploadTooLarge(String);
+
+impl std::fmt::Display for UploadTooLarge {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for UploadTooLarge {}
+
+fn too_large(message: String) -> Error {
+    Error::new(ErrorKind::InvalidData, UploadTooLarge(message))
+}
+
+// Whether an upload's read failed because the upload passed its limit.
+pub(crate) fn is_upload_too_large(error: &Error) -> bool {
+    error
+        .get_ref()
+        .is_some_and(|inner| inner.is::<UploadTooLarge>())
+}
+
+// An upload refused, worded as it stands: past its size limit it is too
+// large, a failure to keep it or a pipeline answer keeps its own code, and
+// anything else is bad input.
+pub(crate) fn upload_refusal(error: SubmitNzbError) -> async_graphql::Error {
+    let code = match &error {
+        SubmitNzbError::Upload(io) if is_upload_too_large(io) => "UPLOAD_TOO_LARGE",
+        SubmitNzbError::Save(_) => "INTERNAL",
+        SubmitNzbError::Fetch(_) => "FETCH_FAILED",
+        SubmitNzbError::State(state) => crate::observability::state_code(state),
+        SubmitNzbError::Scheduler(scheduler) => crate::observability::scheduler_code(scheduler),
+        _ => "INVALID_INPUT",
+    };
+    crate::auth::graphql_error(code, error.to_string())
+}
+
 struct LimitedReader<R> {
     inner: R,
     remaining: u64,
@@ -443,10 +482,10 @@ impl<R: Read> Read for LimitedReader<R> {
             .min(buf.len());
         let read = self.inner.read(&mut buf[..cap])?;
         if read as u64 > self.remaining {
-            return Err(Error::new(
-                ErrorKind::InvalidData,
-                format!("{} exceeds {} bytes", self.label, self.limit),
-            ));
+            return Err(too_large(format!(
+                "{} exceeds {} bytes",
+                self.label, self.limit
+            )));
         }
         self.remaining -= read as u64;
         Ok(read)
@@ -505,10 +544,9 @@ pub(crate) fn inline_nzb_base64_fits(encoded_len: usize) -> Result<(), SubmitNzb
     if base64_len_within(encoded_len, limit) {
         return Ok(());
     }
-    Err(SubmitNzbError::Upload(Error::new(
-        ErrorKind::InvalidData,
-        format!("NZB upload exceeds {limit} bytes"),
-    )))
+    Err(SubmitNzbError::Upload(too_large(format!(
+        "NZB upload exceeds {limit} bytes"
+    ))))
 }
 
 // Padded base64 spends four characters on every three bytes.
@@ -522,10 +560,10 @@ fn base64_len_within(encoded_len: usize, limit: u64) -> bool {
 pub(crate) fn read_inline_nzb_bytes(bytes: Vec<u8>) -> Result<Vec<u8>, SubmitNzbError> {
     let limits = RuntimeSecurityConfig::from_env_or_default_for_tests();
     if bytes.len() as u64 > limits.nzb_upload_limit_bytes {
-        return Err(SubmitNzbError::Upload(Error::new(
-            ErrorKind::InvalidData,
-            format!("NZB upload exceeds {} bytes", limits.nzb_upload_limit_bytes),
-        )));
+        return Err(SubmitNzbError::Upload(too_large(format!(
+            "NZB upload exceeds {} bytes",
+            limits.nzb_upload_limit_bytes
+        ))));
     }
     let encoding = encoding_from_magic(&bytes);
     let source = Cursor::new(bytes);
@@ -561,6 +599,51 @@ mod tests {
     use std::io::Write;
 
     use lzma_turbo::{LzmaEncProps, XzWriter};
+
+    fn code_of(error: &async_graphql::Error) -> Option<async_graphql::Value> {
+        error
+            .extensions
+            .as_ref()
+            .and_then(|ext| ext.get("code"))
+            .cloned()
+    }
+
+    // An upload past its limit is too large; a failure to keep it is a fault;
+    // anything else is bad input. Each keeps its sentence.
+    #[test]
+    fn each_upload_refusal_carries_the_code_of_its_kind() {
+        let too_large = inline_nzb_base64_fits(usize::MAX).unwrap_err();
+        let message = too_large.to_string();
+        let refused = upload_refusal(too_large);
+        assert_eq!(refused.message, message);
+        assert_eq!(
+            code_of(&refused),
+            Some(async_graphql::Value::from("UPLOAD_TOO_LARGE"))
+        );
+
+        let cases = [
+            (SubmitNzbError::Empty, "INVALID_INPUT"),
+            (SubmitNzbError::NotXml, "INVALID_INPUT"),
+            (
+                SubmitNzbError::Upload(std::io::Error::other("truncated")),
+                "INVALID_INPUT",
+            ),
+            (
+                SubmitNzbError::Save(std::io::Error::other("disk gone")),
+                "INTERNAL",
+            ),
+            (
+                SubmitNzbError::Fetch("connection refused".into()),
+                "FETCH_FAILED",
+            ),
+        ];
+        for (error, code) in cases {
+            let message = error.to_string();
+            let refused = upload_refusal(error);
+            assert_eq!(refused.message, message);
+            assert_eq!(code_of(&refused), Some(async_graphql::Value::from(code)));
+        }
+    }
 
     #[test]
     fn inline_base64_bound_matches_the_decoded_limit() {

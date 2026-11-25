@@ -1,0 +1,10 @@
+# Every category: name, own folder and aliases. Scope: ADMIN.
+# Variables: none.
+query ListCategories {
+  categories {
+    id
+    name
+    destDir
+    aliases
+  }
+}

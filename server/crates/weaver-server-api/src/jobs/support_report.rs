@@ -17,7 +17,8 @@ use weaver_server_core::{Database, SchedulerHandle};
 
 use crate::auth::graphql_error;
 use crate::jobs::staging::{
-    inline_nzb_base64_fits, normalize_uploaded_nzb_reader, read_inline_nzb_bytes,
+    inline_nzb_base64_fits, is_upload_too_large, normalize_uploaded_nzb_reader,
+    read_inline_nzb_bytes, upload_refusal,
 };
 
 /// A report safe to paste in public: no names, paths, hosts or passwords.
@@ -66,9 +67,10 @@ fn report_error(error: SupportReportError) -> async_graphql::Error {
         SupportReportError::Parse(_) | SupportReportError::TorrentParse(_) => {
             graphql_error("INVALID_INPUT", error.to_string())
         }
-        SupportReportError::State(_) | SupportReportError::Task(_) => {
-            graphql_error("INTERNAL", error.to_string())
+        SupportReportError::State(ref state) => {
+            graphql_error(crate::observability::state_code(state), error.to_string())
         }
+        SupportReportError::Task(_) => graphql_error("INTERNAL", error.to_string()),
     }
 }
 
@@ -99,8 +101,7 @@ pub(crate) async fn resolve_analyze_nzb(
         }
         (None, Some(encoded)) => {
             let encoded = encoded.trim();
-            inline_nzb_base64_fits(encoded.len())
-                .map_err(|e| graphql_error("INVALID_INPUT", e.to_string()))?;
+            inline_nzb_base64_fits(encoded.len()).map_err(upload_refusal)?;
             Source::Inline(
                 base64::engine::general_purpose::STANDARD
                     .decode(encoded)
@@ -118,16 +119,19 @@ pub(crate) async fn resolve_analyze_nzb(
     tokio::task::spawn_blocking(move || {
         let xml = match source {
             Source::Upload(upload) => {
-                let mut reader = normalize_uploaded_nzb_reader(upload)
-                    .map_err(|e| graphql_error("INVALID_INPUT", e.to_string()))?;
+                let mut reader = normalize_uploaded_nzb_reader(upload).map_err(upload_refusal)?;
                 let mut xml = Vec::new();
-                reader
-                    .read_to_end(&mut xml)
-                    .map_err(|e| graphql_error("INVALID_INPUT", format!("invalid upload: {e}")))?;
+                reader.read_to_end(&mut xml).map_err(|e| {
+                    let code = if is_upload_too_large(&e) {
+                        "UPLOAD_TOO_LARGE"
+                    } else {
+                        "INVALID_INPUT"
+                    };
+                    graphql_error(code, format!("invalid upload: {e}"))
+                })?;
                 xml
             }
-            Source::Inline(bytes) => read_inline_nzb_bytes(bytes)
-                .map_err(|e| graphql_error("INVALID_INPUT", e.to_string()))?,
+            Source::Inline(bytes) => read_inline_nzb_bytes(bytes).map_err(upload_refusal)?,
         };
         analyze_nzb_bytes(&xml, &environment, now_epoch_secs())
             .map(SupportReport::from)

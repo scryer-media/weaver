@@ -1309,6 +1309,9 @@ export const nextDe: LocaleDictionary = {
   "next.security.trustedNetworks": "Vertrauenswürdige Netze",
   "next.security.trustedNetworksHelp":
     "Ein CIDR pro Zeile. Browser in diesen Bereichen überspringen die Anmeldung.",
+  "next.security.mcpEnabled": "MCP-Server erlauben",
+  "next.security.mcpEnabledHelp":
+    "Lässt Agenten mit einem API-Schlüssel die Operationen der Betreiber-Skills über /mcp ausführen.",
   "next.security.signIn": "Anmeldung",
   "next.security.signedInAs": "angemeldet als {{name}}",
   "next.security.notConfigured": "nicht eingerichtet",
