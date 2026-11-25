@@ -79,11 +79,6 @@ impl RootJob for Prepared {
         true
     }
 
-    // One namespace, bound in nothing.
-    fn vouched_above(&self, _: NodeId) -> bool {
-        false
-    }
-
     fn repair(&mut self) -> Vec<RepairOutcome> {
         let outcomes = self.outcomes.get(self.repairs).cloned().unwrap_or_default();
         self.repairs += 1;

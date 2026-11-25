@@ -12,7 +12,7 @@
 use super::{Builder, Effect, NodeId, Tree};
 use crate::member::MemberId;
 use crate::object::{Beside, Standing};
-use crate::recovery::{RepairOutcome, SliceVerdict};
+use crate::recovery::RepairOutcome;
 use crate::volume::{ByteRange, VolumeIndex};
 
 impl Tree {
@@ -149,49 +149,6 @@ impl Tree {
             at = parent;
         }
         false
-    }
-
-    // A checking set below the root whose every disagreement is with an
-    // archive volume whose object delivered every member whole against the
-    // CRC its own headers state: the archive's checks answered the claim,
-    // and the set makes none. A set that disagrees with an end file, with a
-    // volume of an object that delivered any member short or unchecked, or
-    // with nothing it can name keeps its claim.
-    pub fn answered_below(&self, node: NodeId, set: NodeId) -> bool {
-        if node == NodeId::ROOT {
-            return false;
-        }
-        let (Some(namespace), Some(recovery)) = (self.namespace(node), self.recovery(set)) else {
-            return false;
-        };
-        let mut verdicts = Vec::new();
-        let mut disputed = namespace.members().filter(|member| {
-            if !recovery.covers(member.id) {
-                return false;
-            }
-            verdicts.clear();
-            recovery.verdicts(member.id, &mut verdicts);
-            verdicts.contains(&SliceVerdict::Damaged)
-        });
-        let mut any = false;
-        disputed.all(|member| {
-            any = true;
-            self.whole_below(node, member.id)
-        }) && any
-    }
-
-    // What the member of the namespace at `node` was read as stands whole
-    // below it: an object came out of it, and every member that object
-    // delivered is whole against the CRC its own headers state.
-    pub fn whole_below(&self, node: NodeId, member: MemberId) -> bool {
-        self.child_of(node, member)
-            .and_then(|(child, _)| self.namespace(child))
-            .is_some_and(|below| {
-                !below.is_empty()
-                    && below
-                        .members()
-                        .all(|member| member.is_whole() && member.crc32.is_some())
-            })
     }
 
     // The member's damaged ranges past what every recovery object that

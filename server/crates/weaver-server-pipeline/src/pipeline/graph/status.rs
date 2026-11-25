@@ -60,15 +60,6 @@ pub trait RootJob {
     fn recovery_summary(&self) -> RecoverySummary;
     // Whether the recovery object at `set` covers `member` of its namespace.
     fn covers(&self, set: NodeId, member: MemberId) -> bool;
-    // What the namespace `node` came out of, at some depth, a recovery set
-    // proved (`Tree::vouched_above`). Never the root.
-    fn vouched_above(&self, node: NodeId) -> bool;
-    // Every disagreement of the checking set `set`, below the root at
-    // `node`, is with an archive volume whose object delivered every member
-    // whole against its own CRC (`Tree::answered_below`).
-    fn answered_below(&self, _node: NodeId, _set: NodeId) -> bool {
-        false
-    }
     // Run every recovery object of the root namespace.
     fn repair(&mut self) -> Vec<RepairOutcome>;
     // An object below the root produced members.
@@ -127,14 +118,6 @@ impl RootJob for GraphJob {
         self.tree()
             .recovery(set)
             .is_some_and(|recovery| recovery.covers(member))
-    }
-
-    fn vouched_above(&self, node: NodeId) -> bool {
-        self.tree().vouched_above(node)
-    }
-
-    fn answered_below(&self, node: NodeId, set: NodeId) -> bool {
-        self.tree().answered_below(node, set)
     }
 
     fn repair(&mut self) -> Vec<RepairOutcome> {
@@ -303,10 +286,7 @@ pub fn failure(
         .iter()
         .filter_map(|(set, outcome)| match outcome {
             RepairOutcome::Impossible { damaged, reachable }
-                if !excused(set)
-                    && !(set.kind == Kind::Sfv
-                        && (job.vouched_above(set.namespace)
-                            || job.answered_below(set.namespace, set.node))) =>
+                if !excused(set) =>
             {
                 Some((*set, *damaged, *reachable))
             }
