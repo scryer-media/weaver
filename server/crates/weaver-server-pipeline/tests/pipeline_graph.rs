@@ -112,7 +112,6 @@ pub(crate) mod pipeline {
             mod late_made_tests;
             mod loan_tests;
             mod quiet_face_tests;
-            mod relaid_again_tests;
             mod verification_tests;
         }
         pub(crate) mod leaf {

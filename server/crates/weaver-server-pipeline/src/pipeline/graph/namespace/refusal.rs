@@ -99,9 +99,6 @@ impl NamespaceWriter {
         while let Some(effect) = batch.effects.pop_front() {
             if gave_up && gives_up(&effect) {
                 batch.effects.push_front(effect);
-                // A pass applies outside any batch of the loop's: what it
-                // retracted is read no further than the pass.
-                self.retracted_end(Some(0));
                 return Ok(false);
             }
             gave_up |= gives_up(&effect);
@@ -120,7 +117,6 @@ impl NamespaceWriter {
         self.reached_now.extend(end.reached.iter().copied());
         let finished = self.finish_batch(tree, builder, segments, end, &mut batch.out);
         self.reached_now.truncate(depth);
-        self.retracted_end(Some(0));
         finished?;
         self.release_held(tree, builder, segments, &mut batch.out)?;
         Ok(true)

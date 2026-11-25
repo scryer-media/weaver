@@ -442,14 +442,10 @@ pub enum Effect {
         at: u64,
     },
     // A member and everything under it was retracted; the owner drops the
-    // files it wrote for that subtree. `written` is what of a member no
-    // object read had arrived in its file: the bytes the object placed
-    // there, which a request of the same say to have its volumes said
-    // again reads back before the file goes. Empty for a bound member.
+    // files it wrote for that subtree.
     Retracted {
         node: NodeId,
         member: MemberId,
-        written: Coverage,
     },
     // The object at `node` wants a password.
     NeedsPassword {
@@ -5243,20 +5239,6 @@ impl Tree {
     // is dropped with its subtree, and the member is a fresh, undecided
     // member again.
     fn retract(&mut self, node: NodeId, member: MemberId, effects: &mut Vec<Effect>) {
-        // What the member's own file holds, taken before the member starts
-        // over: a member bound to an object holds its bytes there instead.
-        let written = match self
-            .nodes
-            .get(&node)
-            .is_some_and(|found| found.children.contains_key(&member))
-        {
-            true => Coverage::default(),
-            false => self
-                .namespace_mut(node)
-                .and_then(|namespace| namespace.get_mut(member))
-                .map(|record| std::mem::take(&mut record.coverage))
-                .unwrap_or_default(),
-        };
         if let Some((child, _)) = self
             .nodes
             .get(&node)
@@ -5291,11 +5273,7 @@ impl Tree {
         if let Some(found) = self.nodes.get_mut(&node) {
             found.close_windows(member);
         }
-        effects.push(Effect::Retracted {
-            node,
-            member,
-            written,
-        });
+        effects.push(Effect::Retracted { node, member });
     }
 
     // The object at `node` gives its members up: every volume it owned
@@ -8313,16 +8291,12 @@ mod tests {
             &mut Build,
             &mut effects,
         );
-        assert!(
-            matches!(
-                effects.as_slice(),
-                [Effect::Retracted {
-                    node,
-                    member: MemberId(0),
-                    ..
-                }] if *node == child
-            ),
-            "{effects:?}"
+        assert_eq!(
+            effects,
+            vec![Effect::Retracted {
+                node: child,
+                member: MemberId(0)
+            }]
         );
         let inner = tree.namespace(child).unwrap().get(MemberId(0)).unwrap();
         assert_eq!(inner.coverage.bytes_covered(), 0);
