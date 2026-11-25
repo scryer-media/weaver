@@ -90,13 +90,15 @@ async fn read_and_control_keys_and_anonymous_callers_may_not() {
         ("control-key", "control", StatusCode::FORBIDDEN),
     ] {
         let app = restart_test_router(controller.clone(), api_key_cache(raw_key, scope));
-        let (status, _) = post_restart(app, ("x-api-key", raw_key)).await;
+        let (status, payload) = post_restart(app, ("x-api-key", raw_key)).await;
         assert_eq!(status, expected, "{scope}");
+        assert_eq!(payload["code"], "FORBIDDEN", "{scope}");
     }
 
     let app = restart_test_router(controller.clone(), ApiKeyCache::default());
-    let (status, _) = post_restart(app, ("x-api-key", "unknown-key")).await;
+    let (status, payload) = post_restart(app, ("x-api-key", "unknown-key")).await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(payload["code"], "INVALID_API_KEY");
 
     assert!(
         tokio::time::timeout(NOT_REQUESTED_WINDOW, controller.requested())

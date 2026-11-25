@@ -31,7 +31,7 @@ async fn require_read(
     security: &RuntimeSecurityConfig,
     peer: Option<SocketAddr>,
     headers: &HeaderMap,
-) -> Result<(), StatusCode> {
+) -> Result<(), super::Refused> {
     let scope = super::auth::resolve_scope(
         db,
         auth_cache,
@@ -41,11 +41,12 @@ async fn require_read(
         super::auth::BrowserSessionPolicy::TrustedPeer(peer),
         headers,
     )
-    .await?;
+    .await
+    .map_err(super::Refused::Caller)?;
     if scope.can_read() {
         Ok(())
     } else {
-        Err(StatusCode::FORBIDDEN)
+        Err(super::Refused::Scope)
     }
 }
 
@@ -66,7 +67,7 @@ pub(super) async fn job_nzb_download_handler(
     peer: Option<Extension<ConnectInfo<SocketAddr>>>,
     headers: HeaderMap,
 ) -> Response {
-    if let Err(status) = require_read(
+    if let Err(refused) = require_read(
         &request_auth.db,
         &request_auth.auth_cache,
         &request_auth.api_key_cache,
@@ -77,7 +78,7 @@ pub(super) async fn job_nzb_download_handler(
     )
     .await
     {
-        return status.into_response();
+        return super::refusal_response(refused, &headers);
     }
 
     let job = match load_job_nzb_download(&request_auth.db, &handle, job_id).await {
@@ -140,7 +141,7 @@ async fn job_output_file_download(
     headers: HeaderMap,
     request: JobOutputFileDownloadRequest,
 ) -> Response {
-    if let Err(status) = require_read(
+    if let Err(refused) = require_read(
         &request_auth.db,
         &request_auth.auth_cache,
         &request_auth.api_key_cache,
@@ -151,7 +152,7 @@ async fn job_output_file_download(
     )
     .await
     {
-        return status.into_response();
+        return super::refusal_response(refused, &headers);
     }
 
     let output_dir = match load_job_output_dir(&request_auth.db, &handle, job_id).await {

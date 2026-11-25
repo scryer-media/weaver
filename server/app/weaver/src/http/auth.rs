@@ -1435,7 +1435,7 @@ pub(super) async fn require_fresh_admin(
     request_auth: &super::RequestAuthContext,
     peer: Option<SocketAddr>,
     headers: &HeaderMap,
-) -> Result<ResolvedCaller, StatusCode> {
+) -> Result<ResolvedCaller, super::Refused> {
     let caller = resolve_caller(
         &request_auth.db,
         &request_auth.auth_cache,
@@ -1445,9 +1445,10 @@ pub(super) async fn require_fresh_admin(
         BrowserSessionPolicy::TrustedPeer(peer),
         headers,
     )
-    .await?;
+    .await
+    .map_err(super::Refused::Caller)?;
     if !caller.scope.is_admin() {
-        return Err(StatusCode::FORBIDDEN);
+        return Err(super::Refused::Scope);
     }
     if !request_auth.security.authenticated_access_mode()
         || matches!(&caller.identity, CallerIdentity::ApiKey(_))
@@ -1455,10 +1456,10 @@ pub(super) async fn require_fresh_admin(
         return Ok(caller);
     }
     let Some(token) = extract_session_cookie(headers) else {
-        return Err(StatusCode::UNAUTHORIZED);
+        return Err(super::Refused::Caller(StatusCode::UNAUTHORIZED));
     };
     if caller.identity != CallerIdentity::Jwt(hash_api_key(&token)) {
-        return Err(StatusCode::UNAUTHORIZED);
+        return Err(super::Refused::Caller(StatusCode::UNAUTHORIZED));
     }
     let token_hash = hash_to_hex(hash_api_key(&token));
     let db = request_auth.db.clone();
@@ -1467,12 +1468,12 @@ pub(super) async fn require_fresh_admin(
         db.browser_session_password_verified_at(&token_hash, now)
     })
     .await
-    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
-    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    .map_err(|_| super::Refused::Caller(StatusCode::INTERNAL_SERVER_ERROR))?
+    .map_err(|_| super::Refused::Caller(StatusCode::INTERNAL_SERVER_ERROR))?;
     if verified_at
         .is_none_or(|verified_at| verified_at > now || now - verified_at >= FRESH_ADMIN_TTL_SECS)
     {
-        return Err(StatusCode::PRECONDITION_REQUIRED);
+        return Err(super::Refused::Caller(StatusCode::PRECONDITION_REQUIRED));
     }
     Ok(caller)
 }
@@ -1507,13 +1508,13 @@ pub(super) async fn verify_password_handler(
     .await
     {
         Ok(caller) => caller,
-        Err(status) => return status.into_response(),
+        Err(status) => return super::refusal_response(super::Refused::Caller(status), &headers),
     };
     let CallerIdentity::Jwt(_) = caller.identity else {
         return super::error_response(StatusCode::FORBIDDEN, "browser session required");
     };
     let Some(auth) = request_auth.auth_cache.snapshot() else {
-        return StatusCode::UNAUTHORIZED.into_response();
+        return super::refusal_response(super::Refused::Caller(StatusCode::UNAUTHORIZED), &headers);
     };
     let client_id = login_client_id(&request_auth.security, &headers, Some(peer_addr));
     if login_limiter.too_many_failures(&auth.username, &client_id) {
@@ -1533,7 +1534,7 @@ pub(super) async fn verify_password_handler(
     }
     login_limiter.record_success(&username, &client_id);
     let Some(token) = extract_session_cookie(&headers) else {
-        return StatusCode::UNAUTHORIZED.into_response();
+        return super::refusal_response(super::Refused::Caller(StatusCode::UNAUTHORIZED), &headers);
     };
     let token_hash = hash_to_hex(hash_api_key(&token));
     let db = request_auth.db.clone();
@@ -1556,8 +1557,14 @@ pub(super) async fn sign_out_all_handler(
     headers: HeaderMap,
 ) -> Response {
     let peer = peer.map(|Extension(ConnectInfo(peer))| peer);
-    if let Err(status) = require_fresh_admin(&request_auth, peer, &headers).await {
-        return super::error_response(status, "recent password verification required");
+    match require_fresh_admin(&request_auth, peer, &headers).await {
+        Ok(_) => {}
+        Err(super::Refused::Caller(
+            status @ (StatusCode::PRECONDITION_REQUIRED | StatusCode::INTERNAL_SERVER_ERROR),
+        )) => {
+            return super::error_response(status, "recent password verification required");
+        }
+        Err(refused) => return super::refusal_response(refused, &headers),
     }
     let db = request_auth.db.clone();
     let now = epoch_seconds();
@@ -1725,7 +1732,9 @@ mod tests {
             require_fresh_admin(&request_auth, None, &browser_headers)
                 .await
                 .err(),
-            Some(StatusCode::PRECONDITION_REQUIRED)
+            Some(super::super::Refused::Caller(
+                StatusCode::PRECONDITION_REQUIRED
+            ))
         );
 
         let api_key = "fresh-admin-api-key";

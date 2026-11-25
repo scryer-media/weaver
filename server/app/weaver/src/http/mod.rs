@@ -21,7 +21,7 @@ mod upgrade_splash;
 use std::sync::Arc;
 
 use axum::Json;
-use axum::http::{HeaderValue, Method, Response as HttpResponse, StatusCode, header};
+use axum::http::{HeaderMap, HeaderValue, Method, Response as HttpResponse, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use tower_http::compression::{
     CompressionLayer,
@@ -127,6 +127,49 @@ fn coded_error_response(status: StatusCode, code: &str, message: &str) -> Respon
         Json(serde_json::json!({ "code": code, "error": message })),
     )
         .into_response()
+}
+
+// Why a request was refused before its handler did any work.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Refused {
+    // The caller check's answer: 401, or 403 for a browser session that
+    // failed its origin or CSRF binding. Any other status (a storage
+    // failure, a password check that is due) is no refusal of the caller.
+    Caller(StatusCode),
+    // The caller is known, and its scope does not allow the request.
+    Scope,
+}
+
+// A refusal with the coded body, its status unchanged: `INVALID_API_KEY` for
+// a 401 when an API key came with the request, `AUTHENTICATION_REQUIRED` for
+// any other 401, `BROWSER_VERIFICATION_REQUIRED` for a caller's 403, and
+// `FORBIDDEN` for a scope. A status that is no refusal keeps its bare
+// response.
+fn refusal_response(refused: Refused, headers: &HeaderMap) -> Response {
+    use graphql::refusal;
+    match refused {
+        Refused::Caller(status @ StatusCode::UNAUTHORIZED)
+            if headers.contains_key(header::AUTHORIZATION) || headers.contains_key("x-api-key") =>
+        {
+            coded_error_response(status, refusal::INVALID_API_KEY, "invalid API key")
+        }
+        Refused::Caller(status @ StatusCode::UNAUTHORIZED) => coded_error_response(
+            status,
+            refusal::AUTHENTICATION_REQUIRED,
+            "authentication required",
+        ),
+        Refused::Caller(status @ StatusCode::FORBIDDEN) => coded_error_response(
+            status,
+            refusal::BROWSER_VERIFICATION_REQUIRED,
+            "browser verification required",
+        ),
+        Refused::Caller(other) => other.into_response(),
+        Refused::Scope => coded_error_response(
+            StatusCode::FORBIDDEN,
+            refusal::FORBIDDEN,
+            "this API key's scope does not allow this request",
+        ),
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default)]

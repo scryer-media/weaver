@@ -333,6 +333,10 @@ pub(super) mod refusal {
     // 403: a browser session came with the request but failed its origin or
     // CSRF binding.
     pub(in crate::http) const BROWSER_VERIFICATION_REQUIRED: &str = "BROWSER_VERIFICATION_REQUIRED";
+    // 403: the caller is known, and its scope does not allow the request.
+    // Sent by the `/api` handlers; the same code GraphQL's scope guards
+    // put in `extensions.code`.
+    pub(in crate::http) const FORBIDDEN: &str = "FORBIDDEN";
     // 413: an authenticated request's body is larger than the endpoint takes,
     // by its declared length or by the bytes that arrived.
     pub(in crate::http) const REQUEST_TOO_LARGE: &str = "REQUEST_TOO_LARGE";
@@ -389,6 +393,7 @@ pub(super) mod refusal {
         INVALID_API_KEY,
         AUTHENTICATION_REQUIRED,
         BROWSER_VERIFICATION_REQUIRED,
+        FORBIDDEN,
         REQUEST_TOO_LARGE,
         MCP_DISABLED,
         MCP_ORIGIN_NOT_ALLOWED,
@@ -410,30 +415,6 @@ pub(super) mod refusal {
         MCP_ADMIN_REQUIRED,
         MCP_LOG_PATTERN_INVALID,
     ];
-}
-
-// The body for an authentication or browser-binding refusal. Only the body
-// changes: the status is the one the auth check chose, and any status that is
-// not a refusal (a storage failure, say) keeps its bare response.
-fn auth_refusal_response(status: StatusCode, headers: &HeaderMap) -> axum::response::Response {
-    match status {
-        StatusCode::UNAUTHORIZED
-            if headers.contains_key(header::AUTHORIZATION) || headers.contains_key("x-api-key") =>
-        {
-            super::coded_error_response(status, refusal::INVALID_API_KEY, "invalid API key")
-        }
-        StatusCode::UNAUTHORIZED => super::coded_error_response(
-            status,
-            refusal::AUTHENTICATION_REQUIRED,
-            "authentication required",
-        ),
-        StatusCode::FORBIDDEN => super::coded_error_response(
-            status,
-            refusal::BROWSER_VERIFICATION_REQUIRED,
-            "browser verification required",
-        ),
-        other => other.into_response(),
-    }
 }
 
 // Room in a request body for the JSON or multipart framing around its largest
@@ -539,7 +520,7 @@ pub(super) async fn graphql_handler(
             &headers,
         )
         .await
-        .map_err(|status| auth_refusal_response(status, &headers))?,
+        .map_err(|status| super::refusal_response(super::Refused::Caller(status), &headers))?,
     };
     if !matches!(
         resolved.identity,
@@ -548,7 +529,7 @@ pub(super) async fn graphql_handler(
     ) {
         super::auth::validate_browser_csrf(&request_auth.db, &request_auth.security, &headers)
             .await
-            .map_err(|status| auth_refusal_response(status, &headers))?;
+            .map_err(|status| super::refusal_response(super::Refused::Caller(status), &headers))?;
     }
     let mut request = read_request(&headers, body, body_limit(&request_auth.security)).await?;
     request = request

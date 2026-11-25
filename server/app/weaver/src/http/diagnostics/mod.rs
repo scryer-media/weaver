@@ -139,6 +139,30 @@ struct HostFacts {
     storage: Vec<HostStorage>,
 }
 
+// The caller a package is built for, or the coded refusal: a package holds
+// the whole server's state, so only an administrator may take one.
+pub(super) async fn admin_caller(
+    request_auth: &super::RequestAuthContext,
+    peer: Option<SocketAddr>,
+    headers: &HeaderMap,
+) -> Result<super::auth::ResolvedCaller, Response> {
+    let caller = super::auth::resolve_caller(
+        &request_auth.db,
+        &request_auth.auth_cache,
+        &request_auth.api_key_cache,
+        request_auth.session_token.0.as_str(),
+        &request_auth.security,
+        super::auth::BrowserSessionPolicy::TrustedPeer(peer),
+        headers,
+    )
+    .await
+    .map_err(|status| super::refusal_response(super::Refused::Caller(status), headers))?;
+    if !caller.scope.is_admin() {
+        return Err(super::refusal_response(super::Refused::Scope, headers));
+    }
+    Ok(caller)
+}
+
 #[allow(
     clippy::too_many_arguments,
     reason = "axum extractors: each runtime surface the package collects arrives as its own layer"
@@ -154,25 +178,16 @@ pub(super) async fn diagnostics_package_handler(
     peer: Option<Extension<ConnectInfo<SocketAddr>>>,
     headers: HeaderMap,
 ) -> Response {
-    let caller = match super::auth::resolve_caller(
-        &request_auth.db,
-        &request_auth.auth_cache,
-        &request_auth.api_key_cache,
-        request_auth.session_token.0.as_str(),
-        &request_auth.security,
-        super::auth::BrowserSessionPolicy::TrustedPeer(
-            peer.map(|Extension(ConnectInfo(peer))| peer),
-        ),
+    let caller = match admin_caller(
+        &request_auth,
+        peer.map(|Extension(ConnectInfo(peer))| peer),
         &headers,
     )
     .await
     {
         Ok(caller) => caller,
-        Err(status) => return status.into_response(),
+        Err(refusal) => return refusal,
     };
-    if !caller.scope.is_admin() {
-        return StatusCode::FORBIDDEN.into_response();
-    }
 
     let generated_at_utc = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
     let filename = archive::archive_filename(&generated_at_utc);

@@ -39,12 +39,12 @@ pub(super) async fn restart_handler(
     .await
     {
         Ok(caller) => caller,
-        Err(status) => return status.into_response(),
+        Err(status) => return super::refusal_response(super::Refused::Caller(status), &headers),
     };
     // Taking the server away from everyone else is an administrator's
     // decision: a read or control key drives downloads, not the process.
     if !caller.scope.is_admin() {
-        return super::error_response(StatusCode::FORBIDDEN, "admin scope required");
+        return super::refusal_response(super::Refused::Scope, &headers);
     }
 
     // Settled here as well as in the UI: a deployment that must not exit —
