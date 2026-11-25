@@ -865,6 +865,63 @@ async fn update_server_preserves_password() {
 }
 
 #[tokio::test]
+async fn update_server_keeps_a_username_it_is_not_given() {
+    let h = TestHarness::new().await;
+    let resp = h
+        .execute(
+            r#"mutation {
+                addServer(input: {
+                    host: "news.example.com",
+                    port: 119,
+                    tls: false,
+                    connections: 5,
+                    username: "user",
+                    password: "secret",
+                    active: false
+                }) { id }
+            }"#,
+        )
+        .await;
+    assert_no_errors(&resp);
+    let id = response_data(&resp)["addServer"]["id"].as_u64().unwrap();
+
+    // Each update in turn, with the username it sends and the one stored after.
+    for (username_field, stored) in [
+        ("", Some("user")),
+        ("username: null,", Some("user")),
+        (r#"username: "  replaced  ","#, Some("replaced")),
+        ("", Some("replaced")),
+        (r#"username: "   ","#, None),
+        ("", None),
+    ] {
+        let resp = h
+            .execute(&format!(
+                r#"mutation {{
+                    updateServer(id: {id}, input: {{
+                        host: "news.example.com",
+                        port: 119,
+                        tls: false,
+                        connections: 5,
+                        {username_field}
+                        active: false
+                    }}) {{ id }}
+                }}"#
+            ))
+            .await;
+        assert_no_errors(&resp);
+        let resp = h
+            .execute(&format!("{{ server(id: {id}) {{ username }} }}"))
+            .await;
+        assert_no_errors(&resp);
+        assert_eq!(
+            response_data(&resp)["server"]["username"].as_str(),
+            stored,
+            "after an update with `{username_field}`"
+        );
+    }
+}
+
+#[tokio::test]
 async fn remove_server() {
     let h = TestHarness::new().await;
     let resp = h

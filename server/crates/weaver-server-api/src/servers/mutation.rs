@@ -412,6 +412,12 @@ impl NormalizedServerInput {
 
         let password = normalize_optional_string(input.password)
             .or_else(|| fallback.and_then(|server| server.password.clone()));
+        // An update that leaves the username out keeps the stored one, as it
+        // keeps the password; an empty one clears it.
+        let username = match input.username {
+            Some(username) => normalize_optional_string(Some(username)),
+            None => fallback.and_then(|server| server.username.clone()),
+        };
         let max_download_speed = input
             .max_download_speed
             .or_else(|| fallback.map(|server| server.max_download_speed))
@@ -437,7 +443,7 @@ impl NormalizedServerInput {
             host,
             port: input.port,
             tls: input.tls,
-            username: normalize_optional_string(input.username),
+            username,
             password,
             connections: input.connections,
             active: input.active,

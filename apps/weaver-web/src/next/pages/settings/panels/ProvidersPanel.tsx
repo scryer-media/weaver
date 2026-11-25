@@ -207,7 +207,9 @@ function serverInput(form: ServerForm) {
     host: normalizeHost(form.host),
     port: form.port,
     tls: form.tls,
-    username: form.username.trim() || null,
+    // Sent as "" when blanked: `updateServer` keeps a username it is not given
+    // and clears one it is given empty.
+    username: form.username.trim(),
     password: form.password.trim() || null,
     connections: form.connections,
     active: form.active,
@@ -271,9 +273,9 @@ export function ProvidersPanel() {
     : null;
   const editing = typeof editingId === "number" ? servers.find((s) => s.id === editingId) : null;
 
-  // `updateServer` keeps a password it is not given but clears a username it is
-  // not given, so no edit may be sent from the list's copy of a row: the form
-  // is only seeded once the single-server query has returned the stored name.
+  // The form always sends a username, empty to clear it, so no edit may be
+  // sent from the list's copy of a row: the form is only seeded once the
+  // single-server query has returned the stored name.
   useEffect(() => {
     if (details && form === null) {
       setForm(formToState(details, details.username ?? ""));
