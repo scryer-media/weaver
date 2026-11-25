@@ -702,14 +702,16 @@ impl RarStore {
         // layout laid afresh may reach less far than the one before, as when
         // a volume's length is said anew and the headers at its new end are
         // not in yet: what it does not list yet is unread, not refuted, and
-        // its bytes stay where they were placed.
+        // its bytes stay where they were placed. A member the run made that
+        // its headers no longer give the run, as a repaired header that
+        // says it is stored, is something else too: the store streams it.
         let keep = self.entries[start..]
             .iter()
-            .zip(members.iter().skip(start))
-            .position(|(entry, member)| {
+            .zip(members.iter().enumerate().skip(start))
+            .position(|(entry, (id, member))| {
                 #[cfg(test)]
                 super::counts::bump(|counts| counts.compared += 1);
-                !same(entry, member)
+                !same(entry, member) || (entry.made && !self.made_by_run(id, member, format))
             })
             .map_or(self.entries.len(), |at| start + at);
         for id in (keep..self.entries.len()).rev() {
@@ -717,9 +719,6 @@ impl RarStore {
         }
         if keep < self.entries.len() {
             self.entries.truncate(keep);
-            if self.first_stored.is_some_and(|first| first >= keep) {
-                self.first_stored = None;
-            }
             self.remap();
         }
         for (id, member) in members.iter().enumerate().skip(start) {
@@ -732,9 +731,6 @@ impl RarStore {
             if !made && let Some(emit) = verdict(member, || in_clear(&self.volumes, member)) {
                 refusal = Some(emit);
                 break;
-            }
-            if !made && !is_directory(member) {
-                self.first_stored.get_or_insert(id);
             }
             if id == self.entries.len() {
                 self.announce(member, made, out);

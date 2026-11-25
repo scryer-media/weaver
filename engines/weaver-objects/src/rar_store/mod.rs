@@ -18,7 +18,7 @@ mod gaps;
 mod image;
 mod layout;
 mod lock;
-mod made;
+pub(crate) mod made;
 mod order;
 mod place;
 mod record;
@@ -466,11 +466,9 @@ pub struct RarStore {
     // the ones that can travel to another owner. Filed where a volume comes
     // or goes and where pieces do, so no question about one scans pieces.
     unmapped: BTreeSet<VolumeIndex>,
-    // The entries the store's run makes, filed as entries come and go, and
-    // the first file entry the store streams itself, filed as the layout's
-    // members are looked at (`sync`): neither question scans the entries.
+    // The entries the store's run makes, filed as entries come and go, so
+    // the question scans no entry.
     made: BTreeSet<usize>,
-    first_stored: Option<usize>,
     // The volumes held that are bound and not yet closed: more of them is
     // still to come. Filed where a volume is named, closes, comes or goes,
     // so asking whether everything bound has closed scans no volume.
@@ -519,6 +517,9 @@ pub struct RarStore {
     inversions: BTreeSet<u32>,
     entries: Vec<Entry>,
     candidates: Vec<Candidate>,
+    // The candidate the job offered last, one offered before among them: a
+    // run decodes under it, as the engine's run takes the latest offer.
+    offered: Option<usize>,
     // The candidate that opened the headers.
     headers_open: Option<usize>,
     asked: bool,
@@ -539,6 +540,9 @@ pub struct RarStore {
     stale: bool,
     // The object gave its set up; it says nothing more.
     gone: bool,
+    // A run over its made members was started: what the tree marks refuted
+    // since is that run's finding, not only the store's own walk's.
+    started: bool,
     // Moved wherever anything `place` reads may change: a look at what
     // changed, a volume touched, a condemned file's cipher taken or let go.
     // Data that only passes through moves nothing.
@@ -576,7 +580,6 @@ impl RarStore {
             giving: BTreeMap::new(),
             unmapped: BTreeSet::new(),
             made: BTreeSet::new(),
-            first_stored: None,
             open: BTreeSet::new(),
             pieces_in: BTreeMap::new(),
             locked: BTreeSet::new(),
@@ -592,6 +595,7 @@ impl RarStore {
             inversions: BTreeSet::new(),
             entries: Vec::new(),
             candidates: Vec::new(),
+            offered: None,
             headers_open: None,
             asked: false,
             wrong_key: None,
@@ -602,6 +606,7 @@ impl RarStore {
             gaps_said: gaps::Gaps::default(),
             stale: false,
             gone: false,
+            started: false,
             placed: Placed::default(),
             derive_due: BTreeSet::new(),
             derived: BTreeMap::new(),
@@ -1252,6 +1257,14 @@ impl Object for RarStore {
         let why = match first.is_none_or(|found| found.name.is_none()) {
             true => Some(Why::FirstBytesLost),
             false => crate::quiet::damaged(standing)
+                // My run found bad what proof above found whole: it cannot
+                // read a member it makes, as the engine's run cannot. With
+                // no run started, what is refuted is the store's own walk's
+                // finding, which a repair answers.
+                .or_else(|| {
+                    (self.started && standing.refuted() && !standing.lost())
+                        .then_some(Why::InvalidArchive)
+                })
                 .or_else(|| self.shut())
                 .or_else(|| crate::quiet::unplaced(standing, self.lacks())),
         };
@@ -1363,7 +1376,7 @@ impl Object for RarStore {
         // The offer answers the question the store asked: a candidate that
         // opens nothing leaves it free to ask for the next one.
         self.asked = false;
-        self.candidate(secret);
+        self.offered = Some(self.candidate(secret));
         self.dirty.extend(self.volumes.keys().copied());
         self.stale = true;
         self.settle(None, out);

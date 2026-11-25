@@ -13,6 +13,7 @@
 // file's data stays held until a password opens it, and an open one's
 // padding past its length is envelope.
 
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use unrar_rs::{MappedSlice, StoredLayoutBuilder};
@@ -300,7 +301,10 @@ impl RarStore {
     // its headers reached before they moved, to where they reach now, what
     // the map places anywhere but the volume's own envelope, past `fresh`.
     // Every byte past the reach is kept in the envelope as itself, and the
-    // map keeps what it placed below it, so no other kept byte leaves.
+    // map keeps what it placed below it, so no other kept byte leaves. The
+    // cipher padding of an enciphered stored member's record is placed in
+    // the envelope but is the record's: it goes back with the member's
+    // bytes, so their replay feeds the cipher the whole last block.
     pub(super) fn unkept(
         &self,
         volume: VolumeIndex,
@@ -317,6 +321,8 @@ impl RarStore {
         }
         let window = ByteRange::new(from, reach);
         let mut placements = Vec::new();
+        // The members whose bytes went back here, in volume order.
+        let mut given = BTreeSet::new();
         for (range, _, _) in found.kept.runs() {
             let Some(range) = range.intersect(window) else {
                 continue;
@@ -327,18 +333,22 @@ impl RarStore {
             for placement in &placements {
                 let piece = ByteRange::at(cursor, placement.len());
                 cursor = piece.end;
-                if *placement
-                    == (Placement::Envelope {
-                        envelope: volume.0,
-                        range: piece,
-                    })
-                {
-                    continue;
-                }
+                let back = match placement {
+                    Placement::Envelope { envelope, range }
+                        if *envelope == volume.0 && *range == piece =>
+                    {
+                        self.padding_in(volume, piece, &given)
+                    }
+                    Placement::Member { member, .. } => {
+                        given.insert(member.0 as usize);
+                        vec![piece]
+                    }
+                    _ => vec![piece],
+                };
                 let cut = fresh
                     .filter(|(delivered, _)| *delivered == volume)
                     .map_or(ByteRange::new(piece.end, piece.end), |(_, cut)| cut);
-                for part in outside(piece, cut) {
+                for part in back.into_iter().flat_map(|back| outside(back, cut)) {
                     out.push(Emit::Unkept {
                         volume,
                         range: part,
@@ -467,6 +477,28 @@ impl RarStore {
             .collect();
         parts.sort_by_key(|(_, part, _)| part.start);
         parts
+    }
+
+    // Of `range`, placed in the volume's envelope, the cipher padding of
+    // the records of stored members in `given`: what lies in such a
+    // member's data, past its length. The rest is the volume's own.
+    fn padding_in(
+        &self,
+        volume: VolumeIndex,
+        range: ByteRange,
+        given: &BTreeSet<usize>,
+    ) -> Vec<ByteRange> {
+        self.parts_in(volume, range)
+            .into_iter()
+            .filter(|(id, _, _)| {
+                given.contains(id)
+                    && self
+                        .entries
+                        .get(*id)
+                        .is_some_and(|entry| !matches!(entry.lock, Lock::Plain))
+            })
+            .map(|(_, part, _)| part)
+            .collect()
     }
 
     // A member's bytes, by what the store knows of its key.
