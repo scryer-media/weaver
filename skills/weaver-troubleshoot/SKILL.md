@@ -29,7 +29,7 @@ extracts and capped searches.
 | `JobEvents` | `jobEvents` | READ |
 | `HistoryPage` | `historyPage` | READ |
 | `ServerHealth` | `serverHealth` | READ |
-| `TorrentsPage` | `torrents` | READ |
+| `TorrentsPage` | `torrentPage` | READ |
 | `TorrentDetail` | `torrent` | READ |
 | `TorrentNetwork` | `torrentPresence`, `torrentRoutes` | READ |
 | `DiskState` | `diskUsage`, `systemInfo` | READ |
@@ -78,12 +78,11 @@ Each file's leading comment gives its purpose and a variables example.
    explaining.
 
 4. **Page, don't list.** Queue and history: `pageSize` 25 first, filter by
-   `states`, `status` or `search`. Torrents: `first` 25. The torrent list
-   returns no next cursor; the next page's `after` is `off:<offset>` in
-   base64url without padding:
+   `states`, `status` or `search`. Torrents: `first` 25; the next page's
+   `after` is `nextCursor`, null on the last page:
 
    ```sh
-   after=$(printf 'off:%s' 25 | base64 | tr '+/' '-_' | tr -d '=\n')
+   after=$(jq -r '.data.torrentPage.nextCursor // empty' torrents.json)
    jq -n --arg a "$after" '{first: 25, after: $a}' > vars.json
    ```
 

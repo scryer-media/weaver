@@ -181,7 +181,7 @@ decides.
    ```sh
    jq -n '{first: 25}' > vars.json
    sh "$G" "$O"/TorrentsPage.graphql vars.json > torrents.json
-   jq -r '.data.torrents[] | [.id, .state, (.stated // "-"), (.routeReason // "-"), .private,
+   jq -r '.data.torrentPage.items[] | [.id, .state, (.stated // "-"), (.routeReason // "-"), .private,
      .peers, (.swarmSeeds // "-"), .name[0:50]] | @tsv' torrents.json
    jq -n --argjson id 42 '{id: $id}' > vars.json
    sh "$G" "$O"/TorrentDetail.graphql vars.json > torrent.json

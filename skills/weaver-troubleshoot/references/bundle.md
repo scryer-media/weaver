@@ -9,9 +9,11 @@ diagnostics**.
 ## Who may fetch it
 
 - An `ADMIN` key, or a browser session with full access.
-- A `READ` or `CONTROL` key: bare HTTP 403, no body.
-- A missing or refused key: bare HTTP 401, no body.
-- A build failure: HTTP 500 with `{"error": "failed to write diagnostics archive: ..."}`.
+- A `READ` or `CONTROL` key: HTTP 403, code `FORBIDDEN`.
+- A refused key: HTTP 401, code `INVALID_API_KEY`; no key:
+  `AUTHENTICATION_REQUIRED`.
+- A build failure: HTTP 500, code `INTERNAL`, `error`
+  `failed to write diagnostics archive: ...`.
 
 Building takes at least 10 seconds: Weaver samples its metrics twice, 10
 seconds apart.

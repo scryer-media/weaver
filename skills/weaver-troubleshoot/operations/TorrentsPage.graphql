@@ -1,26 +1,29 @@
 # One bounded page of torrents: state, why it stands still, swarm and rates.
 # No tracker URLs. Scope: READ.
 # Variables: {"first": 25, "after": null, "category": null}
-# first at most 500. The list returns no next cursor; see SKILL.md paging.
+# first at most 500. Next page: "after" = nextCursor; null on the last page.
 query TorrentsPage($first: Int = 25, $after: String, $category: String) {
-  torrents(first: $first, after: $after, category: $category) {
-    id
-    name
-    state
-    stated
-    detail
-    routeReason
-    private
-    progress
-    totalBytes
-    haveBytes
-    downloadBps
-    uploadBps
-    peers
-    seeds
-    swarmSeeds
-    swarmLeechers
-    ratio
-    category
+  torrentPage(first: $first, after: $after, category: $category) {
+    nextCursor
+    items {
+      id
+      name
+      state
+      stated
+      detail
+      routeReason
+      private
+      progress
+      totalBytes
+      haveBytes
+      downloadBps
+      uploadBps
+      peers
+      seeds
+      swarmSeeds
+      swarmLeechers
+      ratio
+      category
+    }
   }
 }
