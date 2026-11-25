@@ -18,7 +18,9 @@ use super::owner::Owner;
 use super::writer::{Codec, Item, Options, Version, write};
 use super::{PASSWORD, fixture, store, unrar};
 use crate::engine::Format;
+use crate::keys::{CAPACITY, Keys};
 use crate::rar_engine::{Rar, member_window};
+use crate::rar_store::RarStore;
 use crate::testing::payload;
 
 // A set's volumes whole, as the RAR engine reads them.
@@ -279,12 +281,15 @@ pub(super) fn check(label: &str, volumes: Vec<Vec<u8>>, password: Option<&str>) 
     }
 
     // The shelf has teeth: a run of every member reads a stored file's
-    // data, which it never held.
-    let mut sink = |_| true;
-    let shelved = owner.shelved();
-    let view: Arc<dyn Volumes> = shelved.clone();
-    Rar::run(password.map(str::to_owned)).run(view, &mut sink, Budget::default());
-    assert!(!shelved.strays.lock().unwrap().is_empty(), "{label}");
+    // data, which it never held. A set of compressed files alone holds no
+    // such data.
+    if stored > 0 {
+        let mut sink = |_| true;
+        let shelved = owner.shelved();
+        let view: Arc<dyn Volumes> = shelved.clone();
+        Rar::run(password.map(str::to_owned)).run(view, &mut sink, Budget::default());
+        assert!(!shelved.strays.lock().unwrap().is_empty(), "{label}");
+    }
     owner
 }
 
@@ -341,14 +346,14 @@ fn a_mixed_set_faces_as_the_engine_would_for_its_compressed_members() {
             owner.object.engine().is_none(),
             "{version:?}: no run before a header"
         );
-        // Not before the set's last volume is read: a header still to come
-        // could add a member the run makes.
+        // Before the set's last volume is read: the run starts at the first
+        // member it makes, and chases the layout from there.
         for volume in 0..volumes.len() - 1 {
             owner.frames(volume, 4096);
         }
         assert!(
-            owner.object.engine().is_none(),
-            "{version:?}: no run before the end"
+            owner.object.engine().is_some(),
+            "{version:?}: a run before the end"
         );
         owner.whole(4096);
         let face = owner.object.engine().expect("a mixed set runs");
@@ -396,25 +401,17 @@ fn a_mixed_set_faces_as_the_engine_would_for_its_compressed_members() {
     }
 }
 
-// What stays with the engine whole: a solid set, a set of compressed files
-// alone, and one whose first file is compressed, which nothing up front
-// says is followed by a stored one.
+// What stays with the engine whole: a solid set, whose members a run
+// decodes only in order from the first.
 #[test]
-fn sets_the_store_cannot_stream_part_of_still_go_to_the_engine() {
+fn a_solid_set_still_goes_to_the_engine() {
     for version in [Version::Rar5, Version::Rar4] {
-        let (first, _) = packed(version, "first.nfo");
-        let (second, _) = packed(version, "second.nfo");
-        for (label, items, solid) in [
-            ("compressed only", vec![first.clone(), second], false),
-            (
-                "compressed first",
-                vec![first, Item::File("alpha.mkv", payload(1, 10_000))],
-                false,
-            ),
-            ("solid", mixed_items(version), true),
+        for (label, items) in [
+            ("mixed", mixed_items(version)),
+            ("compressed first", compressed_first(version)),
         ] {
             let mut options = Options::new(version);
-            options.solid = solid;
+            options.solid = true;
             let volumes = write(&items, &options);
             let mut owner = Owner::named(store(), volumes);
             owner.whole(4096);
@@ -424,6 +421,46 @@ fn sets_the_store_cannot_stream_part_of_still_go_to_the_engine() {
                 owner.said
             );
             assert!(owner.object.engine().is_none(), "{version:?} {label}");
+        }
+    }
+}
+
+fn compressed_first(version: Version) -> Vec<Item> {
+    let (first, _) = packed(version, "first.nfo");
+    vec![first, Item::File("alpha.mkv", payload(1, 10_000))]
+}
+
+// A set that is not solid, of compressed files alone: it stays with the
+// store, whose run makes every member as the whole engine does, in one
+// volume and across many.
+#[test]
+fn a_set_of_compressed_files_alone_stays_with_the_store() {
+    for version in [Version::Rar5, Version::Rar4] {
+        let (first, _) = packed(version, "first.nfo");
+        let (second, _) = packed(version, "second.nfo");
+        let items = vec![first, second];
+        for split in [None, Some(6_000)] {
+            let mut options = Options::new(version);
+            options.split = split;
+            let volumes = write(&items, &options);
+            let owner = check(&format!("{version:?} {split:?}"), volumes, None);
+            assert!(!owner.said.iter().any(|emit| matches!(emit, Emit::NeedsEngine(_))));
+        }
+    }
+}
+
+// A set whose first file is compressed and is followed by a stored one: the
+// stored one is streamed and the compressed one made.
+#[test]
+fn a_set_whose_first_file_is_compressed_streams_the_stored_one_after_it() {
+    for version in [Version::Rar5, Version::Rar4] {
+        for split in [None, Some(6_000)] {
+            let mut options = Options::new(version);
+            options.split = split;
+            let volumes = write(&compressed_first(version), &options);
+            let owner = check(&format!("{version:?} {split:?}"), volumes, None);
+            assert!(owner.member("alpha.mkv").closed);
+            assert!(!owner.said.iter().any(|emit| matches!(emit, Emit::NeedsEngine(_))));
         }
     }
 }
@@ -539,6 +576,103 @@ fn an_enciphered_compressed_member_asks_again_after_a_wrong_password() {
     }
 }
 
+// Damage in an enciphered compressed member's packed data, under the right
+// password. A RAR5 header with a password check value proves the password
+// before a byte is decrypted, so the failure after it is the bytes': the
+// whole engine's run and the store's scoped run alike say damage and never
+// ask for another password. Without a check value, or in RAR4, which has
+// none, the password is unproven and the same failure asks for another, as
+// a wrong key's bytes would.
+#[test]
+fn damage_under_a_proven_password_is_damage_and_under_an_unproven_one_asks_again() {
+    for (version, check, proven) in [
+        (Version::Rar5, true, true),
+        (Version::Rar5, false, false),
+        (Version::Rar4, true, false),
+    ] {
+        for headers in [false, true] {
+            let label = format!("{version:?} check {check} headers {headers}");
+            let mut options = Options::new(version);
+            options.password = Some(PASSWORD);
+            options.encrypt_headers = headers;
+            options.clear = vec![0, 2, 3];
+            options.check = check;
+            let mut volumes = write(&mixed_items(version), &options);
+            let notes = opened(&volumes[0], Some(PASSWORD))
+                .members
+                .into_iter()
+                .find(|member| member.name == "notes.nfo")
+                .expect("the compressed member");
+            // Inside the coded stream, past its first block's header, so the
+            // decode runs on and its checksum fails.
+            volumes[0][(notes.data_offset + notes.data_size / 2) as usize] ^= 0x55;
+            let asks = |said: &[&Emit]| said.contains(&&Emit::NeedsPassword);
+            let damage =
+                |said: &[&Emit]| said.iter().any(|emit| matches!(emit, Emit::Damaged { .. }));
+
+            let (engine, engine_said) = engine_run(&volumes, Some(PASSWORD));
+            let engine_said: Vec<&Emit> = engine_said.iter().collect();
+            assert!(!engine["notes.nfo"].closed, "{label}");
+            assert_eq!(asks(&engine_said), !proven, "{label}: {engine_said:?}");
+            assert_eq!(damage(&engine_said), proven, "{label}: {engine_said:?}");
+
+            let mut owner = Owner::named(store(), volumes);
+            owner.offer(PASSWORD);
+            owner.whole(4096);
+            // Enciphered RAR5 headers with no check value go to the engine.
+            if headers && !check {
+                assert_eq!(
+                    trouble(&owner),
+                    [&Emit::NeedsEngine(Why::EncryptedHeader)],
+                    "{label}"
+                );
+                continue;
+            }
+            assert!(trouble(&owner).is_empty(), "{label}: {:?}", trouble(&owner));
+            let strays = owner.run();
+            assert!(strays.is_empty(), "{label}: {strays:?} {:?}", owner.said);
+            let said = trouble(&owner);
+            assert!(!owner.member("notes.nfo").closed, "{label}");
+            assert_eq!(asks(&said), !proven, "{label}: {said:?}");
+            assert_eq!(damage(&said), proven, "{label}: {said:?}");
+        }
+    }
+}
+
+// A set whose last volume has no end record, single and in volumes: no
+// header says the layout is complete, and the run does not wait on one. It
+// starts at the member it makes, before the job is quiet, and makes it.
+#[test]
+fn a_mixed_set_with_no_end_record_runs_before_one_is_read() {
+    for version in [Version::Rar5, Version::Rar4] {
+        for split in [None, Some(6_000)] {
+            let label = format!("{version:?} {split:?}");
+            let mut options = Options::new(version);
+            options.split = split;
+            options.numbered = true;
+            options.ended = false;
+            let volumes = write(&mixed_items(version), &options);
+            let extracted = unrar(&volumes, None);
+            assert_eq!(extracted.len(), 4, "{label}");
+            let mut owner = Owner::named(store(), volumes);
+            owner.whole(4096);
+            assert!(trouble(&owner).is_empty(), "{label}: {:?}", trouble(&owner));
+            let face = owner
+                .object
+                .engine()
+                .expect("the set runs with no end record read");
+            assert!(face.makes(MemberId(1)), "{label}");
+            owner.quiet();
+            assert!(owner.run().is_empty(), "{label}");
+            assert!(trouble(&owner).is_empty(), "{label}: {:?}", trouble(&owner));
+            for (name, bytes) in &extracted {
+                let got = owner.member(name);
+                assert!(got.closed && got.bytes == *bytes, "{label}: {name}");
+            }
+        }
+    }
+}
+
 // A nameless RAR4 set whose end records state no number: its middle
 // volumes are held where their links put them, on trust. Once the run can
 // start, every volume it reads holds a part of a member, stored or made,
@@ -583,79 +717,101 @@ fn a_nameless_rar4_volume_the_run_reads_stays_where_it_was_laid() {
 // A repaired header that names the compressed member otherwise than the
 // bytes first posted did: the store retracts it and what follows it, never
 // the stored member before it, and announces it again as made; the run
-// then makes it under its repaired name. Plain and enciphered headers.
+// then makes it under its repaired name. Plain and enciphered headers. The
+// store's keys are its own, derived as the bytes come; enciphered RAR5
+// headers also under keys already in the cache.
 #[test]
 fn a_repaired_header_of_a_made_member_retracts_it_and_the_run_makes_it_again() {
     for version in [Version::Rar5, Version::Rar4] {
         for headers in [false, true] {
-            let mut options = Options::new(version);
-            if headers {
-                options.password = Some(PASSWORD);
-                options.encrypt_headers = true;
-            }
-            let label = format!("{version:?} headers enciphered {headers}");
-            let real = write(&mixed_items(version), &options).remove(0);
-            let mut other = mixed_items(version);
-            let Item::Packed { name, .. } = &mut other[1] else {
-                unreachable!()
-            };
-            *name = "notez.nfo";
-            let wrong = write(&other, &options).remove(0);
-            assert_eq!(real.len(), wrong.len());
-            let length = real.len() as u64;
-            let mut owner = Owner::named(store(), vec![real.clone()]);
-            if headers {
-                owner.offer(PASSWORD);
-            }
-            owner.deliver_as(
-                0,
-                weaver_graph::ByteRange::new(0, length),
-                weaver_graph::Provenance::Damaged,
-                Some(&wrong),
-            );
-            owner.close(0);
-            // RAR4 headers enciphered in bytes that came damaged lay no
-            // member until they are repaired, so no run starts before.
-            let ran = !(headers && version == Version::Rar4);
-            assert_eq!(owner.object.engine().is_some(), ran, "{label}");
-            if ran {
-                assert!(owner.run().is_empty(), "{label}");
-                assert!(owner.member("notez.nfo").closed, "{label}");
-                let made = owner.object.engine().expect("a mixed set runs");
-                assert!(made.makes(MemberId(1)), "{label}");
-            }
-
-            // The header comes again repaired, and the rest after it.
-            let first = real.iter().zip(&wrong).position(|(a, b)| a != b).unwrap() as u64;
-            let header = weaver_graph::ByteRange::new(first.saturating_sub(64), first + 64);
-            owner.said.clear();
-            owner.deliver_as(0, header, weaver_graph::Provenance::Repaired, None);
-            owner.deliver_as(
-                0,
-                weaver_graph::ByteRange::new(0, length),
-                weaver_graph::Provenance::Repaired,
-                None,
-            );
-            owner.close(0);
-            assert_eq!(
-                owner.said.contains(&Emit::Retract(MemberId(1))),
-                ran,
-                "{label}: {:?}",
-                owner.said
-            );
-            assert!(!owner.said.contains(&Emit::Retract(MemberId(0))), "{label}");
-            assert!(
-                owner
-                    .object
-                    .engine()
-                    .expect("still mixed")
-                    .makes(MemberId(1))
-            );
-            assert!(owner.run().is_empty(), "{label}");
-            for (name, bytes) in unrar(std::slice::from_ref(&real), options.password) {
-                let got = owner.member(&name);
-                assert!(got.closed && got.bytes == bytes, "{label}: {name}");
-            }
+            repaired_header_of_a_made_member(version, headers, false);
         }
+    }
+    repaired_header_of_a_made_member(Version::Rar5, true, true);
+}
+
+// Enciphered RAR4 headers, damaged as first posted, repaired under keys
+// already in the cache: the stored member after the made one is given back
+// with its record's cipher padding, so its replay deciphers its last block
+// and it closes.
+#[test]
+fn a_repaired_rar4_header_under_cached_keys_delivers_every_member() {
+    repaired_header_of_a_made_member(Version::Rar4, true, true);
+}
+
+fn repaired_header_of_a_made_member(version: Version, headers: bool, warm: bool) {
+    let mut options = Options::new(version);
+    if headers {
+        options.password = Some(PASSWORD);
+        options.encrypt_headers = true;
+    }
+    let label = format!("{version:?} headers enciphered {headers} warm {warm}");
+    let real = write(&mixed_items(version), &options).remove(0);
+    let mut other = mixed_items(version);
+    let Item::Packed { name, .. } = &mut other[1] else {
+        unreachable!()
+    };
+    *name = "notez.nfo";
+    let wrong = write(&other, &options).remove(0);
+    assert_eq!(real.len(), wrong.len());
+    let length = real.len() as u64;
+    let keys = Arc::new(Keys::new(CAPACITY));
+    if warm {
+        let mut first = Owner::named(RarStore::with_keys(Arc::clone(&keys)), vec![real.clone()]);
+        first.offer(PASSWORD);
+        first.whole(4096);
+    }
+    let mut owner = Owner::named(RarStore::with_keys(keys), vec![real.clone()]);
+    if headers {
+        owner.offer(PASSWORD);
+    }
+    owner.deliver_as(
+        0,
+        weaver_graph::ByteRange::new(0, length),
+        weaver_graph::Provenance::Damaged,
+        Some(&wrong),
+    );
+    owner.close(0);
+    // RAR4 headers enciphered in bytes that came damaged lay no
+    // member until they are repaired, so no run starts before.
+    let ran = !(headers && version == Version::Rar4);
+    assert_eq!(owner.object.engine().is_some(), ran, "{label}");
+    if ran {
+        assert!(owner.run().is_empty(), "{label}");
+        assert!(owner.member("notez.nfo").closed, "{label}");
+        let made = owner.object.engine().expect("a mixed set runs");
+        assert!(made.makes(MemberId(1)), "{label}");
+    }
+
+    // The header comes again repaired, and the rest after it.
+    let first = real.iter().zip(&wrong).position(|(a, b)| a != b).unwrap() as u64;
+    let header = weaver_graph::ByteRange::new(first.saturating_sub(64), first + 64);
+    owner.said.clear();
+    owner.deliver_as(0, header, weaver_graph::Provenance::Repaired, None);
+    owner.deliver_as(
+        0,
+        weaver_graph::ByteRange::new(0, length),
+        weaver_graph::Provenance::Repaired,
+        None,
+    );
+    owner.close(0);
+    assert_eq!(
+        owner.said.contains(&Emit::Retract(MemberId(1))),
+        ran,
+        "{label}: {:?}",
+        owner.said
+    );
+    assert!(!owner.said.contains(&Emit::Retract(MemberId(0))), "{label}");
+    assert!(
+        owner
+            .object
+            .engine()
+            .expect("still mixed")
+            .makes(MemberId(1))
+    );
+    assert!(owner.run().is_empty(), "{label}");
+    for (name, bytes) in unrar(std::slice::from_ref(&real), options.password) {
+        let got = owner.member(&name);
+        assert!(got.closed && got.bytes == bytes, "{label}: {name}");
     }
 }

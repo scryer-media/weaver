@@ -63,11 +63,16 @@ impl Volumes for Shelved {
         let length = self.lengths[volume.0 as usize];
         let end = (offset + into.len() as u64).min(length);
         let range = ByteRange::new(offset.min(end), end);
+        // At or past the volume's end, which a shelf need not reach: a
+        // volume may end in a stored file's data.
+        if range.is_empty() {
+            return Ok(0);
+        }
         let kept = self
             .shelves
             .get(&volume.0)
             .is_some_and(|shelf| shelf.coverage.covered(range));
-        if !range.is_empty() && !kept {
+        if !kept {
             self.strays
                 .lock()
                 .unwrap()
@@ -627,6 +632,17 @@ impl Owner {
         })
     }
 
+    // Whether the shelf holds any verified byte of `range` of an envelope:
+    // what a run, which reads verified bytes only, can read there.
+    pub fn shelf_verified_in(&self, envelope: u32, range: ByteRange) -> bool {
+        self.shelves.get(&envelope).is_some_and(|shelf| {
+            shelf
+                .coverage
+                .overlapping(range)
+                .any(|run| run.provenance.is_verified())
+        })
+    }
+
     // The bytes the shelf holds, every envelope together.
     pub fn shelf_bytes(&self) -> u64 {
         self.shelves
@@ -644,15 +660,25 @@ impl Owner {
     // The store's run, over the shelf as it stands, its emits applied as
     // the tree applies a run's: what it reads that the shelf never kept.
     pub fn run(&mut self) -> Vec<(u32, u64, usize)> {
+        let started = self.start();
+        self.run_started(started)
+    }
+
+    // The store's run as it starts now, to be run later (`run_started`).
+    pub fn start(&mut self) -> Box<dyn weaver_graph::Extraction> {
+        self.object.engine_mut().expect("a mixed set runs").start()
+    }
+
+    // A run started earlier, over the shelf as it stands now, as `run`.
+    pub fn run_started(&mut self, started: Box<dyn weaver_graph::Extraction>) -> Vec<(u32, u64, usize)> {
         let shelved = self.shelved();
         let mut emits = Vec::new();
         let mut sink = |emit| {
             emits.push(emit);
             true
         };
-        let engine = self.object.engine_mut().expect("a mixed set runs");
         let view: Arc<dyn Volumes> = shelved.clone();
-        engine.start().run(view, &mut sink, Budget::default());
+        started.run(view, &mut sink, Budget::default());
         // A run's retract starts its member over, as the tree does: the
         // member stays the store's, with nothing written.
         let (retracts, emits): (Vec<Emit>, Vec<Emit>) = emits

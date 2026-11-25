@@ -473,6 +473,8 @@ fn a_compressed_set_renamed_from_swapped_posted_numbers_is_one_engine() {
         let mut options = super::split(Version::Rar4);
         options.split = Some(10_000);
         options.compressed = Some(0);
+        // Solid: a compressed set that goes to the engine whole.
+        options.solid = true;
         let set = write(&[Item::File("track.flac", payload(9, 57_000))], &options);
         assert_eq!(set.len(), 6);
         let mut run = Run::new();
@@ -538,6 +540,8 @@ fn another_sets_volume_held_by_its_posted_name_leaves_when_renamed_first() {
         let mut options = super::split(Version::Rar4);
         options.split = Some(10_000);
         options.compressed = Some(0);
+        // Solid: a compressed set that goes to the engine whole.
+        options.solid = true;
         write(&[Item::File(name, payload(seed, 37_000))], &options)
     };
     let a = set("track.flac", 9);
@@ -638,6 +642,8 @@ fn a_volume_renamed_before_its_neighbours_come_rejoins_its_engine() {
             let mut options = super::split(Version::Rar4);
             options.split = Some(10_000);
             options.compressed = Some(0);
+            // Solid: a compressed set that goes to the engine whole.
+            options.solid = true;
             let set = write(
                 &[Item::File("track.flac", payload(9, count * 10_000 - 3_000))],
                 &options,
@@ -717,6 +723,8 @@ fn a_long_compressed_set_renamed_one_at_a_time_looks_volumes_up() {
     let mut options = super::split(Version::Rar4);
     options.split = Some(5_000);
     options.compressed = Some(0);
+    // Solid: a compressed set that goes to the engine whole.
+    options.solid = true;
     let set = write(
         &[Item::File("track.flac", payload(9, VOLUMES * 5_000 - 700))],
         &options,
@@ -1389,6 +1397,8 @@ fn a_long_nameless_compressed_set_walks_its_volumes_a_bounded_number_of_times() 
         let mut options = super::split(Version::Rar4);
         options.split = Some(5_000);
         options.compressed = Some(0);
+        // Solid: a compressed set that goes to the engine whole.
+        options.solid = true;
         let set = write(
             &[Item::File("track.flac", payload(9, volumes * 5_000 - 700))],
             &options,

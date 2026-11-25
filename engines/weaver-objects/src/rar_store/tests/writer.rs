@@ -4,8 +4,9 @@
 // A small RAR writer for the tests: stored files and directories, split
 // across volumes at a data budget, AES through the formats' own key
 // derivations, enciphered headers, a recovery record, and the shapes the
-// store must hand to an engine (solid, compressed). Nothing here compresses:
-// a packed item carries data a real RAR coded.
+// store must hand to an engine (solid, compressed). A packed item carries
+// data a real RAR coded, or data `literal` coded: every byte a literal, no
+// match, so any bytes can be a compressed member.
 
 use aws_lc_rs::cipher::{AES_128, AES_256, EncryptingKey, EncryptionContext, UnboundCipherKey};
 use aws_lc_rs::iv::FixedLength;
@@ -83,6 +84,9 @@ pub struct Options {
     // RAR4: each volume's end record states its number, as rar writes a
     // set's volumes; without it a RAR4 volume states no number anywhere.
     pub numbered: bool,
+    // The last volume ends with its end record, as rar writes it; without
+    // it the set ends where its last file's data does.
+    pub ended: bool,
 }
 
 impl Options {
@@ -100,6 +104,7 @@ impl Options {
             check: true,
             hash_key: false,
             numbered: false,
+            ended: true,
         }
     }
 }
@@ -533,9 +538,11 @@ impl Volumes<'_> {
     }
 
     fn finish(&mut self, more: bool) {
-        let end = self.layout.end(more, self.done.len());
-        let end = self.seal(end);
-        self.current.extend(end);
+        if more || self.options.ended {
+            let end = self.layout.end(more, self.done.len());
+            let end = self.seal(end);
+            self.current.extend(end);
+        }
         self.done.push(std::mem::take(&mut self.current));
     }
 
@@ -636,4 +643,113 @@ pub fn write(items: &[Item], options: &Options) -> Vec<Vec<u8>> {
     }
     volumes.finish(false);
     volumes.done
+}
+
+// MSB-first bits, as both formats' decoders read them.
+#[derive(Default)]
+struct Bits {
+    bytes: Vec<u8>,
+    used: usize,
+}
+
+impl Bits {
+    fn put(&mut self, value: u32, count: usize) {
+        for bit in (0..count).rev() {
+            if self.used.is_multiple_of(8) {
+                self.bytes.push(0);
+            }
+            if value >> bit & 1 == 1 {
+                *self.bytes.last_mut().unwrap() |= 0x80 >> (self.used % 8);
+            }
+            self.used += 1;
+        }
+    }
+}
+
+// The code lengths of a table of `total` symbols in which the 256 literals
+// are 8 bits long and nothing else has a code: each literal's canonical code
+// is its own byte. Coded with the bit-length codes both formats share: a
+// length, 17 to repeat the one before (7 bits, 11 more), 18 and 19 for runs
+// of zeros (3 bits, 3 more; 7 bits, 11 more). The bit-length table gives
+// 8, 17, 18 and 19 two bits each, so their codes are 00, 01, 10 and 11.
+fn literal_tables(bits: &mut Bits, total: usize) {
+    for symbol in 0..20u32 {
+        bits.put(u32::from(matches!(symbol, 8 | 17 | 18 | 19)) * 2, 4);
+    }
+    bits.put(0b00, 2);
+    for run in [138, 117] {
+        bits.put(0b01, 2);
+        bits.put(run - 11, 7);
+    }
+    let mut zeros = total as u32 - 256;
+    while zeros > 0 {
+        if zeros >= 11 {
+            let run = zeros.min(138);
+            bits.put(0b11, 2);
+            bits.put(run - 11, 7);
+            zeros -= run;
+        } else {
+            assert!(zeros >= 3, "{zeros}");
+            bits.put(0b10, 2);
+            bits.put(zeros - 3, 3);
+            zeros = 0;
+        }
+    }
+}
+
+// `plain` coded as `version` codes a compressed file, every byte a literal:
+// an item the store must leave to a run, which any decoder makes `plain`
+// from. RAR5: one last block with its tables (306 + 64 + 16 + 44 lengths)
+// under a header whose checksum is 0x5A over its flags and size bytes.
+// RAR4: an LZ block that resets the tables (299 + 60 + 17 + 28 lengths).
+// Both stop at the file's unpacked size.
+pub fn literal(version: Version, name: &'static str, plain: &[u8]) -> Item {
+    let mut bits = Bits::default();
+    let packed = match version {
+        Version::Rar5 => {
+            literal_tables(&mut bits, 430);
+            for &byte in plain {
+                bits.put(u32::from(byte), 8);
+            }
+            let size = bits.bytes.len();
+            let last_bits = bits.used - (size - 1) * 8;
+            let size_bytes = (size as u32).to_le_bytes();
+            let count = match size {
+                0..=0xff => 1,
+                0x100..=0xffff => 2,
+                _ => 3,
+            };
+            assert!(size < 1 << 24, "{size}");
+            let flags = 0x80 | 0x40 | ((count - 1) << 3) as u8 | (last_bits - 1) as u8;
+            let checksum = size_bytes[..count]
+                .iter()
+                .fold(0x5a ^ flags, |sum, byte| sum ^ byte);
+            let mut packed = vec![flags, checksum];
+            packed.extend_from_slice(&size_bytes[..count]);
+            packed.extend(bits.bytes);
+            packed
+        }
+        Version::Rar4 => {
+            bits.put(0b00, 2);
+            literal_tables(&mut bits, 404);
+            for &byte in plain {
+                bits.put(u32::from(byte), 8);
+            }
+            bits.bytes
+        }
+    };
+    let codec = Codec {
+        method: 3,
+        version: match version {
+            Version::Rar5 => 0,
+            Version::Rar4 => 29,
+        },
+        dict: 0,
+    };
+    Item::Packed {
+        name,
+        plain: plain.to_vec(),
+        packed,
+        codec,
+    }
 }
