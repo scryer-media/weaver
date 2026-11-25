@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"net/http"
 	"path"
 	"slices"
@@ -59,7 +60,7 @@ func torrentScenarios() []torrentScenario {
 				"with the seeder gone, a leecher pulls the whole set from Weaver and every volume matches",
 			},
 			Run: func(lane *torrentLane, evidence map[string]any) error {
-				return lane.downloadScenario("rar-store", submitOptions{}, evidence, lane.leechFromWeaver)
+				return lane.downloadScenario("rar-store", submitOptions{Unpack: true}, evidence, lane.leechFromWeaver)
 			},
 		},
 		{
@@ -69,7 +70,7 @@ func torrentScenarios() []torrentScenario {
 				"with the seeder gone, a leecher pulls the archive from Weaver and it matches",
 			},
 			Run: func(lane *torrentLane, evidence map[string]any) error {
-				return lane.downloadScenario("rar-compressed", submitOptions{}, evidence, lane.leechFromWeaver)
+				return lane.downloadScenario("rar-compressed", submitOptions{Unpack: true}, evidence, lane.leechFromWeaver)
 			},
 		},
 		{
@@ -125,8 +126,9 @@ func torrentScenarios() []torrentScenario {
 		{
 			Name: "unwanted-extension",
 			Asserts: []string{
-				"a torrent carrying a .cmd file is refused with REFUSED naming the file",
-				"it is not listed and the tracker never hears its infohash (checked again at the lane's end)",
+				"a torrent carrying a .cmd file is added with that file left out and the rest wanted",
+				"a torrent named after an executable is refused with REFUSED naming it",
+				"the refused torrent is not listed and the tracker never hears its infohash (checked again at the lane's end)",
 			},
 			Run: scenarioUnwanted,
 		},
@@ -175,7 +177,7 @@ func torrentScenarios() []torrentScenario {
 			Name: "bandwidth-split",
 			Asserts: []string{
 				"an 80% usenet split with no download limit is in force, needs a limit, and holds neither side to a rate",
-				"under a 2 MiB/s limit every reading holds usenet to at least its 80% and torrents to at least their 20%, neither past the limit",
+				"under a 2 MiB/s limit every reading shares the whole limit out, each side keeping at least a 1% probe",
 				"with usenet idle, the last 75% of a 12 MiB torrent takes at least 75% of its size over 1.25x the whole limit",
 			},
 			Run: scenarioBandwidthSplit,
@@ -193,9 +195,9 @@ func torrentScenarios() []torrentScenario {
 		{
 			Name: "pause-all-torrents",
 			Asserts: []string{
-				"pauseTorrents holds the other torrent QUEUED, stated HELD_MANUAL, keeps the one paused on its own PAUSED, and reads torrentsPaused, with the usenet queue not paused",
-				"resumeTorrents lifts the hold: the torrent paused on its own stays PAUSED, the other seeds again",
-				"the client facade's torrents/stop hashes=all is the same hold: every torrent reads stoppedUP and torrentsPaused is true",
+				"pauseClass(class: TORRENT) holds the other torrent QUEUED, stated HELD_MANUAL, keeps the one paused on its own PAUSED, and pausedClasses reads TORRENT, with the usenet queue not paused",
+				"resumeClass(class: TORRENT) lifts the hold: the torrent paused on its own stays PAUSED, the other seeds again",
+				"the client facade's torrents/stop hashes=all is the same hold: every torrent reads stoppedUP and pausedClasses reads TORRENT",
 				"torrents/start hashes=all lifts it: the other seeds again and the torrent paused on its own still reads stoppedUP",
 			},
 			Run: scenarioPauseAllTorrents,
@@ -205,7 +207,7 @@ func torrentScenarios() []torrentScenario {
 			Asserts: []string{
 				"auth/login with an API key answers 204 and a SID cookie; app/webapiVersion answers 2.16.2",
 				"torrents/add by file and by magnet each answer success_count 1 and the torrents seed (uploading or stalledUP)",
-				"a duplicate add, an unwanted torrent and a URL that is no torrent each answer 409",
+				"a duplicate add, a torrent named after an executable and a URL that is no torrent each answer 409",
 				"stop reads stoppedUP, start reads a seeding state, delete removes it",
 				"five bad logins answer 401 Unauthorized and the next 403",
 			},
@@ -217,7 +219,7 @@ func torrentScenarios() []torrentScenario {
 				"at the lane's end, the tracker has never heard any refused torrent's infohash",
 			},
 			Run: func(lane *torrentLane, evidence map[string]any) error {
-				return lane.assertNeverAnnounced(evidence, "disabled", "unwanted", "facade-refused")
+				return lane.assertNeverAnnounced(evidence, "disabled", "executable", "facade-refused")
 			},
 		},
 	}
@@ -370,6 +372,18 @@ func (lane *torrentLane) downloadScenario(slug string, options submitOptions, ev
 	}
 	if len(view.Trackers) == 0 || view.Trackers[0].URL != fixture.Tracker {
 		return fmt.Errorf("trackers %+v, want %s", view.Trackers, fixture.Tracker)
+	}
+	if options.Unpack {
+		view, err = lane.waitTorrent(view.ID, slug+" unpacks", func(view *torrentView) bool {
+			return view != nil && view.Unpacking != nil
+		})
+		evidence["unpacked"] = view
+		if err != nil {
+			return err
+		}
+		if view.Unpacking.Result != "WHOLE" {
+			return fmt.Errorf("unpacking %s (%s), want WHOLE", view.Unpacking.Result, deref(view.Unpacking.Reason))
+		}
 	}
 	output, err := verifyTorrentOutput(fixture, deref(view.StorageDir))
 	evidence["output"] = output
@@ -651,19 +665,35 @@ func scenarioRemove(lane *torrentLane, evidence map[string]any) error {
 }
 
 func scenarioUnwanted(lane *torrentLane, evidence map[string]any) error {
+	// The default unwanted extensions leave run.cmd out; readme.txt is wanted.
 	fixture := lane.fixture("unwanted")
-	_, err := lane.submit(fixture, submitOptions{})
-	evidence["error"] = fmt.Sprint(err)
+	view, err := lane.submit(fixture, submitOptions{})
+	evidence["added"] = view
+	if err != nil {
+		return fmt.Errorf("unwanted file: %w, want the torrent added with the file left out", err)
+	}
+	defer lane.cleanupTorrent(view.ID, evidence)
+	selected := map[string]bool{}
+	for _, file := range view.Files {
+		selected[file.Path] = file.Selected
+	}
+	if want := map[string]bool{"readme.txt": true, "extras/run.cmd": false}; !maps.Equal(selected, want) {
+		return fmt.Errorf("selected files %v, want %v", selected, want)
+	}
+
+	executable := lane.fixture("executable")
+	_, err = lane.submit(executable, submitOptions{})
+	evidence["refused"] = fmt.Sprint(err)
 	if code := graphqlCode(err); code != "REFUSED" {
-		return fmt.Errorf("unwanted torrent: code %q (%v), want REFUSED", code, err)
+		return fmt.Errorf("executable torrent: code %q (%v), want REFUSED", code, err)
 	}
-	if !strings.Contains(err.Error(), "run.cmd") {
-		return fmt.Errorf("refusal %q does not name run.cmd", err)
+	if !strings.Contains(err.Error(), executable.Name) {
+		return fmt.Errorf("refusal %q does not name %s", err, executable.Name)
 	}
-	if err := lane.assertNotListed(fixture.Infohash); err != nil {
+	if err := lane.assertNotListed(executable.Infohash); err != nil {
 		return err
 	}
-	return lane.assertNeverAnnounced(evidence, "unwanted")
+	return lane.assertNeverAnnounced(evidence, "executable")
 }
 
 func scenarioDuplicate(lane *torrentLane, evidence map[string]any) error {
@@ -1091,19 +1121,18 @@ func scenarioBandwidthSplit(lane *torrentLane, evidence map[string]any) error {
 	if err := setBandwidth(map[string]any{"downloadBps": capBps}); err != nil {
 		return err
 	}
-	// Each reading of the split under the limit holds each side to at least
-	// its share and neither past the whole limit. A side that lends keeps its
-	// own share as its limit, so the two may add up to more than the limit.
+	// Each reading of the split under the limit shares the whole limit out:
+	// the two rates add up to it exactly, and a side that moves nothing keeps
+	// a probe of a hundredth of it, so neither side is ever below the probe.
+	const probeBps = capBps / 100
 	check := func(view *bandwidthSplitView) error {
 		if view.InForce == nil || view.InForce.UsenetPct != usenetPct || view.NeedsDownloadLimit ||
 			view.UsenetBps == nil || view.TorrentBps == nil {
 			return fmt.Errorf("under a %d B/s limit with an %d%% usenet split: %s", capBps, usenetPct, view.summary())
 		}
-		usenetShare := int64(capBps) - torrentShare
-		if *view.UsenetBps < usenetShare || *view.TorrentBps < torrentShare ||
-			*view.UsenetBps > capBps || *view.TorrentBps > capBps {
-			return fmt.Errorf("under a %d B/s limit the split must hold usenet to %d..%d B/s and torrents to %d..%d B/s: %s",
-				capBps, usenetShare, capBps, torrentShare, capBps, view.summary())
+		if *view.UsenetBps+*view.TorrentBps != capBps || *view.UsenetBps < probeBps || *view.TorrentBps < probeBps {
+			return fmt.Errorf("under a %d B/s limit the split must share it all out with each side at %d B/s or more: %s",
+				capBps, probeBps, view.summary())
 		}
 		return nil
 	}
@@ -1303,7 +1332,7 @@ func scenarioFacade(lane *torrentLane, evidence map[string]any) error {
 	}
 	evidence["add_refused"] = fmt.Sprintf("%d %s", status, body)
 	if status != http.StatusConflict {
-		return fmt.Errorf("unwanted add: %d %q, want 409", status, body)
+		return fmt.Errorf("executable add: %d %q, want 409", status, body)
 	}
 	status, body, err = client.form("torrents/add", map[string]string{"urls": "http://torrent-tracker:8080/lane.torrent"})
 	if err != nil {
@@ -1612,15 +1641,25 @@ func scenarioUploadCap(lane *torrentLane, evidence map[string]any) error {
 }
 
 type queueHoldView struct {
-	IsPaused       bool `json:"isPaused"`
-	TorrentsPaused bool `json:"torrentsPaused"`
+	IsPaused      bool     `json:"isPaused"`
+	PausedClasses []string `json:"pausedClasses"`
+}
+
+// classPaused reports whether pausedClasses names class.
+func (view *queueHoldView) classPaused(class string) bool {
+	for _, paused := range view.PausedClasses {
+		if paused == class {
+			return true
+		}
+	}
+	return false
 }
 
 func (lane *torrentLane) queueHold() (*queueHoldView, error) {
 	var out struct {
 		GlobalQueueState queueHoldView `json:"globalQueueState"`
 	}
-	err := lane.gql(`{ globalQueueState { isPaused torrentsPaused } }`, nil, &out)
+	err := lane.gql(`{ globalQueueState { isPaused pausedClasses } }`, nil, &out)
 	return &out.GlobalQueueState, err
 }
 
@@ -1634,11 +1673,11 @@ func (lane *torrentLane) waitTorrentsHold(describe string, want bool) error {
 			return false, "", err
 		}
 		seen = view
-		return view.TorrentsPaused == want, fmt.Sprintf("torrentsPaused=%t isPaused=%t", view.TorrentsPaused, view.IsPaused), nil
+		return view.classPaused("TORRENT") == want, fmt.Sprintf("pausedClasses=%v isPaused=%t", view.PausedClasses, view.IsPaused), nil
 	}); err != nil {
 		return err
 	}
-	if seen.IsPaused {
+	if seen.IsPaused || seen.classPaused("NZB") {
 		return fmt.Errorf("%s: the usenet queue reads paused", describe)
 	}
 	return nil
@@ -1664,7 +1703,7 @@ func scenarioPauseAllTorrents(lane *torrentLane, evidence map[string]any) error 
 	}
 	defer lane.cleanupTorrent(only.ID, evidence)
 	defer func() {
-		if err := lane.mutateBool("resumeTorrents", "", nil); err != nil {
+		if err := lane.mutateBool("resumeClass", "(class: TORRENT)", nil); err != nil {
 			evidence["restore_hold_error"] = err.Error()
 		}
 	}()
@@ -1675,28 +1714,28 @@ func scenarioPauseAllTorrents(lane *torrentLane, evidence map[string]any) error 
 		return err
 	}
 
-	if err := lane.mutateBool("pauseTorrents", "", nil); err != nil {
-		return fmt.Errorf("pauseTorrents: %w", err)
+	if err := lane.mutateBool("pauseClass", "(class: TORRENT)", nil); err != nil {
+		return fmt.Errorf("pauseClass TORRENT: %w", err)
 	}
 	held, err := lane.waitTorrent(only.ID, "the hold queues hold-only, held by the operator", heldManual)
 	evidence["held"] = held
 	if err != nil {
 		return err
 	}
-	if err := lane.waitTorrentsHold("pauseTorrents reads torrentsPaused", true); err != nil {
+	if err := lane.waitTorrentsHold("pauseClass TORRENT reads TORRENT paused", true); err != nil {
 		return err
 	}
 	if view, err := lane.torrent(own.ID); err != nil || !paused(view) {
 		return fmt.Errorf("under the hold hold-own reads %s (%v)", view.summary(), err)
 	}
 
-	if err := lane.mutateBool("resumeTorrents", "", nil); err != nil {
-		return fmt.Errorf("resumeTorrents: %w", err)
+	if err := lane.mutateBool("resumeClass", "(class: TORRENT)", nil); err != nil {
+		return fmt.Errorf("resumeClass TORRENT: %w", err)
 	}
-	if _, err := lane.waitTorrent(only.ID, "resumeTorrents lets hold-only seed", seeding); err != nil {
+	if _, err := lane.waitTorrent(only.ID, "resumeClass TORRENT lets hold-only seed", seeding); err != nil {
 		return err
 	}
-	if err := lane.waitTorrentsHold("resumeTorrents clears torrentsPaused", false); err != nil {
+	if err := lane.waitTorrentsHold("resumeClass TORRENT clears TORRENT paused", false); err != nil {
 		return err
 	}
 	stillOwn, err := lane.torrent(own.ID)
@@ -1705,7 +1744,7 @@ func scenarioPauseAllTorrents(lane *torrentLane, evidence map[string]any) error 
 		return err
 	}
 	if !paused(stillOwn) {
-		return fmt.Errorf("resumeTorrents resumed the torrent paused on its own: %s", stillOwn.summary())
+		return fmt.Errorf("resumeClass TORRENT resumed the torrent paused on its own: %s", stillOwn.summary())
 	}
 
 	// The client facade's every-torrent stop and start are the same hold.
@@ -1724,7 +1763,7 @@ func scenarioPauseAllTorrents(lane *torrentLane, evidence map[string]any) error 
 		}
 		evidence["facade_stopped_"+hash] = state
 	}
-	if err := lane.waitTorrentsHold("torrents/stop hashes=all reads torrentsPaused", true); err != nil {
+	if err := lane.waitTorrentsHold("torrents/stop hashes=all reads TORRENT paused", true); err != nil {
 		return err
 	}
 	if status, body, err := client.form("torrents/start", map[string]string{"hashes": "all"}); err != nil || status != http.StatusOK {
@@ -1735,7 +1774,7 @@ func scenarioPauseAllTorrents(lane *torrentLane, evidence map[string]any) error 
 		return err
 	}
 	evidence["facade_started_only"] = state
-	if err := lane.waitTorrentsHold("torrents/start hashes=all clears torrentsPaused", false); err != nil {
+	if err := lane.waitTorrentsHold("torrents/start hashes=all clears TORRENT paused", false); err != nil {
 		return err
 	}
 	list, err := client.info(ownHash)

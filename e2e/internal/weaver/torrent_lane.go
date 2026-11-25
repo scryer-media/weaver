@@ -311,7 +311,8 @@ uploadedBytes downloadedBytes ratio downloadBps uploadBps peers seeds leechers c
 seedingLeft route seedingPolicy { ratioGoal seedTimeGoalMinutes inactiveGoalMinutes mode action uploadCap levels { ratioGoal } }
 seedingOverride { ratioGoal { state value } action { state value } }
 files { index path length selected progress }
-trackers { tier url status message seeders leechers lastAnnounceMs }`
+trackers { tier url status message seeders leechers lastAnnounceMs }
+unpacking { result reason }`
 
 type torrentView struct {
 	ID              int     `json:"id"`
@@ -336,9 +337,14 @@ type torrentView struct {
 	Leechers        int     `json:"leechers"`
 	CompletedAtMs   *int64  `json:"completedAtMs"`
 	StorageDir      *string `json:"storageDir"`
-	SeedingLeft     *string `json:"seedingLeft"`
-	Route           *string `json:"route"`
-	SeedingPolicy   struct {
+	// How its unpacking came out, once over; absent while it runs.
+	Unpacking *struct {
+		Result string  `json:"result"`
+		Reason *string `json:"reason"`
+	} `json:"unpacking"`
+	SeedingLeft   *string `json:"seedingLeft"`
+	Route         *string `json:"route"`
+	SeedingPolicy struct {
 		RatioGoal *float64 `json:"ratioGoal"`
 		Action    string   `json:"action"`
 		// The level each term comes from.
@@ -388,6 +394,9 @@ type submitOptions struct {
 	Paused   bool
 	Forced   bool
 	Seeding  map[string]any
+	// Unpack asks for this torrent's archives to be extracted; unpacking is
+	// off by default.
+	Unpack bool
 }
 
 func (lane *torrentLane) submit(fixture *torrentFixture, options submitOptions) (*torrentView, error) {
@@ -406,6 +415,9 @@ func (lane *torrentLane) submit(fixture *torrentFixture, options submitOptions) 
 	}
 	if options.Seeding != nil {
 		input["seeding"] = options.Seeding
+	}
+	if options.Unpack {
+		input["unpack"] = true
 	}
 	var out struct {
 		SubmitTorrent torrentView `json:"submitTorrent"`

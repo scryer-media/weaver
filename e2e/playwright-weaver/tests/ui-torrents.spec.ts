@@ -4,7 +4,6 @@
 import { readFileSync } from "node:fs";
 import type { Locator, Page } from "@playwright/test";
 import { expect, test } from "./helpers";
-import { expectGraphqlErrors } from "./support/graphql-errors";
 import { operationResponse } from "./support/graphql-operations";
 import { byTestIdPrefix, tableRow } from "./support/settings-locators";
 import { jobIds, testIds, torrentIds } from "./support/testids";
@@ -232,8 +231,7 @@ test("Pause torrents on the Downloads page holds every torrent and leaves the qu
 });
 
 test("removing a private torrent short of its goal asks about its files and then the goal", async ({ cleanPage: page }) => {
-  // The daemon refuses the first remove with the goal it is short of; the dialog turns that into its second confirm.
-  expectGraphqlErrors(page, /seeding goal is not met/);
+  // The daemon never refuses the remove; the web asks about the unmet goal itself, as the second confirm.
   await openJob(page, fileFixture);
   await page.getByTestId(torrentIds.jobRemove).click();
   const first = page.getByTestId(testIds.dialog("torrent-remove"));

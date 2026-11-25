@@ -818,12 +818,12 @@
       "oracle": "browser"
     },
     {
-      "name": "pauseTorrents",
+      "name": "pauseClass",
       "owner": "ui-torrents",
       "oracle": "browser"
     },
     {
-      "name": "resumeTorrents",
+      "name": "resumeClass",
       "owner": "ui-torrents",
       "oracle": "browser"
     },
@@ -841,6 +841,157 @@
       "name": "setTorrentCategory",
       "owner": "torrents",
       "oracle": "api-metrics"
+    },
+    {
+      "name": "submit",
+      "owner": "ui-torrents",
+      "oracle": "browser"
+    },
+    {
+      "name": "setBandwidth",
+      "owner": "rate-limits",
+      "oracle": "api-metrics"
+    },
+    {
+      "name": "setEgressQuota",
+      "owner": "bandwidth-and-server-quotas",
+      "oracle": "api-metrics"
+    },
+    {
+      "name": "saveDnsProfile",
+      "owner": "advanced-networking-dns",
+      "oracle": "browser"
+    },
+    {
+      "name": "saveDnsServerList",
+      "owner": "advanced-networking-dns",
+      "oracle": "browser"
+    },
+    {
+      "name": "deleteDnsProfile",
+      "owner": "proxy-routing",
+      "oracle": "api-metrics",
+      "rationale": "The flow deletes the DNS profile it made as its cleanup; no spec asserts the deletion itself."
+    },
+    {
+      "name": "deleteDnsServerList",
+      "owner": "proxy-routing",
+      "oracle": "api-metrics",
+      "rationale": "The flow deletes the DNS server list it made as its cleanup; no spec asserts the deletion itself."
+    },
+    {
+      "name": "testDnsServers",
+      "owner": "advanced-networking-dns",
+      "oracle": "unit-only",
+      "rationale": "The server API tests cover it; no release spec calls it."
+    },
+    {
+      "name": "setUnwantedExtensionAction",
+      "owner": "ui-post-processing",
+      "oracle": "unit-only",
+      "rationale": "The server API tests cover it; no release spec calls it."
+    },
+    {
+      "name": "recheckTorrent",
+      "owner": "torrents",
+      "oracle": "unit-only",
+      "rationale": "The torrent service tests cover a recheck; no release spec calls it."
+    },
+    {
+      "name": "addTorrentTrackers",
+      "owner": "torrents",
+      "oracle": "unit-only",
+      "rationale": "The server API tests cover it; no release spec calls it."
+    },
+    {
+      "name": "applyTrackerFile",
+      "owner": "torrents",
+      "oracle": "unit-only",
+      "rationale": "The server API tests cover it; no release spec calls it."
+    },
+    {
+      "name": "banTorrentPeer",
+      "owner": "torrents",
+      "oracle": "unit-only",
+      "rationale": "The server API tests cover it; no release spec calls it."
+    },
+    {
+      "name": "deleteTrackerRule",
+      "owner": "torrents",
+      "oracle": "unit-only",
+      "rationale": "The server API tests cover it; no release spec calls it."
+    },
+    {
+      "name": "dhtAnnounceTorrent",
+      "owner": "torrents",
+      "oracle": "unit-only",
+      "rationale": "The server API tests cover it; no release spec calls it."
+    },
+    {
+      "name": "previewTrackerFile",
+      "owner": "torrents",
+      "oracle": "unit-only",
+      "rationale": "The server API tests cover it; no release spec calls it."
+    },
+    {
+      "name": "reannounceTorrent",
+      "owner": "torrents",
+      "oracle": "unit-only",
+      "rationale": "The server API tests cover it; no release spec calls it."
+    },
+    {
+      "name": "removeTorrentTrackers",
+      "owner": "torrents",
+      "oracle": "unit-only",
+      "rationale": "The server API tests cover it; no release spec calls it."
+    },
+    {
+      "name": "replaceTorrentTrackers",
+      "owner": "torrents",
+      "oracle": "unit-only",
+      "rationale": "The server API tests cover it; no release spec calls it."
+    },
+    {
+      "name": "saveTrackerRule",
+      "owner": "torrents",
+      "oracle": "unit-only",
+      "rationale": "The server API tests cover it; no release spec calls it."
+    },
+    {
+      "name": "setTorrentFilePriorities",
+      "owner": "torrents",
+      "oracle": "unit-only",
+      "rationale": "The server API tests cover it; no release spec calls it."
+    },
+    {
+      "name": "setTorrentFirstLastPieceFirst",
+      "owner": "torrents",
+      "oracle": "unit-only",
+      "rationale": "The server API tests cover it; no release spec calls it."
+    },
+    {
+      "name": "setTorrentLocation",
+      "owner": "torrents",
+      "oracle": "unit-only",
+      "rationale": "The server API tests cover it; no release spec calls it."
+    },
+    {
+      "name": "setTorrentRateLimits",
+      "owner": "torrents",
+      "oracle": "unit-only",
+      "rationale": "The server API tests cover it; no release spec calls it."
+    },
+    {
+      "name": "setTorrentSequential",
+      "owner": "torrents",
+      "oracle": "unit-only",
+      "rationale": "The server API tests cover it; no release spec calls it."
+    },
+    {
+      "name": "unbindTrackerRule",
+      "owner": "torrents",
+      "oracle": "unit-only",
+      "rationale": "The server API tests cover it; no release spec calls it."
     }
   ],
   "behaviors": [
