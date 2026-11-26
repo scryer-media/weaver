@@ -453,6 +453,10 @@ impl Pipeline {
         }
         let limit = self.graph_job_slot_limit(job_id);
         let Some(graph) = self.graph_jobs.get_mut(&job_id) else {
+            // A job outside the pipeline, such as a torrent's unpacking, is
+            // never admitted as an NZB: it gets the pipeline's slots, and
+            // holds back its own runs while it is paused or stopped.
+            let limit = self.graph_slot_limit();
             if let Some(unheard) = self.graph_outside.deliver(said, limit) {
                 crate::pipeline::graph::job::discard_unheard(unheard);
             }
