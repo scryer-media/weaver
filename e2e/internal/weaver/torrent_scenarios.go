@@ -965,11 +965,14 @@ func scenarioDownloadCap(lane *torrentLane, evidence map[string]any) error {
 // progress reading.
 func (lane *torrentLane) cappedDownload(fixture *torrentFixture, capBps int64, evidence map[string]any, sample func() error) error {
 	// Progress is read two ways: Weaver's own fetched-bytes counter, and
-	// what the seeder, the only peer holding this infohash, has sent; a
-	// reading is the larger of the two. The last reading at or below a
-	// quarter of the whole and the first reading of the whole bracket the
-	// transfer of at least the last three quarters, so the time between
-	// those readings is at least as long as that transfer took. One second
+	// what the seeder, the only peer holding this infohash, has sent. The
+	// bracket opens at the last reading where the larger of the two is at or
+	// below a quarter of the whole, and closes at the first reading where
+	// Weaver has fetched the whole: the seeder's count runs ahead of what
+	// Weaver took in, into socket buffers and past the whole, so it may
+	// only open the bracket. Between the two lies the transfer of at least
+	// the last three quarters, so that time is at least as long as that
+	// transfer took. One second
 	// of the cap is allowed as a burst. Starting the bracket at the submit,
 	// before any byte can move, keeps it sound when no early reading is seen.
 	type reading struct {
@@ -1007,9 +1010,8 @@ func (lane *torrentLane) cappedDownload(fixture *torrentFixture, capBps int64, e
 			if len(samples) < 400 {
 				samples = append(samples, fmt.Sprintf("+%dms %s downloaded=%d seeder_sent=%d", now.Sub(submitted).Milliseconds(), state, fetched, sent))
 			}
-			bytes := max(sent, fetched)
-			if bytes >= fixture.TotalBytes {
-				full = &reading{at: now, bytes: bytes}
+			if bytes := max(sent, fetched); fetched >= fixture.TotalBytes {
+				full = &reading{at: now, bytes: fetched}
 			} else if bytes <= fixture.TotalBytes/4 {
 				last = reading{at: now, bytes: bytes}
 			}

@@ -389,16 +389,6 @@
       "oracle": "existing-pipeline"
     },
     {
-      "name": "setQueueSpeedLimit",
-      "owner": "rate-limits",
-      "oracle": "api-metrics"
-    },
-    {
-      "name": "setSpeedLimit",
-      "owner": "rate-limits",
-      "oracle": "api-metrics"
-    },
-    {
       "name": "addRssFeed",
       "owner": "ui-ingress-automation",
       "oracle": "browser"
