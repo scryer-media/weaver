@@ -831,7 +831,14 @@ impl RarStore {
             #[cfg(test)]
             super::counts::bump(|counts| counts.visited += 1);
             let made = self.made_by_run(id, member, format);
-            if !made && let Some(emit) = verdict(member, || in_clear(&self.volumes, member)) {
+            // A link is one by the rule the run reads (`links`), whatever
+            // the member's eligibility says: a RAR4 header has no
+            // redirection record for it to show.
+            let refused = || match self.links(member, format) {
+                true => Some(Emit::NeedsEngine(Why::NotAFile)),
+                false => verdict(member, || in_clear(&self.volumes, member)),
+            };
+            if !made && let Some(emit) = refused() {
                 refusal = Some(emit);
                 break;
             }

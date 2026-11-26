@@ -1045,20 +1045,8 @@ async fn a_compressed_rar4_unix_symlink_is_no_member_of_the_run() {
         let mut options = options(Version::Rar4);
         options.solid = solid;
         let mut set = mixed(Version::Rar4, Size::Small, MKV, &options);
-        let bytes = &mut set.volumes[0].1;
-        let name = MKV[1].as_bytes();
-        let at = bytes
-            .windows(name.len())
-            .position(|window| window == name)
-            .expect("the compressed member's header");
-        let header = at - 32;
-        assert_eq!(bytes[header + 2], 0x74, "a file header");
-        assert_eq!(bytes[header + 15], 3, "written on a Unix host");
-        assert_ne!(bytes[header + 25], 0x30, "compressed");
-        bytes[header + 28..header + 32].copy_from_slice(&0o120_777u32.to_le_bytes());
-        let size = u16::from_le_bytes([bytes[header + 5], bytes[header + 6]]) as usize;
-        let crc = (par2_rs::checksum::crc32(&bytes[header + 2..header + size]) & 0xffff) as u16;
-        bytes[header..header + 2].copy_from_slice(&crc.to_le_bytes());
+        let method = unix_link(&mut set.volumes[0].1, MKV[1]);
+        assert_ne!(method, 0x30, "compressed");
         set
     };
     // What a job's end is judged on: its status, what it delivered, and
@@ -1095,6 +1083,87 @@ async fn a_compressed_rar4_unix_symlink_is_no_member_of_the_run() {
     // keeps, so the engine reads it whole from the start.
     let whole = run(&Scenario::new(linked(true).posts())).await;
     assert_eq!(end(&graph), end(&whole), "as the engine reads it whole");
+}
+
+// Marks member `name`'s RAR4 header in `bytes` a Unix symlink by its
+// attributes, as `rar` writes a link on a Unix host, and seals the header's
+// CRC again. Returns the header's method byte.
+fn unix_link(bytes: &mut [u8], name: &str) -> u8 {
+    let name = name.as_bytes();
+    let at = bytes
+        .windows(name.len())
+        .position(|window| window == name)
+        .expect("the member's header");
+    let header = at - 32;
+    assert_eq!(bytes[header + 2], 0x74, "a file header");
+    assert_eq!(bytes[header + 15], 3, "written on a Unix host");
+    bytes[header + 28..header + 32].copy_from_slice(&0o120_777u32.to_le_bytes());
+    let size = u16::from_le_bytes([bytes[header + 5], bytes[header + 6]]) as usize;
+    let crc = (par2_rs::checksum::crc32(&bytes[header + 2..header + size]) & 0xffff) as u16;
+    bytes[header..header + 2].copy_from_slice(&crc.to_le_bytes());
+    bytes[header + 25]
+}
+
+// A RAR4 set of a stored file and a stored Unix symlink to it, as `rar`
+// writes a link on a Unix host: its body is the target's name. RAR4 has no
+// redirection record, so the link is one by its attributes alone.
+fn stored_rar4_link() -> Set {
+    let file = payload(5 * ARTICLE + 11, 41);
+    let items = vec![
+        Item::File("alpha.mkv", file.clone()),
+        Item::File("link.mkv", b"alpha.mkv".to_vec()),
+    ];
+    let mut volumes = named_volumes(write(&items, &options(Version::Rar4)));
+    assert_eq!(unix_link(&mut volumes[0].1, "link.mkv"), 0x30, "stored");
+    Set {
+        volumes,
+        files: vec![("alpha.mkv", file)],
+    }
+}
+
+// A stored RAR4 link is a link by the rule the run reads, as a RAR5
+// redirection is: the store streams none of it and gives the set to the
+// engine, whose run passes the link over as no file. The file beside it is
+// delivered and the link is not, as a regular file or otherwise.
+#[tokio::test]
+async fn a_stored_rar4_unix_symlink_is_not_delivered_as_a_file() {
+    let set = stored_rar4_link();
+    let graph = run(&Scenario::new(set.posts())).await;
+    assert!(
+        graph.completed(),
+        "{:?} {:?} {:?}",
+        graph.status,
+        graph.failure,
+        graph.files.keys()
+    );
+    assert_files("stored link", &graph.files, &set.files);
+    assert!(
+        kinds(&graph).contains(&"rar_engine"),
+        "the engine read the set: {:?}",
+        kinds(&graph)
+    );
+}
+
+// The file a stored RAR4 link points at lost an article, with nothing to
+// rebuild it: the link is no usable file, so nothing usable is delivered
+// and the job fails rather than ending Partial on the link.
+#[tokio::test]
+async fn a_stored_rar4_unix_symlink_beside_a_lost_file_fails() {
+    let set = stored_rar4_link();
+    let (_, at) = set.data_of("alpha.mkv", None).remove(0);
+    let graph = run(&Scenario::new(set.posts()).damaged(0, article_in(at))).await;
+    assert!(
+        matches!(graph.status, Some(JobStatus::Failed { .. })),
+        "{:?} {:?} {:?}",
+        graph.status,
+        graph.failure,
+        graph.files.keys()
+    );
+    assert!(
+        !graph.files.contains_key(&delivered("link.mkv")),
+        "{:?}",
+        graph.files.keys()
+    );
 }
 
 // A recovery record in every volume is the set's own: the store leaves it,

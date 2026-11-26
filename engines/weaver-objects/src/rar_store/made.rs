@@ -152,14 +152,27 @@ impl RarStore {
                 IneligibilityReason::Compressed { .. } | IneligibilityReason::Encrypted
             )
         );
-        let Some(first) = member
-            .parts
-            .first()
-            .and_then(|part| self.part_facts(part.volume, part.data_offset))
-        else {
+        let Some(first) = self.first_traits(member, format) else {
             return false;
         };
-        fresh && eligible && by_run(self.solid_archive(), Traits::of_part(first, format))
+        fresh && eligible && by_run(self.solid_archive(), first)
+    }
+
+    // Whether member `member` is a link by its first header, as the run
+    // reads one (`Traits::link`): a RAR5 redirection, or a RAR4 Unix
+    // symlink. It holds no file body, so the store streams none of it and
+    // gives the set to the engine as it does any redirection (`verdict`),
+    // whose run passes the link over as no file.
+    pub(super) fn links(&self, member: &StoredMember, format: ArchiveFormat) -> bool {
+        self.first_traits(member, format)
+            .is_some_and(|first| first.link)
+    }
+
+    // What member `member`'s first header states, as the walk read it.
+    fn first_traits(&self, member: &StoredMember, format: ArchiveFormat) -> Option<Traits> {
+        let part = member.parts.first()?;
+        self.part_facts(part.volume, part.data_offset)
+            .map(|first| Traits::of_part(first, format))
     }
 
     // Whether the set's first volume's main header says it is solid.
