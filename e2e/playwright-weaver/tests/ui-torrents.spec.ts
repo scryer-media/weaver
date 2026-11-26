@@ -246,7 +246,8 @@ test("removing a private torrent short of its goal asks about its files and then
   await expect(queueRow(page, magnetFixture.name)).toBeVisible();
 });
 
-test("removing a public torrent from the queue inspector takes one confirm", async ({ cleanPage: page }) => {
+test("removing a public torrent short of the global goal from the queue inspector asks about the goal too", async ({ cleanPage: page }) => {
+  // The global seed-time goal saved above applies to public torrents as well.
   await page.goto("/");
   await queueRow(page, magnetFixture.name).click();
   await page.getByTestId(torrentIds.inspectorRemove).click();
@@ -254,6 +255,9 @@ test("removing a public torrent from the queue inspector takes one confirm", asy
   await expect(confirm.getByTestId(torrentIds.removeDeleteFiles)).not.toBeChecked();
   await confirm.getByTestId(testIds.confirmAccept).click();
   await expect(confirm).toBeHidden();
-  await expect(page.getByTestId(testIds.dialog("torrent-unmet-goal"))).toHaveCount(0);
+  const second = page.getByTestId(testIds.dialog("torrent-unmet-goal"));
+  await expect(second).toBeVisible();
+  await second.getByTestId(testIds.confirmAccept).click();
+  await expect(second).toBeHidden();
   await expect(queueRow(page, magnetFixture.name)).toHaveCount(0);
 });

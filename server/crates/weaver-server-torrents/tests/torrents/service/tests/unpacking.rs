@@ -100,7 +100,7 @@ async fn an_archive_torrent_unpacks_beside_its_files_and_seeds_from_them() {
         std::env!("CARGO_MANIFEST_DIR"),
         "/../weaver-server-core/tests/fixtures/rar5/rar5_store.rar"
     ));
-    unpacks_beside_and_seeds("set.rar", archive).await;
+    unpacks_beside_and_seeds("set.rar", archive, 128, small_txt_beside).await;
 }
 
 // A torrent of a gzipped tar is an archive's too: its pieces feed the graph,
@@ -117,7 +117,36 @@ async fn a_tar_gz_torrent_unpacks_beside_its_file_and_seeds_from_it() {
         .unwrap();
     let mut gzip = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
     std::io::Write::write_all(&mut gzip, &tar.into_inner().unwrap()).unwrap();
-    unpacks_beside_and_seeds("set.tar.gz", &gzip.finish().unwrap()).await;
+    unpacks_beside_and_seeds("set.tar.gz", &gzip.finish().unwrap(), 128, small_txt_beside).await;
+}
+
+// A torrent of a compressed RAR that holds a file beside an `.xz` of
+// another unpacks both layers: the file, and what the `.xz` holds in place
+// of it, beside the archive. It completes and seeds on.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_compressed_rar_torrent_holding_an_xz_unpacks_both_layers_and_completes() {
+    let archive = std::fs::read(concat!(
+        std::env!("CARGO_MANIFEST_DIR"),
+        "/../../../e2e/testdata/nested-xz-rar/archive.rar"
+    ))
+    .unwrap();
+    unpacks_beside_and_seeds("archive.rar", &archive, 64 * 1024, |dir| {
+        assert!(dir.join("test-media.mkv").is_file());
+        assert!(
+            std::fs::read_to_string(dir.join("release.nfo"))
+                .unwrap()
+                .starts_with("Nested XZ sidecar beside ordinary media.")
+        );
+        assert!(!dir.join("release.nfo.xz").exists());
+        std::fs::remove_file(dir.join("test-media.mkv")).unwrap();
+    })
+    .await;
+}
+
+// `small.txt` lies beside the archive, as it came; it is taken away.
+fn small_txt_beside(dir: &Path) {
+    assert_eq!(std::fs::read(dir.join("small.txt")).unwrap(), SMALL_TXT);
+    std::fs::remove_file(dir.join("small.txt")).unwrap();
 }
 
 const SMALL_TXT: &[u8] = include_bytes!(concat!(
@@ -125,15 +154,20 @@ const SMALL_TXT: &[u8] = include_bytes!(concat!(
     "/../weaver-server-core/tests/fixtures/originals/small.txt"
 ));
 
-// Adds a torrent of one file, `name`, whose bytes are `archive` holding
-// `small.txt`, and downloads it whole: the torrent gets a tee, completes
-// without a history row, keeps `archive` as it came, unpacks `small.txt`
-// beside it, and with that file gone still reads every piece from `archive`.
-async fn unpacks_beside_and_seeds(name: &str, archive: &[u8]) {
-    let member = SMALL_TXT;
+// Adds a torrent of one file, `name`, whose bytes are `archive`, in pieces
+// of `piece` bytes, and downloads it whole: the torrent gets a tee,
+// completes without a history row, keeps `archive` as it came, and has what
+// `beside` checks unpacked beside it; with that taken away, it still reads
+// every piece from `archive`.
+async fn unpacks_beside_and_seeds(
+    name: &str,
+    archive: &[u8],
+    piece: usize,
+    beside: impl Fn(&Path),
+) {
     let rig = rig(set_clock());
     rig.service.open().await.unwrap();
-    let bytes = metainfo(name, &[(name, archive)], 128, false);
+    let bytes = metainfo(name, &[(name, archive)], piece, false);
     let job_id = rig
         .service
         .add_opened(request(AddSource::Metainfo(bytes)))
@@ -191,10 +225,9 @@ async fn unpacks_beside_and_seeds(name: &str, archive: &[u8]) {
     let view = rig.service.torrent(job_id).await.unwrap();
     let dir = PathBuf::from(view.storage_dir.unwrap());
     assert_eq!(std::fs::read(dir.join(name)).unwrap(), archive);
-    assert_eq!(std::fs::read(dir.join("small.txt")).unwrap(), member);
+    beside(&dir);
 
-    // The unpacked file gone, every piece still reads from the archive.
-    std::fs::remove_file(dir.join("small.txt")).unwrap();
+    // The unpacked files gone, every piece still reads from the archive.
     for piece in 0..layout.piece_count() {
         let range = layout.piece_range(piece);
         for span in layout.spans(piece) {

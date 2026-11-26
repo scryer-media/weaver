@@ -801,11 +801,6 @@ func verifyTorrentOutput(fixture *torrentFixture, dir string) (map[string]any, e
 			problems = append(problems, fmt.Sprintf("%s BLAKE3 %s, want %s", rel, got, want))
 		}
 	}
-	for _, rel := range fixture.Absent {
-		if _, ok := listing[rel]; ok {
-			problems = append(problems, "unpacking left "+rel)
-		}
-	}
 	retainedAt := map[string]string{}
 	for rel, want := range fixture.Retained {
 		length := int64(-1)

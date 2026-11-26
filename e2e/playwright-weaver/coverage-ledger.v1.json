@@ -637,6 +637,12 @@
       "rationale": "Changing the listen address only takes effect at the next restart, so a browser flow cannot observe its result within a test; the refusal paths (environment-pinned, strict-security without login) and the pending/restart reporting are covered by weaver-server-api security_policy tests and weaver-server-core security unit tests."
     },
     {
+      "name": "setMcpEnabled",
+      "owner": "ui-security",
+      "oracle": "unit-only",
+      "rationale": "No release spec drives the agent endpoint; the admin-only refusal, the live switch and the stored value are covered by weaver-server-api security_policy tests."
+    },
+    {
       "name": "beginFirstRunSetup",
       "owner": "ui-security",
       "oracle": "unit-only",
