@@ -48,6 +48,12 @@ pub trait Format: Send + Sync {
     fn front(_first_bytes: &[u8]) -> Option<Self::Front> {
         None
     }
+    // A volume's front, and whether the headers in it were read to their
+    // end, so it says all its headers ever will: `false` where that is not
+    // known.
+    fn read_front(first_bytes: &[u8]) -> Option<(Self::Front, bool)> {
+        Self::front(first_bytes).map(|front| (front, false))
+    }
     // Whether the front states the volume's place itself, rather than only
     // linking it to the volumes beside it.
     fn states_place(_front: &Self::Front) -> bool {
@@ -121,9 +127,11 @@ pub trait Format: Send + Sync {
 }
 
 // A volume bound, as far as it places the others: what its front states,
-// and its length once known.
+// whether its headers were read to their end there, and its length once
+// known.
 pub struct Holding<'a, T> {
     pub front: Option<&'a T>,
+    pub ended: bool,
     pub length: Option<u64>,
 }
 
@@ -133,6 +141,7 @@ pub struct Holding<'a, T> {
 pub struct Holdings<'a, T> {
     bound: &'a BTreeSet<u32>,
     fronts: &'a BTreeMap<u32, T>,
+    ended: &'a BTreeSet<u32>,
     lengths: &'a BTreeMap<u32, u64>,
     beside: &'a Beside,
     except: Option<u32>,
@@ -144,6 +153,7 @@ impl<'a, T> Holdings<'a, T> {
         counts::bump(|counts| counts.lookups += 1);
         (Some(index) != self.except && self.bound.contains(&index)).then(|| Holding {
             front: self.fronts.get(&index),
+            ended: self.ended.contains(&index),
             length: self.lengths.get(&index).copied(),
         })
     }
@@ -205,6 +215,8 @@ pub(crate) mod counts {
 // evidence travels when a corrected name gives one back for reoffering.
 pub(crate) struct CarriedVolume<T> {
     pub(crate) front: Option<T>,
+    // Whether the front's headers were read to their end.
+    pub(crate) ended: bool,
     pub(crate) length: Option<u64>,
     // What a decode of the volume holds resident, as the object that parsed
     // it read that from headers the engine's front does not hold.
@@ -280,6 +292,10 @@ pub struct EngineObject<F: Format> {
     #[serde(default)]
     tails: BTreeSet<u32>,
     bound: BTreeSet<u32>,
+    // The volumes whose fronts held their headers to the end. Last, so a
+    // state written before it decodes with none.
+    #[serde(default)]
+    ended: BTreeSet<u32>,
     // The places held where a front does not say its volume is not, and
     // the free places beside them (`Beside`), filed as a volume is bound,
     // its front comes, or it goes. Built from `bound` and `fronts` at the
@@ -308,7 +324,8 @@ impl<F: Format> Durable for EngineObject<F> {
             .chain(self.fronts.keys())
             .chain(self.lengths.keys())
             .chain(self.windows.keys())
-            .chain(self.tails.iter());
+            .chain(self.tails.iter())
+            .chain(self.ended.iter());
         let named = known.into_iter().all(|volume| self.bound.contains(volume));
         (!named).then_some("a volume named that is not bound")
     }
@@ -326,6 +343,7 @@ impl<F: Format> Default for EngineObject<F> {
             windows: BTreeMap::new(),
             tails: BTreeSet::new(),
             bound: BTreeSet::new(),
+            ended: BTreeSet::new(),
             beside: OnceLock::new(),
             password: None,
             placed: crate::placed::Placed::default(),
@@ -356,6 +374,7 @@ impl<F: Format> EngineObject<F> {
         Holdings {
             bound: &self.bound,
             fronts: &self.fronts,
+            ended: &self.ended,
             lengths: &self.lengths,
             beside: self.beside.get_or_init(|| {
                 let mut beside = Beside::default();
@@ -376,6 +395,14 @@ impl<F: Format> EngineObject<F> {
                 .fronts
                 .get(&volume)
                 .is_some_and(|front| F::misplaced(front, volume))
+    }
+
+    // Whether the front just kept for `volume` held its headers to the end.
+    fn read_to_end(&mut self, volume: u32, ended: bool) {
+        match ended {
+            true => self.ended.insert(volume),
+            false => self.ended.remove(&volume),
+        };
     }
 
     // File where `volume` stands, as its binding or front changed, once
@@ -637,10 +664,11 @@ impl<F: Format + 'static> Object for EngineObject<F> {
             return;
         }
         if delivery.offset == 0 {
-            if let Some(front) = F::front(delivery.bytes)
+            if let Some((front, ended)) = F::read_front(delivery.bytes)
                 && !self.fronts.contains_key(&volume)
             {
                 self.fronts.insert(volume, front);
+                self.read_to_end(volume, ended);
                 self.file(volume);
                 self.await_tail(volume);
             }
@@ -757,8 +785,9 @@ impl<F: Format + 'static> Object for EngineObject<F> {
         if let Some(window) = F::window(front) {
             self.windows.insert(volume.0, window);
         }
-        if let Some(front) = F::front(front) {
+        if let Some((front, ended)) = F::read_front(front) {
             self.fronts.insert(volume.0, front);
+            self.read_to_end(volume.0, ended);
         }
         if let Some(length) = length {
             self.lengths.insert(volume.0, length);
@@ -821,6 +850,7 @@ impl<F: Format + 'static> Object for EngineObject<F> {
             self.recovered.remove(&volume.0);
             Box::new(CarriedVolume {
                 front: self.fronts.remove(&volume.0),
+                ended: self.ended.remove(&volume.0),
                 length: self.lengths.remove(&volume.0),
                 window: self.windows.remove(&volume.0),
             }) as weaver_graph::Carried
@@ -865,6 +895,7 @@ impl<F: Format + 'static> Object for EngineObject<F> {
         self.bound(volume, name, front, carried.length.or(length));
         if let Some(front) = carried.front {
             self.fronts.insert(volume.0, front);
+            self.read_to_end(volume.0, carried.ended);
             self.file(volume.0);
             self.await_tail(volume.0);
         }

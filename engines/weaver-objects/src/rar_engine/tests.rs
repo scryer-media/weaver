@@ -619,6 +619,58 @@ fn a_stated_volume_is_placed_beside_a_bound_volume_whose_front_is_unread() {
     );
 }
 
+// The second volume ends on a whole member. Its front read to the end
+// record says the next volume opens on a new member, so a volume that
+// states the next number and opens on a member begun before it is no
+// volume of this set. A front cut short after that member says nothing
+// against it, and it is placed on its number.
+#[test]
+fn a_stated_volume_does_not_follow_a_front_read_to_its_end_on_a_whole_member() {
+    let spanning = spanning();
+    let (head, rest) = spanning.split_at(16);
+    let first = [
+        rar5::start(Some(0)),
+        rar5::file(
+            "lead.bin",
+            rar5::SPLIT_AFTER,
+            head,
+            spanning.len() as u64,
+            None,
+        ),
+        rar5::end(true),
+    ]
+    .concat();
+    let lead = [
+        rar5::start(Some(1)),
+        rar5::file(
+            "lead.bin",
+            rar5::SPLIT_BEFORE,
+            rest,
+            spanning.len() as u64,
+            Some(crc32(&spanning)),
+        ),
+        rar5::file("notes.txt", 0, NOTES, NOTES.len() as u64, Some(crc32(NOTES))),
+    ]
+    .concat();
+    let whole = [lead.as_slice(), &rar5::end(true)].concat();
+    let stranger = [
+        rar5::start(Some(2)),
+        rar5::file("other.bin", rar5::SPLIT_BEFORE, NOTES, 99, None),
+    ]
+    .concat();
+    for (second, placed) in [(&whole, Vec::new()), (&lead, vec![VolumeIndex(2)])] {
+        let mut engine = RarEngine::new();
+        engine.bound(VolumeIndex(0), "a1b2.101", &first, None);
+        engine.bound(VolumeIndex(1), "a1b2.102", second, None);
+        assert_eq!(
+            engine.claim("a1b2.103", (&stranger).into(), None),
+            placed,
+            "second volume of {} bytes",
+            second.len()
+        );
+    }
+}
+
 #[test]
 fn the_engine_bids_for_the_volumes_after_the_one_the_run_reached() {
     let mut engine = named(&["set.part1.rar", "set.part2.rar", "set.part3.rar"]);

@@ -22,7 +22,7 @@ use super::harness::{
     ARTICLE, Outcome, Post, Scenario, assert_fetched_once, kinds, par2_set, payload, run,
     run_holding,
 };
-use super::rar_fixtures::delivered;
+use super::rar_fixtures::{delivered, rar5_revs};
 use crate::history::HistoryFailureKind;
 use crate::jobs::model::JobStatus;
 use weaver_objects::rar_store::writer::{Item, Options, Version, lifted, literal, write};
@@ -592,6 +592,80 @@ async fn no_end_record_with_no_right_password_delivers_the_stored_members() {
             assert_runs_named_no_stored_member(&label, &spoken);
         }
     }
+}
+
+// A set whose one member is compressed and enciphered under `-p`, its headers
+// in the clear: the store keeps it for its run, which asks for a password.
+// With none given, or one that does not open it, the run is still asking
+// when the job goes quiet, and the job fails for the password, as it does
+// when an engine runs the set.
+#[tokio::test]
+async fn a_compressed_member_no_password_opens_fails_for_the_password() {
+    for version in VERSIONS {
+        let (item, _) = packed(version, Size::Small, MKV[1]);
+        let mut sealed = options(version);
+        sealed.password = Some(SECRET);
+        let set = Set {
+            volumes: named_volumes(write(&[item], &sealed)),
+            files: Vec::new(),
+        };
+        for (case, scenario) in [
+            ("none", Scenario::new(set.posts())),
+            ("wrong", Scenario::new(set.posts()).password("ember-harbour")),
+        ] {
+            let label = format!("{version:?} {case}");
+            let graph = run(&scenario).await;
+            assert!(
+                matches!(graph.status, Some(JobStatus::Failed { .. })),
+                "{label}: {:?} {:?} {:?}",
+                graph.status,
+                graph.failure,
+                graph.files.keys()
+            );
+            assert_eq!(
+                graph.failure_kind,
+                Some(HistoryFailureKind::Password),
+                "{label}: {:?}",
+                graph.failure
+            );
+            assert!(
+                !kinds(&graph).contains(&"rar_engine"),
+                "{label}: the store ran the set: {:?}",
+                kinds(&graph)
+            );
+        }
+    }
+}
+
+// A mixed set in volumes beside two recovery volumes, and a PAR2 set over
+// every file posted. An article of the first stored member is lost: the
+// `.rev` set rebuilds its volume from one recovery volume, and what is made
+// again waits to move to its name. The other recovery volume is never
+// fetched, so the PAR2 set never rules and the job waits on nothing. Its
+// files move to their names, and it delivers every member whole.
+#[tokio::test]
+async fn a_job_that_stalls_with_files_to_move_moves_them_and_delivers() {
+    let version = Version::Rar5;
+    let set = mixed(version, Size::Large, MKV, &split(version, 30_001));
+    let bytes: Vec<&[u8]> = set.volumes.iter().map(|(_, bytes)| bytes.as_slice()).collect();
+    let mut posts = set.posts();
+    posts.extend(rar5_revs("silver.horizon", &bytes, 2));
+    let files: Vec<(&str, &[u8])> = posts
+        .iter()
+        .map(|post| (post.name.as_str(), post.bytes.as_slice()))
+        .collect();
+    let par2 = par2_set("silver.horizon", &files, 4);
+    posts.extend(par2);
+    let (volume, at) = set.data_of(MKV[0], None).remove(0);
+    let graph = run(&Scenario::new(posts).lost(volume, article_in(at))).await;
+    assert_eq!(
+        graph.status,
+        Some(JobStatus::Complete),
+        "{:?} {:?}",
+        graph.failure,
+        graph.graph().rulings
+    );
+    assert_files("stalled", &graph.files, &set.files);
 }
 
 // Two compressed members, each after a stored one: the store runs only once

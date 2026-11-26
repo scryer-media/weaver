@@ -1254,3 +1254,52 @@ async fn a_stored_member_behind_a_header_repaired_after_a_crash_is_delivered_who
     assert_restarted(&restarted, &whole);
     assert_eq!(restarted.graph.outcomes, whole.graph().outcomes);
 }
+
+// A stored RAR inside a stored RAR, one article lost inside a
+// member of the inner archive and nothing to repair it. Whether the loss
+// is told before the outer archive's first article or after it, the loss
+// comes down to the inner archive: it gives that member up and delivers the
+// rest beside it whole, so the job ends Partial.
+#[tokio::test]
+async fn a_loss_inside_a_nested_rar_ends_the_same_told_before_or_after_the_bind() {
+    let members = [
+        ("movie.mkv", payload(6 * ARTICLE + 13, 31)),
+        ("notes.txt", b"lantern release notes\r\n".to_vec()),
+        ("readme.nfo", b"lantern readme\r\n".to_vec()),
+        ("extra.bin", payload(4 * ARTICLE + 9, 37)),
+    ];
+    let inner = rar(&members);
+    let outer = rar(&[("inner.rar", inner.clone())]);
+    let extra = &members[3].1;
+    let at = outer
+        .windows(extra.len())
+        .position(|window| window == extra.as_slice())
+        .expect("a stored archive holds its member's bytes as they are");
+    let ordinal = (at / ARTICLE + 1) as u32;
+    assert!((ordinal as usize + 1) * ARTICLE <= at + extra.len());
+    let posted = || Scenario::new(vec![Post::plain("outer.rar", outer.clone())]).lost(0, ordinal);
+    for (order, scenario) in [
+        ("lost after the first article", posted()),
+        ("lost before the first article", posted().reversed(&[0])),
+    ] {
+        let outcome = run(&scenario).await;
+        assert_eq!(
+            outcome.status,
+            Some(JobStatus::Partial),
+            "{order}: {:?} {:?}",
+            outcome.failure,
+            outcome.files.keys().collect::<Vec<_>>()
+        );
+        for (name, bytes) in &members[..3] {
+            let whole = outcome
+                .files
+                .iter()
+                .any(|(path, held)| path.rsplit('/').next() == Some(*name) && held == bytes);
+            assert!(
+                whole,
+                "{order}: {name} delivered whole: {:?}",
+                outcome.files.keys().collect::<Vec<_>>()
+            );
+        }
+    }
+}

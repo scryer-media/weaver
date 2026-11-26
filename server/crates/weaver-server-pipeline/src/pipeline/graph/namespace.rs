@@ -1695,35 +1695,8 @@ impl NamespaceWriter {
         }
         self.replay_file(tree, builder, segments, node, member, None, out)?;
         let mut effects = Vec::new();
-        // A recovery volume hears a loss when it is marked, and one marked
-        // before the member was bound reached no object: it hears those
-        // now, with the bytes, before the close, or its walk would wait on
-        // bytes that never come.
-        if tree.recovers(child)
-            && let Some((_, volume)) = tree.child_of(node, member)
-        {
-            let lost: Vec<ByteRange> = tree
-                .namespace(node)
-                .and_then(|namespace| namespace.get(member))
-                .map(|record| {
-                    record
-                        .coverage
-                        .runs()
-                        .filter(|run| run.provenance == Provenance::Lost)
-                        .map(|run| run.range)
-                        .collect()
-                })
-                .unwrap_or_default();
-            for range in lost {
-                tree.volume_lost(
-                    child,
-                    volume,
-                    range,
-                    &mut self.placing(builder),
-                    &mut effects,
-                );
-            }
-        }
+        // A loss marked on the member before the bind comes down from the
+        // tree now, to a data or a recovery volume alike.
         tree.handed_over(node, member, &mut self.placing(builder), &mut effects);
         self.apply_each(
             tree,

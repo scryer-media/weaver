@@ -191,15 +191,20 @@ pub fn drive(job: &mut dyn RootJob, slots: &mut RepairSlots, asker: AskerId, lim
     }
     match job.phase() {
         RootPhase::Extracting => Step::Wait,
-        // The delivery takes every file from its name, so it waits for
-        // each file still moving there. Only now do the files move: each
-        // once, to the name the ledger settled on while the job downloaded.
-        _ if job.moves_waiting() => {
-            job.deliver_names();
-            Step::Wait
-        }
-        _ => Step::Deliver,
+        _ => after_recovery(job),
     }
+}
+
+// The step after recovery, wherever the job comes to it: the names move,
+// then the job delivers. The delivery takes every file from its name, so it
+// waits for each file still moving there. Only now do the files move: each
+// once, to the name the ledger settled on while the job downloaded.
+pub(super) fn after_recovery(job: &mut dyn RootJob) -> Step {
+    if job.moves_waiting() {
+        job.deliver_names();
+        return Step::Wait;
+    }
+    Step::Deliver
 }
 
 // The objects that could not rebuild what they found, and that failure

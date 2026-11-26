@@ -1035,6 +1035,7 @@ impl Object for SevenZipStore {
     fn engine_volume(&self, _volume: VolumeIndex) -> Option<weaver_graph::Carried> {
         Some(Box::new(crate::engine::CarriedVolume {
             front: self.measured,
+            ended: false,
             length: self.length,
             window: self.window,
         }))

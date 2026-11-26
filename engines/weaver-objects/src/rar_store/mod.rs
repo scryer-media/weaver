@@ -1148,7 +1148,10 @@ impl RarStore {
     // whole, at the length every volume but the last shares. A volume held
     // with no name may place bytes, so it is said alone; the runs between
     // the volumes held hold nothing and are each said once, as a gap. The
-    // cost is that of the volumes held, never of the last one's number.
+    // cost is that of the volumes held, never of the last one's number. A
+    // place said a gap while nothing was held there marks nothing then
+    // (the tree marks only bound volumes), and a volume held there later is
+    // no gap: nothing said of it before damages it or hides it.
     fn say_gaps(&mut self, out: &mut Vec<Emit>) {
         let Some(last) = self.last().filter(|_| self.finished()) else {
             return;
@@ -1162,11 +1165,15 @@ impl RarStore {
             return;
         };
         let range = ByteRange::new(0, length);
-        let held: Vec<(u32, bool)> = self
+        // A volume said to be given back arrived and is only moving: it is
+        // held here until the tree takes it, and no gap or damage is its.
+        let mut held: Vec<(u32, bool)> = self
             .volumes
             .range(..last)
             .map(|(index, found)| (index.0, found.name.is_none()))
+            .chain(self.giving.range(..last).map(|(index, _)| (index.0, false)))
             .collect();
+        held.sort_unstable();
         let mut next = 0;
         for (index, nameless) in held {
             self.say_gap(next, index, range, out);
@@ -1408,6 +1415,10 @@ impl Object for RarStore {
                         .then_some(Why::InvalidArchive)
                 })
                 .or_else(|| self.shut())
+                // My run asked for a password for a member it makes, and
+                // none it was offered opened it: the set is shut by it, as
+                // a set an engine runs is.
+                .or_else(|| (self.started && standing.asking()).then_some(Why::Encrypted))
                 .or_else(|| crate::quiet::unplaced(standing, self.lacks())),
         };
         if let Some(why) = why {
@@ -1545,6 +1556,7 @@ impl Object for RarStore {
         let held = self.volumes.get(&volume)?;
         Some(Box::new(crate::engine::CarriedVolume {
             front: held.stated().cloned(),
+            ended: held.walk.ended,
             length: held.length,
             window: held.stated().and_then(crate::rar_engine::window),
         }))

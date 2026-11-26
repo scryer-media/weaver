@@ -37,12 +37,14 @@ use crate::engine::SetName;
 use crate::rar_engine::naming;
 
 // A volume of the set already held, as far as it places the next: what its
-// headers state, once they are read, and whether a volume follows it, once
-// that is known.
+// headers state, once they are read, whether a volume follows it, once
+// that is known, and whether its headers were read to their end. A front
+// is never read to its end.
 #[derive(Clone, Copy)]
 pub(crate) struct Held<'a> {
     pub(crate) facts: Option<&'a RarVolumeFacts>,
     pub(crate) successor: Option<bool>,
+    pub(crate) ended: bool,
 }
 
 // The volumes held, by index, as far as they place the next: looked up
@@ -96,6 +98,7 @@ fn held(index: VolumeIndex, volume: &Volume) -> Option<Held<'_>> {
     (!volume.misplaced(index)).then_some(Held {
         facts: volume.stated(),
         successor: volume.walk.successor(),
+        ended: volume.walk.ended,
     })
 }
 
@@ -151,7 +154,18 @@ pub(crate) fn front_facts(
     password: Option<&str>,
     kdf: Arc<KdfCache>,
 ) -> Option<RarVolumeFacts> {
-    headers(first_bytes, password, kdf).filter(|facts| facts.is_volume || read_main(facts))
+    front_walk(first_bytes, password, kdf).map(|(facts, _)| facts)
+}
+
+// What `front_facts` reads, and whether its headers were read to their end:
+// the walk stopped on the end record, or on the Quick Open cache, not where
+// the bytes ran out.
+pub(crate) fn front_walk(
+    first_bytes: &[u8],
+    password: Option<&str>,
+    kdf: Arc<KdfCache>,
+) -> Option<(RarVolumeFacts, bool)> {
+    walk(first_bytes, password, kdf).filter(|(facts, _)| facts.is_volume || read_main(facts))
 }
 
 // Whether headers read off a volume were read past its main header: they
@@ -179,13 +193,23 @@ pub(crate) fn headers(
     password: Option<&str>,
     kdf: Arc<KdfCache>,
 ) -> Option<RarVolumeFacts> {
+    walk(first_bytes, password, kdf).map(|(facts, _)| facts)
+}
+
+// The headers, and whether the walk read them to their end.
+fn walk(
+    first_bytes: &[u8],
+    password: Option<&str>,
+    kdf: Arc<KdfCache>,
+) -> Option<(RarVolumeFacts, bool)> {
     opens_rar(first_bytes)?;
     let walk = RarArchive::parse_volume_facts_walk_with_shared_kdf_cache(
         Cursor::new(first_bytes.to_vec()),
         password,
         kdf,
-    );
-    Some(walk.ok()?.facts)
+    )
+    .ok()?;
+    Some((walk.facts, walk.short_at.is_none()))
 }
 
 // The most a volume given back may carry of what was read of it: the ceiling
@@ -260,7 +284,8 @@ impl Nameless<'_> {
             && self.facts.is_encrypted == other.facts.is_encrypted
     }
 
-    fn follows(&self, previous: &Nameless<'_>, index: u32) -> bool {
+    // `ended` when the headers of `previous` were read to their end.
+    fn follows(&self, previous: &Nameless<'_>, ended: bool, index: u32) -> bool {
         if !self.kin(previous) || self.position().is_some_and(|stated| stated != index) {
             return false;
         }
@@ -270,8 +295,15 @@ impl Nameless<'_> {
             // stated number; nothing else in the headers ties the volumes.
             (None, None) => self.position() == Some(index),
             // A volume whose file headers are not read yet links on its
-            // stated number alone, as a boundary between members does.
-            _ => (previous.unread() || self.unread()) && self.position() == Some(index),
+            // stated number alone, as a boundary between members does. So
+            // does one after a volume whose headers stop short of their end
+            // on a member that does not carry on: its last header is not
+            // read yet, and it says nothing against the next, as
+            // `runs_into` reads it.
+            _ => {
+                let short = !ended && previous.continuing_member().is_none();
+                (previous.unread() || self.unread() || short) && self.position() == Some(index)
+            }
         }
     }
 
@@ -499,6 +531,7 @@ impl RarStore {
                     let claimant = Held {
                         facts,
                         successor: given.and_then(|given| given.walk.successor()),
+                        ended: given.is_some_and(|given| given.walk.ended),
                     };
                     let filed = Filed {
                         bound: Bound(&self.volumes),
@@ -944,7 +977,7 @@ pub(crate) fn place(facts: &RarVolumeFacts, held: &impl Places) -> Option<Volume
         previous.successor != Some(false)
             && previous
                 .facts
-                .is_some_and(|facts| this.follows(&Nameless { facts }, index))
+                .is_some_and(|facts| this.follows(&Nameless { facts }, previous.ended, index))
     };
     // A stated position is judged by what the neighbours' headers say, and
     // a neighbour none of whose headers were read yet says nothing against
@@ -971,9 +1004,11 @@ pub(crate) fn place(facts: &RarVolumeFacts, held: &impl Places) -> Option<Volume
         });
         return (before && after).then_some(VolumeIndex(stated));
     }
+    // The volume placed is no held one: what it says against the next is
+    // what its headers state, as before.
     let precedes = |next: &Held<'_>, index: u32| {
         next.facts
-            .is_some_and(|facts| Nameless { facts }.follows(&this, index))
+            .is_some_and(|facts| Nameless { facts }.follows(&this, true, index))
     };
     // A place the volume's own headers rule out is no place for it, however
     // its neighbours link to it: a volume that opens on a continued member
@@ -1061,5 +1096,115 @@ impl<P: Places> Places for Instead<'_, P> {
 
     fn held(&self) -> impl Iterator<Item = u32> + '_ {
         self.held.held()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+    use std::sync::Arc;
+
+    use unrar_rs::{KdfCache, RarVolumeFacts};
+    use weaver_graph::VolumeIndex;
+
+    use super::{Held, headers, place};
+    use crate::rar_store::writer::{Item, Options, Version, write};
+    use crate::testing::payload;
+
+    fn read(bytes: &[u8]) -> RarVolumeFacts {
+        headers(bytes, None, Arc::new(KdfCache::new())).expect("headers")
+    }
+
+    // Four volumes: the first file runs from the first into the second, a
+    // small one lies whole in the second, and the third runs on from the
+    // second into the third and fourth.
+    fn set(version: Version) -> Vec<Vec<u8>> {
+        let mut options = Options::new(version);
+        options.split = Some(6_000);
+        options.numbered = true;
+        let set = write(
+            &[
+                Item::File("alpha.bin", payload(1, 10_000)),
+                Item::File("beta.bin", payload(2, 300)),
+                Item::File("gamma.bin", payload(3, 10_000)),
+            ],
+            &options,
+        );
+        assert_eq!(set.len(), 4, "{version:?}");
+        set
+    }
+
+    // The second volume's front read as far as the small file's data: the
+    // member it last read does not carry on, and the header of the one
+    // that does is not read yet.
+    fn short_second(set: &[Vec<u8>]) -> RarVolumeFacts {
+        let whole = read(&set[1]);
+        let small = whole
+            .members
+            .iter()
+            .find(|member| member.name == "beta.bin")
+            .expect("the small file");
+        let short = read(&set[1][..(small.data_offset + small.data_size) as usize]);
+        assert!(short.members.iter().all(|member| !member.split_after));
+        assert!(short.members.iter().any(|member| member.split_before));
+        short
+    }
+
+    fn holding<'a>(
+        first: &'a RarVolumeFacts,
+        second: &'a RarVolumeFacts,
+        ended: bool,
+    ) -> BTreeMap<u32, Held<'a>> {
+        BTreeMap::from([
+            (
+                0,
+                Held {
+                    facts: Some(first),
+                    successor: Some(true),
+                    ended: true,
+                },
+            ),
+            (
+                1,
+                Held {
+                    facts: Some(second),
+                    successor: None,
+                    ended,
+                },
+            ),
+        ])
+    }
+
+    // A volume that states the next position follows a held volume whose
+    // headers stop short of their end on a member that does not carry on:
+    // that volume's last header is not read yet, and it says nothing
+    // against the next. Read to its end on that member, it does.
+    #[test]
+    fn a_stated_position_follows_a_volume_whose_headers_stop_short() {
+        for version in [Version::Rar5, Version::Rar4] {
+            let set = set(version);
+            let first = read(&set[0]);
+            let second = short_second(&set);
+            let third = read(&set[2]);
+            assert_eq!(third.volume_number, Some(2), "{version:?}");
+            let short = holding(&first, &second, false);
+            assert_eq!(place(&third, &short), Some(VolumeIndex(2)), "{version:?}");
+            let ended = holding(&first, &second, true);
+            assert_eq!(place(&third, &ended), None, "{version:?}");
+        }
+    }
+
+    // A volume that states no position gets nothing from a neighbour that
+    // stops short: a RAR4 front short of its numbered end record is held
+    // nowhere beside it by that neighbour alone.
+    #[test]
+    fn a_volume_stating_no_position_gets_nothing_from_a_neighbour_that_stops_short() {
+        let set = set(Version::Rar4);
+        let first = read(&set[0]);
+        let second = short_second(&set);
+        let mut third = read(&set[2]);
+        third.volume_number = None;
+        let short = holding(&first, &second, false);
+        assert_eq!(place(&third, &short), None);
     }
 }

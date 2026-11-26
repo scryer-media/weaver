@@ -34,8 +34,14 @@ impl Format for Rar {
     // is offered the password after it is bound. An archive that is no
     // volume is no front of a set the engine holds.
     fn front(first_bytes: &[u8]) -> Option<RarVolumeFacts> {
-        claim::front_facts(first_bytes, None, Arc::new(KdfCache::new()))
-            .filter(|facts| facts.is_volume)
+        Self::read_front(first_bytes).map(|(facts, _)| facts)
+    }
+
+    // A front holds its headers to the end where the walk over it read the
+    // end record: a volume no larger than its front.
+    fn read_front(first_bytes: &[u8]) -> Option<(RarVolumeFacts, bool)> {
+        claim::front_walk(first_bytes, None, Arc::new(KdfCache::new()))
+            .filter(|(facts, _)| facts.is_volume)
     }
 
     fn states_place(front: &RarVolumeFacts) -> bool {
@@ -184,16 +190,18 @@ pub(crate) fn member_window(solid: bool, member: &RarVolumeMemberFacts) -> Optio
 // held where its own headers do not place it places nothing beside it.
 struct Kept<'a>(&'a Holdings<'a, RarVolumeFacts>);
 
-fn held<'a>(index: u32, facts: Option<&'a RarVolumeFacts>) -> Option<Held<'a>> {
+fn held<'a>(index: u32, facts: Option<&'a RarVolumeFacts>, ended: bool) -> Option<Held<'a>> {
     (!facts.is_some_and(|facts| claim::misplaced(VolumeIndex(index), facts))).then_some(Held {
         facts,
         successor: None,
+        ended,
     })
 }
 
 impl Holds for Kept<'_> {
     fn at(&self, index: u32) -> Option<Held<'_>> {
-        held(index, self.0.get(index)?.front)
+        let holding = self.0.get(index)?;
+        held(index, holding.front, holding.ended)
     }
 }
 

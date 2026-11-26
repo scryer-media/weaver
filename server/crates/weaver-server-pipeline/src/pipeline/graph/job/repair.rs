@@ -14,7 +14,7 @@
 use std::collections::BTreeSet;
 
 use weaver_graph::slots::Ticket;
-use weaver_graph::{MemberId, NodeId, VolumeIndex};
+use weaver_graph::{Effect, MemberId, NodeId, VolumeIndex};
 
 use super::{GraphError, GraphJob};
 use crate::pipeline::graph::namespace::{GivingUp, Lender, WriteError};
@@ -538,7 +538,11 @@ impl GraphJob {
                     self.pay_release();
                     return Ok(None);
                 }
-                self.heard(batch.into_out())?;
+                let out = batch.into_out();
+                if let Some(quieting) = self.quieting.as_mut() {
+                    quieting.hold_over(&out);
+                }
+                self.heard(out)?;
             }
             let Some(quieting) = self.quieting.as_mut() else {
                 return Ok(Some(false));
@@ -592,6 +596,9 @@ impl GraphJob {
                 &mut out,
             )?;
             let Some(batch) = batch else {
+                if let Some(quieting) = self.quieting.as_mut() {
+                    quieting.hold_over(&out);
+                }
                 self.heard(out)?;
                 continue;
             };
@@ -682,6 +689,29 @@ pub(super) struct Quieting {
     changed: bool,
     rung: bool,
     admitted: Vec<NodeId>,
+}
+
+impl Quieting {
+    // An object bound a volume of a sibling's on this pass, given back or
+    // given up and read back, has not read it yet: it hears quiet on the
+    // next pass, not this one. Every other object of the tier is still told
+    // and may give up on this pass. One set of the objects bound, then one
+    // pass over what is left to tell.
+    fn hold_over(&mut self, applied: &[Effect]) {
+        let bound: BTreeSet<NodeId> = applied
+            .iter()
+            .filter_map(|effect| match effect {
+                Effect::Bound { child, .. } => Some(*child),
+                _ => None,
+            })
+            .collect();
+        if bound.is_empty() {
+            return;
+        }
+        self.changed = true;
+        self.told
+            .retain(|(node, quiet)| !(*quiet && bound.contains(node)));
+    }
 }
 
 // What the repair walk asked, for its tests compiled apart in

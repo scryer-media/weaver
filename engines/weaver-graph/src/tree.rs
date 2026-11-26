@@ -1181,7 +1181,12 @@ impl Tree {
     }
 
     // The owner handed the object bound at a member of `node`'s namespace
-    // everything the member received before the bind. A member that closed
+    // everything the member received before the bind. A loss marked on the
+    // member before then reached no object: it comes down now, as a loss
+    // told after the bind does, so what the object places of it is marked on
+    // its members and what it cannot place yet is held until it can. A
+    // recovery volume hears it as well, with the bytes and before the close,
+    // or its walk would wait on bytes that never come. A member that closed
     // meanwhile, or before the bind, has its object hear that now: its close
     // waited for this.
     pub fn handed_over(
@@ -1194,6 +1199,28 @@ impl Tree {
         let Some((child, volume)) = self.awaiting(node, member) else {
             return;
         };
+        let lost: Vec<ByteRange> = self
+            .namespace(node)
+            .and_then(|namespace| namespace.get(member))
+            .map(|record| {
+                record
+                    .coverage
+                    .runs()
+                    .filter(|run| run.provenance == Provenance::Lost)
+                    .map(|run| run.range)
+                    .collect()
+            })
+            .unwrap_or_default();
+        // Every loss is told at the root or below it, and refusal from the
+        // root waits on every set between: the furthest origin it can have.
+        for &range in &lost {
+            self.descend_lost(child, (volume, range), NodeId::ROOT, effects);
+        }
+        if self.recovers(child) {
+            for range in lost {
+                self.volume_lost(child, volume, range, builder, effects);
+            }
+        }
         if let Some(binding) = self
             .nodes
             .get_mut(&child)

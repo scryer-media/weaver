@@ -1515,6 +1515,7 @@ impl<'a> Filed<'a> {
         let held = claim::Held {
             facts: Some(facts),
             successor: None,
+            ended: false,
         };
         self.held.insert(at, held);
         self.beside.file(at, true);
@@ -1603,6 +1604,7 @@ fn place_both_ways<'a>(
         claim::Held {
             facts: Some(facts),
             successor: None,
+            ended: false,
         },
     );
     filed.hold(placed.0, facts);

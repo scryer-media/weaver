@@ -456,6 +456,7 @@ fn a_volume_given_back_is_answered_as_one_offered_fresh() {
         assert_eq!(object.reclaim(name, short, None, &*given), fresh, "{case}");
         let engine = crate::engine::CarriedVolume {
             front: stated(short),
+            ended: false,
             length: None,
             window: None,
         };
@@ -2195,6 +2196,41 @@ fn a_volume_held_without_a_name_is_said_alone() {
     let mut again = Vec::new();
     object.say_gaps(&mut again);
     assert!(again.is_empty(), "{again:?}");
+}
+
+// A volume said to be given back arrived and is only moving: until the tree
+// takes it, it is held for the gaps, and one with no name is not said
+// missing alone. Once taken, its place is a gap like any held nowhere.
+#[test]
+fn a_volume_being_given_back_is_no_gap() {
+    let mut object = store();
+    for index in [0u32, 3] {
+        let mut volume = super::Volume::new();
+        volume.name = Some(format!("alpha.part{}.rar", index + 1));
+        volume.length = Some(100);
+        volume.closed = true;
+        object.volumes.insert(VolumeIndex(index), volume);
+    }
+    let mut named = super::Volume::new();
+    named.name = Some("alpha.part2.rar".to_owned());
+    object.giving.insert(VolumeIndex(1), named);
+    object.giving.insert(VolumeIndex(2), super::Volume::new());
+    object.lasts.insert(VolumeIndex(3));
+    let mut out = Vec::new();
+    object.say_gaps(&mut out);
+    assert!(out.is_empty(), "{out:?}");
+    assert_eq!(object.gaps_said.runs().count(), 0);
+    object.giving.clear();
+    let mut taken = Vec::new();
+    object.say_gaps(&mut taken);
+    assert_eq!(
+        taken,
+        vec![Emit::Gap {
+            first: VolumeIndex(1),
+            end: VolumeIndex(3),
+            range: ByteRange::new(0, 100),
+        }]
+    );
 }
 
 // A fixture written by RAR itself streams to what unrar-rs extracts from it.
