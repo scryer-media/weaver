@@ -1222,6 +1222,10 @@ impl Recovery for Par3 {
         self.feed_proven(member, segments);
     }
 
+    // TODO: record what arrives on the set's blocks, as PAR2 does on its
+    // slices (`block_sizes`, and the grid at each block size), so a damaged
+    // member names its bad blocks without a read-back. Only the whole
+    // member's CRC32 is kept here.
     fn feed_proven(&mut self, member: MemberId, segments: &[Segment]) {
         self.input.offer_all(member, crate::grid::WHOLE, segments);
     }

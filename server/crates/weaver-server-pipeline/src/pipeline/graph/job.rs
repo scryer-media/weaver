@@ -811,6 +811,13 @@ impl GraphJob {
         self.loans.repairing()
     }
 
+    // The job's next repair stands on its thread, having read nothing,
+    // until the hold is let go.
+    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
+    pub fn hold_next_repair(&mut self) -> Arc<loans::RepairHold> {
+        self.loans.hold_next_repair()
+    }
+
     // Completion waits for every worker's acknowledgment and for replays
     // or checks queued behind admission, not just actual recovery work.
     pub fn work_pending(&self) -> bool {
