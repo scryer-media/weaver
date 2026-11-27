@@ -839,11 +839,10 @@ impl Object for SevenZipStore {
                 break;
             }
         }
-        let pieces: Vec<ByteRange> = match proof {
-            Some(proof) => minus(range, proof).collect(),
-            None => vec![range],
-        };
-        for piece in pieces {
+        // With no proof pending, the cut is empty at the range's end, and
+        // the one piece is the whole range.
+        let cut = proof.unwrap_or(ByteRange::new(range.end, range.end));
+        for piece in minus(range, cut) {
             let at = (piece.start - range.start) as usize;
             let slice = bytes.slice(at..at + piece.len() as usize);
             self.route(piece, &slice, delivery.provenance, read, out);
