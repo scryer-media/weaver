@@ -197,7 +197,7 @@ jobs:
       - name: Install sccache
         uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
         with:
-          version: v0.17.0
+          version: v0.20.1
       - name: Configure trusted tag sccache
         if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/weaver-v') && needs.verify-release-tag.result == 'success' }}
         uses: ./.github/actions/configure-sccache-r2
@@ -206,7 +206,7 @@ jobs:
           access-key-id: ${{ secrets.SCCACHE_S3_ACCESS_ID }}
           secret-access-key: ${{ secrets.SCCACHE_S3_SECRET }}
           key-prefix: weaver/trusted-release/v1/rust-1.97.1/x86_64-unknown-linux-gnu/
-      - uses: taiki-e/install-action@b80e2bb2635f28eb98b9fce1e2f0887e1535c6b2 # v2
+      - uses: taiki-e/install-action@073e1fd0bc889c9aee68dbaaa927cde1b5653a83 # v2
         with:
           tool: cargo-audit
       - name: Run cargo audit
@@ -242,7 +242,7 @@ jobs:
       - name: Install sccache
         uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
         with:
-          version: v0.17.0
+          version: v0.20.1
       - name: Configure trusted tag sccache
         if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/weaver-v') }}
         uses: ./.github/actions/configure-sccache-r2
@@ -345,7 +345,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y nasm par2 xz-utils zip
-      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
+      - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7
         with:
           go-version-file: e2e/go.mod
           cache-dependency-path: e2e/go.sum
@@ -361,7 +361,7 @@ jobs:
       - name: Install sccache
         uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
         with:
-          version: v0.17.0
+          version: v0.20.1
       - name: Configure trusted tag sccache
         if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/weaver-v') }}
         uses: ./.github/actions/configure-sccache-r2
@@ -377,7 +377,7 @@ jobs:
         with:
           cache-bin: false
           save-if: ${{ matrix.crate == 'weaver' }}
-      - uses: taiki-e/install-action@b80e2bb2635f28eb98b9fce1e2f0887e1535c6b2 # v2
+      - uses: taiki-e/install-action@073e1fd0bc889c9aee68dbaaa927cde1b5653a83 # v2
         with:
           tool: nextest
       - name: Download embedded web artifact
@@ -444,7 +444,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y nasm par2 xz-utils zip
-      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
+      - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7
         with:
           go-version-file: e2e/go.mod
           cache-dependency-path: e2e/go.sum
@@ -459,7 +459,7 @@ jobs:
       - name: Install sccache
         uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
         with:
-          version: v0.17.0
+          version: v0.20.1
       - name: Configure trusted tag sccache
         if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/weaver-v') }}
         uses: ./.github/actions/configure-sccache-r2
@@ -601,7 +601,7 @@ jobs:
       - name: Install sccache
         uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
         with:
-          version: v0.17.0
+          version: v0.20.1
       - name: Configure trusted tag sccache
         if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/weaver-v') && needs.verify-release-tag.result == 'success' }}
         uses: ./.github/actions/configure-sccache-r2
@@ -690,7 +690,7 @@ jobs:
       - name: Install sccache
         uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
         with:
-          version: v0.17.0
+          version: v0.20.1
       - name: Configure trusted tag sccache
         if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/weaver-v') && needs.verify-release-tag.result == 'success' }}
         uses: ./.github/actions/configure-sccache-r2
@@ -699,7 +699,7 @@ jobs:
           access-key-id: ${{ secrets.SCCACHE_S3_ACCESS_ID }}
           secret-access-key: ${{ secrets.SCCACHE_S3_SECRET }}
           key-prefix: weaver/trusted-release/v1/rust-1.97.1/x86_64-pc-windows-msvc/
-      - uses: taiki-e/install-action@b80e2bb2635f28eb98b9fce1e2f0887e1535c6b2 # v2
+      - uses: taiki-e/install-action@073e1fd0bc889c9aee68dbaaa927cde1b5653a83 # v2
         with:
           tool: nextest
       - name: Download embedded web artifact
@@ -765,7 +765,7 @@ jobs:
       - name: Install sccache
         uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
         with:
-          version: v0.17.0
+          version: v0.20.1
       - name: Configure trusted tag sccache
         if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/weaver-v') && needs.verify-release-tag.result == 'success' }}
         uses: ./.github/actions/configure-sccache-r2
@@ -835,7 +835,7 @@ jobs:
       - name: Install sccache
         uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
         with:
-          version: v0.17.0
+          version: v0.20.1
       - name: Configure trusted tag sccache
         if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/weaver-v') && needs.verify-release-tag.result == 'success' }}
         uses: ./.github/actions/configure-sccache-r2
@@ -972,7 +972,7 @@ jobs:
       - name: Install sccache
         uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
         with:
-          version: v0.17.0
+          version: v0.20.1
       - name: Configure trusted tag sccache
         if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/weaver-v') && needs.verify-release-tag.result == 'success' }}
         uses: ./.github/actions/configure-sccache-r2
@@ -1035,7 +1035,7 @@ jobs:
       - name: Install sccache
         uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
         with:
-          version: v0.17.0
+          version: v0.20.1
       - name: Configure trusted tag sccache
         if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/weaver-v') }}
         uses: ./.github/actions/configure-sccache-r2
@@ -1137,7 +1137,7 @@ jobs:
       - name: Install sccache
         uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
         with:
-          version: v0.17.0
+          version: v0.20.1
       - name: Configure trusted tag sccache
         if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/weaver-v') }}
         uses: ./.github/actions/configure-sccache-r2
@@ -1242,7 +1242,7 @@ jobs:
       - name: Install sccache
         uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
         with:
-          version: v0.17.0
+          version: v0.20.1
       - name: Configure trusted tag sccache
         if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/weaver-v') }}
         uses: ./.github/actions/configure-sccache-r2
@@ -1447,11 +1447,11 @@ jobs:
       - name: Install Syft
         id: syft_first
         continue-on-error: true
-        uses: anchore/sbom-action/download-syft@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
+        uses: anchore/sbom-action/download-syft@dfcb83b97731532d72be422cbc51ee64adb6fd56 # v0.24.4
       - name: Install Syft (second attempt)
         id: syft_retry
         if: steps.syft_first.outcome == 'failure'
-        uses: anchore/sbom-action/download-syft@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
+        uses: anchore/sbom-action/download-syft@dfcb83b97731532d72be422cbc51ee64adb6fd56 # v0.24.4
       # The release-provenance job runs on Linux and cannot mount a UDZO image,
       # so the bundle's SBOM is produced here, from the staged tree the image
       # was built out of.
@@ -1514,7 +1514,7 @@ jobs:
       - name: Install sccache
         uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
         with:
-          version: v0.17.0
+          version: v0.20.1
       - name: Configure trusted tag sccache
         if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/weaver-v') }}
         uses: ./.github/actions/configure-sccache-r2
@@ -1720,11 +1720,11 @@ jobs:
       - name: Install Syft
         id: syft_first
         continue-on-error: true
-        uses: anchore/sbom-action/download-syft@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
+        uses: anchore/sbom-action/download-syft@dfcb83b97731532d72be422cbc51ee64adb6fd56 # v0.24.4
       - name: Install Syft (second attempt)
         id: syft_retry
         if: steps.syft_first.outcome == 'failure'
-        uses: anchore/sbom-action/download-syft@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
+        uses: anchore/sbom-action/download-syft@dfcb83b97731532d72be422cbc51ee64adb6fd56 # v0.24.4
       # The release-provenance job runs on Linux and cannot mount a UDZO image,
       # so the bundle's SBOM is produced here, from the staged tree the image
       # was built out of.
@@ -1802,7 +1802,7 @@ jobs:
       - name: Install sccache
         uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
         with:
-          version: v0.17.0
+          version: v0.20.1
       - name: Configure trusted tag sccache
         if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/weaver-v') }}
         uses: ./.github/actions/configure-sccache-r2
@@ -2205,7 +2205,7 @@ jobs:
       - name: Install sccache
         uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
         with:
-          version: v0.17.0
+          version: v0.20.1
       - name: Configure trusted tag sccache
         if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/weaver-v') }}
         uses: ./.github/actions/configure-sccache-r2
@@ -2578,7 +2578,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - name: Install Cosign
-        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        uses: sigstore/cosign-installer@881c63bd87e38389154debd8331404ce7ca8a3ab # v4.1.4
       - name: Download linux amd64 portable artifact
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
@@ -2593,7 +2593,7 @@ jobs:
         run: sh docker/prepare-build-context.sh artifacts docker-ctx
       - uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
-      - uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4
+      - uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -2676,7 +2676,7 @@ jobs:
       packages: read
     steps:
       - name: Install Cosign
-        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        uses: sigstore/cosign-installer@881c63bd87e38389154debd8331404ce7ca8a3ab # v4.1.4
       - name: Verify production image signature, provenance, and SBOM
         env:
           IMAGE: ghcr.io/${{ github.repository_owner }}/weaver
@@ -2760,7 +2760,7 @@ jobs:
       - name: Install sccache
         uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
         with:
-          version: v0.17.0
+          version: v0.20.1
       - name: Configure trusted tag sccache
         if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/weaver-v') && needs.verify-release-tag.result == 'success' }}
         uses: ./.github/actions/configure-sccache-r2
@@ -2770,7 +2770,7 @@ jobs:
           secret-access-key: ${{ secrets.SCCACHE_S3_SECRET }}
           key-prefix: weaver/trusted-release/v1/rust-1.97.1/x86_64-unknown-linux-gnu/
       - name: Install Cosign
-        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        uses: sigstore/cosign-installer@881c63bd87e38389154debd8331404ce7ca8a3ab # v4.1.4
       - name: Install SLSA verifier
         uses: slsa-framework/slsa-verifier/actions/installer@ea584f4502babc6f60d9bc799dbbb13c1caa9ee6 # v2.7.1
       # Merge every run-scoped release artifact into one flat directory, the
@@ -3354,11 +3354,11 @@ jobs:
       - name: Install Syft
         id: syft_first
         continue-on-error: true
-        uses: anchore/sbom-action/download-syft@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
+        uses: anchore/sbom-action/download-syft@dfcb83b97731532d72be422cbc51ee64adb6fd56 # v0.24.4
       - name: Install Syft (second attempt)
         id: syft_retry
         if: steps.syft_first.outcome == 'failure'
-        uses: anchore/sbom-action/download-syft@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
+        uses: anchore/sbom-action/download-syft@dfcb83b97731532d72be422cbc51ee64adb6fd56 # v0.24.4
       - name: Generate archive SBOMs and SLSA subject list
         run: |
           set -euo pipefail
