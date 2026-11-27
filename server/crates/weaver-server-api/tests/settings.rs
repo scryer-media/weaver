@@ -232,10 +232,7 @@ async fn web_appearance_defaults_and_persists_partial_updates_and_reset() {
     let h = TestHarness::new().await;
     // Existing installations have their settings but no saved appearance.
     let defaults = json!({ "palette": "WEAVER", "mode": "SYSTEM", "accent": null });
-    assert_eq!(
-        serde_json::to_value(AppearanceStore::load(&h.db).unwrap().current()).unwrap(),
-        defaults
-    );
+    assert_eq!(saved_appearance(&h), defaults);
 
     let query = "{ webAppearance { palette mode accent } }";
     let response = h.execute_as(query, CallerScope::Admin).await;
@@ -274,10 +271,7 @@ async fn web_appearance_defaults_and_persists_partial_updates_and_reset() {
         let fetched = h.execute_as(query, CallerScope::Admin).await;
         assert_no_errors(&fetched);
         assert_eq!(response_data(&fetched)["webAppearance"], expected);
-        assert_eq!(
-            serde_json::to_value(AppearanceStore::load(&h.db).unwrap().current()).unwrap(),
-            expected
-        );
+        assert_eq!(saved_appearance(&h), expected);
     }
 
     for invalid in [
@@ -293,11 +287,112 @@ async fn web_appearance_defaults_and_persists_partial_updates_and_reset() {
                 .errors
                 .is_empty()
         );
-        assert_eq!(
-            serde_json::to_value(AppearanceStore::load(&h.db).unwrap().current()).unwrap(),
-            defaults
-        );
+        assert_eq!(saved_appearance(&h), defaults);
     }
+}
+
+/// The saved palette, mode and accent, as the GraphQL fields read them.
+fn saved_appearance(h: &TestHarness) -> serde_json::Value {
+    let saved = serde_json::to_value(AppearanceStore::load(&h.db).unwrap().current()).unwrap();
+    json!({ "palette": saved["palette"], "mode": saved["mode"], "accent": saved["accent"] })
+}
+
+#[tokio::test]
+async fn web_appearance_keeps_progress_colours_per_palette() {
+    let h = TestHarness::new().await;
+    let query = "{ webAppearance { palette progressColors { palette stage color } } }";
+    let response = h.execute_as(query, CallerScope::Admin).await;
+    assert_no_errors(&response);
+    assert_eq!(
+        response_data(&response)["webAppearance"]["progressColors"],
+        json!([])
+    );
+
+    let save = |changes: &str| {
+        format!(
+            "mutation {{ updateWebAppearance(input: {{ progressColors: [{changes}] }}) \
+             {{ palette progressColors {{ palette stage color }} }} }}"
+        )
+    };
+    // Picks for two palettes, given out of order, come back ordered by palette then stage.
+    let picked = h
+        .execute_as(
+            &save(
+                "{ palette: TERMINAL, stage: COMPLETED, color: GREY }, \
+                 { palette: WEAVER, stage: FAILED, color: MAGENTA }, \
+                 { palette: WEAVER, stage: DOWNLOADING, color: CYAN }",
+            ),
+            CallerScope::Admin,
+        )
+        .await;
+    assert_no_errors(&picked);
+    let weaver_and_terminal = json!([
+        { "palette": "WEAVER", "stage": "DOWNLOADING", "color": "CYAN" },
+        { "palette": "WEAVER", "stage": "FAILED", "color": "MAGENTA" },
+        { "palette": "TERMINAL", "stage": "COMPLETED", "color": "GREY" },
+    ]);
+    assert_eq!(
+        response_data(&picked)["updateWebAppearance"]["progressColors"],
+        weaver_and_terminal
+    );
+
+    // Changing the palette keeps every palette's picks.
+    let switched = h
+        .execute_as(
+            "mutation { updateWebAppearance(input: { palette: TERMINAL }) \
+             { palette progressColors { palette stage color } } }",
+            CallerScope::Admin,
+        )
+        .await;
+    assert_no_errors(&switched);
+    assert_eq!(
+        response_data(&switched)["updateWebAppearance"]["progressColors"],
+        weaver_and_terminal
+    );
+
+    // A new colour replaces the pick; null restores one stage of one palette.
+    let changed = h
+        .execute_as(
+            &save(
+                "{ palette: WEAVER, stage: DOWNLOADING, color: LIME }, \
+                 { palette: WEAVER, stage: FAILED, color: null }",
+            ),
+            CallerScope::Admin,
+        )
+        .await;
+    assert_no_errors(&changed);
+    let expected = json!([
+        { "palette": "WEAVER", "stage": "DOWNLOADING", "color": "LIME" },
+        { "palette": "TERMINAL", "stage": "COMPLETED", "color": "GREY" },
+    ]);
+    assert_eq!(
+        response_data(&changed)["updateWebAppearance"]["progressColors"],
+        expected
+    );
+    let reloaded = serde_json::to_value(AppearanceStore::load(&h.db).unwrap().current()).unwrap();
+    assert_eq!(reloaded["progressColors"], expected);
+
+    // More changes than palette and stage pairs are refused before anything is saved.
+    let too_many = vec!["{ palette: AMBER, stage: PAUSED, color: RED }"; 29].join(", ");
+    assert!(
+        !h.execute_as(&save(&too_many), CallerScope::Admin)
+            .await
+            .errors
+            .is_empty()
+    );
+    let after = serde_json::to_value(AppearanceStore::load(&h.db).unwrap().current()).unwrap();
+    assert_eq!(after["progressColors"], expected);
+}
+
+#[test]
+fn appearance_saved_before_progress_colours_still_loads() {
+    let saved: weaver_server_api::settings::appearance::WebAppearance =
+        serde_json::from_str(r#"{"palette":"AMBER","mode":"DARK","accent":"ROSE"}"#).unwrap();
+    assert!(saved.progress_colors.is_empty());
+    assert_eq!(
+        saved.palette,
+        weaver_server_api::settings::appearance::WebPalette::Amber
+    );
 }
 
 #[tokio::test]

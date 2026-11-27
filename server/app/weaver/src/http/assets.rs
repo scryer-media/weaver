@@ -52,7 +52,7 @@ struct SpaEntry<'a> {
 
 fn rewrite_index_html(raw: &[u8], entry: &SpaEntry<'_>) -> Vec<u8> {
     let base_url = entry.base_url;
-    let appearance = entry.appearance;
+    let appearance = &entry.appearance;
     // Every attribute comes from a closed GraphQL enum.
     let attributes = format!(
         "data-palette=\"{}\" data-mode=\"{}\" data-accent=\"{}\"",

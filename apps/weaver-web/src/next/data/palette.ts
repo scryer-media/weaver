@@ -56,16 +56,18 @@ export const WV_FILL = {
   violet: "color-mix(in srgb, var(--color-wv-violet) 12%, transparent)",
 } as const;
 
+// Every stage but queued takes the operator's pick for the palette in use
+// (`lib/appearance.ts`), else the palette's own default (`theme.css`).
 const STATUS_COLORS: Record<StatusToken, string> = {
-  downloading: WV.progress,
+  downloading: "var(--wv-stage-downloading)",
   queued: WV.idle,
-  paused: WV.warn,
-  verifying: WV.info,
-  repairing: WV.info,
-  extracting: WV.violet,
-  copying: WV.info,
-  completed: WV.green,
-  failed: WV.error,
+  paused: "var(--wv-stage-paused)",
+  verifying: "var(--wv-stage-checking)",
+  repairing: "var(--wv-stage-checking)",
+  extracting: "var(--wv-stage-extracting)",
+  copying: "var(--wv-stage-copying)",
+  completed: "var(--wv-stage-completed)",
+  failed: "var(--wv-stage-failed)",
 };
 
 /** Colour for a backend job state, via the shared status-token mapping. */

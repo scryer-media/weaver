@@ -285,6 +285,42 @@
   --wv-accent: light-dark(#903952, #ed9aaf);
 }
 
+/*
+ * Progress colours. A job stage draws `--wv-stage-*`; each palette's default
+ * comes from its own tokens, and the operator's pick for the palette in use is
+ * set on the root element as `var(--wv-swatch-*)`. Queued is always grey.
+ */
+:root {
+  --wv-swatch-grey: var(--color-wv-idle);
+  --wv-swatch-teal: var(--color-wv-teal);
+  --wv-swatch-cyan: light-dark(#00687a, #4cc6d6);
+  --wv-swatch-blue: var(--color-wv-info);
+  --wv-swatch-indigo: light-dark(#3d4aa0, #9ca6f2);
+  --wv-swatch-violet: var(--color-wv-violet);
+  --wv-swatch-magenta: light-dark(#8b2a7e, #e48bd8);
+  --wv-swatch-rose: light-dark(#903952, #ed9aaf);
+  --wv-swatch-red: var(--color-wv-error);
+  --wv-swatch-amber: var(--color-wv-warn);
+  --wv-swatch-lime: light-dark(#4b6312, #b4d65c);
+  --wv-swatch-green: var(--color-wv-green);
+
+  --wv-stage-downloading-default: var(--color-wv-progress);
+  --wv-stage-paused-default: var(--color-wv-warn);
+  --wv-stage-checking-default: var(--color-wv-info);
+  --wv-stage-copying-default: var(--wv-swatch-magenta);
+  --wv-stage-extracting-default: var(--color-wv-violet);
+  --wv-stage-completed-default: var(--color-wv-green);
+  --wv-stage-failed-default: var(--color-wv-error);
+
+  --wv-stage-downloading: var(--wv-stage-downloading-default);
+  --wv-stage-paused: var(--wv-stage-paused-default);
+  --wv-stage-checking: var(--wv-stage-checking-default);
+  --wv-stage-copying: var(--wv-stage-copying-default);
+  --wv-stage-extracting: var(--wv-stage-extracting-default);
+  --wv-stage-completed: var(--wv-stage-completed-default);
+  --wv-stage-failed: var(--wv-stage-failed-default);
+}
+
 :is(
   [data-palette="PHOSPHOR"],
   [data-palette="AMBER"],

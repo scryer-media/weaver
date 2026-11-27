@@ -239,7 +239,11 @@ function SetupGate({ children }: { children: React.ReactNode }) {
           if (!cancelled) {
             // Before the tree mounts, so a signed-out browser goes straight to
             // the sign-in page instead of firing queries that are refused.
-            if (payload.appearance) applyAppearance(payload.appearance);
+            if (payload.appearance)
+              applyAppearance({
+                ...payload.appearance,
+                progressColors: payload.appearance.progressColors ?? [],
+              });
             noteAuthStatus(payload);
             setSetupRequired(Boolean(payload.setupRequired));
             setSetupEnvironment(

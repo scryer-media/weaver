@@ -1763,6 +1763,11 @@ export const UPDATE_WEB_APPEARANCE_MUTATION = gql`
       palette
       mode
       accent
+      progressColors {
+        palette
+        stage
+        color
+      }
     }
   }
 `;

@@ -7874,6 +7874,10 @@ type WebAppearance {
 	palette: WebPalette!
 	mode: WebMode!
 	accent: WebAccent
+	"""
+	Picks for every palette, ordered by palette then stage.
+	"""
+	progressColors: [WebProgressColorPick!]!
 }
 
 input WebAppearanceInput {
@@ -7883,6 +7887,11 @@ input WebAppearanceInput {
 	Omit to retain the accent. Null restores the palette's own highlight.
 	"""
 	accent: WebAccent
+	"""
+	Changes applied over the saved picks; other picks are kept. At most
+	one change per palette and stage (4 x 7).
+	"""
+	progressColors: [WebProgressColorChange!]
 }
 
 enum WebMode {
@@ -7896,6 +7905,55 @@ enum WebPalette {
 	PHOSPHOR
 	AMBER
 	TERMINAL
+}
+
+input WebProgressColorChange {
+	palette: WebPalette!
+	stage: WebProgressStage!
+	"""
+	Null restores the palette's default for this stage.
+	"""
+	color: WebProgressColor
+}
+
+enum WebProgressColor {
+	GREY
+	TEAL
+	CYAN
+	BLUE
+	INDIGO
+	VIOLET
+	MAGENTA
+	ROSE
+	RED
+	AMBER
+	LIME
+	GREEN
+}
+
+"""
+One palette's chosen colour for one stage. Stages without a pick use the palette's default.
+"""
+type WebProgressColorPick {
+	palette: WebPalette!
+	stage: WebProgressStage!
+	color: WebProgressColor!
+}
+
+"""
+A job stage whose progress colour can be picked. Queued is always grey.
+"""
+enum WebProgressStage {
+	DOWNLOADING
+	PAUSED
+	"""
+	Verifying and repairing.
+	"""
+	CHECKING
+	COPYING
+	EXTRACTING
+	COMPLETED
+	FAILED
 }
 
 """
