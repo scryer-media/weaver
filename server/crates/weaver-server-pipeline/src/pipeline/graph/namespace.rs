@@ -4054,13 +4054,8 @@ impl NamespaceWriter {
             self.verifications.insert((node, member));
             return Ok(false);
         }
-        // A member its producer vouched for, every byte of which this file
-        // holds, folds the stated CRC32 onto what was written of it.
-        let held = self
-            .files
-            .get(&node)
-            .and_then(|files| files.recorded.get(&member))
-            .is_none_or(|recorded| recorded.is_empty());
+        // A member its producer checked as it decoded it folds the stated
+        // CRC32 onto what was written of it, once.
         let Some(leaf) = self
             .files
             .get_mut(&node)
@@ -4068,7 +4063,7 @@ impl NamespaceWriter {
         else {
             return Ok(false);
         };
-        if record.vouched && held {
+        if record.checked {
             leaf.fold_checked(length, Digest::crc32(stated));
         }
         match leaf.folded(length, Algorithm::Crc32) {

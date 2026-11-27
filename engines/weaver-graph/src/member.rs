@@ -47,7 +47,7 @@ pub struct Member {
     // Its producer checked the bytes it said against `crc32` as it decoded
     // them. Not kept: a restore folds a closed member's stated CRC32, and
     // one restored open checks its file as any other does.
-    pub vouched: bool,
+    pub checked: bool,
     // Its front came: clean bytes from offset zero were once in hand, so
     // more than its name placed it, whether or not the front is kept now.
     // Only a retraction, which starts the member over, takes it back.
@@ -463,7 +463,7 @@ impl Namespace {
                 coverage: Coverage::new(),
                 closed: false,
                 crc32: None,
-                vouched: false,
+                checked: false,
                 fronted: false,
                 refuted: None,
                 reached: None,
@@ -1087,7 +1087,7 @@ impl Namespace {
             found.length = None;
             let was = std::mem::replace(&mut found.closed, false);
             found.crc32 = None;
-            found.vouched = false;
+            found.checked = false;
             found.fronted = false;
             found.refuted = None;
             found.reached = None;

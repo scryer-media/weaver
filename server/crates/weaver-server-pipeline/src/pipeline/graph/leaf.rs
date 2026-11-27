@@ -128,6 +128,11 @@ pub struct Leaf {
     // writes land so the member's own digest is known without reading the
     // file back.
     pub written: BTreeMap<u64, Written>,
+    // The checked stamp was applied (`fold_checked`): a digest it gave that
+    // a later write took away is not given again without a check. Not kept;
+    // a start over (`truncate`) takes it back, and a retraction drops the
+    // whole leaf.
+    stamped: bool,
     // The bytes that changed after they were written, by start and the
     // revision that changed them, to where they end: what a write replaced,
     // a close cut off or a start over emptied. A byte written for the first
@@ -375,6 +380,7 @@ impl Leaf {
             file: None,
             on_disk,
             written: BTreeMap::new(),
+            stamped: false,
             changed: BTreeMap::new(),
             queued: None,
         }
@@ -908,9 +914,10 @@ impl Leaf {
     // wrote against `digest` as it decoded them: the one run written over
     // exactly them, which folded nothing, takes the digest, and nothing is
     // hashed or read. A write that lands on the run after this takes the
-    // digest away again, as from any folded run it cannot fold.
+    // digest away again, as from any folded run it cannot fold, and it is
+    // given once: what a later write took away is checked, not stamped.
     pub fn fold_checked(&mut self, length: u64, digest: Digest) {
-        if length == 0 || self.written.len() != 1 {
+        if self.stamped || length == 0 || self.written.len() != 1 {
             return;
         }
         if let Some(run) = self.written.get_mut(&0)
@@ -918,6 +925,7 @@ impl Leaf {
             && run.digest.is_none()
         {
             run.digest = Some(digest);
+            self.stamped = true;
         }
     }
 
@@ -1156,6 +1164,7 @@ impl Leaf {
     pub fn truncate(&mut self) -> Result<(), LeafError> {
         self.revision += 1;
         self.written.clear();
+        self.stamped = false;
         self.change(0, u64::MAX);
         let create = self.queued.is_some().then(|| self.create(None));
         if let (Some(create), Some(queued)) = (create, self.queued.as_mut()) {

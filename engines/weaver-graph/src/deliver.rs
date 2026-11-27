@@ -337,7 +337,7 @@ pub enum Emit {
     // checksum of a member decoded whole without a mismatch, said in place
     // of `Checksum`. The member's own check takes it as what its file
     // holds, and hashes and reads nothing.
-    Vouched {
+    Checked {
         member: MemberId,
         crc32: u32,
     },

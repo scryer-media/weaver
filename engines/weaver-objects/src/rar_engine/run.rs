@@ -290,7 +290,7 @@ impl Walk<'_, '_> {
             return Err(self.failed_through(decoded.last, error));
         }
         self.open = None;
-        self.checksum_of(archive, at, member, decoded.checked)?;
+        self.checksum_of(archive, at, member, Verified::Apart(decoded.checked))?;
         self.say(Emit::MemberClosed(member))
     }
 
@@ -322,21 +322,20 @@ impl Walk<'_, '_> {
     // RAR5 member: its header's CRC32 is keyed, and a keyed checksum is not
     // the member's own.
     //
-    // Every decode verifies, so a member decoded without a mismatch had
-    // every byte said for it checked against the CRC32 its decoding archive
-    // read, `checked`. It is vouched for when that is the CRC32 stated: the
-    // same archive's, or, for a member decoded on an archive of its own,
-    // the walk's headers'.
+    // Every decode verifies, so a member whose decode returned without a
+    // mismatch had every byte said for it checked against the CRC32 its
+    // decoding archive states (`Verified`). It is said checked when that is
+    // the CRC32 stated here.
     fn checksum_of(
         &mut self,
         archive: &RarArchive,
         index: usize,
         member: MemberId,
-        checked: Option<u32>,
+        verified: Verified,
     ) -> Result<(), Stop> {
         match archive.member_info(index).and_then(|info| info.crc32) {
             Some(_) if keyed(archive, index) => Ok(()),
-            Some(crc32) if checked == Some(crc32) => self.say(Emit::Vouched { member, crc32 }),
+            Some(crc32) if verified.against(crc32) => self.say(Emit::Checked { member, crc32 }),
             Some(crc32) => self.say(Emit::Checksum { member, crc32 }),
             None => Ok(()),
         }
@@ -422,8 +421,7 @@ impl Walk<'_, '_> {
         match decoded {
             Ok(_) => {
                 self.open = None;
-                let checked = archive.member_info(index).and_then(|info| info.crc32);
-                self.checksum_of(archive, index, member, checked)?;
+                self.checksum_of(archive, index, member, Verified::Here)?;
                 self.say(Emit::MemberClosed(member)).map(|()| 1)
             }
             Err(_) if out.stopped => Err(Stop::Silent),
@@ -522,8 +520,7 @@ impl Walk<'_, '_> {
             None => unreachable!("a pool runs its caller"),
         }
         self.open = None;
-        let checked = own.member_info(0).and_then(|info| info.crc32);
-        self.checksum_of(&own, 0, member, checked)?;
+        self.checksum_of(&own, 0, member, Verified::Here)?;
         self.say(Emit::MemberClosed(member))?;
         let mut decoded = beside
             .decoded
@@ -1169,10 +1166,6 @@ impl Seek for Reader {
 #[error("the owner stopped the run")]
 struct Stopped;
 
-// The decoder's output, handed to the sink in pieces of at least
-// `EMIT_BYTES`, the member's last aside. A write that size or larger with
-// nothing gathered goes to the sink as it is; anything smaller gathers until
-// the pieces reach it. Either way each byte is copied once.
 // Whether member `index`'s stated CRC32 is keyed, as an encrypted RAR5
 // member's is: a keyed checksum is not the member's own, so nothing checks
 // its bytes' CRC32.
@@ -1180,6 +1173,34 @@ fn keyed(archive: &RarArchive, index: usize) -> bool {
     archive.format() == ArchiveFormat::Rar5 && archive.member_is_encrypted(index)
 }
 
+// What a member's decode, returned Ok under verify, compared its bytes with.
+// With verify set, unrar-rs hashes the CRC32 of every byte it writes for a
+// member that states one, and compares it with the CRC32 the member's final
+// header states before the decode returns; the CRC32 it computed is not
+// handed back.
+#[derive(Clone, Copy)]
+enum Verified {
+    // Decoded on the archive asked for its CRC32: what that archive states
+    // is what the decoder compared.
+    Here,
+    // Decoded on an archive of its own: the CRC32 that archive stated once
+    // its decode returned Ok, which the asked archive's must equal.
+    Apart(Option<u32>),
+}
+
+impl Verified {
+    fn against(self, stated: u32) -> bool {
+        match self {
+            Verified::Here => true,
+            Verified::Apart(checked) => checked == Some(stated),
+        }
+    }
+}
+
+// The decoder's output, handed to the sink in pieces of at least
+// `EMIT_BYTES`, the member's last aside. A write that size or larger with
+// nothing gathered goes to the sink as it is; anything smaller gathers until
+// the pieces reach it. Either way each byte is copied once.
 struct Out<'s, 'a, 'b> {
     sink: &'s mut Sink<'a>,
     member: MemberId,
