@@ -3,15 +3,21 @@
 
 use std::net::{IpAddr, SocketAddr};
 
-use async_graphql::{Context, MaybeUndefined, Object, Result};
+use async_graphql::{Context, Object, Result};
 use base64::Engine;
+use weaver_server_core::StateError;
+use weaver_server_core::ingest::Kind;
 use weaver_server_core::jobs::class::AddRefusal;
 use weaver_server_core::jobs::ids::JobId;
 use weaver_server_core::torrents::service::{ActionError, AddRequest, AddSource};
 
-use super::service;
-use super::types::{SubmitTorrentInput, Torrent, TorrentFilePriorityInput, TorrentTrackerInput};
-use crate::auth::{CallerScope, ControlGuard, graphql_error};
+use super::types::{
+    SubmitTorrentInputGql, TorrentFilePriorityInputGql, TorrentGql, TorrentSourceInput,
+    TorrentTrackerInput,
+};
+use super::{changed_torrent, service};
+use crate::auth::{CallerScope, ControlGuard, graphql_error, invalid_input};
+use crate::jobs::staging::{classify_upload, upload_refusal};
 use crate::settings::types::SeedingPolicyInput;
 
 pub(super) fn action_error(error: ActionError) -> async_graphql::Error {
@@ -19,10 +25,40 @@ pub(super) fn action_error(error: ActionError) -> async_graphql::Error {
         ActionError::NotFound(_) => "NOT_FOUND",
         ActionError::UnmetGoal(_) => "SEEDING_GOAL_UNMET",
         ActionError::Invalid(_) => "INVALID_INPUT",
-        ActionError::State(_) => "INTERNAL",
+        ActionError::State(message) => {
+            tracing::error!(error = %message, "torrent action failed on its state");
+            return crate::observability::state_error(StateError::Database(message.clone()));
+        }
         ActionError::Forbidden(_) => "FORBIDDEN",
     };
     graphql_error(code, error.to_string())
+}
+
+/// A torrent source's metainfo or magnet link, an upload read within the
+/// bounds `submit` reads one in.
+pub(crate) async fn torrent_source(
+    ctx: &Context<'_>,
+    source: TorrentSourceInput,
+) -> Result<AddSource> {
+    Ok(match source {
+        TorrentSourceInput::MetainfoBase64(encoded) => AddSource::Metainfo(
+            base64::engine::general_purpose::STANDARD
+                .decode(encoded.trim())
+                .map_err(|_| invalid_input("metainfoBase64 is not base64"))?,
+        ),
+        TorrentSourceInput::MetainfoUpload(upload) => {
+            let upload = upload
+                .value(ctx)
+                .map_err(|error| invalid_input(format!("invalid upload: {error}")))?;
+            match classify_upload(&upload, true).await.map_err(upload_refusal)? {
+                (Kind::Metainfo, decoded) => {
+                    AddSource::Metainfo(decoded.unwrap_or_else(|| upload.content.to_vec()))
+                }
+                _ => return Err(invalid_input("metainfoUpload is not a torrent file")),
+            }
+        }
+        TorrentSourceInput::Magnet(magnet) => AddSource::Magnet(magnet),
+    })
 }
 
 #[derive(Default)]
@@ -42,27 +78,16 @@ impl TorrentsMutation {
 
 #[Object]
 impl TorrentsMutation {
+    /// Add a torrent from its metainfo or a magnet link, and return it.
+    /// An uploaded metainfo file is bounded as `submit` bounds one.
     #[graphql(guard = "ControlGuard")]
     async fn submit_torrent(
         &self,
         ctx: &Context<'_>,
-        input: SubmitTorrentInput,
-    ) -> Result<Torrent> {
-        let torrents = service(ctx)?;
-        let source = match (input.metainfo_base64, input.magnet) {
-            (Some(encoded), None) => AddSource::Metainfo(
-                base64::engine::general_purpose::STANDARD
-                    .decode(encoded.trim())
-                    .map_err(|_| graphql_error("INVALID_INPUT", "metainfoBase64 is not base64"))?,
-            ),
-            (None, Some(magnet)) => AddSource::Magnet(magnet),
-            _ => {
-                return Err(graphql_error(
-                    "INVALID_INPUT",
-                    "give one of metainfoBase64 or magnet",
-                ));
-            }
-        };
+        input: SubmitTorrentInputGql,
+    ) -> Result<TorrentGql> {
+        service(ctx)?;
+        let source = torrent_source(ctx, input.source).await?;
         let policy_override = input
             .seeding
             .map(SeedingPolicyInput::into_policy)
@@ -77,70 +102,58 @@ impl TorrentsMutation {
                 forced: input.forced,
                 unpack: input.unpack,
                 metadata: Vec::new(),
-                upload_limit: None,
-                download_limit: None,
+                upload_limit: input.upload_limit_bps,
+                download_limit: input.download_limit_bps,
                 placement: Default::default(),
                 tags: input.tags,
             },
         )
         .await?;
-        torrents
-            .torrent(job_id)
-            .await
-            .map(Into::into)
-            .ok_or_else(|| graphql_error("NOT_FOUND", "the torrent left before it was read"))
+        changed_torrent(ctx, job_id.0).await
     }
 
+    /// Remove the torrent, and its files when `deleteFiles`; return its id.
+    /// Never refused for a seeding goal still to meet.
     #[graphql(guard = "ControlGuard")]
     async fn remove_torrent(
         &self,
         ctx: &Context<'_>,
         id: u64,
         #[graphql(default)] delete_files: bool,
-    ) -> Result<bool> {
-        // Never refused for a seeding goal still to meet.
+    ) -> Result<u64> {
         service(ctx)?
             .remove(JobId(id), delete_files)
             .await
             .map_err(action_error)?;
-        Ok(true)
+        Ok(id)
     }
 
+    /// Run the torrent outside the queue's limits, or under them again.
     #[graphql(guard = "ControlGuard")]
-    async fn pause_torrent(&self, ctx: &Context<'_>, id: u64) -> Result<bool> {
-        service(ctx)?.pause(JobId(id)).await.map_err(action_error)?;
-        Ok(true)
-    }
-
-    #[graphql(guard = "ControlGuard")]
-    async fn resume_torrent(&self, ctx: &Context<'_>, id: u64) -> Result<bool> {
-        service(ctx)?
-            .resume(JobId(id))
-            .await
-            .map_err(action_error)?;
-        Ok(true)
-    }
-
-    #[graphql(guard = "ControlGuard")]
-    async fn set_torrent_forced(&self, ctx: &Context<'_>, id: u64, forced: bool) -> Result<bool> {
+    async fn set_torrent_forced(
+        &self,
+        ctx: &Context<'_>,
+        id: u64,
+        forced: bool,
+    ) -> Result<TorrentGql> {
         service(ctx)?
             .set_forced(JobId(id), forced)
             .await
             .map_err(action_error)?;
-        Ok(true)
+        changed_torrent(ctx, id).await
     }
 
     /// Move the torrent's directory under `path`; it goes on from there.
     /// A key that only controls may name only a path under the default
     /// save folder or a category's folder.
     #[graphql(guard = "ControlGuard")]
-    async fn set_torrent_location(&self, ctx: &Context<'_>, id: u64, path: String) -> Result<bool> {
+    async fn set_torrent_location(&self, ctx: &Context<'_>, id: u64, path: String) -> Result<TorrentGql> {
         let caller = *ctx.data::<CallerScope>()?;
         service(ctx)?
             .set_location_as(caller, JobId(id), path)
             .await
             .map_err(action_error)?;
-        Ok(true)
+        changed_torrent(ctx, id).await
     }
 
     /// Set each named file's level; the others keep theirs.
@@ -149,8 +162,8 @@ impl TorrentsMutation {
         &self,
         ctx: &Context<'_>,
         id: u64,
-        priorities: Vec<TorrentFilePriorityInput>,
-    ) -> Result<bool> {
+        priorities: Vec<TorrentFilePriorityInputGql>,
+    ) -> Result<TorrentGql> {
         let priorities: Vec<_> = priorities
             .into_iter()
             .map(|file| (file.index, file.priority.into()))
@@ -159,65 +172,53 @@ impl TorrentsMutation {
             .set_file_priorities(JobId(id), &priorities)
             .await
             .map_err(action_error)?;
-        Ok(true)
+        changed_torrent(ctx, id).await
     }
 
     /// Check every piece of the torrent again, trusting nothing saved.
     #[graphql(guard = "ControlGuard")]
-    async fn recheck_torrent(&self, ctx: &Context<'_>, id: u64) -> Result<bool> {
+    async fn recheck_torrent(&self, ctx: &Context<'_>, id: u64) -> Result<TorrentGql> {
         service(ctx)?
             .recheck(JobId(id))
             .await
             .map_err(action_error)?;
-        Ok(true)
+        changed_torrent(ctx, id).await
     }
 
+    /// Fetch the torrent's pieces in order, or not.
     #[graphql(guard = "ControlGuard")]
     async fn set_torrent_sequential(
         &self,
         ctx: &Context<'_>,
         id: u64,
         sequential: bool,
-    ) -> Result<bool> {
+    ) -> Result<TorrentGql> {
         service(ctx)?
             .set_sequential(JobId(id), sequential)
             .await
             .map_err(action_error)?;
-        Ok(true)
+        changed_torrent(ctx, id).await
     }
 
+    /// Fetch each file's first and last pieces first, or not.
     #[graphql(guard = "ControlGuard")]
     async fn set_torrent_first_last_piece_first(
         &self,
         ctx: &Context<'_>,
         id: u64,
         first_last_piece_first: bool,
-    ) -> Result<bool> {
+    ) -> Result<TorrentGql> {
         service(ctx)?
             .set_first_last_piece_first(JobId(id), first_last_piece_first)
             .await
             .map_err(action_error)?;
-        Ok(true)
-    }
-
-    #[graphql(guard = "ControlGuard")]
-    async fn set_torrent_category(
-        &self,
-        ctx: &Context<'_>,
-        id: u64,
-        category: Option<String>,
-    ) -> Result<bool> {
-        service(ctx)?
-            .set_category(JobId(id), category)
-            .await
-            .map_err(action_error)?;
-        Ok(true)
+        changed_torrent(ctx, id).await
     }
 
     /// Ban a peer's address from the torrent: an IP, or an IP and port
     /// whose port is ignored.
     #[graphql(guard = "ControlGuard")]
-    async fn ban_torrent_peer(&self, ctx: &Context<'_>, id: u64, address: String) -> Result<bool> {
+    async fn ban_torrent_peer(&self, ctx: &Context<'_>, id: u64, address: String) -> Result<TorrentGql> {
         let address = address.trim();
         let ip = address
             .parse::<SocketAddr>()
@@ -228,25 +229,26 @@ impl TorrentsMutation {
             .ban_peers(JobId(id), &[ip])
             .await
             .map_err(action_error)?;
-        Ok(true)
+        changed_torrent(ctx, id).await
     }
 
-    /// The torrent's own upload and download limits in bytes per second,
-    /// in force on its peers at once; null is unlimited and 0 closes that
-    /// direction. A limit left out is kept.
+    /// Set both of the torrent's own limits in bytes per second, in force on
+    /// its peers at once. As `setBandwidth`: null or left out is no limit, 0
+    /// lets nothing through, and a value past the largest stored one is
+    /// refused.
     #[graphql(guard = "ControlGuard")]
     async fn set_torrent_rate_limits(
         &self,
         ctx: &Context<'_>,
         id: u64,
-        upload: MaybeUndefined<u64>,
-        download: MaybeUndefined<u64>,
-    ) -> Result<bool> {
+        upload_bps: Option<u64>,
+        download_bps: Option<u64>,
+    ) -> Result<TorrentGql> {
         service(ctx)?
-            .set_rate_limits(JobId(id), upload.into(), download.into())
+            .set_rate_limits(JobId(id), Some(upload_bps), Some(download_bps))
             .await
             .map_err(action_error)?;
-        Ok(true)
+        changed_torrent(ctx, id).await
     }
 
     /// Add `urls` as one tier after the torrent's last; the ones it lists
@@ -257,12 +259,12 @@ impl TorrentsMutation {
         ctx: &Context<'_>,
         id: u64,
         urls: Vec<String>,
-    ) -> Result<bool> {
+    ) -> Result<TorrentGql> {
         service(ctx)?
             .add_trackers(JobId(id), vec![urls])
             .await
             .map_err(action_error)?;
-        Ok(true)
+        changed_torrent(ctx, id).await
     }
 
     /// List `trackers` in place of the torrent's own.
@@ -272,7 +274,7 @@ impl TorrentsMutation {
         ctx: &Context<'_>,
         id: u64,
         trackers: Vec<TorrentTrackerInput>,
-    ) -> Result<bool> {
+    ) -> Result<TorrentGql> {
         service(ctx)?
             .replace_trackers(
                 JobId(id),
@@ -283,21 +285,22 @@ impl TorrentsMutation {
             )
             .await
             .map_err(action_error)?;
-        Ok(true)
+        changed_torrent(ctx, id).await
     }
 
+    /// Take `urls` out of the torrent's tracker list.
     #[graphql(guard = "ControlGuard")]
     async fn remove_torrent_trackers(
         &self,
         ctx: &Context<'_>,
         id: u64,
         urls: Vec<String>,
-    ) -> Result<bool> {
+    ) -> Result<TorrentGql> {
         service(ctx)?
             .remove_trackers(JobId(id), &urls)
             .await
             .map_err(action_error)?;
-        Ok(true)
+        changed_torrent(ctx, id).await
     }
 
     /// Announce now, to every tracker or to `tracker` alone.
@@ -307,24 +310,24 @@ impl TorrentsMutation {
         ctx: &Context<'_>,
         id: u64,
         tracker: Option<String>,
-    ) -> Result<bool> {
+    ) -> Result<TorrentGql> {
         let service = service(ctx)?;
         match tracker {
             Some(url) => service.reannounce_tracker(JobId(id), &url).await,
             None => service.reannounce(JobId(id)).await,
         }
         .map_err(action_error)?;
-        Ok(true)
+        changed_torrent(ctx, id).await
     }
 
     /// Look the torrent up on the DHT now.
     #[graphql(guard = "ControlGuard")]
-    async fn dht_announce_torrent(&self, ctx: &Context<'_>, id: u64) -> Result<bool> {
+    async fn dht_announce_torrent(&self, ctx: &Context<'_>, id: u64) -> Result<TorrentGql> {
         service(ctx)?
             .dht_announce(JobId(id))
             .await
             .map_err(action_error)?;
-        Ok(true)
+        changed_torrent(ctx, id).await
     }
 
     /// The torrent's own seeding policy; null returns it to its category's
@@ -335,12 +338,12 @@ impl TorrentsMutation {
         ctx: &Context<'_>,
         id: u64,
         seeding: Option<SeedingPolicyInput>,
-    ) -> Result<bool> {
+    ) -> Result<TorrentGql> {
         let policy = seeding.map(SeedingPolicyInput::into_policy).transpose()?;
         service(ctx)?
             .set_policy_override(JobId(id), policy)
             .await
             .map_err(action_error)?;
-        Ok(true)
+        changed_torrent(ctx, id).await
     }
 }

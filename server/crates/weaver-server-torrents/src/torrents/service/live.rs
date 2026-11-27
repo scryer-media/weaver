@@ -621,6 +621,30 @@ impl Live {
         file_have
     }
 
+    // `file_have_now` for the files in `files` alone, the same values. Off
+    // a session it reads only those files; in one, the session's figures
+    // for every file are copied once by `stats`, and only these are kept.
+    pub(super) fn file_have_page(&self, files: std::ops::Range<usize>) -> Vec<u64> {
+        let kept = |files: std::ops::Range<usize>| -> Vec<u64> {
+            files
+                .map(|file| self.file_have.get(file).copied().unwrap_or(0))
+                .collect()
+        };
+        let Some(attached) = &self.attached else {
+            return kept(files);
+        };
+        let reported = attached.handle.stats().file_progress;
+        if !reported.is_empty() {
+            return files
+                .map(|file| reported.get(file).copied().unwrap_or(0))
+                .collect();
+        }
+        match self.store.as_deref() {
+            Some(store) => store.file_have_of(files),
+            None => kept(files),
+        }
+    }
+
     // The session's figures for the torrent now, over what was kept of it,
     // with its durations as last kept.
     fn sampled(&self, now: i64) -> Reading {

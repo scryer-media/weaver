@@ -580,6 +580,15 @@ impl TorrentStore {
         self.have().file_have.clone()
     }
 
+    // The bytes in the pieces it has of each file in `files`, past its
+    // files read as none: `file_have` for those files alone.
+    pub(crate) fn file_have_of(&self, files: std::ops::Range<usize>) -> Vec<u64> {
+        let have = self.have();
+        files
+            .map(|file| have.file_have.get(file).copied().unwrap_or(0))
+            .collect()
+    }
+
     // Each file's bytes in the pieces it has, into `into`, reusing its room.
     pub(crate) fn file_have_into(&self, into: &mut Vec<u64>) {
         into.clone_from(&self.have().file_have);

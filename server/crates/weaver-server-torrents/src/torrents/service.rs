@@ -96,8 +96,8 @@ pub use settings::{
 };
 pub use tick::TorrentRoute;
 pub use views::{
-    ClockFields, PeerKinds, RowParts, TorrentLeg, TorrentPieces, TorrentSupport, TorrentView,
-    ViewClock,
+    ClockFields, FilesPage, PeerKinds, RowParts, TorrentLeg, TorrentPieces, TorrentSupport,
+    TorrentView, ViewClock,
 };
 
 // Why a magnet with no trackers is turned away on a route with no DHT.

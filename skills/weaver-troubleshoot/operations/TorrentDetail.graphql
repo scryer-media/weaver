@@ -6,8 +6,8 @@ query TorrentDetail($id: Int!) {
     id
     name
     state
-    stated
-    detail
+    stateReason
+    stateDetail
     routeReason
     route
     routeConsumer
@@ -16,13 +16,13 @@ query TorrentDetail($id: Int!) {
     totalBytes
     haveBytes
     wastedBytes
-    peers
-    seeds
-    leechers
+    connectedPeers
+    connectedSeeds
+    connectedLeechers
     swarmSeeds
     swarmLeechers
     reannounceSeconds
-    lastSeenCompleteMs
+    lastSeenCompleteAt
     activeSeconds
     seedingGoalLeft
     unpacking {
@@ -38,8 +38,8 @@ query TorrentDetail($id: Int!) {
       fails
       seeders
       leechers
-      lastAnnounceMs
-      nextAnnounceMs
+      lastAnnounceAt
+      nextAnnounceAt
       resolvedBy
     }
   }

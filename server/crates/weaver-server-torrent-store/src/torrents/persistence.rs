@@ -1519,6 +1519,12 @@ pub trait TorrentsPersistenceInsertPlacedTorrentInternalQueries {
         checking: bool,
     ) -> Result<(), StateError>;
     fn torrent_outputs(&self, job_id: JobId) -> Result<Vec<String>, StateError>;
+    fn torrent_outputs_page(
+        &self,
+        job_id: JobId,
+        offset: usize,
+        limit: usize,
+    ) -> Result<Vec<String>, StateError>;
     #[cfg(any(test, feature = "test-support"))]
     fn set_torrent_adopted(
         &self,
@@ -2066,6 +2072,46 @@ impl<T: TorrentDatabase> TorrentsPersistenceInsertPlacedTorrentInternalQueries f
                 return Ok(Vec::new());
             };
             serde_json::from_str(&text).map_err(|error| StateError::Database(error.to_string()))
+        })
+    }
+
+    // At most `limit` of [`Self::torrent_outputs`] after the first `offset`,
+    // in the order they are kept, the page taken in SQL: the torrent's row
+    // by its key, and its list by each name's place in it.
+    fn torrent_outputs_page(
+        &self,
+        job_id: JobId,
+        offset: usize,
+        limit: usize,
+    ) -> Result<Vec<String>, StateError> {
+        let id = stored(job_id.0)?;
+        let offset = i64::try_from(offset).unwrap_or(i64::MAX);
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        let datastore = self.borrow().datastore();
+        self.borrow().run_sql_blocking_read(async move {
+            let sql = match datastore.engine() {
+                weaver_server_db::persistence::sql_runtime::SqlEngine::Sqlite => {
+                    "SELECT o.value AS name FROM torrents t, json_each(t.outputs) o \
+                      WHERE t.job_id = {} AND t.outputs IS NOT NULL \
+                      ORDER BY o.key LIMIT {} OFFSET {}"
+                }
+                weaver_server_db::persistence::sql_runtime::SqlEngine::Postgres => {
+                    "SELECT o.name FROM torrents t \
+                      CROSS JOIN LATERAL json_array_elements_text(t.outputs::json) \
+                      WITH ORDINALITY AS o(name, place) \
+                      WHERE t.job_id = {} AND t.outputs IS NOT NULL \
+                      ORDER BY o.place LIMIT {} OFFSET {}"
+                }
+            };
+            let rows = SqlRuntime::fetch_all(
+                datastore.read_exec(),
+                sql,
+                &[SqlArg::I64(id), SqlArg::I64(limit), SqlArg::I64(offset)],
+            )
+            .await?;
+            rows.into_iter()
+                .map(|row| row.text("name"))
+                .collect()
         })
     }
 

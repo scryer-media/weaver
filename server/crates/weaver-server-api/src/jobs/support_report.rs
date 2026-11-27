@@ -51,9 +51,8 @@ pub struct AnalyzeNzbInput {
 /// as base64, or a magnet link. Exactly one source is required.
 #[derive(Debug, InputObject)]
 pub struct AnalyzeTorrentInput {
-    pub torrent_upload: Option<Upload>,
-    pub torrent_base64: Option<String>,
-    pub magnet: Option<String>,
+    /// The torrent to analyze.
+    pub source: crate::torrents::types::TorrentSourceInput,
 }
 
 // The largest .torrent file the analyzer reads.
@@ -147,14 +146,15 @@ pub(crate) async fn resolve_analyze_torrent(
 ) -> Result<SupportReport> {
     let environment =
         ReportEnvironment::current(ctx.data::<Database>()?, ctx.data::<SchedulerHandle>()?);
-    let source = match (input.torrent_upload, input.torrent_base64, input.magnet) {
-        (Some(upload), None, None) => {
+    use crate::torrents::types::TorrentSourceInput;
+    let source = match input.source {
+        TorrentSourceInput::MetainfoUpload(upload) => {
             let upload = upload
                 .value(ctx)
                 .map_err(|e| graphql_error("INVALID_INPUT", format!("invalid upload: {e}")))?;
             TorrentSource::Upload(upload)
         }
-        (None, Some(encoded), None) => {
+        TorrentSourceInput::MetainfoBase64(encoded) => {
             let encoded = encoded.trim();
             if encoded.len() as u64 > MAX_TORRENT_BYTES.div_ceil(3) * 4 {
                 return Err(graphql_error("INVALID_INPUT", "the torrent is too large"));
@@ -165,13 +165,7 @@ pub(crate) async fn resolve_analyze_torrent(
                     .map_err(|e| graphql_error("INVALID_INPUT", format!("invalid base64: {e}")))?,
             )
         }
-        (None, None, Some(link)) => TorrentSource::Magnet(link),
-        _ => {
-            return Err(graphql_error(
-                "INVALID_INPUT",
-                "analyzeTorrent requires exactly one of torrentUpload, torrentBase64 or magnet",
-            ));
-        }
+        TorrentSourceInput::Magnet(link) => TorrentSource::Magnet(link),
     };
 
     tokio::task::spawn_blocking(move || {

@@ -379,12 +379,27 @@ impl TorrentView {
             .get(file.index as usize)
             .copied()
             .unwrap_or(0);
-        if file.length == 0 {
-            1.0
-        } else {
-            (have as f64 / file.length as f64).min(1.0)
-        }
+        file_share(have, file.length)
     }
+}
+
+// The share of a file of `length` bytes that `have` bytes are, from 0 to 1;
+// a file of no bytes is whole.
+fn file_share(have: u64, length: u64) -> f64 {
+    if length == 0 {
+        1.0
+    } else {
+        (have as f64 / length as f64).min(1.0)
+    }
+}
+
+/// One page of a torrent's files.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FilesPage {
+    /// The page's files in index order, each with the share of it in hand.
+    pub files: Vec<(TorrentFile, f64)>,
+    /// How many files the torrent has.
+    pub total: usize,
 }
 
 // What the exporter reads of a torrent beside its view.
@@ -853,13 +868,27 @@ impl TorrentService {
     /// its files, its trackers and its tags are read only when asked for,
     /// and are empty otherwise.
     pub async fn torrent_shown(&self, job_id: JobId, shown: Shown) -> Option<TorrentView> {
+        self.torrent_read(job_id, shown).await.map(|(view, _)| view)
+    }
+
+    /// `torrent_shown`, with whether the torrent is one file named as the
+    /// torrent is, read from its layout whether or not its files are shown:
+    /// what its save path is read from.
+    pub async fn torrent_read(&self, job_id: JobId, shown: Shown) -> Option<(TorrentView, bool)> {
         self.ensure(&[job_id]).await;
         let settings = self.settings();
         let now = self.inner.clock.unix_ms();
-        let (mut view, tracked) = {
+        let (mut view, tracked, one_file) = {
             let live = self.inner.live.lock().await;
             let torrent = live.get(&job_id)?;
             let mut view = self.view(&settings, torrent, now);
+            let one_file = {
+                let mut files = torrent.layout.iter().flat_map(|layout| layout.files());
+                matches!(
+                    (files.next(), files.next()),
+                    (Some(file), None) if file.name == torrent.record.name
+                )
+            };
             if shown.files {
                 view.files = torrent.files();
             }
@@ -870,7 +899,7 @@ impl TorrentService {
                     torrent.trackers.clone(),
                 )
             });
-            (view, tracked)
+            (view, tracked, one_file)
         };
         if let Some((announces, pinned, listed)) = tracked {
             self.track(&mut view, pinned, &listed, &announces, &mut HashMap::new());
@@ -878,7 +907,98 @@ impl TorrentService {
         if shown.tags {
             self.tag(&mut [&mut view]).await;
         }
-        Some(view)
+        Some((view, one_file))
+    }
+
+    /// One page of the torrent's files in index order: at most `limit`
+    /// after the first `offset`, each with the share of it in hand, and how
+    /// many files the torrent has. Only the page's files are built and
+    /// their bytes in hand read; a torrent in a session copies its figures
+    /// for every file once, in the session's `stats`. None when there is no
+    /// such torrent.
+    pub async fn torrent_files(
+        &self,
+        job_id: JobId,
+        offset: usize,
+        limit: usize,
+    ) -> Option<FilesPage> {
+        self.ensure(&[job_id]).await;
+        let live = self.inner.live.lock().await;
+        let torrent = live.get(&job_id)?;
+        let Some(layout) = torrent.layout.as_deref() else {
+            return Some(FilesPage {
+                files: Vec::new(),
+                total: 0,
+            });
+        };
+        let total = layout.file_count();
+        if limit == 0 || offset >= total {
+            return Some(FilesPage {
+                files: Vec::new(),
+                total,
+            });
+        }
+        let page = offset..offset.saturating_add(limit).min(total);
+        let file_have = torrent.file_have_page(page.clone());
+        let files = page
+            .zip(file_have)
+            .filter_map(|(index, have)| {
+                let file = layout.file(index)?;
+                Some((
+                    TorrentFile {
+                        index: index as u32,
+                        path: file.name.clone(),
+                        length: file.length,
+                        priority: torrent.levels.get(index).copied().unwrap_or_default(),
+                    },
+                    file_share(have, file.length),
+                ))
+            })
+            .collect();
+        Some(FilesPage { files, total })
+    }
+
+    /// One page of the files the torrent's unpacking placed beside its own,
+    /// as `unpacked_files` lists them: the names at most `limit` after the
+    /// first `offset`, in the order its row keeps them, taken in SQL, then
+    /// each one looked at off the runtime. One no longer there is left out
+    /// of the page. With the page, whether names follow it.
+    pub async fn unpacked_files_page(
+        &self,
+        job_id: JobId,
+        offset: usize,
+        limit: usize,
+    ) -> Result<(Vec<UnpackedFile>, bool), ActionError> {
+        self.ensure(&[job_id]).await;
+        let dir = {
+            let live = self.inner.live.lock().await;
+            let torrent = live.get(&job_id).ok_or(ActionError::NotFound(job_id))?;
+            if torrent.record.unpack_end.is_none() || limit == 0 {
+                return Ok((Vec::new(), false));
+            }
+            super::files_dir(torrent)
+        };
+        let db = self.inner.db.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut names = db
+                .torrent_outputs_page(job_id, offset, limit + 1)
+                .map_err(|error| ActionError::State(error.to_string()))?;
+            let more = names.len() > limit;
+            names.truncate(limit);
+            let files = names
+                .into_iter()
+                .filter_map(|name| {
+                    let meta = std::fs::metadata(dir.join(&name)).ok()?;
+                    meta.is_file().then_some(UnpackedFile {
+                        name,
+                        length: meta.len(),
+                    })
+                })
+                .collect();
+            Ok((files, more))
+        })
+        .await
+        .map_err(|error| ActionError::State(error.to_string()))?
     }
 
     /// The files the torrent's unpacking placed beside its own, which its
