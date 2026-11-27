@@ -222,6 +222,7 @@ export const nextKo: LocaleDictionary = {
   "next.speedLimit.bySchedule": "일정에 따른 속도 제한",
   "next.speedLimit.buttonTitle": "다운로드 속도 제한",
   "next.speedLimit.title": "제한",
+  "next.speedLimit.adjustQuotas": "대역폭 할당량 조정",
   "next.speedLimit.speed": "속도",
   "next.speedLimit.ceiling": "다운로드 속도",
   "next.speedLimit.ceilingAria": "초당 메가바이트 단위 속도 제한",

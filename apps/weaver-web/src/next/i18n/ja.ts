@@ -231,6 +231,7 @@ export const nextJa: LocaleDictionary = {
   "next.speedLimit.bySchedule": "スケジュールによる速度制限",
   "next.speedLimit.buttonTitle": "ダウンロード速度制限",
   "next.speedLimit.title": "制限",
+  "next.speedLimit.adjustQuotas": "帯域幅の容量を調整",
   "next.speedLimit.speed": "速度",
   "next.speedLimit.ceiling": "ダウンロード速度",
   "next.speedLimit.ceilingAria": "速度制限（メガバイト毎秒）",

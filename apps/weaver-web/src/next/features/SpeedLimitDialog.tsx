@@ -10,9 +10,7 @@ import {
 } from "@/graphql/networking";
 import { useTranslate } from "@/lib/context/translate-context";
 import type { Bandwidth, BandwidthSplit } from "@/lib/networking";
-import { cn } from "@/lib/utils";
-import { Eyebrow, SectionHeader } from "@/next/components/chrome";
-import { Icon } from "@/next/components/icons";
+import { SectionHeader } from "@/next/components/chrome";
 import { PrimaryButton, SecondaryButton } from "@/next/components/controls";
 import { Dialog } from "@/next/components/Dialog";
 import { FormRow } from "@/next/components/rows";
@@ -45,9 +43,10 @@ import { FieldRows, Fold } from "@/next/pages/settings/framework";
  * the live metrics stream carries, so every opener sees a change within a
  * tick without refetching the settings.
  *
- * Below the speeds, shut behind a disclosure each time the dialog opens, it
- * holds each egress's quota, one egress at a time behind a picker, with the same fields and `setEgressQuota` as the egress editor.
- * Every egress edited since the dialog opened is saved on Apply.
+ * Below the speeds an "Adjust bandwidth quotas" button slides open each
+ * egress's quota, one egress at a time behind a picker, with the same fields
+ * and `setEgressQuota` as the egress editor. It starts shut each time the
+ * dialog opens. Every egress edited since then is saved on Apply.
  */
 export function useSpeedLimitDialog() {
   const t = useTranslate();
@@ -237,22 +236,14 @@ export function useSpeedLimitDialog() {
       ) : null}
       {quotaEgress ? (
         <>
-          <button
-            type="button"
-            aria-expanded={quotaOpen}
-            onClick={() => setQuotaOpen((was) => !was)}
-            className="group flex h-[30px] w-full flex-none cursor-pointer items-center gap-[10px] border-b border-wv-line-strong bg-wv-section px-4 text-left sm:px-6"
-          >
-            <Eyebrow>{t("next.networking.egress.quota")}</Eyebrow>
-            <Icon
-              name="expand"
-              size={12}
-              className={cn(
-                "ml-auto flex-none text-wv-muted transition-transform group-hover:text-wv-fg",
-                quotaOpen && "rotate-90",
-              )}
-            />
-          </button>
+          <div className="flex justify-center border-b border-wv-hairline px-4 py-[14px] sm:px-6">
+            <SecondaryButton
+              expanded={quotaOpen}
+              onClick={() => setQuotaOpen((was) => !was)}
+            >
+              {t("next.speedLimit.adjustQuotas")}
+            </SecondaryButton>
+          </div>
           <Fold open={quotaOpen}>
             <FieldRows
               fields={[

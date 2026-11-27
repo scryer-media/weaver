@@ -211,6 +211,7 @@ export const nextZh: LocaleDictionary = {
   "next.speedLimit.bySchedule": "速度限制由计划设定",
   "next.speedLimit.buttonTitle": "下载速度限制",
   "next.speedLimit.title": "限制",
+  "next.speedLimit.adjustQuotas": "调整带宽配额",
   "next.speedLimit.speed": "速度",
   "next.speedLimit.ceiling": "下载速度",
   "next.speedLimit.ceilingAria": "速度限制（兆字节每秒）",

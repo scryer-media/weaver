@@ -409,7 +409,10 @@ test("the limits dialog edits each egress's quota behind a picker and saves ever
   const dialog = page.getByRole("dialog", { name: "Limits", exact: true });
   assert.equal(await dialog.getByText("persists across restarts").count(), 0);
   // The quotas start shut behind their header.
-  const disclose = dialog.getByRole("button", { name: "Quota", exact: true });
+  const disclose = dialog.getByRole("button", {
+    name: "Adjust bandwidth quotas",
+    exact: true,
+  });
   assert.equal(await disclose.getAttribute("aria-expanded"), "false");
   const picker = dialog.getByRole("button", { name: "Egress", exact: true });
   assert.equal(
@@ -473,7 +476,12 @@ test("with torrents off the limits dialog hides the upload caps and saves them a
   const { page, errors } = await open("limits", { torrents: "off" });
   await page.getByTitle("Download speed limit", { exact: true }).click();
   const dialog = page.getByRole("dialog", { name: "Limits", exact: true });
-  await dialog.getByRole("button", { name: "Quota", exact: true }).click();
+  await dialog
+    .getByRole("button", {
+      name: "Adjust bandwidth quotas",
+      exact: true,
+    })
+    .click();
   await dialog.getByRole("button", { name: "Egress", exact: true }).click();
   await page
     .getByRole("menuitemradio", { name: "LTE standby", exact: true })

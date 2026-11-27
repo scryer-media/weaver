@@ -78,6 +78,7 @@ export function SecondaryButton({
   size = "default",
   testId,
   menuOpen,
+  expanded,
 }: {
   children: ReactNode;
   /** A leading icon, named by the action. */
@@ -91,6 +92,8 @@ export function SecondaryButton({
   testId?: string;
   /** Set when the button opens a `Menu`: whether that menu is open. */
   menuOpen?: boolean;
+  /** Set when the button slides a part of the page open: whether it is open. */
+  expanded?: boolean;
 }) {
   const triggersMenu = menuOpen !== undefined;
   return (
@@ -99,7 +102,7 @@ export function SecondaryButton({
       data-testid={testId}
       data-wv-menu-trigger={triggersMenu ? "" : undefined}
       aria-haspopup={triggersMenu ? "menu" : undefined}
-      aria-expanded={menuOpen}
+      aria-expanded={menuOpen ?? expanded}
       title={title}
       onClick={onClick}
       disabled={disabled}

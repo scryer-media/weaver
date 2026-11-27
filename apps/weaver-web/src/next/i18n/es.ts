@@ -228,6 +228,7 @@ export const nextEs: LocaleDictionary = {
     "Límite de velocidad fijado por una programación",
   "next.speedLimit.buttonTitle": "Límite de velocidad de descarga",
   "next.speedLimit.title": "Límites",
+  "next.speedLimit.adjustQuotas": "Ajustar cuotas de ancho de banda",
   "next.speedLimit.speed": "Velocidad",
   "next.speedLimit.ceiling": "Velocidad de descarga",
   "next.speedLimit.ceilingAria": "Límite de velocidad en megabytes por segundo",
