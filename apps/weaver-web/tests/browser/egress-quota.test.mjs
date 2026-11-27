@@ -407,9 +407,17 @@ test("the limits dialog edits each egress's quota behind a picker and saves ever
   const { page, errors } = await open("limits");
   await page.getByTitle("Download speed limit", { exact: true }).click();
   const dialog = page.getByRole("dialog", { name: "Limits", exact: true });
-  await dialog.getByText("Quota", { exact: true }).waitFor();
   assert.equal(await dialog.getByText("persists across restarts").count(), 0);
+  // The quotas start shut behind their header.
+  const disclose = dialog.getByRole("button", { name: "Quota", exact: true });
+  assert.equal(await disclose.getAttribute("aria-expanded"), "false");
   const picker = dialog.getByRole("button", { name: "Egress", exact: true });
+  assert.equal(
+    await picker.evaluate((element) => element.closest("[inert]") !== null),
+    true,
+  );
+  await disclose.click();
+  assert.equal(await disclose.getAttribute("aria-expanded"), "true");
   const pick = async (name) => {
     await picker.click();
     await page.getByRole("menuitemradio", { name, exact: true }).click();
@@ -429,7 +437,8 @@ test("the limits dialog edits each egress's quota behind a picker and saves ever
   await cap("Upload hard cap").click();
   await pick("LTE standby");
   assert.equal(await allowance("Download cap").inputValue(), "30");
-  // A cap switched on with nothing typed is refused, and its egress is shown.
+  // A cap switched on with nothing typed is refused, and its egress is shown, with the quotas shut or not.
+  await disclose.click();
   await dialog.getByRole("button", { name: "Apply", exact: true }).click();
   await dialog
     .getByText("Set an allowance before switching the quota on.", {
@@ -437,6 +446,7 @@ test("the limits dialog edits each egress's quota behind a picker and saves ever
     })
     .waitFor();
   assert.equal((await sent(page)).length, 0);
+  assert.equal(await disclose.getAttribute("aria-expanded"), "true");
   assert.equal(await allowance("Download cap").inputValue(), "1");
   await allowance("Upload hard cap").fill("50");
   if (shot("limits")) await dialog.screenshot({ path: shot("limits") });
@@ -463,6 +473,7 @@ test("with torrents off the limits dialog hides the upload caps and saves them a
   const { page, errors } = await open("limits", { torrents: "off" });
   await page.getByTitle("Download speed limit", { exact: true }).click();
   const dialog = page.getByRole("dialog", { name: "Limits", exact: true });
+  await dialog.getByRole("button", { name: "Quota", exact: true }).click();
   await dialog.getByRole("button", { name: "Egress", exact: true }).click();
   await page
     .getByRole("menuitemradio", { name: "LTE standby", exact: true })

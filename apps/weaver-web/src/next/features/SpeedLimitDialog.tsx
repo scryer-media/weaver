@@ -10,7 +10,9 @@ import {
 } from "@/graphql/networking";
 import { useTranslate } from "@/lib/context/translate-context";
 import type { Bandwidth, BandwidthSplit } from "@/lib/networking";
-import { SectionHeader } from "@/next/components/chrome";
+import { cn } from "@/lib/utils";
+import { Eyebrow, SectionHeader } from "@/next/components/chrome";
+import { Icon } from "@/next/components/icons";
 import { PrimaryButton, SecondaryButton } from "@/next/components/controls";
 import { Dialog } from "@/next/components/Dialog";
 import { FormRow } from "@/next/components/rows";
@@ -27,7 +29,7 @@ import {
   type EgressQuotaDraft,
 } from "@/next/features/networking/egress-quota";
 import { LimitControl, SplitControl } from "@/next/features/networking/limits";
-import { FieldRows } from "@/next/pages/settings/framework";
+import { FieldRows, Fold } from "@/next/pages/settings/framework";
 
 /**
  * The speed limit dialog, opened from the queue header and the rail's
@@ -43,8 +45,8 @@ import { FieldRows } from "@/next/pages/settings/framework";
  * the live metrics stream carries, so every opener sees a change within a
  * tick without refetching the settings.
  *
- * Below the speeds it holds each egress's quota, one egress at a time behind
- * a picker, with the same fields and `setEgressQuota` as the egress editor.
+ * Below the speeds, shut behind a disclosure each time the dialog opens, it
+ * holds each egress's quota, one egress at a time behind a picker, with the same fields and `setEgressQuota` as the egress editor.
  * Every egress edited since the dialog opened is saved on Apply.
  */
 export function useSpeedLimitDialog() {
@@ -88,6 +90,8 @@ export function useSpeedLimitDialog() {
     Record<number, EgressQuotaDraft>
   >({});
   const [savingQuotas, setSavingQuotas] = useState(false);
+  // The quotas sit shut behind their header; a refused quota opens them.
+  const [quotaOpen, setQuotaOpen] = useState(false);
   const quotaEgress =
     egresses.find((egress) => egress.id === quotaEgressId) ?? egresses[0];
   const quotaDraft = quotaEgress
@@ -99,6 +103,7 @@ export function useSpeedLimitDialog() {
     setUploadEdit(undefined);
     setSplitEdit(undefined);
     setQuotaEdits({});
+    setQuotaOpen(false);
     setError(null);
     setOpen(true);
   };
@@ -120,6 +125,7 @@ export function useSpeedLimitDialog() {
     );
     if (invalid) {
       setQuotaEgressId(invalid.id);
+      setQuotaOpen(true);
       setError(egressQuotaProblem(t, quotaEdits[invalid.id]!));
       return;
     }
@@ -231,28 +237,42 @@ export function useSpeedLimitDialog() {
       ) : null}
       {quotaEgress ? (
         <>
-          <SectionHeader
-            label={t("next.networking.egress.quota")}
-            sticky={false}
-          />
-          <FieldRows
-            fields={[
-              {
-                id: "quota-egress",
-                label: t("next.networking.egress.section"),
-                control: {
-                  kind: "select",
-                  value: String(quotaEgress.id),
-                  options: egresses.map((egress) => ({
-                    value: String(egress.id),
-                    label: egress.name,
-                  })),
-                  onChange: (id) => setQuotaEgressId(Number(id)),
+          <button
+            type="button"
+            aria-expanded={quotaOpen}
+            onClick={() => setQuotaOpen((was) => !was)}
+            className="group flex h-[30px] w-full flex-none cursor-pointer items-center gap-[10px] border-b border-wv-line-strong bg-wv-section px-4 text-left sm:px-6"
+          >
+            <Eyebrow>{t("next.networking.egress.quota")}</Eyebrow>
+            <Icon
+              name="expand"
+              size={12}
+              className={cn(
+                "ml-auto flex-none text-wv-muted transition-transform group-hover:text-wv-fg",
+                quotaOpen && "rotate-90",
+              )}
+            />
+          </button>
+          <Fold open={quotaOpen}>
+            <FieldRows
+              fields={[
+                {
+                  id: "quota-egress",
+                  label: t("next.networking.egress.section"),
+                  control: {
+                    kind: "select",
+                    value: String(quotaEgress.id),
+                    options: egresses.map((egress) => ({
+                      value: String(egress.id),
+                      label: egress.name,
+                    })),
+                    onChange: (id) => setQuotaEgressId(Number(id)),
+                  },
                 },
-              },
-              ...quotaFields,
-            ]}
-          />
+                ...quotaFields,
+              ]}
+            />
+          </Fold>
         </>
       ) : null}
       {scheduled !== null ? (
