@@ -2336,6 +2336,95 @@ fn an_encrypted_member_refuted_with_its_fold_dropped_tries_the_next_password() {
     assert_eq!((owner.said.len(), owner.replays), (said, replays));
 }
 
+// The same member under the false candidate alone: the namespace's failed
+// check finds no other candidate, so a password is asked for and the
+// member's extent is said damaged. The right password offered later gives
+// the false one up as a failed fold's doubt is given up: the member is read
+// again once, folds, and closes clean, and the store no longer holds it
+// damaged. A password given up already, offered again, changes nothing.
+#[test]
+fn a_member_refuted_with_its_fold_dropped_is_retried_by_a_password_offered_later() {
+    use crate::grid::WHOLE;
+    let plain = payload(96, 9_000);
+    let archive = encrypted(&plain);
+    let wrong = false_password(&archive);
+    let start = records::local_len(&archive).unwrap() + 12;
+    let end = start + plain.len() as u64;
+    let whole = ByteRange::new(0, plain.len() as u64);
+    let mut owner = Owner::single(Zip::new(), archive.clone());
+    owner.pull = Pull::Unseekable;
+    for other in 1..=4 {
+        for at in 0..4096 {
+            owner.object.grid.offer(
+                MemberId(other),
+                WHOLE,
+                &weaver_graph::Segment {
+                    range: ByteRange::at(at * 2, 1),
+                    crc32: 0,
+                    verified: true,
+                },
+            );
+        }
+    }
+    offer(&mut owner, &wrong);
+    owner.deliver(0, ByteRange::new(0, end - 1));
+    owner.deliver_as(
+        0,
+        ByteRange::at(start + 4000, 1),
+        Provenance::Repaired,
+        None,
+    );
+    owner.deliver(0, ByteRange::new(end - 1, archive.len() as u64));
+    owner.close(0);
+    let member = member_id(&owner, "alpha.bin");
+    assert!(owner.member("alpha.bin").closed);
+    assert!(owner.object.grid.dropped(member, WHOLE));
+    assert_eq!(owner.object.grid.fold(member, WHOLE, 0, whole), None);
+    let count = |owner: &Owner, of: fn(&Emit) -> bool| owner.said.iter().filter(|e| of(e)).count();
+    let damaged = |emit: &Emit| matches!(emit, Emit::Damaged { .. });
+    let again = |emit: &Emit| matches!(emit, Emit::Again { .. });
+    let retract = |emit: &Emit| matches!(emit, Emit::Retract(_));
+    let asked = |emit: &Emit| *emit == Emit::NeedsPassword;
+    assert_eq!(count(&owner, damaged), 0, "{:?}", owner.said);
+
+    owner.refuted(member);
+    assert_eq!(count(&owner, asked), 1, "{:?}", owner.said);
+    assert!(count(&owner, damaged) > 0, "{:?}", owner.said);
+    assert_eq!(count(&owner, again), 0, "{:?}", owner.said);
+    assert!(owner.object.members[member.0 as usize].damaged);
+    let said_damage = count(&owner, damaged);
+
+    offer(&mut owner, PASSWORD);
+    assert_eq!(
+        count(&owner, retract),
+        1,
+        "read again once: {:?}",
+        owner.said
+    );
+    assert_eq!(count(&owner, again), 1, "{:?}", owner.said);
+    assert_eq!(count(&owner, asked), 1, "{:?}", owner.said);
+    assert_eq!(count(&owner, damaged), said_damage, "{:?}", owner.said);
+    assert!(owner.replays > 0);
+    let got = owner.member("alpha.bin");
+    assert!(got.closed);
+    assert!(got.bytes == plain);
+    assert!(owner.object.grid.fold(member, WHOLE, 0, whole).is_some());
+    // The damage the store said is no longer its own: the member started
+    // over, and nothing held it damaged once the store ruled again.
+    assert!(!owner.object.members[member.0 as usize].damaged);
+    let mut out = Vec::new();
+    owner
+        .object
+        .quiet(&crate::testing::Quiet(Vec::new()), &mut out);
+    assert!(out.is_empty(), "{out:?}");
+    assert!(owner.posted(0) == Some(archive));
+
+    let (said, replays) = (owner.said.len(), owner.replays);
+    offer(&mut owner, &wrong);
+    owner.refuted(member);
+    assert_eq!((owner.said.len(), owner.replays), (said, replays));
+}
+
 fn no_trouble_but_retract(owner: &Owner) {
     for emit in &owner.said {
         assert!(

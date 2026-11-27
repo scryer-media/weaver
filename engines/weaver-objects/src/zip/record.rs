@@ -269,7 +269,8 @@ impl Zip {
     }
 
     // A member whose whole CRC fails over verified bytes under a candidate
-    // nothing proved, kept for want of another: a new password retries it.
+    // nothing proved, kept for want of another: a new password retries it,
+    // whether its fold failed or the namespace's check did.
     pub(super) fn retry_doubted(&mut self, out: &mut Vec<Emit>) {
         let Some(map) = &mut self.map else {
             return;
@@ -289,8 +290,16 @@ impl Zip {
             }
             let whole = ByteRange::new(0, entry.length);
             let folded = self.grid.fold(member, WHOLE, 0, whole);
-            if grid::verdict(folded, entry.length, 0, entry.crc) != SliceVerdict::Damaged
-                || !folded.is_some_and(|folded| folded.verified)
+            // A member with no fold, its CRC failed by the namespace's check
+            // over verified bytes and said damaged for it, is retried as one
+            // whose fold failed.
+            let refuted = folded.is_none()
+                && self.members.get(member.0 as usize).is_some_and(|said| {
+                    said.closed && said.damaged && said.coverage.verified(whole)
+                });
+            if !refuted
+                && (grid::verdict(folded, entry.length, 0, entry.crc) != SliceVerdict::Damaged
+                    || !folded.is_some_and(|folded| folded.verified))
             {
                 continue;
             }
