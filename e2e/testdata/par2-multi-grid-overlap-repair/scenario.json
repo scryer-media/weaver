@@ -1,0 +1,13 @@
+{
+  "slug": "par2-multi-grid-overlap-repair",
+  "title": "Lattice.Harbor.PAR2.MultiGrid.Overlap.Repair.2026.1080p.WEB-DL.H264-TESTGRP",
+  "description": "One payload described by independent 64 KiB and 96 KiB PAR2 sets, with 128 KiB of it zeroed. The 64 KiB set holds one recovery block for its two damaged slices and cannot rebuild the payload; the 96 KiB set holds four for its two and must, so the payload is delivered byte for byte.",
+  "category": "2000",
+  "expected_outcome": "repair_then_success",
+  "requiredJobEvents": [
+    "RepairComplete"
+  ],
+  "expectedOutputBLAKE3": {
+    "payload.mkv": "76a4f368c6a1e48e3c78104a2be86addb9b800e5c6531b2fb89477a3a09a4747"
+  }
+}
