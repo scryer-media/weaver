@@ -66,6 +66,7 @@ async fn an_unwanted_member_found_while_unpacking_refuses_the_unpacking_and_the_
         .unpack_end
         .unwrap();
     assert_eq!(end.result, UnpackResult::Refused);
+    assert_eq!(end.cause, Some(UnpackCause::Refused));
     assert!(end.why.as_deref().unwrap().contains("txt"), "{end:?}");
     assert!(rig.db.get_job_history(job_id.0).unwrap().is_none());
     assert_eq!(
@@ -277,6 +278,7 @@ async fn a_finished_torrent_unpacking_refused_seeds_on_and_its_removal_is_comple
     assert_eq!(view.detail, None);
     let end = view.unpack_end.clone().unwrap();
     assert_eq!(end.result, UnpackResult::Refused);
+    assert_eq!(end.cause, Some(UnpackCause::Refused));
     assert!(end.why.as_deref().unwrap().contains("txt"), "{end:?}");
     assert!(rig.db.get_job_history(job_id.0).unwrap().is_none());
     assert_eq!(*rig.service.retired().borrow(), 0);
@@ -339,6 +341,7 @@ async fn an_unwanted_unpacked_file_is_deleted_under_the_delete_action_and_said_o
         view.unpack_end,
         Some(UnpackEnd::short(
             false,
+            UnpackCause::DeliveredInPart,
             "delivered in part; removed for an unwanted extension: small.txt".into()
         ))
     );
@@ -392,6 +395,7 @@ async fn unpacked_files_that_cannot_be_placed_are_kept_and_said_on_the_unpacking
         .unpack_end
         .unwrap();
     assert_eq!(end.result, UnpackResult::Failed);
+    assert_eq!(end.cause, Some(UnpackCause::NotPlaced));
     let error = end.why.unwrap();
     assert!(error.contains("could not be placed"), "{error}");
     assert!(error.contains(&work.display().to_string()), "{error}");
@@ -1144,6 +1148,7 @@ async fn reopened_for_a_plain_file(restart: bool) {
         ended,
         Some(UnpackEnd::short(
             true,
+            UnpackCause::DeliveredInPart,
             "delivered in part; damaged: extra.bin".into()
         ))
     );
@@ -1289,6 +1294,7 @@ async fn reopened_after_ending_short(restart: bool, mark_fails: bool) {
     assert_eq!(view.state, TorrentState::Seeding);
     let ended = view.unpack_end.clone().unwrap();
     assert_eq!(ended.result, UnpackResult::Refused);
+    assert_eq!(ended.cause, Some(UnpackCause::Refused));
     assert!(ended.why.as_deref().unwrap().contains("txt"), "{ended:?}");
     let dir = PathBuf::from(view.storage_dir.unwrap());
     let outputs = rig.db.torrent_outputs(job_id).unwrap();
@@ -1640,6 +1646,10 @@ async fn ignored_volume_fails(ignored: usize) {
     assert!(beside.is_empty(), "{beside:?}");
     assert!(rig.service.unpacked_files(job_id).await.unwrap().is_empty());
     let end = rig.service.torrent(job_id).await.unwrap().unpack_end;
+    assert_eq!(
+        end.as_ref().and_then(|end| end.cause),
+        Some(UnpackCause::NothingDelivered)
+    );
 
     rig.service.pause(job_id).await.unwrap();
     let view = rig.service.torrent(job_id).await.unwrap();

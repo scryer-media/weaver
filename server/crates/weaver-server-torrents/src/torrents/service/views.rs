@@ -137,6 +137,11 @@ pub struct TorrentView {
     /// it seeds.
     pub queue_position: Option<u32>,
     pub seeding_left: Option<String>,
+    /// Each seeding goal in force, read with `seeding_left` and from the
+    /// same terms and counters.
+    pub seeding_goals: Vec<status::GoalProgress>,
+    /// Whether those goals are met by the terms' mode; false with none.
+    pub seeding_goal_met: bool,
     /// The torrent's own seeding policy, when it sets a leaf.
     pub seeding_override: Option<SeedingPolicy>,
     /// The seeding terms in force, and the level each comes from.
@@ -154,6 +159,10 @@ pub struct TorrentView {
     /// How its unpacking came out, once over: the unpacking's own line,
     /// which nothing of the torrent's reads.
     pub unpack_end: Option<UnpackEnd>,
+    /// Whether its download is complete and its unpacking, where one
+    /// applies, is over, whole or short: complete and not unpacking
+    /// (`Live::unpacking`).
+    pub content_ready: bool,
     pub route: Option<String>,
     pub files: Vec<TorrentFile>,
     /// Whether its pieces are fetched in order.
@@ -718,6 +727,7 @@ impl TorrentService {
         // second included, and its averages over that same time.
         let active_seconds =
             status::active_seconds(counters.active_duration_s, reading.timed.active_ms);
+        let seeding_goals = status::goals(&policy, counters, have, now);
         TorrentView {
             job_id: record.job_id,
             name: record.name.clone(),
@@ -805,6 +815,8 @@ impl TorrentService {
             files_dir: record.files_dir.clone(),
             queue_position: torrent.queue_rank,
             seeding_left: status::goal_left(&policy, counters, have, now),
+            seeding_goal_met: status::goals_met(&policy, &seeding_goals),
+            seeding_goals,
             seeding_override: record.policy_override,
             seeding_policy: policy,
             seeding_levels,
@@ -815,6 +827,7 @@ impl TorrentService {
                 .unwrap_or_else(|| settings.unpack(record, rule)),
             unpack_override: record.unpack,
             unpack_end: record.unpack_end.clone(),
+            content_ready: record.completed_at_ms.is_some() && !torrent.unpacking(),
             scope: settings.scope(record.category_id, rule),
             route: torrent.route.key().map(|key| key.as_str().to_owned()),
             files: Vec::new(),

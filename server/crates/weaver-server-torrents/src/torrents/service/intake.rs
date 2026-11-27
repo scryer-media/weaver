@@ -686,6 +686,14 @@ impl TorrentService {
         }
     }
 
+    /// The metadata the torrent of `job_id` was added with, read from its
+    /// row alone: what a duplicate add compares its request with.
+    pub async fn added_metadata(&self, job_id: JobId) -> Result<Vec<(String, String)>, AddError> {
+        self.db(move |db| db.torrent_metadata(job_id))
+            .await
+            .map_err(|error| AddError::State(state_error(error)))
+    }
+
     async fn reserve(&self) -> Result<JobId, AddError> {
         self.db(|db| db.reserve_next_job_id())
             .await

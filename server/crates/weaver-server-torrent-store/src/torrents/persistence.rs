@@ -794,16 +794,24 @@ fn torrent_args(
                 .map(|end| end.result.as_str().to_owned()),
         ),
         SqlArg::OptText(torrent.unpack_end.as_ref().and_then(|end| end.why.clone())),
+        SqlArg::OptText(
+            torrent
+                .unpack_end
+                .as_ref()
+                .and_then(|end| end.cause)
+                .map(|cause| cause.as_str().to_owned()),
+        ),
     ])
 }
 
 // The values that mark a torrent's unpacking over as `end`: whether it is
-// over, how it came out and why, in that order.
+// over, how it came out, why and its code, in that order.
 fn unpack_end_args(end: &UnpackEnd) -> Vec<SqlArg> {
     vec![
         SqlArg::Bool(true),
         SqlArg::Text(end.result.as_str().to_owned()),
         SqlArg::OptText(end.why.clone()),
+        SqlArg::OptText(end.cause.map(|cause| cause.as_str().to_owned())),
     ]
 }
 
@@ -815,8 +823,8 @@ fn unpack_over_update(end: Option<&UnpackEnd>, id: i64) -> (&'static str, Vec<Sq
             let mut args = unpack_end_args(end);
             args.push(SqlArg::I64(id));
             (
-                "UPDATE torrents SET unpack_over = {}, unpack_end = {}, unpack_why = {} \
-                 WHERE job_id = {}",
+                "UPDATE torrents SET unpack_over = {}, unpack_end = {}, unpack_why = {}, \
+                 unpack_cause = {} WHERE job_id = {}",
                 args,
             )
         }
@@ -992,8 +1000,8 @@ impl<T: TorrentDatabase> TorrentsPersistenceInsertTorrentQueries for T {
         self.borrow().run_sql_blocking(async move {
             let changed = SqlRuntime::execute(
                 datastore.write_exec(),
-                "UPDATE torrents SET unpack_over = {}, unpack_end = {}, unpack_why = {} \
-                 WHERE job_id = {}",
+                "UPDATE torrents SET unpack_over = {}, unpack_end = {}, unpack_why = {}, \
+                 unpack_cause = {} WHERE job_id = {}",
                 &args,
             )
             .await?;
@@ -1915,7 +1923,7 @@ impl<T: TorrentDatabase> TorrentsPersistenceInsertPlacedTorrentInternalQueries f
                 Box::pin(async move {
                     tx.execute(
                         "UPDATE torrents SET outputs = {}, unpack_over = {}, unpack_end = {}, \
-                         unpack_why = {} WHERE job_id = {}",
+                         unpack_why = {}, unpack_cause = {} WHERE job_id = {}",
                         &args,
                     )
                     .await?;

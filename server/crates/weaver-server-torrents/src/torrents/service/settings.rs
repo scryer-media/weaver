@@ -473,6 +473,11 @@ impl TorrentService {
         Ok(())
     }
 
+    /// The tracker rule of id `id`, as the service holds it in memory.
+    pub fn tracker_rule(&self, id: u32) -> Option<crate::settings::model::TrackerRule> {
+        self.rules().of(Some(id)).cloned()
+    }
+
     pub async fn load_rules(&self) -> Result<(), String> {
         let rules = self
             .db(|db| db.list_tracker_rules())

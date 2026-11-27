@@ -518,6 +518,8 @@ fn view(state: TorrentState) -> TorrentView {
         files_dir: None,
         queue_position: None,
         seeding_left: None,
+        seeding_goals: Vec::new(),
+        seeding_goal_met: false,
         seeding_override: None,
         seeding_policy: Seeding::default(),
         seeding_levels: Default::default(),
@@ -526,6 +528,7 @@ fn view(state: TorrentState) -> TorrentView {
         unpack: true,
         unpack_override: None,
         unpack_end: None,
+        content_ready: false,
         route: None,
         files: Vec::new(),
         sequential: false,
@@ -4170,6 +4173,7 @@ fn unpacked_files_list_after_the_torrents_own_and_never_touch_its_state() {
     let end = |result, why: Option<&str>| UnpackEnd {
         result,
         why: why.map(str::to_owned),
+        cause: None,
     };
     for end in [
         end(UnpackResult::Whole, None),

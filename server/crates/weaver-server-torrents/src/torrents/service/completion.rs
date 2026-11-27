@@ -13,7 +13,7 @@ use crate::jobs::model::JobStatus;
 use crate::pipeline::graph::status::{Delivery, Failure, shortfall_message};
 use crate::post_processing::model::QueueEvent;
 use crate::torrents::metrics::TorrentEvent;
-use crate::torrents::model::UnpackEnd;
+use crate::torrents::model::{UnpackCause, UnpackEnd};
 use crate::torrents::persistence::TorrentsPersistenceInsertPlacedTorrentInternalQueries;
 use crate::torrents::persistence::TorrentsPersistenceInsertTorrentQueries;
 use crate::torrents::relocate::Existing;
@@ -209,8 +209,9 @@ impl TorrentService {
         // What the policy left out, worded as the job's reason; a file it
         // could not remove stays where unpacking made it, and says why.
         let removed = match removed {
-            Ok(removed) => crate::post_processing::model::unwanted_files_removed_reason(&removed),
-            Err(why) => Some(why),
+            Ok(removed) => crate::post_processing::model::unwanted_files_removed_reason(&removed)
+                .map(|why| (UnpackCause::UnwantedRemoved, why)),
+            Err(why) => Some((UnpackCause::UnwantedNotRemoved, why)),
         };
         // How it came out: short when a file did not move beside the
         // torrent's, or the delivery was in part, or the policy left a file
@@ -222,14 +223,18 @@ impl TorrentService {
                 let why = unplaced(&work, &error);
                 UnpackEnd::short(
                     placed_any,
+                    UnpackCause::NotPlaced,
                     match removed {
-                        Some(removed) => format!("{why}; {removed}"),
+                        Some((_, removed)) => format!("{why}; {removed}"),
                         None => why,
                     },
                 )
             }
-            None => match part.or(removed) {
-                Some(why) => UnpackEnd::short(placed_any, why),
+            None => match part
+                .map(|why| (UnpackCause::DeliveredInPart, why))
+                .or(removed)
+            {
+                Some((cause, why)) => UnpackEnd::short(placed_any, cause, why),
                 None => UnpackEnd::whole(),
             },
         };
@@ -299,7 +304,7 @@ impl TorrentService {
         there: Vec<String>,
     ) -> Placing {
         tracing::warn!(job_id = job_id.0, error = %error, "a torrent's unpacked files were not placed");
-        let end = UnpackEnd::short(!there.is_empty(), unplaced(work, &error));
+        let end = UnpackEnd::short(!there.is_empty(), UnpackCause::NotPlaced, unplaced(work, &error));
         let ending = end.clone();
         let recorded = self.queue_save(job_id, "finish_torrent_unpack", move |db| {
             db.finish_torrent_unpack(job_id, &[], &dropped, &[], &ending)
@@ -340,7 +345,7 @@ impl TorrentService {
                 tracing::warn!(job_id = job_id.0, error = %error, "a torrent's unwanted unpacked files were not all removed");
             }
         }
-        let end = UnpackEnd::short(false, why);
+        let end = UnpackEnd::short(false, UnpackCause::NothingDelivered, why);
         let ending = end.clone();
         let recorded = self.queue_save(job_id, "finish_torrent_unpack", move |db| {
             db.finish_torrent_unpack(job_id, &[], &[], &[], &ending)

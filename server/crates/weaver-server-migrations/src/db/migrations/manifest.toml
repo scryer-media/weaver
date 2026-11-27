@@ -2003,3 +2003,20 @@ kind = "sql"
 file = "migrations/0138_history_protocol_index/postgres.sql"
 engine = "postgres"
 scope = "all"
+
+[[migration]]
+version = 139
+description = "keep why a torrent's unpacking came out short as a code"
+checksum_algo = "blake3"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0139_torrent_unpack_cause/sqlite.sql"
+engine = "sqlite"
+scope = "all"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0139_torrent_unpack_cause/postgres.sql"
+engine = "postgres"
+scope = "all"

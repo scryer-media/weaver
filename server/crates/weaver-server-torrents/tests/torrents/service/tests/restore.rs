@@ -1691,6 +1691,7 @@ async fn a_checkpoint_the_database_refuses_ends_unpacking_and_holds_no_write_up(
         .unpack_end
         .unwrap();
     assert_eq!(end.result, UnpackResult::Refused);
+    assert_eq!(end.cause, Some(UnpackCause::Refused));
     assert!(
         end.why
             .as_deref()
@@ -1740,7 +1741,7 @@ async fn an_unpacking_run_again_keeps_the_files_the_first_one_placed() {
             &[],
             &[],
             &[],
-            &UnpackEnd::short(false, "none".into()),
+            &UnpackEnd::short(false, UnpackCause::NothingDelivered, "none".into()),
         )
         .unwrap();
     rig.db
@@ -1749,7 +1750,7 @@ async fn an_unpacking_run_again_keeps_the_files_the_first_one_placed() {
             &["small.txt".to_owned(), "notes.txt".to_owned()],
             &[],
             &[],
-            &UnpackEnd::short(true, "damaged: x".into()),
+            &UnpackEnd::short(true, UnpackCause::DeliveredInPart, "damaged: x".into()),
         )
         .unwrap();
     assert_eq!(
@@ -1759,7 +1760,11 @@ async fn an_unpacking_run_again_keeps_the_files_the_first_one_placed() {
     // How it came out is the last placing's, as the row reads back.
     assert_eq!(
         rig.db.get_torrent(job_id).unwrap().unwrap().unpack_end,
-        Some(UnpackEnd::short(true, "damaged: x".into()))
+        Some(UnpackEnd::short(
+            true,
+            UnpackCause::DeliveredInPart,
+            "damaged: x".into()
+        ))
     );
     rig.service.stop().await;
 }
