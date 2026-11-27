@@ -545,7 +545,7 @@ query Torrents($range: UsageRange!) {
   torrentHistory(range: $range) {
     total { kind range { bytes bytesUploaded durationMs } }
     trackers { id range { bytes bytesUploaded durationMs } }
-    peers { torrents connected seeds }
+    live { torrents connectedPeers connectedSeeds }
   }
 }
 "#;
@@ -611,8 +611,8 @@ async fn torrents_read_the_total_and_each_tracker() {
     );
     // No torrent client in this server: no peers.
     assert_eq!(
-        torrents["peers"],
-        serde_json::json!({ "torrents": 0, "connected": 0, "seeds": 0 })
+        torrents["live"],
+        serde_json::json!({ "torrents": 0, "connectedPeers": 0, "connectedSeeds": 0 })
     );
 }
 

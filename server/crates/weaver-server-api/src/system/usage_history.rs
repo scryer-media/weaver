@@ -465,24 +465,26 @@ pub fn load_integrity_history(
 }
 
 #[derive(Debug, Clone, Copy, Default, SimpleObject)]
-pub struct TorrentPeers {
+pub struct TorrentLiveTotals {
     /// Torrents the client holds now.
     pub torrents: u32,
     /// Peers connected now, across every torrent.
-    pub connected: u32,
+    pub connected_peers: u32,
     /// Of those, the ones that have every piece.
-    pub seeds: u32,
+    pub connected_seeds: u32,
 }
 
-impl TorrentPeers {
+impl TorrentLiveTotals {
     pub fn of(published: &Published) -> Self {
         published
             .torrents
             .iter()
             .fold(Self::default(), |sum, torrent| Self {
                 torrents: sum.torrents.saturating_add(1),
-                connected: sum.connected.saturating_add(torrent.peers_established),
-                seeds: sum.seeds.saturating_add(torrent.peer_seeders),
+                connected_peers: sum
+                    .connected_peers
+                    .saturating_add(torrent.peers_established),
+                connected_seeds: sum.connected_seeds.saturating_add(torrent.peer_seeders),
             })
     }
 }
@@ -502,7 +504,7 @@ pub struct TorrentHistory {
     /// so trackers are never added together.
     pub trackers: Vec<UsageConsumer>,
     /// Now, as the torrent client last published its torrents.
-    pub peers: TorrentPeers,
+    pub live: TorrentLiveTotals,
 }
 
 /// Read the torrent ledger for one request, against `today`.
@@ -510,7 +512,7 @@ pub fn load_torrent_history(
     db: &Database,
     today: NaiveDate,
     period: UsagePeriod,
-    peers: TorrentPeers,
+    live: TorrentLiveTotals,
 ) -> Result<TorrentHistory, StateError> {
     let total = read_summary(db, today, period, Some(CoreKind::Torrent))?;
     let trackers = read_summary(db, today, period, Some(CoreKind::Tracker))?;
@@ -524,7 +526,7 @@ pub fn load_torrent_history(
             .into_iter()
             .map(Into::into)
             .collect(),
-        peers,
+        live,
     })
 }
 

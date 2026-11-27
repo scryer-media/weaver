@@ -40,7 +40,11 @@ export function TorrentsDashboard() {
 
   const range = torrents?.total.range;
   const days = torrents?.total.days ?? [];
-  const peers = torrents?.peers ?? { torrents: 0, connected: 0, seeds: 0 };
+  const live = torrents?.live ?? {
+    torrents: 0,
+    connectedPeers: 0,
+    connectedSeeds: 0,
+  };
   const trackers = trackersInOrder(torrents?.trackers ?? []);
   const empty = torrents !== null && noTorrents(torrents);
 
@@ -91,10 +95,10 @@ export function TorrentsDashboard() {
               <MetricCell
                 last
                 eyebrow={t("next.torrentDash.peers")}
-                value={formatCount(peers.connected)}
+                value={formatCount(live.connectedPeers)}
                 note={t("next.torrentDash.peersNote", {
-                  seeds: formatCount(peers.seeds),
-                  torrents: formatCount(peers.torrents),
+                  seeds: formatCount(live.connectedSeeds),
+                  torrents: formatCount(live.torrents),
                 })}
               />
             </div>

@@ -1313,7 +1313,7 @@ export const TORRENT_HISTORY_QUERY = gql`
         days { day bytes bytesUploaded }
       }
       trackers { kind id range { ${USAGE_TOTALS_FIELDS} } }
-      peers { torrents connected seeds }
+      live { torrents connectedPeers connectedSeeds }
     }
   }
 `;

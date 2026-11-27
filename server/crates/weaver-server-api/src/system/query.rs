@@ -282,17 +282,17 @@ impl SystemQuery {
         range: crate::system::usage_history::UsageRange,
     ) -> Result<crate::system::usage_history::TorrentHistory> {
         use crate::system::usage_history::{
-            TorrentPeers, load_torrent_history, local_today, usage_period,
+            TorrentLiveTotals, load_torrent_history, local_today, usage_period,
         };
         let period = usage_period(&range)
             .map_err(|error| graphql_error("INVALID_INPUT", error.to_string()))?;
-        let peers = ctx
+        let live = ctx
             .data_opt::<weaver_server_core::torrents::service::TorrentService>()
-            .map(|torrents| TorrentPeers::of(&torrents.metrics().published))
+            .map(|torrents| TorrentLiveTotals::of(&torrents.metrics().published))
             .unwrap_or_default();
         let db = ctx.data::<Database>()?.clone();
         spawn_blocking_with(
-            move || load_torrent_history(&db, local_today(), period, peers),
+            move || load_torrent_history(&db, local_today(), period, live),
             state_error,
         )
         .await

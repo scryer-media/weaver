@@ -139,10 +139,10 @@ export interface IntegrityHistory {
   failures: FailureCount[];
 }
 
-export interface TorrentPeers {
+export interface TorrentLiveTotals {
   torrents: number;
-  connected: number;
-  seeds: number;
+  connectedPeers: number;
+  connectedSeeds: number;
 }
 
 export interface TorrentHistory {
@@ -152,7 +152,7 @@ export interface TorrentHistory {
   total: UsageConsumer;
   /** A torrent counts under each tracker it lists, so these never add up. */
   trackers: UsageConsumer[];
-  peers: TorrentPeers;
+  live: TorrentLiveTotals;
 }
 
 /** Part out of whole, 0 to 100; `null` when the whole is nothing. */
@@ -210,7 +210,7 @@ export function stagesInOrder(
 export function noTorrents(history: TorrentHistory): boolean {
   const all = history.total.allTime;
   return (
-    history.peers.torrents === 0 &&
+    history.live.torrents === 0 &&
     all.bytes === 0 &&
     all.bytesUploaded === 0 &&
     all.durationMs === 0
