@@ -270,6 +270,55 @@ impl RarStore {
             }
         }
     }
+
+    // The member's file failed the check of the namespace above it. A CRC32
+    // the store states below is that namespace's to judge: the store acts on
+    // its own failure only under a key on trial. So only a member closed
+    // with a stated CRC32 its runs do not prove is touched. Under a key on
+    // trial, over verified bytes, the key is condemned as a failed whole
+    // condemns it, and the next candidate reads the member again; otherwise
+    // the member's extent is damaged for the recovery beside it, once for
+    // each version of its bytes.
+    pub(super) fn refuted(&mut self, member: MemberId, out: &mut Vec<Emit>) {
+        if self.gone {
+            return;
+        }
+        let Some(entry) = self.entries.get(member.0 as usize) else {
+            return;
+        };
+        let (Some(expected), Some(length)) = (entry.crc, entry.plain_len()) else {
+            return;
+        };
+        if entry.judges_its_checksum() || !entry.out.closed {
+            return;
+        }
+        let hash_key = entry.hash_key.as_deref();
+        let (verdict, composed) = gate(
+            &entry.plain_runs,
+            length,
+            expected,
+            entry.uses_mac,
+            hash_key,
+        );
+        if verdict == SliceVerdict::Intact {
+            return;
+        }
+        let whole = ByteRange::new(0, length);
+        if let Some(candidate) = entry.trial
+            && entry.out.coverage.verified(whole)
+        {
+            self.condemn(candidate, out);
+            // The files it keyed are locked again: the next candidate opens
+            // them, or the store asks for one.
+            self.settle(None, out);
+            return;
+        }
+        let mut extents = Vec::new();
+        self.member_extent(member, whole, &mut extents);
+        for extent in extents {
+            self.say_damaged(extent.volume, extent.range, composed, out);
+        }
+    }
 }
 
 // What a rewrite cut from a member's runs and did not cover came out of the

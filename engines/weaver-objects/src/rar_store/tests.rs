@@ -2939,3 +2939,147 @@ fn a_repair_inside_a_run_past_read_back_refeeds_it_in_pieces() {
         }
     }
 }
+
+// Where a member's bytes lie in the volumes, read off a store that walked
+// them all.
+fn member_extents(volumes: &[Vec<u8>], name: &str) -> Vec<weaver_graph::Extent> {
+    let mut walked = Owner::named(store(), volumes.to_vec());
+    walked.whole(4096);
+    let member = member_id(&walked, name);
+    let length = walked.member(name).length.expect("a length");
+    let mut extents = Vec::new();
+    walked
+        .object
+        .member_extent(member, ByteRange::new(0, length), &mut extents);
+    extents
+}
+
+fn damage_said(owner: &Owner) -> Vec<(VolumeIndex, ByteRange)> {
+    owner
+        .said
+        .iter()
+        .filter_map(|emit| match emit {
+            Emit::Damaged { volume, range } => Some((*volume, *range)),
+            _ => None,
+        })
+        .collect()
+}
+
+// A stored file split over two volumes, a byte of its last part posted
+// wrong with good article checksums: its first part passes its own CRC and
+// the last carries the file's, which the store states below and leaves to
+// the namespace. The namespace's failed check is heard as damage over every
+// part of the file, once.
+#[test]
+fn a_member_refuted_by_the_namespace_says_its_damage_once() {
+    let volumes = write(&items(), &split(Version::Rar5));
+    let extents = member_extents(&volumes, "alpha.bin");
+    assert!(extents.len() > 1, "{extents:?}");
+    let last = extents.last().unwrap();
+    let mut posted = volumes.clone();
+    posted[last.volume.0 as usize][last.range.start as usize + 10] ^= 0x5a;
+    let mut owner = Owner::named(store(), volumes.clone());
+    for (volume, bytes) in posted.iter().enumerate() {
+        let whole = ByteRange::new(0, bytes.len() as u64);
+        owner.deliver_as(volume, whole, Provenance::Fresh, Some(bytes));
+    }
+    for volume in 0..volumes.len() {
+        owner.close(volume);
+    }
+    let member = member_id(&owner, "alpha.bin");
+    assert!(owner.member("alpha.bin").closed);
+    assert!(owner.said.contains(&Emit::Checksum {
+        member,
+        crc32: crate::grid::crc32(&files()[0].1),
+    }));
+    no_trouble(&owner);
+
+    owner.refuted(member);
+    let said: Vec<_> = extents
+        .iter()
+        .map(|extent| (extent.volume, extent.range))
+        .collect();
+    assert_eq!(damage_said(&owner), said);
+    for emit in &owner.said {
+        assert!(
+            !matches!(
+                emit,
+                Emit::Again { .. } | Emit::NeedsPassword | Emit::Refuse(_)
+            ),
+            "unexpected {emit:?}"
+        );
+    }
+    let before = owner.said.len();
+    owner.refuted(member);
+    assert_eq!(owner.said.len(), before, "{:?}", owner.said);
+}
+
+// A member the store proves, by the CRC32 it states below or by the keyed
+// checksum it judges itself, is not touched by the namespace's word.
+#[test]
+fn a_member_refuted_that_the_store_ruled_changes_nothing() {
+    let volumes = write(&items(), &split(Version::Rar5));
+    let mut plain = Owner::named(store(), volumes);
+    plain.whole(4096);
+    let mut keyed = encrypted(Version::Rar5, false);
+    keyed.hash_key = true;
+    let mut keyed = Owner::named(store(), write(&items(), &keyed));
+    keyed.offer(PASSWORD);
+    keyed.whole(4096);
+    keyed.said.retain(|emit| *emit != Emit::NeedsPassword);
+    for owner in [&mut plain, &mut keyed] {
+        no_trouble(owner);
+        streamed(owner);
+        let before = owner.said.len();
+        for (name, _) in files() {
+            let member = member_id(owner, name);
+            owner.refuted(member);
+        }
+        assert_eq!(owner.said.len(), before, "{:?}", owner.said);
+        streamed(owner);
+    }
+}
+
+// A RAR4 file keyed on trial by a wrong candidate, closed with no runs of
+// the bytes said before them, as a checkpoint written before the store kept
+// them leaves it: the store has no verdict of its own. The namespace's
+// failed check condemns the candidate, as a failed whole does, and the next
+// one reads the file again and opens it; a second word changes nothing.
+#[test]
+fn a_member_refuted_under_a_key_on_trial_condemns_it_and_opens_under_the_next() {
+    let plain = payload(1, 10_000);
+    let items = vec![Item::File("alpha.bin", plain.clone())];
+    let volumes = write(&items, &encrypted(Version::Rar4, false));
+    let length = volumes[0].len() as u64;
+    let mut owner = Owner::named(store(), volumes);
+    owner.offer("not-the-passphrase");
+    owner.deliver(0, ByteRange::new(0, length / 2));
+    let member = member_id(&owner, "alpha.bin");
+    assert!(owner.object.entries[member.0 as usize].trial.is_some());
+    owner.object.entries[member.0 as usize].plain_runs = Default::default();
+    owner.deliver(0, ByteRange::new(length / 2, length));
+    owner.close(0);
+    assert!(owner.member("alpha.bin").closed);
+    assert!(owner.member("alpha.bin").bytes != plain, "the wrong key's");
+    owner.offer(PASSWORD);
+    let again = |owner: &Owner| {
+        owner
+            .said
+            .iter()
+            .filter(|emit| matches!(emit, Emit::Again { .. }))
+            .count()
+    };
+    assert_eq!(again(&owner), 0, "nothing ruled the file: {:?}", owner.said);
+
+    owner.refuted(member);
+    assert_eq!(again(&owner), 1, "its one part, once: {:?}", owner.said);
+    assert!(damage_said(&owner).is_empty(), "{:?}", owner.said);
+    let got = owner.member("alpha.bin");
+    assert!(got.closed);
+    assert!(got.bytes == plain);
+    assert!(got.coverage.verified(ByteRange::new(0, plain.len() as u64)));
+    posted_whole(&owner);
+    let before = owner.said.len();
+    owner.refuted(member_id(&owner, "alpha.bin"));
+    assert_eq!(owner.said.len(), before, "{:?}", owner.said);
+}

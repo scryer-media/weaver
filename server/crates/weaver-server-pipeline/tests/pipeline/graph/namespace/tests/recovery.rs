@@ -804,14 +804,14 @@ fn block_cuts_keep_only_the_distinct_boundaries() {
     assert_eq!(cuts.capacity(), cuts.len());
 }
 
-// Builds the real 7z and zip stores, and everything else as the job's
+// Builds the real 7z, zip and RAR stores, and everything else as the job's
 // pretend builder.
 struct RealStores(Build);
 
 impl Builder for RealStores {
     fn build(&mut self, kind: Kind, id: ObjectId) -> Option<Box<dyn Object>> {
         match kind {
-            Kind::SevenZipStore | Kind::Zip => {
+            Kind::SevenZipStore | Kind::Zip | Kind::RarStore => {
                 weaver_objects::build(kind, id, weaver_graph::Budget::default())
             }
             kind => self.0.build(kind, id),
@@ -861,6 +861,7 @@ enum Body {
 enum Store {
     SevenZip,
     Zip,
+    Rar,
 }
 
 // The archive's name, its bytes, and where the member's data lies in them.
@@ -900,6 +901,19 @@ fn stored_archive(store: Store, file: &[u8]) -> (&'static str, Vec<u8>, ByteRang
                 .unwrap();
             (
                 "a.zip",
+                archive,
+                ByteRange::at(start as u64, file.len() as u64),
+            )
+        }
+        Store::Rar => {
+            use crate::pipeline::tests::direct_store::single_member_store_set;
+            let (_, archive) = single_member_store_set("large.bin", file, 1).pop().unwrap();
+            let start = archive
+                .windows(file.len())
+                .position(|bytes| bytes == file)
+                .unwrap();
+            (
+                "a.rar",
                 archive,
                 ByteRange::at(start as u64, file.len() as u64),
             )
@@ -1032,4 +1046,12 @@ fn a_7z_member_refuted_past_its_fold_is_repaired_as_one_its_fold_ruled() {
 #[test]
 fn a_zip_member_refuted_past_its_fold_is_repaired_as_one_its_fold_ruled() {
     refuted_past_its_fold_is_repaired_as_one_its_fold_ruled(Store::Zip);
+}
+
+// A RAR store states its member's CRC32 below and leaves the check to the
+// namespace, in every order: the failed check is heard as damage over its
+// volume, and the set beside it repairs it.
+#[test]
+fn a_rar_member_refuted_by_the_namespace_is_repaired_in_every_order() {
+    refuted_past_its_fold_is_repaired_as_one_its_fold_ruled(Store::Rar);
 }
