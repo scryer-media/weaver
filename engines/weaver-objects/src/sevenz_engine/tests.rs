@@ -546,6 +546,68 @@ fn a_member_with_a_crc_is_checked_as_it_closes_and_one_without_says_neither() {
     assert!(said(&emits).contains(&Said::Member(3, "deep/".into(), Some(0))));
 }
 
+// A stored 7z of `notes.txt` and `second.bin` whose header states a CRC for
+// the second file only. The writer states one for every file that has bytes,
+// so the header's digests are written again with the first left undefined,
+// and the start header's size and CRCs with them.
+fn first_without_a_crc() -> Vec<u8> {
+    let mut writer = ArchiveWriter::new(Cursor::new(Vec::new())).unwrap();
+    writer.set_content_methods(vec![EncoderConfiguration::new(EncoderMethod::COPY)]);
+    for (name, bytes) in [("notes.txt", NOTES.to_vec()), ("second.bin", second())] {
+        writer
+            .push_archive_entry(ArchiveEntry::new_file(name), Some(Cursor::new(bytes)))
+            .unwrap();
+    }
+    let mut archive = writer.finish().unwrap().into_inner();
+    let header_at = 32 + u64::from_le_bytes(archive[12..20].try_into().unwrap()) as usize;
+    assert_eq!(archive[header_at], 0x01, "the header is not encoded");
+    // kCRC, all defined, then each file's CRC. Stored bytes pack to
+    // themselves, so the packed streams state the same digests first: the
+    // files' are the last.
+    let mut stated = vec![0x0A, 0x01];
+    stated.extend(crc(NOTES).to_le_bytes());
+    stated.extend(crc(&second()).to_le_bytes());
+    let at = header_at
+        + archive[header_at..]
+            .windows(stated.len())
+            .rposition(|window| window == stated)
+            .expect("the header states both CRCs");
+    // kCRC, not all defined, the second file's bit, then its CRC.
+    let mut one = vec![0x0A, 0x00, 0b0100_0000];
+    one.extend(crc(&second()).to_le_bytes());
+    archive.splice(at..at + stated.len(), one);
+    let header = archive[header_at..].to_vec();
+    archive[20..28].copy_from_slice(&(header.len() as u64).to_le_bytes());
+    archive[28..32].copy_from_slice(&crc(&header).to_le_bytes());
+    let start = crc(&archive[12..32]);
+    archive[8..12].copy_from_slice(&start.to_le_bytes());
+    archive
+}
+
+// A file with bytes whose header states no CRC has nothing for the decoder
+// to check: its bytes are said and it closes, and it is not said checked.
+#[test]
+fn a_member_with_bytes_and_no_crc_closes_unchecked() {
+    let archive = first_without_a_crc();
+    let read = parsed(&archive);
+    assert!(!read.files[0].has_crc, "notes.txt states no CRC");
+    assert!(read.files[1].has_crc, "second.bin states its CRC");
+    let emits = run_with(Gate::whole(vec![archive]), weaver_graph::Budget::default());
+    assert_checked_right_before_each_close(&emits);
+    assert_eq!(checksums(&emits), vec![(1, crc(&second()))]);
+    assert_eq!(
+        said(&emits),
+        vec![
+            Said::Member(0, "notes.txt".into(), Some(NOTES.len() as u64)),
+            Said::Bytes(0, NOTES.to_vec()),
+            Said::Closed(0),
+            Said::Member(1, "second.bin".into(), Some(64)),
+            Said::Bytes(1, second()),
+            Said::Closed(1),
+        ]
+    );
+}
+
 // A read the owner failed is the owner's to explain, not a verdict on the
 // format.
 #[test]

@@ -1056,3 +1056,94 @@ fn a_zip_member_refuted_past_its_fold_is_repaired_as_one_its_fold_ruled() {
 fn a_rar_member_refuted_by_the_namespace_is_repaired_in_every_order() {
     refuted_past_its_fold_is_repaired_as_one_its_fold_ruled(Store::Rar);
 }
+
+// A stored member split across two RAR volumes, a byte of its last part
+// wrong. The first part passes the CRC its own header states; the last
+// carries the file's CRC in place of one of its own, so only the namespace's
+// check of the member's file finds the byte. The failed check is heard as
+// damage on the last volume alone, the part no part CRC vouches for, and
+// the set beside it repairs that volume.
+#[test]
+fn a_split_rar_member_refuted_by_the_namespace_blames_its_last_volume_only() {
+    use crate::pipeline::tests::direct_store::single_member_store_set;
+    use crate::pipeline::tests::engines::harness::payload;
+    const LAST: &str = "silver.horizon.part02.rar";
+    let file = payload(2 * 4096 + 16, 67);
+    let volumes = single_member_store_set("large.bin", &file, 2);
+    assert_eq!(volumes[1].0, LAST);
+    let part = &file[file.len().div_ceil(2)..];
+    let start = volumes[1]
+        .1
+        .windows(part.len())
+        .position(|bytes| bytes == part)
+        .unwrap();
+    let flipped = start + 100;
+    let mut posted = volumes[1].1.clone();
+    posted[flipped] ^= 0x01;
+    let fixed: &'static [u8] = Box::leak(vec![volumes[1].1[flipped]].into_boxed_slice());
+    let mut job = Job::new(PLENTY).with_set(Some(Fix {
+        name: LAST,
+        read: ByteRange::new(0, posted.len() as u64),
+        fix: (flipped as u64, fixed),
+    }));
+    let first = job.member(&volumes[0].0, Some(volumes[0].1.len() as u64));
+    let last = job.member(LAST, Some(posted.len() as u64));
+    let mut build = RealStores(job.build());
+    for (member, bytes) in [(first, &volumes[0].1), (last, &posted)] {
+        let arrival = Arrival {
+            node: NodeId::ROOT,
+            member,
+            offset: 0,
+            bytes: Bytes::copy_from_slice(bytes).into(),
+            provenance: Provenance::Fresh,
+        };
+        job.writer
+            .deliver(&mut job.tree, &mut build, &Source, arrival, &mut job.out)
+            .expect("deliver");
+    }
+    let (node, _) = job.tree.child_of(NodeId::ROOT, first).expect("an archive");
+    assert_eq!(
+        job.tree.child_of(NodeId::ROOT, last).map(|(node, _)| node),
+        Some(node),
+        "both volumes are the one store's"
+    );
+    assert!(
+        job.writer.take_verification(&job.tree).is_none(),
+        "the check folds the file as written"
+    );
+    job.close(first);
+    job.close(last);
+    let damaged: Vec<(MemberId, ByteRange)> = job.root().damaged_ranges().collect();
+    assert!(!damaged.is_empty(), "the failed check is heard as damage");
+    assert!(
+        damaged.iter().all(|(member, _)| *member == last),
+        "only the last volume is blamed: {damaged:?}"
+    );
+    let mut build = job.build();
+    let ruled: Vec<RepairOutcome> = job
+        .repair(&mut build, NodeId::ROOT, &[job.set_node()])
+        .into_iter()
+        .map(|(_, outcome)| outcome)
+        .collect();
+    assert_eq!(ruled, vec![RepairOutcome::Repaired { slices: 1 }]);
+    // The whole member failed, so its mark covers the first part too, which
+    // the repair did not write: the store reads both parts again.
+    assert!(job.writer.rechecks_waiting());
+    while let Some(replay) = job.writer.take_replay(&job.tree).unwrap() {
+        let replayed = replay.run(&Default::default());
+        let mut build = job.build();
+        job.writer
+            .replayed(&mut job.tree, &mut build, &Source, replayed, &mut job.out)
+            .unwrap();
+    }
+    assert!(
+        job.writer.take_verification(&job.tree).is_none(),
+        "the check folds the file as the store says it again"
+    );
+    let inner = job.tree.namespace(node).expect("its namespace");
+    let large = inner.find_by_name("large.bin").expect("the member");
+    assert!(large.closed);
+    assert_eq!(inner.damaged_ranges().count(), 0);
+    assert_eq!(job.root().damaged_ranges().count(), 0);
+    assert!(job.file("large.bin") == file, "the member's file is whole");
+}
