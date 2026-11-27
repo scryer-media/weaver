@@ -48,5 +48,5 @@ Delete it yourself to remove the downloads.
 {{- if .Values.torrents.enabled }}
 
 The torrent listen port {{ .Values.torrents.port }} is exposed by {{ include "weaver.fullname" . }}-torrent.
-Turn torrents on in Settings, and set the listen port there to {{ .Values.torrents.port }}.
+Weaver listens on it: the chart sets WEAVER_TORRENT_PORT. Turn torrents on in Settings.
 {{- end }}

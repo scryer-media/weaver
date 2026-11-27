@@ -366,7 +366,7 @@ async fn async_main() {
                 std::process::exit(1);
             }
         };
-    let (db, restore_outcome) =
+    let (mut db, restore_outcome) =
         match weaver_server_core::operations::apply_pending_restore(db, &restore_locator_dir) {
             Ok(result) => result,
             Err(error) => {
@@ -388,6 +388,21 @@ async fn async_main() {
         splash.stop().await;
     }
     let initialize_download_defaults = pending_download_root.is_some() && restore_outcome.is_none();
+    // The torrent listen port the environment pins for this run, read here
+    // once, before the settings first load, and handed to the database.
+    // Nothing below reads the environment for it.
+    match weaver_server_core::settings::service::torrent_port_pin(
+        std::env::var(weaver_server_core::settings::service::TORRENT_PORT_ENV)
+            .ok()
+            .as_deref(),
+    ) {
+        Ok(pin) => db.set_torrent_port_pin(pin),
+        Err(error) => {
+            error!("invalid environment config: {error}");
+            drop(log_guards.take());
+            std::process::exit(1);
+        }
+    }
     let (mut db, mut config) = if let Some(outcome) = restore_outcome {
         tracing::info!(
             restore_id = %outcome.restore_id,

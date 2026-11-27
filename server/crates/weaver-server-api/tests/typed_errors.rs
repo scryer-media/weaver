@@ -142,6 +142,36 @@ async fn a_setting_the_environment_pins_is_env_pinned() {
     );
 }
 
+// Another torrent listen port, while the environment pins it, is refused
+// as a pinned bind address is, and nothing is saved.
+#[tokio::test]
+async fn another_torrent_port_while_it_is_pinned_is_env_pinned() {
+    use weaver_server_core::settings::persistence::SettingsPersistenceQueries;
+    use weaver_server_core::settings::queries::SettingsQueries;
+    use weaver_server_core::settings::service::SettingsServiceQueries;
+    let h = TestHarness::new_with_torrent_port_pin(51_413).await;
+    h.db.set_setting("torrent.base_port", "6881").unwrap();
+    let resp = h
+        .execute(
+            "mutation { updateSettings(input: { torrent: { basePort: 40000, maxActiveDownloads: 9 } }) { torrent { basePort } } }",
+        )
+        .await;
+    assert_refusal(
+        &resp,
+        "WEAVER_TORRENT_PORT is set in this deployment's environment and pins the torrent \
+         listen port; change it there instead",
+        "ENV_PINNED",
+    );
+    assert_eq!(
+        h.db.get_setting("torrent.base_port").unwrap().as_deref(),
+        Some("6881")
+    );
+    let torrent = h.config.read().await.torrent.clone();
+    assert_eq!(torrent.base_port, 51_413);
+    assert_eq!(torrent.max_active_downloads, 3);
+    assert_eq!(h.db.load_config().unwrap().torrent.max_active_downloads, 3);
+}
+
 #[tokio::test]
 async fn an_open_bind_under_strict_security_is_strict_security() {
     use weaver_server_core::security::RuntimeSecurityConfig;

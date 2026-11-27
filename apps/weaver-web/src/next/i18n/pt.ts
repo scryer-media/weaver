@@ -2512,6 +2512,8 @@ export const nextPt: LocaleDictionary = {
   "next.torrents.finishAllForced":
     "Um torrent forçado, ou sem limite de semeadura, semeia até «Parar agora».",
   "next.torrents.basePort": "Porta base",
+  "next.torrents.basePortPinnedHelp":
+    "Fixada por {{variable}} no ambiente do weaver; altere-a na sua implantação.",
   "next.torrents.announcePort": "Porta anunciada",
   "next.torrents.upnp": "UPnP",
   "next.torrents.sslEnabled": "Torrents SSL",

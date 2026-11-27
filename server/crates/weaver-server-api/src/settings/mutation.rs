@@ -25,6 +25,10 @@ use weaver_server_core::settings::tracker_file;
 use weaver_server_core::watch_folder::{WatchFolderConfig, WatchFolderMode, WatchFolderService};
 use weaver_server_core::{Database, SchedulerHandle};
 
+// The refusal of another torrent listen port while the environment pins it.
+pub(crate) const TORRENT_PORT_PINNED: &str = "WEAVER_TORRENT_PORT is set in this deployment's \
+     environment and pins the torrent listen port; change it there instead";
+
 // Refuse a schedule rule this machine could never apply, judged against the
 // live probe as the hardware-profile choice is.
 async fn validate_schedule_input(
@@ -247,6 +251,15 @@ impl SettingsMutation {
                         })?;
                 }
                 let mut torrent = config.read().await.torrent.clone();
+                // A pinned port is refused rather than saved and ignored; the
+                // port it already is saves as an unchanged one.
+                if torrent.base_port_pinned
+                    && update
+                        .base_port
+                        .is_some_and(|port| port != torrent.base_port)
+                {
+                    return Err(graphql_error("ENV_PINNED", TORRENT_PORT_PINNED));
+                }
                 if update.enabled == Some(false)
                     && (torrent.enabled || update.when_disabled.is_some())
                 {

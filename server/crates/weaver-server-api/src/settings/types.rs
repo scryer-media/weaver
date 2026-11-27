@@ -1774,7 +1774,12 @@ impl From<PeerTransportGql> for weaver_server_core::settings::PeerTransport {
 #[derive(Debug, Clone, PartialEq, Eq, SimpleObject)]
 pub struct TorrentSettings {
     pub enabled: bool,
+    /// The first route's listen port: the one `WEAVER_TORRENT_PORT` pins
+    /// while it is set, else the saved one.
     pub base_port: u16,
+    /// Whether `WEAVER_TORRENT_PORT` pins `basePort` for this run. While it
+    /// does, a save naming another port is refused (`ENV_PINNED`).
+    pub base_port_pinned: bool,
     pub announce_port: Option<u16>,
     pub upnp: bool,
     pub encryption: TorrentEncryptionGql,
@@ -1821,6 +1826,7 @@ impl From<&weaver_server_core::settings::TorrentConfig> for TorrentSettings {
         Self {
             enabled: value.enabled,
             base_port: value.base_port,
+            base_port_pinned: value.base_port_pinned,
             announce_port: value.announce_port,
             upnp: value.upnp,
             encryption: value.encryption.into(),

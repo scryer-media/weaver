@@ -2432,6 +2432,8 @@ export const nextKo: LocaleDictionary = {
   "next.torrents.finishAllForced":
     "강제 실행 중이거나 시딩 한도가 없는 torrent는 '지금 중지'까지 시딩합니다.",
   "next.torrents.basePort": "기본 포트",
+  "next.torrents.basePortPinnedHelp":
+    "weaver 환경의 {{variable}}에 의해 설정되어 있습니다. 배포 설정에서 변경하세요.",
   "next.torrents.announcePort": "알림 포트",
   "next.torrents.upnp": "UPnP",
   "next.torrents.sslEnabled": "SSL 토렌트",

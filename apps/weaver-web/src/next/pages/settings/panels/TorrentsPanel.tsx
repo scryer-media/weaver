@@ -1991,6 +1991,23 @@ interface TorrentConnection {
   sslPort: number | null;
 }
 
+/** The torrent settings as read: the form's, and what the daemon reports. */
+interface TorrentSettingsRead extends TorrentConnection {
+  /** Whether WEAVER_TORRENT_PORT pins the base port for this run. */
+  basePortPinned: boolean;
+}
+
+/** The form's part of the torrent settings as read, defaults filled in. */
+function connectionOf(
+  torrent: TorrentSettingsRead | null | undefined,
+): TorrentConnection {
+  if (!torrent) {
+    return { ...DEFAULT_CONNECTION };
+  }
+  const { basePortPinned: _pinned, ...connection } = torrent;
+  return { ...DEFAULT_CONNECTION, ...connection };
+}
+
 interface TorrentForm {
   seeding: SeedingPolicy;
   /** Each torrent's upload cap in bytes per second; null is none. */
@@ -2102,7 +2119,7 @@ export function TorrentsPanel() {
     settings: {
       seeding: SeedingPolicy | null;
       uploadCap: number | null;
-      torrent: TorrentConnection | null;
+      torrent: TorrentSettingsRead | null;
     };
   }>({ query: TORRENT_SETTINGS_QUERY });
   const [updateState, updateSettings] = useMutation(
@@ -2118,9 +2135,11 @@ export function TorrentsPanel() {
   const [forcing, setForcing] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const savedConnection = useMemo<TorrentConnection>(
-    () => ({ ...DEFAULT_CONNECTION, ...(data?.settings?.torrent ?? {}) }),
+    () => connectionOf(data?.settings?.torrent),
     [data?.settings?.torrent],
   );
+  // Set by WEAVER_TORRENT_PORT for this run: shown, not edited.
+  const basePortPinned = data?.settings?.torrent?.basePortPinned ?? false;
   const savedSeeding = useMemo(
     () => seedingAtGlobal(seedingFrom(data?.settings?.seeding ?? null)),
     [data?.settings?.seeding],
@@ -2139,7 +2158,7 @@ export function TorrentsPanel() {
       ? {
           seeding: seedingAtGlobal(seedingFrom(settings.seeding)),
           uploadCap: settings.uploadCap ?? null,
-          torrent: { ...DEFAULT_CONNECTION, ...(settings.torrent ?? {}) },
+          torrent: connectionOf(settings.torrent),
         }
       : null;
   }, [data?.settings]);
@@ -2409,14 +2428,26 @@ export function TorrentsPanel() {
                   id: "basePort",
                   label: t("next.torrents.basePort"),
                   keywords: "port listen",
-                  control: {
-                    kind: "number",
-                    value: values.torrent.basePort,
-                    min: 1,
-                    max: 65535,
-                    onChange: (basePort) =>
-                      patchTorrent({ basePort: Math.round(basePort) }),
-                  },
+                  ...(basePortPinned
+                    ? {
+                        help: t("next.torrents.basePortPinnedHelp", {
+                          variable: "WEAVER_TORRENT_PORT",
+                        }),
+                        control: {
+                          kind: "static" as const,
+                          value: values.torrent.basePort,
+                        },
+                      }
+                    : {
+                        control: {
+                          kind: "number" as const,
+                          value: values.torrent.basePort,
+                          min: 1,
+                          max: 65535,
+                          onChange: (basePort: number) =>
+                            patchTorrent({ basePort: Math.round(basePort) }),
+                        },
+                      }),
                 },
                 {
                   id: "announcePort",

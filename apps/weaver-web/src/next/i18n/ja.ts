@@ -2487,6 +2487,8 @@ export const nextJa: LocaleDictionary = {
   "next.torrents.finishAllForced":
     "強制中の torrent、またはシード上限のない torrent は「今すぐ停止」までシードを続けます。",
   "next.torrents.basePort": "基本ポート",
+  "next.torrents.basePortPinnedHelp":
+    "weaver の環境変数 {{variable}} で設定されています。デプロイ側で変更してください。",
   "next.torrents.announcePort": "アナウンスポート",
   "next.torrents.upnp": "UPnP",
   "next.torrents.sslEnabled": "SSL トレント",

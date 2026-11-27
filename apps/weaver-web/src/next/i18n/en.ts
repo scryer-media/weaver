@@ -2431,6 +2431,8 @@ export const nextEn: LocaleDictionary = {
   "next.torrents.finishAllForced":
     "A forced torrent, or one with no seeding limit, seeds until Stop now.",
   "next.torrents.basePort": "Base port",
+  "next.torrents.basePortPinnedHelp":
+    "Set by {{variable}} in weaver's environment; change it in your deployment instead.",
   "next.torrents.announcePort": "Announce port",
   "next.torrents.upnp": "UPnP",
   "next.torrents.sslEnabled": "SSL torrents",

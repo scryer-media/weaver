@@ -2286,6 +2286,8 @@ export const nextZh: LocaleDictionary = {
   "next.torrents.finishAllForced":
     "强制的 torrent，或没有做种上限的 torrent，会一直做种，直到“立即停止”。",
   "next.torrents.basePort": "基础端口",
+  "next.torrents.basePortPinnedHelp":
+    "由 weaver 环境中的 {{variable}} 设定;请改在部署配置中修改。",
   "next.torrents.announcePort": "通告端口",
   "next.torrents.upnp": "UPnP",
   "next.torrents.sslEnabled": "SSL 种子",
