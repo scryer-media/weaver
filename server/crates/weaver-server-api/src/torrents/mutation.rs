@@ -9,21 +9,29 @@ use weaver_server_core::StateError;
 use weaver_server_core::ingest::Kind;
 use weaver_server_core::jobs::class::AddRefusal;
 use weaver_server_core::jobs::ids::JobId;
-use weaver_server_core::torrents::service::{ActionError, AddRequest, AddSource};
+use weaver_server_core::torrents::service::{
+    ActionError, AddError, AddRequest, AddSource, TorrentSetting,
+};
 
 use super::types::{
-    SubmitTorrentInputGql, TorrentFilePriorityInputGql, TorrentGql, TorrentSourceInput,
+    SubmitTorrentInputGql, SubmitTorrentResultGql, SubmitTorrentStatusGql, TorrentFilePriorityInputGql, TorrentGql, TorrentSourceInput,
     TorrentTrackerInput,
 };
-use super::{changed_torrent, service};
-use crate::auth::{CallerScope, ControlGuard, graphql_error, invalid_input};
+use super::{changed_torrent, read_torrent, service};
+use crate::auth::{CallerScope, ControlGuard, graphql_error, invalid_input, not_found};
+use crate::jobs::batch::MAX_QUEUE_BATCH_IDS;
 use crate::jobs::staging::{classify_upload, upload_refusal};
+use crate::jobs::types::{
+    CLIENT_REQUEST_ID_ATTRIBUTE_KEY, QueueBatchRefusal, QueueBatchResult, submit_metadata,
+};
 use crate::settings::types::SeedingPolicyInput;
 
 pub(super) fn action_error(error: ActionError) -> async_graphql::Error {
     let code = match &error {
         ActionError::NotFound(_) => "NOT_FOUND",
-        ActionError::UnmetGoal(_) => "SEEDING_GOAL_UNMET",
+        // No torrent mutation removes under a seeding goal's gate: one that
+        // got here is refused as the queue refuses it.
+        ActionError::UnmetGoal(_) => "CONFLICT",
         ActionError::Invalid(_) => "INVALID_INPUT",
         ActionError::State(message) => {
             tracing::error!(error = %message, "torrent action failed on its state");
@@ -64,52 +72,63 @@ pub(crate) async fn torrent_source(
 #[derive(Default)]
 pub struct TorrentsMutation;
 
-impl TorrentsMutation {
-    /// Add a torrent, with the client's refusal in its own words.
-    pub(crate) async fn add(ctx: &Context<'_>, request: AddRequest) -> Result<JobId> {
-        service(ctx)?.add(request).await.map_err(|error| {
-            crate::jobs::mutation::add_refusal_error(
-                weaver_server_core::jobs::Protocol::Torrent,
-                AddRefusal::from(error),
-            )
-        })
-    }
-}
-
 #[Object]
 impl TorrentsMutation {
-    /// Add a torrent from its metainfo or a magnet link, and return it.
-    /// An uploaded metainfo file is bounded as `submit` bounds one.
+    /// Add a torrent from its metainfo or a magnet link, and say how the
+    /// add came out. A torrent already added is answered, not refused: as
+    /// a replay when the add carries the client request id it was added
+    /// with, as a duplicate otherwise. An uploaded metainfo file is bounded
+    /// as `submit` bounds one.
     #[graphql(guard = "ControlGuard")]
     async fn submit_torrent(
         &self,
         ctx: &Context<'_>,
         input: SubmitTorrentInputGql,
-    ) -> Result<TorrentGql> {
+    ) -> Result<SubmitTorrentResultGql> {
         service(ctx)?;
         let source = torrent_source(ctx, input.source).await?;
         let policy_override = input
             .seeding
             .map(SeedingPolicyInput::into_policy)
             .transpose()?;
-        let job_id = Self::add(
-            ctx,
-            AddRequest {
-                source,
-                category: input.category,
-                policy_override,
-                paused: input.paused,
-                forced: input.forced,
-                unpack: input.unpack,
-                metadata: Vec::new(),
-                upload_limit: input.upload_limit_bps,
-                download_limit: input.download_limit_bps,
-                placement: Default::default(),
-                tags: input.tags,
-            },
-        )
-        .await?;
-        changed_torrent(ctx, job_id.0).await
+        let metadata = submit_metadata(input.attributes, input.client_request_id.clone())
+            .map_err(|message| graphql_error("INVALID_INPUT", message))?;
+        let request = AddRequest {
+            source,
+            category: input.category,
+            policy_override,
+            paused: input.paused,
+            forced: input.forced,
+            unpack: input.unpack,
+            metadata,
+            upload_limit: input.upload_limit_bps,
+            download_limit: input.download_limit_bps,
+            placement: Default::default(),
+            tags: input.tags,
+        };
+        let client_request_id = input.client_request_id;
+        let (job_id, status) = match service(ctx)?.add(request).await {
+            Ok(job_id) => (job_id, SubmitTorrentStatusGql::Accepted),
+            Err(AddError::Duplicate(existing)) => {
+                let replay = same_request(ctx, existing, client_request_id.as_deref()).await?;
+                let status = if replay {
+                    SubmitTorrentStatusGql::IdempotentReplay
+                } else {
+                    SubmitTorrentStatusGql::Duplicate
+                };
+                (existing, status)
+            }
+            Err(error) => return Err(add_error(error)),
+        };
+        let torrent = read_torrent(ctx, &ctx.look_ahead().field("torrent"), job_id.0)
+            .await?
+            .ok_or_else(|| not_found(format!("torrent {} left before it was read", job_id.0)))?;
+        Ok(SubmitTorrentResultGql {
+            accepted: status != SubmitTorrentStatusGql::Duplicate,
+            status,
+            torrent,
+            client_request_id,
+        })
     }
 
     /// Remove the torrent, and its files when `deleteFiles`; return its id.
@@ -345,5 +364,179 @@ impl TorrentsMutation {
             .await
             .map_err(action_error)?;
         changed_torrent(ctx, id).await
+    }
+
+    /// Check every piece of each torrent named again, as one unit. One
+    /// refused ends the rest: they are listed refused too.
+    #[graphql(guard = "ControlGuard")]
+    async fn recheck_torrents(&self, ctx: &Context<'_>, ids: Vec<u64>) -> Result<QueueBatchResult> {
+        let ids = batch_ids(&ids)?;
+        let outcome = service(ctx)?.recheck_many(&ids).await;
+        Ok(torrent_batch_result(&ids, outcome))
+    }
+
+    /// Run each torrent named outside the queue's limits, or under them
+    /// again, as one unit.
+    #[graphql(guard = "ControlGuard")]
+    async fn set_torrents_forced(
+        &self,
+        ctx: &Context<'_>,
+        ids: Vec<u64>,
+        forced: bool,
+    ) -> Result<QueueBatchResult> {
+        set_torrents(ctx, &ids, TorrentSetting::Forced(forced)).await
+    }
+
+    /// Set both of each named torrent's own limits in bytes per second, as
+    /// `setTorrentRateLimits` sets one torrent's, as one unit.
+    #[graphql(guard = "ControlGuard")]
+    async fn set_torrents_rate_limits(
+        &self,
+        ctx: &Context<'_>,
+        ids: Vec<u64>,
+        upload_bps: Option<u64>,
+        download_bps: Option<u64>,
+    ) -> Result<QueueBatchResult> {
+        let setting = TorrentSetting::RateLimits {
+            upload: Some(upload_bps),
+            download: Some(download_bps),
+        };
+        set_torrents(ctx, &ids, setting).await
+    }
+
+    /// Each named torrent's own seeding policy, as `setTorrentSeeding` sets
+    /// one torrent's, as one unit; null returns them to their category's and
+    /// the global one.
+    #[graphql(guard = "ControlGuard")]
+    async fn set_torrents_seeding(
+        &self,
+        ctx: &Context<'_>,
+        ids: Vec<u64>,
+        seeding: Option<SeedingPolicyInput>,
+    ) -> Result<QueueBatchResult> {
+        let policy = seeding.map(SeedingPolicyInput::into_policy).transpose()?;
+        set_torrents(ctx, &ids, TorrentSetting::Policy(policy)).await
+    }
+
+    /// Remove each torrent named, and its files when `deleteFiles`, as one
+    /// unit. Never refused for a seeding goal still to meet.
+    #[graphql(guard = "ControlGuard")]
+    async fn remove_torrents(
+        &self,
+        ctx: &Context<'_>,
+        ids: Vec<u64>,
+        #[graphql(default)] delete_files: bool,
+    ) -> Result<QueueBatchResult> {
+        let ids = batch_ids(&ids)?;
+        let removals: Vec<(JobId, bool)> = ids.iter().map(|&id| (id, delete_files)).collect();
+        let outcome = service(ctx)?.remove_many(&removals, true).await;
+        Ok(torrent_batch_result(&ids, outcome))
+    }
+}
+
+// The distinct ids a torrent batch names, in the order given, within the
+// queue batches' limit.
+// Whether an add refused as the torrent `existing` already is carries the
+// client request id that torrent was added with. One read of its row's
+// metadata, and only when the add carries an id.
+async fn same_request(
+    ctx: &Context<'_>,
+    existing: JobId,
+    client_request_id: Option<&str>,
+) -> Result<bool> {
+    let Some(asked) = client_request_id.map(str::trim).filter(|id| !id.is_empty()) else {
+        return Ok(false);
+    };
+    let metadata = service(ctx)?
+        .added_metadata(existing)
+        .await
+        .map_err(add_error)?;
+    Ok(metadata
+        .iter()
+        .any(|(key, value)| key == CLIENT_REQUEST_ID_ATTRIBUTE_KEY && value == asked))
+}
+
+// A refused add's GraphQL error, under the one mapping of refusals to codes.
+fn add_error(error: AddError) -> async_graphql::Error {
+    crate::jobs::mutation::add_refusal_error(
+        weaver_server_core::jobs::Protocol::Torrent,
+        AddRefusal::from(error),
+    )
+}
+
+fn batch_ids(ids: &[u64]) -> Result<Vec<JobId>> {
+    let mut seen = std::collections::BTreeSet::new();
+    let ids: Vec<JobId> = ids
+        .iter()
+        .copied()
+        .filter(|id| seen.insert(*id))
+        .map(JobId)
+        .collect();
+    if ids.len() > MAX_QUEUE_BATCH_IDS {
+        return Err(graphql_error(
+            "BATCH_TOO_LARGE",
+            format!("a batch names at most {MAX_QUEUE_BATCH_IDS} ids"),
+        ));
+    }
+    Ok(ids)
+}
+
+// `setting` made to each torrent `ids` names, as one unit. The setting is
+// checked first, as the single mutation checks it: refused, nothing changes.
+async fn set_torrents(
+    ctx: &Context<'_>,
+    ids: &[u64],
+    setting: TorrentSetting,
+) -> Result<QueueBatchResult> {
+    let ids = batch_ids(ids)?;
+    let outcome = service(ctx)?
+        .set_many(ids.iter().map(|&id| (id, setting)).collect())
+        .await;
+    if let Some(Err(error)) = outcome
+        .values()
+        .find(|result| matches!(result, Err(ActionError::Invalid(_))))
+    {
+        return Err(action_error(error.clone()));
+    }
+    Ok(torrent_batch_result(&ids, outcome))
+}
+
+// The answer a torrent batch returns, in the queue batches' shape: each id
+// it named, and why each one that did not take did not. An id the batch
+// did not reach, after one refused, is refused as not reached.
+fn torrent_batch_result(
+    ids: &[JobId],
+    outcome: std::collections::BTreeMap<JobId, std::result::Result<(), ActionError>>,
+) -> QueueBatchResult {
+    let matched = u32::try_from(ids.len()).unwrap_or(u32::MAX);
+    let refused: Vec<QueueBatchRefusal> = ids
+        .iter()
+        .filter_map(|id| {
+            let (code, message) = match outcome.get(id) {
+                Some(Ok(())) => return None,
+                Some(Err(error)) => (
+                    match error {
+                        ActionError::NotFound(_) => "NOT_FOUND",
+                        ActionError::Invalid(_) | ActionError::UnmetGoal(_) => "CONFLICT",
+                        ActionError::State(_) | ActionError::Forbidden(_) => "INTERNAL",
+                    },
+                    error.to_string(),
+                ),
+                None => (
+                    "CONFLICT",
+                    "not reached: a torrent before it in the batch was refused".to_owned(),
+                ),
+            };
+            Some(QueueBatchRefusal {
+                id: id.0,
+                code: code.to_owned(),
+                message,
+            })
+        })
+        .collect();
+    QueueBatchResult {
+        matched,
+        applied: matched.saturating_sub(u32::try_from(refused.len()).unwrap_or(u32::MAX)),
+        refused,
     }
 }

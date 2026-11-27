@@ -3076,10 +3076,13 @@ type MutationRoot {
 	setLogFilter(directives: String!): LogFilter!
 	startApplicationUpgrade(input: StartApplicationUpgradeInput!): ApplicationUpgradeStartPayload!
 	"""
-	Add a torrent from its metainfo or a magnet link, and return it.
-	An uploaded metainfo file is bounded as `submit` bounds one.
+	Add a torrent from its metainfo or a magnet link, and say how the
+	add came out. A torrent already added is answered, not refused: as
+	a replay when the add carries the client request id it was added
+	with, as a duplicate otherwise. An uploaded metainfo file is bounded
+	as `submit` bounds one.
 	"""
-	submitTorrent(input: SubmitTorrentInput!): Torrent!
+	submitTorrent(input: SubmitTorrentInput!): SubmitTorrentResult!
 	"""
 	Remove the torrent, and its files when `deleteFiles`; return its id.
 	Never refused for a seeding goal still to meet.
@@ -3149,6 +3152,32 @@ type MutationRoot {
 	and the global one.
 	"""
 	setTorrentSeeding(id: Int!, seeding: SeedingPolicyInput): Torrent!
+	"""
+	Check every piece of each torrent named again, as one unit. One
+	refused ends the rest: they are listed refused too.
+	"""
+	recheckTorrents(ids: [Int!]!): QueueBatchResult!
+	"""
+	Run each torrent named outside the queue's limits, or under them
+	again, as one unit.
+	"""
+	setTorrentsForced(ids: [Int!]!, forced: Boolean!): QueueBatchResult!
+	"""
+	Set both of each named torrent's own limits in bytes per second, as
+	`setTorrentRateLimits` sets one torrent's, as one unit.
+	"""
+	setTorrentsRateLimits(ids: [Int!]!, uploadBps: Int, downloadBps: Int): QueueBatchResult!
+	"""
+	Each named torrent's own seeding policy, as `setTorrentSeeding` sets
+	one torrent's, as one unit; null returns them to their category's and
+	the global one.
+	"""
+	setTorrentsSeeding(ids: [Int!]!, seeding: SeedingPolicyInput): QueueBatchResult!
+	"""
+	Remove each torrent named, and its files when `deleteFiles`, as one
+	unit. Never refused for a seeding goal still to meet.
+	"""
+	removeTorrents(ids: [Int!]!, deleteFiles: Boolean! = false): QueueBatchResult!
 }
 
 type NamedId {
@@ -4266,6 +4295,14 @@ type QueueItem {
 	NZB material and credentials, which remain unavailable to GraphQL.
 	"""
 	duplicateSummary: DuplicateSummaryInfo
+	"""
+	The job's torrent as the torrent list's rows show it; null for an
+	NZB job, for a torrent whose row is not yet published, and while the
+	torrent client is not running. Its
+	files, peer connections and unpacked files are read on
+	`torrent(id)`, and asking for them here is refused.
+	"""
+	torrent: Torrent
 	"""
 	The job's attributes. An RSS job's item link and id are among them
 	for an admin only.
@@ -6251,6 +6288,58 @@ input SubmitTorrentInput {
 	lets nothing through.
 	"""
 	downloadLimitBps: Int
+	"""
+	The caller's id for this request, kept with the job as `submitNzb`
+	keeps it. A duplicate add with the same id is answered as a replay.
+	"""
+	clientRequestId: String
+	"""
+	The attributes its job is added with, as `submitNzb` takes them.
+	"""
+	attributes: [AttributeInput!]
+}
+
+"""
+What an add of a torrent answers.
+"""
+type SubmitTorrentResult {
+	"""
+	Whether the add stands: true when added, and for a replay of the
+	same request.
+	"""
+	accepted: Boolean!
+	"""
+	How the add came out.
+	"""
+	status: SubmitTorrentStatus!
+	"""
+	The torrent added, or the one already added under it.
+	"""
+	torrent: Torrent!
+	"""
+	The client request id the add carried.
+	"""
+	clientRequestId: String
+}
+
+"""
+How an add of a torrent came out.
+"""
+enum SubmitTorrentStatus {
+	"""
+	The torrent was added.
+	"""
+	ACCEPTED
+	"""
+	The torrent was already added with the same client request id; it
+	is answered as it is, and nothing of it changes.
+	"""
+	IDEMPOTENT_REPLAY
+	"""
+	The torrent was already added, with another client request id or
+	none; nothing was added or changed.
+	"""
+	DUPLICATE
 }
 
 type SubscriptionRoot {
@@ -6721,6 +6810,16 @@ type Torrent {
 	"""
 	savePath: String
 	"""
+	Each seeding goal in force, in the order ratio, seed time, inactive
+	time; empty for a torrent with no goal.
+	"""
+	seedingGoals: [TorrentSeedingGoal!]!
+	"""
+	Whether its seeding goals are met by the terms' mode, any or all;
+	false for a torrent with no goal.
+	"""
+	seedingGoalMet: Boolean!
+	"""
 	The torrent's own seeding terms; absent when it inherits every one.
 	"""
 	seedingOverride: SeedingPolicySettings
@@ -6741,9 +6840,15 @@ type Torrent {
 	"""
 	unpackOverride: Boolean
 	"""
-	The networking route it takes, by its key, when one is resolved.
+	Whether its download is complete and its unpacking, where one
+	applies, is over, whatever its result.
 	"""
-	route: String
+	contentReady: Boolean!
+	"""
+	The networking route it takes, by its key (`TorrentRoute.key`), when
+	one is resolved.
+	"""
+	routeKey: String
 	"""
 	The networking route the torrent takes, by its consumer key:
 	`torrent:default`, `torrent:category:<id>` or `torrent:tracker:<id>`.
@@ -6986,7 +7091,22 @@ type TorrentHistory {
 	"""
 	Now, as the torrent client last published its torrents.
 	"""
-	peers: TorrentPeers!
+	live: TorrentLiveTotals!
+}
+
+type TorrentLiveTotals {
+	"""
+	Torrents the client holds now.
+	"""
+	torrents: Int!
+	"""
+	Peers connected now, across every torrent.
+	"""
+	connectedPeers: Int!
+	"""
+	Of those, the ones that have every piece.
+	"""
+	connectedSeeds: Int!
 }
 
 """
@@ -7171,21 +7291,6 @@ enum TorrentPeerSource {
 	The peer connected to us.
 	"""
 	INCOMING
-}
-
-type TorrentPeers {
-	"""
-	Torrents the client holds now.
-	"""
-	torrents: Int!
-	"""
-	Peers connected now, across every torrent.
-	"""
-	connected: Int!
-	"""
-	Of those, the ones that have every piece.
-	"""
-	seeds: Int!
 }
 
 """
@@ -7448,7 +7553,7 @@ enum TorrentRouteScope {
 
 """
 A scope that runs on a torrent route: the default, or a category or
-tracker rule by its id and name.
+tracker rule.
 """
 type TorrentRouteUse {
 	"""
@@ -7456,13 +7561,15 @@ type TorrentRouteUse {
 	"""
 	scope: TorrentRouteScope!
 	"""
-	The category's or tracker rule's id; absent for the default.
+	The category, when the scope is a category's: read from the settings
+	in memory, only when selected.
 	"""
-	id: Int
+	category: Category
 	"""
-	The category's or tracker rule's name; absent for the default.
+	The tracker rule, when the scope is a tracker rule's: read from the
+	rules the torrent service holds in memory, only when selected.
 	"""
-	name: String
+	trackerRule: TrackerRule
 }
 
 """
@@ -7481,6 +7588,47 @@ type TorrentScheduleSeeding {
 	How many torrents the rule keeps seeding.
 	"""
 	torrents: Int!
+}
+
+"""
+One seeding goal in force and how far the torrent is toward it.
+"""
+type TorrentSeedingGoal {
+	"""
+	What it measures.
+	"""
+	kind: TorrentSeedingGoalKind!
+	"""
+	Whether it is met.
+	"""
+	met: Boolean!
+	"""
+	Where the torrent is: a ratio, or whole minutes. The inactive time is
+	0 while there has been no activity.
+	"""
+	current: Float!
+	"""
+	The goal: a ratio, or minutes.
+	"""
+	target: Float!
+}
+
+"""
+Which seeding goal a `TorrentSeedingGoal` measures.
+"""
+enum TorrentSeedingGoalKind {
+	"""
+	Its share ratio.
+	"""
+	RATIO
+	"""
+	Its time seeding, in minutes.
+	"""
+	SEED_TIME
+	"""
+	Its time with no payload sent or received, in minutes.
+	"""
+	INACTIVE_TIME
 }
 
 """
@@ -7927,6 +8075,36 @@ enum TorrentTrackerStatus {
 }
 
 """
+Why a torrent's unpacking came out short, as a code.
+"""
+enum TorrentUnpackReason {
+	"""
+	The unpacking refused the torrent's files before it ended.
+	"""
+	REFUSED
+	"""
+	It delivered no usable file whole.
+	"""
+	NOTHING_DELIVERED
+	"""
+	What it made was not all placed beside the torrent's files.
+	"""
+	NOT_PLACED
+	"""
+	It delivered in part.
+	"""
+	DELIVERED_IN_PART
+	"""
+	Files it made were removed for an unwanted extension.
+	"""
+	UNWANTED_REMOVED
+	"""
+	A file it made with an unwanted extension could not be removed.
+	"""
+	UNWANTED_NOT_REMOVED
+}
+
+"""
 How a torrent's unpacking came out.
 """
 enum TorrentUnpackResult {
@@ -7990,6 +8168,11 @@ type TorrentUnpacking {
 	Why it is short of whole.
 	"""
 	reason: String
+	"""
+	Why it is short of whole, as a code; absent for a whole unpacking,
+	and for one that ended before the code was kept.
+	"""
+	reasonCode: TorrentUnpackReason
 	"""
 	One page of the files it placed beside the torrent's own, in the
 	order it placed them: the `first` after the offset cursor `after`,

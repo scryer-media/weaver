@@ -220,7 +220,8 @@ fn metainfo_of_files(name: &str, count: usize) -> String {
 fn submit(metainfo: &str, extra: &str) -> String {
     format!(
         r#"mutation {{ submitTorrent(input: {{ source: {{ metainfoBase64: "{metainfo}" }} {extra} }}) {{
-            id name state stateDetail totalBytes private files {{ items {{ path length }} }}
+            status accepted clientRequestId
+            torrent {{ id name state stateDetail totalBytes private files {{ items {{ path length }} }} }}
         }} }}"#
     )
 }
@@ -242,7 +243,7 @@ async fn a_metainfo_is_added_and_read_back() {
         .await;
     assert!(response.errors.is_empty(), "{:?}", response.errors);
     let data = response.data.into_json().unwrap();
-    let torrent = &data["submitTorrent"];
+    let torrent = &data["submitTorrent"]["torrent"];
     assert_eq!(torrent["name"], "one.mkv");
     assert_eq!(torrent["totalBytes"], 3000);
     assert_eq!(torrent["state"], "STALLED");
@@ -271,7 +272,7 @@ async fn a_torrent_is_submitted_from_one_source_arm() {
         .decode(metainfo("uploaded.mkv", 3000, false))
         .unwrap();
     let mut request = Request::new(
-        "mutation Submit($input: SubmitTorrentInput!) { submitTorrent(input: $input) { id name totalBytes } }",
+        "mutation Submit($input: SubmitTorrentInput!) { submitTorrent(input: $input) { torrent { id name totalBytes } } }",
     )
     .data(CallerScope::Local)
     .data(CallerIdentity::Local([7; 32]))
@@ -289,13 +290,13 @@ async fn a_torrent_is_submitted_from_one_source_arm() {
     );
     let response = rig.harness.schema.execute(request).await;
     assert!(response.errors.is_empty(), "{:?}", response.errors);
-    let added = response.data.into_json().unwrap()["submitTorrent"].clone();
+    let added = response.data.into_json().unwrap()["submitTorrent"]["torrent"].clone();
     assert_eq!(added["name"], "uploaded.mkv");
     assert_eq!(added["totalBytes"], 3000);
 
     // An upload that is no torrent is refused.
     let mut request = Request::new(
-        "mutation Submit($input: SubmitTorrentInput!) { submitTorrent(input: $input) { id } }",
+        "mutation Submit($input: SubmitTorrentInput!) { submitTorrent(input: $input) { torrent { id } } }",
     )
     .data(CallerScope::Local)
     .data(CallerIdentity::Local([7; 32]))
@@ -316,13 +317,13 @@ async fn a_torrent_is_submitted_from_one_source_arm() {
 
     let two = rig
         .execute(&format!(
-            r#"mutation {{ submitTorrent(input: {{ source: {{ metainfoBase64: "{}", magnet: "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567" }} }}) {{ id }} }}"#,
+            r#"mutation {{ submitTorrent(input: {{ source: {{ metainfoBase64: "{}", magnet: "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567" }} }}) {{ torrent {{ id }} }} }}"#,
             metainfo("two.mkv", 3000, false)
         ))
         .await;
     assert!(!two.errors.is_empty());
     let none = rig
-        .execute("mutation { submitTorrent(input: { source: {} }) { id } }")
+        .execute("mutation { submitTorrent(input: { source: {} }) { torrent { id } } }")
         .await;
     assert!(!none.errors.is_empty());
     // Neither refused source added a torrent.
@@ -343,7 +344,7 @@ async fn a_torrents_files_page_by_first_and_an_offset_cursor() {
         .execute(&submit(&metainfo_of_files("folder", 5), ""))
         .await;
     assert!(response.errors.is_empty(), "{:?}", response.errors);
-    let id = response.data.into_json().unwrap()["submitTorrent"]["id"]
+    let id = response.data.into_json().unwrap()["submitTorrent"]["torrent"]["id"]
         .as_u64()
         .unwrap();
     let files = |arguments: String| {
@@ -416,7 +417,7 @@ async fn torrent_updates_read_only_what_the_subscription_selects() {
         .execute(&submit(&metainfo_of_files("folder", 3), ""))
         .await;
     assert!(response.errors.is_empty(), "{:?}", response.errors);
-    let id = response.data.into_json().unwrap()["submitTorrent"]["id"]
+    let id = response.data.into_json().unwrap()["submitTorrent"]["torrent"]["id"]
         .as_u64()
         .unwrap();
     let replaced = rig
@@ -499,7 +500,7 @@ async fn torrent_file_updates_give_a_page_of_the_files() {
         .execute(&submit(&metainfo_of_files("folder", 4), ""))
         .await;
     assert!(response.errors.is_empty(), "{:?}", response.errors);
-    let id = response.data.into_json().unwrap()["submitTorrent"]["id"]
+    let id = response.data.into_json().unwrap()["submitTorrent"]["torrent"]["id"]
         .as_u64()
         .unwrap();
     let follow = |arguments: String| {
@@ -542,7 +543,7 @@ async fn a_list_refuses_the_fields_read_on_one_torrent() {
         .execute(&submit(&metainfo("listed.mkv", 3000, false), ""))
         .await;
     assert!(response.errors.is_empty(), "{:?}", response.errors);
-    let id = response.data.into_json().unwrap()["submitTorrent"]["id"]
+    let id = response.data.into_json().unwrap()["submitTorrent"]["torrent"]["id"]
         .as_u64()
         .unwrap();
     for (field, selection) in [
@@ -595,7 +596,7 @@ async fn one_torrent_reads_only_what_the_query_selects() {
         .execute(&submit(&metainfo("one.mkv", 3000, false), ""))
         .await;
     assert!(response.errors.is_empty(), "{:?}", response.errors);
-    let id = response.data.into_json().unwrap()["submitTorrent"]["id"]
+    let id = response.data.into_json().unwrap()["submitTorrent"]["torrent"]["id"]
         .as_u64()
         .unwrap();
     let replaced = rig
@@ -688,13 +689,89 @@ async fn one_torrent_reads_only_what_the_query_selects() {
     assert_eq!(listed["torrents"]["items"][0]["savePath"], full["savePath"]);
 }
 
+// A new torrent is ACCEPTED, and its client request id is echoed and kept
+// with its job.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_duplicate_is_refused() {
+async fn a_new_torrent_is_accepted() {
     let rig = rig().await;
     let bytes = metainfo("one.mkv", 3000, false);
-    assert!(rig.execute(&submit(&bytes, "")).await.errors.is_empty());
-    let again = rig.execute(&submit(&bytes, "")).await;
-    assert_eq!(code(&again).as_deref(), Some("DUPLICATE"));
+    let response = rig
+        .execute(&submit(&bytes, r#"clientRequestId: "req-1""#))
+        .await;
+    assert!(response.errors.is_empty(), "{:?}", response.errors);
+    let result = response.data.into_json().unwrap()["submitTorrent"].clone();
+    assert_eq!(result["status"], "ACCEPTED");
+    assert_eq!(result["accepted"], true);
+    assert_eq!(result["clientRequestId"], "req-1");
+    assert_eq!(result["torrent"]["name"], "one.mkv");
+}
+
+// The same torrent again with the client request id it was added with is
+// a replay: accepted, answered with the torrent already added, and nothing
+// of that torrent changes, though the replay asks for other settings.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_replay_of_the_same_request_answers_the_torrent_unchanged() {
+    let rig = rig().await;
+    let bytes = metainfo("one.mkv", 3000, false);
+    let first = rig
+        .execute(&submit(&bytes, r#"clientRequestId: "req-1" forced: false"#))
+        .await;
+    assert!(first.errors.is_empty(), "{:?}", first.errors);
+    let id = first.data.into_json().unwrap()["submitTorrent"]["torrent"]["id"]
+        .as_u64()
+        .unwrap();
+    let settings = |id: u64| {
+        format!(
+            "{{ torrent(id: {id}) {{ forced paused: state uploadLimitBps seedingPolicy {{ ratioGoal }} }} }}"
+        )
+    };
+    let before = rig.execute(&settings(id)).await.data.into_json().unwrap();
+
+    let again = rig
+        .execute(&submit(
+            &bytes,
+            r#"clientRequestId: " req-1 " forced: true paused: true uploadLimitBps: 5
+               seeding: { ratioGoal: { state: SET, value: 9.0 } }"#,
+        ))
+        .await;
+    assert!(again.errors.is_empty(), "{:?}", again.errors);
+    let result = again.data.into_json().unwrap()["submitTorrent"].clone();
+    assert_eq!(result["status"], "IDEMPOTENT_REPLAY");
+    assert_eq!(result["accepted"], true);
+    assert_eq!(result["clientRequestId"], " req-1 ");
+    assert_eq!(result["torrent"]["id"], id);
+    assert_eq!(rig.execute(&settings(id)).await.data.into_json().unwrap(), before);
+}
+
+// The same torrent again with another client request id, or none, is a
+// duplicate: not accepted, answered with the torrent already added, and no
+// error.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_duplicate_is_answered_and_not_accepted() {
+    let rig = rig().await;
+    let bytes = metainfo("one.mkv", 3000, false);
+    let first = rig
+        .execute(&submit(&bytes, r#"clientRequestId: "req-1""#))
+        .await;
+    assert!(first.errors.is_empty(), "{:?}", first.errors);
+    let id = first.data.into_json().unwrap()["submitTorrent"]["torrent"]["id"].clone();
+    for extra in [r#"clientRequestId: "req-2""#, "", r#"clientRequestId: "  ""#] {
+        let again = rig.execute(&submit(&bytes, extra)).await;
+        assert!(again.errors.is_empty(), "{extra}: {:?}", again.errors);
+        let result = again.data.into_json().unwrap()["submitTorrent"].clone();
+        assert_eq!(result["status"], "DUPLICATE", "{extra}");
+        assert_eq!(result["accepted"], false, "{extra}");
+        assert_eq!(result["torrent"]["id"], id, "{extra}");
+    }
+    // A torrent added with no client request id is a duplicate for any.
+    let other = metainfo("two.mkv", 3000, false);
+    assert!(rig.execute(&submit(&other, "")).await.errors.is_empty());
+    let again = rig
+        .execute(&submit(&other, r#"clientRequestId: "req-3""#))
+        .await;
+    let result = again.data.into_json().unwrap()["submitTorrent"].clone();
+    assert_eq!(result["status"], "DUPLICATE");
+    assert_eq!(result["clientRequestId"], "req-3");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -704,14 +781,14 @@ async fn a_magnet_is_added_without_a_network() {
         .execute(
             r#"mutation { submitTorrent(input: { source: {
                 magnet: "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567&tr=http%3A%2F%2F127.0.0.1%3A9%2Fannounce"
-            } }) { id } }"#,
+            } }) { torrent { id } } }"#,
         )
         .await;
     // The add does not wait on its route: the torrent is held until the
     // route opens.
     assert!(response.errors.is_empty(), "{:?}", response.errors);
     assert!(
-        response.data.into_json().unwrap()["submitTorrent"]["id"]
+        response.data.into_json().unwrap()["submitTorrent"]["torrent"]["id"]
             .as_u64()
             .is_some()
     );
@@ -733,7 +810,7 @@ async fn an_unwanted_extension_is_left_out_not_refused() {
         .execute(&submit(&metainfo("disc.iso", 2000, false), ""))
         .await;
     assert!(response.errors.is_empty(), "{:?}", response.errors);
-    let id = response.data.into_json().unwrap()["submitTorrent"]["id"]
+    let id = response.data.into_json().unwrap()["submitTorrent"]["torrent"]["id"]
         .as_u64()
         .unwrap();
     let listed = rig.execute("{ torrents { items { id } } }").await;
@@ -753,7 +830,7 @@ async fn removing_a_private_torrent_short_of_its_goal_is_never_refused() {
         ))
         .await;
     assert!(response.errors.is_empty(), "{:?}", response.errors);
-    let id = response.data.into_json().unwrap()["submitTorrent"]["id"]
+    let id = response.data.into_json().unwrap()["submitTorrent"]["torrent"]["id"]
         .as_u64()
         .unwrap();
     // The page names what is left before it asks; the server takes the
@@ -826,7 +903,7 @@ async fn the_queue_names_a_torrents_phase() {
         .execute(&submit(&metainfo("one.mkv", 3000, false), ""))
         .await;
     assert!(response.errors.is_empty(), "{:?}", response.errors);
-    let id = response.data.into_json().unwrap()["submitTorrent"]["id"]
+    let id = response.data.into_json().unwrap()["submitTorrent"]["torrent"]["id"]
         .as_u64()
         .unwrap();
     let queue = rig.execute("{ queueItems { id state } }").await;
@@ -883,7 +960,7 @@ async fn a_torrent_reads_its_leechers_file_progress_and_seeding_policy() {
         assert!(response.errors.is_empty(), "{:?}", response.errors);
         response.data.into_json().unwrap()
     };
-    let id = |data: &Value| data["submitTorrent"]["id"].as_u64().unwrap();
+    let id = |data: &Value| data["submitTorrent"]["torrent"]["id"].as_u64().unwrap();
     let detail = |id: u64| format!("{{ torrent(id: {id}) {{ {DETAIL} }} }}");
 
     let global = id(&read(submit(&metainfo("a.mkv", 3000, false), "")).await);
@@ -978,7 +1055,7 @@ async fn the_queue_events_carry_a_torrent() {
         .execute(&submit(&metainfo("one.mkv", 3000, false), ""))
         .await;
     assert!(response.errors.is_empty(), "{:?}", response.errors);
-    let id = response.data.into_json().unwrap()["submitTorrent"]["id"]
+    let id = response.data.into_json().unwrap()["submitTorrent"]["torrent"]["id"]
         .as_u64()
         .unwrap();
     assert_eq!(next(id).await, ("ITEM_CREATED".into(), "STALLED".into()));
@@ -1234,7 +1311,7 @@ async fn live_metrics_carry_what_every_torrent_downloads_and_uploads() {
         .execute(&submit(&metainfo("rates.mkv", 3000, false), ""))
         .await;
     assert!(response.errors.is_empty(), "{:?}", response.errors);
-    let id = response.data.into_json().unwrap()["submitTorrent"]["id"]
+    let id = response.data.into_json().unwrap()["submitTorrent"]["torrent"]["id"]
         .as_u64()
         .unwrap();
 
@@ -1291,7 +1368,7 @@ async fn torrent_updates_push_one_torrent_until_it_is_gone() {
         .execute(&submit(&metainfo("one.mkv", 3000, false), ""))
         .await;
     assert!(response.errors.is_empty(), "{:?}", response.errors);
-    let id = response.data.into_json().unwrap()["submitTorrent"]["id"]
+    let id = response.data.into_json().unwrap()["submitTorrent"]["torrent"]["id"]
         .as_u64()
         .unwrap();
 
@@ -1711,7 +1788,7 @@ async fn a_tracker_rule_sets_the_goals_of_the_torrents_announcing_to_its_hosts()
     bstr(&mut announcing, b"http://a.tracker.test/announce");
     announcing.extend_from_slice(&bytes[1..]);
     let announcing = base64::engine::general_purpose::STANDARD.encode(announcing);
-    let id = read(submit(&announcing, "")).await["submitTorrent"]["id"]
+    let id = read(submit(&announcing, "")).await["submitTorrent"]["torrent"]["id"]
         .as_u64()
         .unwrap();
     let source = || async move {
@@ -1780,7 +1857,7 @@ async fn the_rules_in_force_are_the_ones_each_save_leaves() {
     bstr(&mut announcing, b"http://a.tracker.test/announce");
     announcing.extend_from_slice(&bytes[1..]);
     let announcing = base64::engine::general_purpose::STANDARD.encode(announcing);
-    let id = read(submit(&announcing, "")).await["submitTorrent"]["id"]
+    let id = read(submit(&announcing, "")).await["submitTorrent"]["torrent"]["id"]
         .as_u64()
         .unwrap();
     let ratio = || async move {
@@ -1805,7 +1882,7 @@ async fn a_torrents_peers_are_listed_and_a_ban_is_kept() {
         .execute(&submit(&metainfo("one.mkv", 3000, false), ""))
         .await;
     assert!(response.errors.is_empty(), "{:?}", response.errors);
-    let id = response.data.into_json().unwrap()["submitTorrent"]["id"]
+    let id = response.data.into_json().unwrap()["submitTorrent"]["torrent"]["id"]
         .as_u64()
         .unwrap();
 
@@ -1866,7 +1943,7 @@ async fn a_torrents_rate_limits_are_set_and_read_back() {
         .execute(&submit(&metainfo("one.mkv", 3000, false), ""))
         .await;
     assert!(response.errors.is_empty(), "{:?}", response.errors);
-    let id = response.data.into_json().unwrap()["submitTorrent"]["id"]
+    let id = response.data.into_json().unwrap()["submitTorrent"]["torrent"]["id"]
         .as_u64()
         .unwrap();
     let limits = |torrent: &Value| {
@@ -1950,7 +2027,7 @@ async fn file_levels_and_picking_toggles_round_trip() {
         .execute(&submit(&metainfo("one.mkv", 3000, false), ""))
         .await;
     assert!(response.errors.is_empty(), "{:?}", response.errors);
-    let id = response.data.into_json().unwrap()["submitTorrent"]["id"]
+    let id = response.data.into_json().unwrap()["submitTorrent"]["torrent"]["id"]
         .as_u64()
         .unwrap();
     let read = |id: u64| {
@@ -2032,7 +2109,7 @@ async fn a_torrents_trackers_are_listed_and_edited() {
     let announcing = base64::engine::general_purpose::STANDARD.encode(announcing);
     let response = rig.execute(&submit(&announcing, "")).await;
     assert!(response.errors.is_empty(), "{:?}", response.errors);
-    let id = response.data.into_json().unwrap()["submitTorrent"]["id"]
+    let id = response.data.into_json().unwrap()["submitTorrent"]["torrent"]["id"]
         .as_u64()
         .unwrap();
     let run = |query: String| {
@@ -2159,7 +2236,7 @@ async fn a_read_key_sees_no_trackers_passkey() {
         .execute(&submit(&metainfo("one.mkv", 3000, false), ""))
         .await;
     assert!(response.errors.is_empty(), "{:?}", response.errors);
-    let id = response.data.into_json().unwrap()["submitTorrent"]["id"]
+    let id = response.data.into_json().unwrap()["submitTorrent"]["torrent"]["id"]
         .as_u64()
         .unwrap();
     let added = rig
@@ -2236,7 +2313,8 @@ async fn the_torrent_routes_are_listed_with_their_scopes_and_reasons() {
 
     let response = rig
         .execute(
-            "{ torrentRoutes { key scopes { scope id name } open listenAddress utp \
+            "{ torrentRoutes { key scopes { scope category { id name } trackerRule { id name } } \
+             open listenAddress utp \
              mappings { mapper protocol localPort externalPort gatewayAddress error } \
              externalAddresses reason } }",
         )
@@ -2248,8 +2326,12 @@ async fn the_torrent_routes_are_listed_with_their_scopes_and_reasons() {
         serde_json::json!([{
             "key": key.as_str(),
             "scopes": [
-                { "scope": "DEFAULT", "id": null, "name": null },
-                { "scope": "TRACKER_RULE", "id": id, "name": "tracker.test" },
+                { "scope": "DEFAULT", "category": null, "trackerRule": null },
+                {
+                    "scope": "TRACKER_RULE",
+                    "category": null,
+                    "trackerRule": { "id": id, "name": "tracker.test" },
+                },
             ],
             "open": false,
             "listenAddress": null,
@@ -2310,8 +2392,7 @@ fn an_open_route_shows_where_it_listens_and_its_mappings() {
     assert!(route.open);
     assert_eq!(route.listen_address.as_deref(), Some("127.0.0.1:6881"));
     assert!(route.utp);
-    assert_eq!(route.scopes[0].id, Some(3));
-    assert_eq!(route.scopes[0].name.as_deref(), Some("tv"));
+    assert_eq!(route.scopes[0].of, TorrentScope::Category(3));
     assert_eq!(route.mappings.len(), 2);
     assert_eq!(route.mappings[0].external_port, None);
     assert_eq!(
@@ -2610,7 +2691,7 @@ async fn the_routes_and_trackers_say_who_resolves_their_names() {
     ] {
         let response = rig.execute(&submit(&announcing(name, announce), "")).await;
         assert!(response.errors.is_empty(), "{:?}", response.errors);
-        let id = response.data.into_json().unwrap()["submitTorrent"]["id"]
+        let id = response.data.into_json().unwrap()["submitTorrent"]["torrent"]["id"]
             .as_u64()
             .unwrap();
         let response = rig
@@ -2634,13 +2715,13 @@ async fn a_held_torrent_carries_its_routes_reason_code() {
     let response = offline
         .execute(&format!(
             r#"mutation {{ submitTorrent(input: {{ source: {{ metainfoBase64: "{}" }} }}) {{
-                id state stateDetail routeReason
+                torrent {{ id state stateDetail routeReason }}
             }} }}"#,
             metainfo("offline.mkv", 3000, false)
         ))
         .await;
     assert!(response.errors.is_empty(), "{:?}", response.errors);
-    let submitted = response.data.into_json().unwrap()["submitTorrent"].clone();
+    let submitted = response.data.into_json().unwrap()["submitTorrent"]["torrent"].clone();
     let id = submitted["id"].as_u64().unwrap();
     let held = serde_json::json!({
         "id": id, "state": "STALLED", "stateDetail": "offline", "routeReason": "LEG_DOWN"
@@ -2666,7 +2747,7 @@ async fn a_held_torrent_has_a_support_report_without_its_name() {
         .execute(&submit(&metainfo("zqxsentinel.mkv", 3000, true), ""))
         .await;
     assert!(response.errors.is_empty(), "{:?}", response.errors);
-    let id = response.data.into_json().unwrap()["submitTorrent"]["id"]
+    let id = response.data.into_json().unwrap()["submitTorrent"]["torrent"]["id"]
         .as_u64()
         .unwrap();
     let response = rig
@@ -3134,7 +3215,7 @@ async fn the_updates_of_a_page_wait_for_the_load() {
             .await;
         assert!(response.errors.is_empty(), "{:?}", response.errors);
         ids.push(
-            response.data.into_json().unwrap()["submitTorrent"]["id"]
+            response.data.into_json().unwrap()["submitTorrent"]["torrent"]["id"]
                 .as_u64()
                 .unwrap(),
         );
@@ -3252,7 +3333,7 @@ async fn a_control_key_moves_a_torrent_only_under_the_save_folders() {
         .execute(&submit(&metainfo("one.mkv", 3000, false), ""))
         .await;
     assert!(added.errors.is_empty(), "{:?}", added.errors);
-    let id = added.data.into_json().unwrap()["submitTorrent"]["id"]
+    let id = added.data.into_json().unwrap()["submitTorrent"]["torrent"]["id"]
         .as_u64()
         .unwrap();
     let rig = &rig;
@@ -3294,4 +3375,186 @@ async fn a_control_key_moves_a_torrent_only_under_the_save_folders() {
     let moved = move_to(elsewhere.clone(), CallerScope::Admin).await;
     assert!(moved.errors.is_empty(), "{:?}", moved.errors);
     assert_eq!(dir().await.parent(), Some(elsewhere.as_path()));
+}
+
+// Each ids-only batch answers as the queue's batches do: what it matched,
+// what it applied, and a refusal per id it could not act on. A list past
+// the queue batch limit is refused whole.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_torrent_batches_act_on_each_id_and_refuse_the_unknown() {
+    let rig = rig().await;
+    let mut ids = Vec::new();
+    for name in ["one.mkv", "two.mkv"] {
+        let response = rig.execute(&submit(&metainfo(name, 3000, false), "")).await;
+        assert!(response.errors.is_empty(), "{:?}", response.errors);
+        ids.push(
+            response.data.into_json().unwrap()["submitTorrent"]["torrent"]["id"]
+                .as_u64()
+                .unwrap(),
+        );
+    }
+    let [one, two] = [ids[0], ids[1]];
+    let batch = |call: &str| {
+        format!("mutation {{ {call} {{ matched applied refused {{ id code }} }} }}")
+    };
+
+    for (mutation, field) in [
+        (
+            format!("setTorrentsForced(ids: [{one}, {two}], forced: true)"),
+            "setTorrentsForced",
+        ),
+        (
+            format!("setTorrentsRateLimits(ids: [{one}, {two}], uploadBps: 1000, downloadBps: 2000)"),
+            "setTorrentsRateLimits",
+        ),
+        (
+            format!(
+                "setTorrentsSeeding(ids: [{one}, {two}], seeding: {{ ratioGoal: {{ state: SET, value: 2.5 }} }})"
+            ),
+            "setTorrentsSeeding",
+        ),
+    ] {
+        let response = rig.execute(&batch(&mutation)).await;
+        assert!(response.errors.is_empty(), "{field}: {:?}", response.errors);
+        let got = response.data.into_json().unwrap()[field].clone();
+        assert_eq!(
+            got,
+            serde_json::json!({ "matched": 2, "applied": 2, "refused": [] }),
+            "{field}"
+        );
+    }
+    for id in [one, two] {
+        let read = rig
+            .execute(&format!(
+                "{{ torrent(id: {id}) {{ forced uploadLimitBps downloadLimitBps seedingPolicy {{ ratioGoal }} }} }}"
+            ))
+            .await;
+        assert!(read.errors.is_empty(), "{:?}", read.errors);
+        assert_eq!(
+            read.data.into_json().unwrap()["torrent"],
+            serde_json::json!({
+                "forced": true,
+                "uploadLimitBps": 1000,
+                "downloadLimitBps": 2000,
+                "seedingPolicy": { "ratioGoal": 2.5 },
+            })
+        );
+    }
+
+    // An id no torrent holds is refused by name, and the batch goes on.
+    let response = rig
+        .execute(&batch(&format!("recheckTorrents(ids: [999999, {one}])")))
+        .await;
+    assert!(response.errors.is_empty(), "{:?}", response.errors);
+    let got = &response.data.into_json().unwrap()["recheckTorrents"];
+    assert_eq!(got["refused"][0]["id"], 999999);
+    assert_eq!(got["refused"][0]["code"], "NOT_FOUND");
+
+    // Past the limit nothing is attempted.
+    let many = (1..=1001).map(|id| id.to_string()).collect::<Vec<_>>().join(", ");
+    let response = rig
+        .execute(&batch(&format!("removeTorrents(ids: [{many}])")))
+        .await;
+    assert_eq!(code(&response).as_deref(), Some("BATCH_TOO_LARGE"));
+
+    let response = rig
+        .execute(&batch(&format!("removeTorrents(ids: [{one}, {two}])")))
+        .await;
+    assert!(response.errors.is_empty(), "{:?}", response.errors);
+    assert_eq!(
+        response.data.into_json().unwrap()["removeTorrents"],
+        serde_json::json!({ "matched": 2, "applied": 2, "refused": [] })
+    );
+    let left = rig.execute("{ torrents { items { id } } }").await;
+    assert_eq!(
+        left.data.into_json().unwrap()["torrents"]["items"],
+        serde_json::json!([])
+    );
+}
+
+// A queue item's `torrent` is its published torrent row, read once for the
+// whole list and only when asked: a list that does not ask reads no row. A
+// torrent's client request id and attributes reach its queue item.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_queue_items_torrent_is_read_once_per_list_and_only_when_asked() {
+    let rig = rig().await;
+    rig.torrents.publish_to(rig.harness.handle.clone());
+    let mut ids = Vec::new();
+    for name in ["one.mkv", "two.mkv"] {
+        let response = rig
+            .execute(&submit(
+                &metainfo(name, 3000, false),
+                &format!(
+                    r#"clientRequestId: "req-{name}" attributes: [{{ key: "tvdbId", value: "7" }}]"#
+                ),
+            ))
+            .await;
+        assert!(response.errors.is_empty(), "{:?}", response.errors);
+        ids.push(
+            response.data.into_json().unwrap()["submitTorrent"]["torrent"]["id"]
+                .as_u64()
+                .unwrap(),
+        );
+    }
+    let reads = || rig.torrents.snapshot().rows_of_reads();
+
+    let before = reads();
+    let plain = rig
+        .execute("{ queueItems { id clientRequestId attributes { key value } } }")
+        .await;
+    assert!(plain.errors.is_empty(), "{:?}", plain.errors);
+    assert_eq!(reads(), before);
+    let plain = plain.data.into_json().unwrap();
+    for (id, name) in ids.iter().zip(["one.mkv", "two.mkv"]) {
+        let item = plain["queueItems"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["id"].as_u64() == Some(*id))
+            .cloned()
+            .unwrap();
+        assert_eq!(item["clientRequestId"], format!("req-{name}"));
+        assert_eq!(
+            item["attributes"],
+            serde_json::json!([{ "key": "tvdbId", "value": "7" }])
+        );
+    }
+
+    let before = reads();
+    let linked = rig
+        .execute("{ queueItems { id torrent { id name state } } }")
+        .await;
+    assert!(linked.errors.is_empty(), "{:?}", linked.errors);
+    assert_eq!(reads(), before + 1);
+    let linked = linked.data.into_json().unwrap();
+    for (id, name) in ids.iter().zip(["one.mkv", "two.mkv"]) {
+        let item = linked["queueItems"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["id"].as_u64() == Some(*id))
+            .cloned()
+            .unwrap();
+        assert_eq!(item["torrent"]["id"], *id);
+        assert_eq!(item["torrent"]["name"], name);
+    }
+
+    // One item read alone reads its own row.
+    let before = reads();
+    let one = rig
+        .execute(&format!("{{ queueItem(id: {}) {{ torrent {{ name }} }} }}", ids[0]))
+        .await;
+    assert!(one.errors.is_empty(), "{:?}", one.errors);
+    assert_eq!(reads(), before + 1);
+    assert_eq!(
+        one.data.into_json().unwrap()["queueItem"]["torrent"]["name"],
+        "one.mkv"
+    );
+
+    for selection in ["files { items { path } }", "peerConnections { address }", "unpacking { files { items { path } } }"] {
+        let refused = rig
+            .execute(&format!("{{ queueItems {{ torrent {{ {selection} }} }} }}"))
+            .await;
+        assert_eq!(code(&refused).as_deref(), Some("INVALID_INPUT"), "{selection}");
+    }
 }

@@ -427,6 +427,12 @@ pub struct QueueItem {
     #[graphql(skip)]
     #[serde(skip)]
     pub disk_write: Option<Option<QueueDiskWrite>>,
+    /// The published torrent rows the list this item came in shares, read
+    /// once for the list when a row's `torrent` is asked for; none when no
+    /// list shared them, and `torrent` then reads this row's alone.
+    #[graphql(skip)]
+    #[serde(skip)]
+    pub torrent_rows: crate::torrents::QueueTorrentRows,
 }
 
 /// A job's write to its destination disk, while the disk is slow or the
@@ -474,6 +480,20 @@ pub(crate) fn attach_disk_writes(
 
 #[async_graphql::ComplexObject]
 impl QueueItem {
+    /// The job's torrent as the torrent list's rows show it; null for an
+    /// NZB job, for a torrent whose row is not yet published, and while the
+    /// torrent client is not running. Its
+    /// files, peer connections and unpacked files are read on
+    /// `torrent(id)`, and asking for them here is refused.
+    async fn torrent(
+        &self,
+        ctx: &async_graphql::Context<'_>,
+    ) -> async_graphql::Result<Option<crate::torrents::types::TorrentGql>> {
+        if self.protocol != ProtocolGql::Torrent {
+            return Ok(None);
+        }
+        crate::torrents::queue_torrent(ctx, &self.torrent_rows, self.id)
+    }
     /// The job's attributes. An RSS job's item link and id are among them
     /// for an admin only.
     async fn attributes(&self, ctx: &async_graphql::Context<'_>) -> Vec<Attribute> {
@@ -1726,6 +1746,7 @@ fn queue_item_from_display(
         attention: attention_for_live_job(info, state),
         duplicate_summary: None,
         disk_write: None,
+        torrent_rows: Default::default(),
     }
 }
 
@@ -1780,6 +1801,7 @@ pub fn queue_item_from_submission(
         attention: None,
         duplicate_summary: None,
         disk_write: None,
+        torrent_rows: Default::default(),
     }
 }
 

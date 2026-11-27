@@ -1907,8 +1907,14 @@ export const TORRENT_ROUTES_QUERY = gql`
       key
       scopes {
         scope
-        id
-        name
+        category {
+          id
+          name
+        }
+        trackerRule {
+          id
+          name
+        }
       }
       open
       listenAddress
@@ -2124,7 +2130,7 @@ export const TORRENT_UPDATES_SUBSCRIPTION = gql`
         result
         reason
       }
-      route
+      routeKey
       routeConsumer
       sequential
       firstLastPieceFirst
@@ -3511,12 +3517,6 @@ export const SET_UNACCEPTABLE_EXTENSIONS_MUTATION = gql`
 export const SET_UNWANTED_EXTENSION_ACTION_MUTATION = gql`
   mutation SetUnwantedExtensionAction($action: UnwantedExtensionAction!) {
     setUnwantedExtensionAction(action: $action)
-  }
-`;
-
-export const VALIDATED_ARCHIVE_PASSWORD_QUERY = gql`
-  query ValidatedArchivePassword($id: Int!) {
-    validatedArchivePassword(id: $id)
   }
 `;
 

@@ -16,14 +16,16 @@ use weaver_server_core::torrents::service::{
 };
 use weaver_server_core::torrents::sessions::TorrentRouteReason;
 use weaver_server_core::torrents::sessions::{PortMapped, PortmapProtocol, PortmapTransport};
-use weaver_server_core::torrents::status::Stated;
+use weaver_server_core::torrents::status::{self, Stated};
 use weaver_server_core::torrents::{
     ConnectionKind, Encryption, FetchPhase, FilePriority, NamedBy, PeerInfo, PeerSourceFlag,
-    TorrentState, TorrentTracker, TorrentVersion, TrackerStatus, UnpackEnd, UnpackResult,
+    TorrentState, TorrentTracker, TorrentVersion, TrackerStatus, UnpackCause, UnpackEnd, UnpackResult,
     UnpackedFile, redacted_tracker_url,
 };
 
-use crate::auth::graphql_error;
+use crate::auth::{AdminGuard, graphql_error};
+use crate::observability::with_timed_config_read;
+use weaver_server_core::settings::SharedConfig;
 use crate::jobs::types::{decode_offset_cursor, encode_offset_cursor, ms_to_datetime};
 use crate::networking::ResolvedBy;
 use crate::settings::types::{
@@ -240,26 +242,56 @@ pub enum TorrentRouteScopeGql {
 }
 
 /// A scope that runs on a torrent route: the default, or a category or
-/// tracker rule by its id and name.
+/// tracker rule.
 #[derive(Clone, Debug, SimpleObject)]
-#[graphql(name = "TorrentRouteUse")]
+#[graphql(name = "TorrentRouteUse", complex)]
 pub struct TorrentRouteUseGql {
     /// What kind of scope it is.
     pub scope: TorrentRouteScopeGql,
-    /// The category's or tracker rule's id; absent for the default.
-    pub id: Option<u32>,
-    /// The category's or tracker rule's name; absent for the default.
-    pub name: Option<String>,
+    #[graphql(skip)]
+    pub of: TorrentScope,
+}
+
+#[ComplexObject]
+impl TorrentRouteUseGql {
+    /// The category, when the scope is a category's: read from the settings
+    /// in memory, only when selected.
+    #[graphql(guard = "AdminGuard")]
+    async fn category(&self, ctx: &Context<'_>) -> Result<Option<crate::categories::types::Category>> {
+        let TorrentScope::Category(id) = self.of else {
+            return Ok(None);
+        };
+        let config = ctx.data::<SharedConfig>()?;
+        Ok(
+            with_timed_config_read(config, "torrents.route_use.category", |cfg| {
+                cfg.categories
+                    .iter()
+                    .find(|category| category.id == id)
+                    .map(crate::categories::types::Category::from)
+            })
+            .await,
+        )
+    }
+
+    /// The tracker rule, when the scope is a tracker rule's: read from the
+    /// rules the torrent service holds in memory, only when selected.
+    #[graphql(guard = "AdminGuard")]
+    async fn tracker_rule(&self, ctx: &Context<'_>) -> Result<Option<crate::settings::types::TrackerRule>> {
+        let TorrentScope::TrackerRule(id) = self.of else {
+            return Ok(None);
+        };
+        Ok(super::service(ctx)?.tracker_rule(id).map(Into::into))
+    }
 }
 
 impl From<(TorrentScope, Option<String>)> for TorrentRouteUseGql {
-    fn from((scope, name): (TorrentScope, Option<String>)) -> Self {
-        let (scope, id) = match scope {
-            TorrentScope::Default => (TorrentRouteScopeGql::Default, None),
-            TorrentScope::Category(id) => (TorrentRouteScopeGql::Category, Some(id)),
-            TorrentScope::TrackerRule(id) => (TorrentRouteScopeGql::TrackerRule, Some(id)),
+    fn from((of, _name): (TorrentScope, Option<String>)) -> Self {
+        let scope = match of {
+            TorrentScope::Default => TorrentRouteScopeGql::Default,
+            TorrentScope::Category(_) => TorrentRouteScopeGql::Category,
+            TorrentScope::TrackerRule(_) => TorrentRouteScopeGql::TrackerRule,
         };
-        Self { scope, id, name }
+        Self { scope, of }
     }
 }
 
@@ -734,6 +766,37 @@ impl From<UnpackResult> for TorrentUnpackResultGql {
     }
 }
 
+/// Why a torrent's unpacking came out short, as a code.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Enum)]
+#[graphql(name = "TorrentUnpackReason")]
+pub enum TorrentUnpackReasonGql {
+    /// The unpacking refused the torrent's files before it ended.
+    Refused,
+    /// It delivered no usable file whole.
+    NothingDelivered,
+    /// What it made was not all placed beside the torrent's files.
+    NotPlaced,
+    /// It delivered in part.
+    DeliveredInPart,
+    /// Files it made were removed for an unwanted extension.
+    UnwantedRemoved,
+    /// A file it made with an unwanted extension could not be removed.
+    UnwantedNotRemoved,
+}
+
+impl From<UnpackCause> for TorrentUnpackReasonGql {
+    fn from(cause: UnpackCause) -> Self {
+        match cause {
+            UnpackCause::Refused => Self::Refused,
+            UnpackCause::NothingDelivered => Self::NothingDelivered,
+            UnpackCause::NotPlaced => Self::NotPlaced,
+            UnpackCause::DeliveredInPart => Self::DeliveredInPart,
+            UnpackCause::UnwantedRemoved => Self::UnwantedRemoved,
+            UnpackCause::UnwantedNotRemoved => Self::UnwantedNotRemoved,
+        }
+    }
+}
+
 /// The unpacked files a page holds when `first` is not given.
 pub const DEFAULT_UNPACKED_FILE_PAGE: usize = 100;
 /// The most unpacked files a page holds.
@@ -754,6 +817,9 @@ pub struct TorrentUnpackingGql {
     pub result: TorrentUnpackResultGql,
     /// Why it is short of whole.
     pub reason: Option<String>,
+    /// Why it is short of whole, as a code; absent for a whole unpacking,
+    /// and for one that ended before the code was kept.
+    pub reason_code: Option<TorrentUnpackReasonGql>,
 }
 
 #[ComplexObject]
@@ -862,6 +928,48 @@ pub(crate) fn page_args(
     let offset =
         decode_offset_cursor(after).map_err(|message| graphql_error("CURSOR_INVALID", message))?;
     Ok((offset, first.map_or(default, |first| first as usize).min(max)))
+}
+
+/// Which seeding goal a `TorrentSeedingGoal` measures.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Enum)]
+#[graphql(name = "TorrentSeedingGoalKind")]
+pub enum TorrentSeedingGoalKindGql {
+    /// Its share ratio.
+    Ratio,
+    /// Its time seeding, in minutes.
+    SeedTime,
+    /// Its time with no payload sent or received, in minutes.
+    InactiveTime,
+}
+
+/// One seeding goal in force and how far the torrent is toward it.
+#[derive(Clone, Debug, PartialEq, SimpleObject)]
+#[graphql(name = "TorrentSeedingGoal")]
+pub struct TorrentSeedingGoalGql {
+    /// What it measures.
+    pub kind: TorrentSeedingGoalKindGql,
+    /// Whether it is met.
+    pub met: bool,
+    /// Where the torrent is: a ratio, or whole minutes. The inactive time is
+    /// 0 while there has been no activity.
+    pub current: f64,
+    /// The goal: a ratio, or minutes.
+    pub target: f64,
+}
+
+impl From<status::GoalProgress> for TorrentSeedingGoalGql {
+    fn from(goal: status::GoalProgress) -> Self {
+        Self {
+            kind: match goal.kind {
+                status::GoalKind::Ratio => TorrentSeedingGoalKindGql::Ratio,
+                status::GoalKind::SeedTime => TorrentSeedingGoalKindGql::SeedTime,
+                status::GoalKind::InactiveTime => TorrentSeedingGoalKindGql::InactiveTime,
+            },
+            met: goal.met,
+            current: goal.current,
+            target: goal.target,
+        }
+    }
 }
 
 /// One page of `torrents`.
@@ -983,6 +1091,12 @@ pub struct TorrentGql {
     pub save_path: Option<String>,
     #[graphql(skip)]
     pub seeding_left: Option<String>,
+    /// Each seeding goal in force, in the order ratio, seed time, inactive
+    /// time; empty for a torrent with no goal.
+    pub seeding_goals: Vec<TorrentSeedingGoalGql>,
+    /// Whether its seeding goals are met by the terms' mode, any or all;
+    /// false for a torrent with no goal.
+    pub seeding_goal_met: bool,
     /// The torrent's own seeding terms; absent when it inherits every one.
     pub seeding_override: Option<SeedingPolicySettings>,
     /// The seeding terms in effect.
@@ -993,8 +1107,12 @@ pub struct TorrentGql {
     pub unpack: bool,
     /// The torrent's own unpack; absent inherits.
     pub unpack_override: Option<bool>,
-    /// The networking route it takes, by its key, when one is resolved.
-    pub route: Option<String>,
+    /// Whether its download is complete and its unpacking, where one
+    /// applies, is over, whatever its result.
+    pub content_ready: bool,
+    /// The networking route it takes, by its key (`TorrentRoute.key`), when
+    /// one is resolved.
+    pub route_key: Option<String>,
     /// The networking route the torrent takes, by its consumer key:
     /// `torrent:default`, `torrent:category:<id>` or `torrent:tracker:<id>`.
     pub route_consumer: String,
@@ -1028,6 +1146,7 @@ impl TorrentGql {
             id: self.id,
             result: end.result.into(),
             reason: end.why.clone(),
+            reason_code: end.cause.map(Into::into),
         })
     }
 
@@ -1157,6 +1276,8 @@ impl TorrentGql {
             storage_dir: view.storage_dir,
             save_path: (!save_path.is_empty()).then_some(save_path),
             seeding_left: view.seeding_left,
+            seeding_goals: view.seeding_goals.into_iter().map(Into::into).collect(),
+            seeding_goal_met: view.seeding_goal_met,
             seeding_override: view.seeding_override.map(Into::into),
             seeding_policy: SeedingTermsGql::of(
                 view.seeding_policy,
@@ -1166,7 +1287,8 @@ impl TorrentGql {
             tracker_rule: view.tracker_rule,
             unpack: view.unpack,
             unpack_override: view.unpack_override,
-            route: view.route,
+            content_ready: view.content_ready,
+            route_key: view.route,
             route_consumer: weaver_server_core::proxies::Consumer::Torrent(view.scope).key(),
             sequential: view.sequential,
             first_last_piece_first: view.first_last_piece_first,
@@ -1376,6 +1498,40 @@ pub struct SubmitTorrentInputGql {
     /// Its own download limit in bytes per second; absent is no limit and 0
     /// lets nothing through.
     pub download_limit_bps: Option<u64>,
+    /// The caller's id for this request, kept with the job as `submitNzb`
+    /// keeps it. A duplicate add with the same id is answered as a replay.
+    pub client_request_id: Option<String>,
+    /// The attributes its job is added with, as `submitNzb` takes them.
+    pub attributes: Option<Vec<crate::jobs::types::AttributeInput>>,
+}
+
+/// How an add of a torrent came out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Enum)]
+#[graphql(name = "SubmitTorrentStatus")]
+pub enum SubmitTorrentStatusGql {
+    /// The torrent was added.
+    Accepted,
+    /// The torrent was already added with the same client request id; it
+    /// is answered as it is, and nothing of it changes.
+    IdempotentReplay,
+    /// The torrent was already added, with another client request id or
+    /// none; nothing was added or changed.
+    Duplicate,
+}
+
+/// What an add of a torrent answers.
+#[derive(SimpleObject)]
+#[graphql(name = "SubmitTorrentResult")]
+pub struct SubmitTorrentResultGql {
+    /// Whether the add stands: true when added, and for a replay of the
+    /// same request.
+    pub accepted: bool,
+    /// How the add came out.
+    pub status: SubmitTorrentStatusGql,
+    /// The torrent added, or the one already added under it.
+    pub torrent: TorrentGql,
+    /// The client request id the add carried.
+    pub client_request_id: Option<String>,
 }
 
 #[cfg(test)]

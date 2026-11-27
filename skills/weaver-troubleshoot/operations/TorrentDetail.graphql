@@ -9,7 +9,7 @@ query TorrentDetail($id: Int!) {
     stateReason
     stateDetail
     routeReason
-    route
+    routeKey
     routeConsumer
     private
     progress
@@ -25,9 +25,18 @@ query TorrentDetail($id: Int!) {
     lastSeenCompleteAt
     activeSeconds
     seedingGoalLeft
+    seedingGoalMet
+    seedingGoals {
+      kind
+      met
+      current
+      target
+    }
+    contentReady
     unpacking {
       result
       reason
+      reasonCode
     }
     trackers {
       tier

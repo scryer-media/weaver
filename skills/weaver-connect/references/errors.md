@@ -55,7 +55,7 @@ useful; never parse it.
 | `TORRENTS_DISABLED` | The torrent client is not running | Report. Torrents are opt-in. |
 | `TORRENTS_UNAVAILABLE` | Torrents cannot be turned on: the server was started without them (`WEAVER_TORRENTS`) | Report; the operator decides. |
 | `TORRENTS_LOADING` | Stored torrents are still being read at start | Ask again once, a little later. |
-| `SEEDING_GOAL_UNMET` | A removal was refused because the seeding goal is not met | Report; the operator decides. |
+| `CONFLICT` | A queue cancel of a private torrent was refused: its seeding goal is not met. `removeTorrent` and `removeTorrents` are never refused for it | Report; the operator decides. |
 
 ## Server faults
 

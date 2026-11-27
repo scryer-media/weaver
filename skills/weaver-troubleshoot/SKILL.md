@@ -29,7 +29,7 @@ extracts and capped searches.
 | `JobEvents` | `jobEvents` | READ |
 | `HistoryPage` | `historyPage` | READ |
 | `ServerHealth` | `serverHealth` | READ |
-| `TorrentsPage` | `torrentPage` | READ |
+| `TorrentsPage` | `torrents` | READ |
 | `TorrentDetail` | `torrent` | READ |
 | `TorrentNetwork` | `torrentPresence`, `torrentRoutes` | READ |
 | `DiskState` | `diskUsage`, `systemInfo` | READ |
@@ -82,7 +82,7 @@ Each file's leading comment gives its purpose and a variables example.
    `after` is `nextCursor`, null on the last page:
 
    ```sh
-   after=$(jq -r '.data.torrentPage.nextCursor // empty' torrents.json)
+   after=$(jq -r '.data.torrents.nextCursor // empty' torrents.json)
    jq -n --arg a "$after" '{first: 25, after: $a}' > vars.json
    ```
 

@@ -71,12 +71,15 @@ impl JobsQuery {
         if ctx.look_ahead().field("duplicateSummary").exists() {
             attach_duplicate_summaries(ctx.data::<Database>()?.clone(), &mut items).await?;
         }
+        if ctx.look_ahead().field("torrent").exists() {
+            crate::torrents::QueueTorrentRows::share(&mut items);
+        }
         Ok(items)
     }
     /// Server-paginated queue rows for the interactive queue table.
     #[graphql(guard = "ReadGuard")]
     async fn queue_page(&self, ctx: &Context<'_>, input: QueuePageInput) -> Result<QueuePage> {
-        build_queue_page(
+        let mut page = build_queue_page(
             ctx.data::<SchedulerHandle>()?,
             ctx.data::<weaver_server_core::SharedPipelineState>()?,
             ctx.data::<crate::jobs::replay::QueueEventReplay>()?,
@@ -85,7 +88,11 @@ impl JobsQuery {
             page_wants(ctx),
             &mut DuplicateSummaryCache::default(),
         )
-        .await
+        .await?;
+        if ctx.look_ahead().field("items").field("torrent").exists() {
+            crate::torrents::QueueTorrentRows::share(&mut page.items);
+        }
+        Ok(page)
     }
     /// Public queue facade for one active item.
     #[graphql(guard = "ReadGuard")]
@@ -143,6 +150,9 @@ impl JobsQuery {
             .exists()
         {
             attach_duplicate_summaries(ctx.data::<Database>()?.clone(), &mut items).await?;
+        }
+        if ctx.look_ahead().field("items").field("torrent").exists() {
+            crate::torrents::QueueTorrentRows::share(&mut items);
         }
         let metrics = handle.get_metrics();
         let latest_cursor = replay.latest_cursor().await;

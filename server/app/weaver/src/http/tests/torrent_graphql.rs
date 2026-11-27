@@ -281,13 +281,13 @@ async fn a_server_running_torrents_takes_a_metainfo_and_lists_it() {
     let submitted = graphql(
         &app,
         &format!(
-            r#"mutation {{ submitTorrent(input: {{ source: {{ metainfoBase64: "{}" }} }}) {{ id name totalBytes }} }}"#,
+            r#"mutation {{ submitTorrent(input: {{ source: {{ metainfoBase64: "{}" }} }}) {{ torrent {{ id name totalBytes }} }} }}"#,
             metainfo("one.mkv", 3000)
         ),
     )
     .await;
     assert_eq!(submitted.get("errors"), None, "{submitted}");
-    let torrent = &submitted["data"]["submitTorrent"];
+    let torrent = &submitted["data"]["submitTorrent"]["torrent"];
     assert_eq!(torrent["name"], "one.mkv");
     assert_eq!(torrent["totalBytes"], 3000);
     let id = torrent["id"].as_u64().unwrap();
@@ -313,13 +313,13 @@ async fn a_torrent_submitted_in_a_category_there_is_none_of_makes_it() {
         let submitted = graphql(
             &app,
             &format!(
-                r#"mutation {{ submitTorrent(input: {{ source: {{ metainfoBase64: "{}" }}, category: "{category}" }}) {{ name category }} }}"#,
+                r#"mutation {{ submitTorrent(input: {{ source: {{ metainfoBase64: "{}" }}, category: "{category}" }}) {{ torrent {{ name category }} }} }}"#,
                 metainfo(name, 3000)
             ),
         )
         .await;
         assert_eq!(submitted.get("errors"), None, "{submitted}");
-        assert_eq!(submitted["data"]["submitTorrent"]["category"], "films");
+        assert_eq!(submitted["data"]["submitTorrent"]["torrent"]["category"], "films");
     }
     let listed = graphql(&app, "{ categories { name destDir } }").await;
     assert_eq!(listed.get("errors"), None, "{listed}");
@@ -363,13 +363,13 @@ async fn empty_seeding_terms_inherit_the_global_policy() {
     let submitted = graphql(
         &app,
         &format!(
-            r#"mutation {{ submitTorrent(input: {{ source: {{ metainfoBase64: "{}" }}, seeding: {{}} }}) {{ id {seeding} }} }}"#,
+            r#"mutation {{ submitTorrent(input: {{ source: {{ metainfoBase64: "{}" }}, seeding: {{}} }}) {{ torrent {{ id {seeding} }} }} }}"#,
             metainfo("one.mkv", 3000)
         ),
     )
     .await;
     assert_eq!(submitted.get("errors"), None, "{submitted}");
-    let torrent = &submitted["data"]["submitTorrent"];
+    let torrent = &submitted["data"]["submitTorrent"]["torrent"];
     inherits(torrent);
     let id = torrent["id"].as_u64().unwrap();
     let read = |app: Router| async move {

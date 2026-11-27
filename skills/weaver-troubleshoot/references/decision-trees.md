@@ -152,7 +152,7 @@ its own. Report it and stop.
    - `disk_space` → waits for room; resumes by itself when room is made.
    - A `configuredStorage` `error` → the folder could not be read
      (unmounted drive, permissions).
-   - Torrent `stated` `DISK_FULL` → a write found no room; it keeps
+   - Torrent `stateReason` `DISK_FULL` → a write found no room; it keeps
      seeding.
 3. Slow disk: `jq '.data.systemInfo.volumes[]' disk.json`. `storageKind`
    `platter` or `network` with `bufferedBytes` near `bufferLimitBytes` → the
@@ -181,8 +181,8 @@ decides.
    ```sh
    jq -n '{first: 25}' > vars.json
    sh "$G" "$O"/TorrentsPage.graphql vars.json > torrents.json
-   jq -r '.data.torrentPage.items[] | [.id, .state, (.stated // "-"), (.routeReason // "-"), .private,
-     .peers, (.swarmSeeds // "-"), .name[0:50]] | @tsv' torrents.json
+   jq -r '.data.torrents.items[] | [.id, .state, (.stateReason // "-"), (.routeReason // "-"), .private,
+     .connectedPeers, (.swarmSeeds // "-"), .name[0:50]] | @tsv' torrents.json
    jq -n --argjson id 42 '{id: $id}' > vars.json
    sh "$G" "$O"/TorrentDetail.graphql vars.json > torrent.json
    jq -r '.data.torrent.trackers[] | [.tier, .status, .fails, (.message // "")[0:120]] | @tsv' torrent.json
@@ -194,11 +194,11 @@ decides.
      adds one in its tracker rule.
    - `FILES_MISSING` → its files are not where they were (drive not
      mounted).
-   - `FETCHING_METADATA` with `stated` `FETCH_WAITING` → no peer named that
+   - `FETCHING_METADATA` with `stateReason` `FETCH_WAITING` → no peer named that
      may serve the metadata.
    - Every tracker `NOT_WORKING`, `UNREACHABLE` or `TRACKER_ERROR` → quote
      the tracker `message`. A private torrent has no other peer source.
    - Trackers `WORKING` but `swarmSeeds` 0 → no seeder exists. Not a Weaver
      fault.
-   - Trackers `WORKING`, seeders exist, `peers` 0, route `exposure.inbound`
+   - Trackers `WORKING`, seeders exist, `connectedPeers` 0, route `exposure.inbound`
      false → peers cannot connect in; report the route.

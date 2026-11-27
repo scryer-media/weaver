@@ -925,6 +925,36 @@
       "rationale": "The server API tests cover it; no release spec calls it."
     },
     {
+      "name": "recheckTorrents",
+      "owner": "torrents",
+      "oracle": "unit-only",
+      "rationale": "The server API tests cover it; no release spec calls it."
+    },
+    {
+      "name": "setTorrentsForced",
+      "owner": "torrents",
+      "oracle": "unit-only",
+      "rationale": "The server API tests cover it; no release spec calls it."
+    },
+    {
+      "name": "setTorrentsRateLimits",
+      "owner": "torrents",
+      "oracle": "unit-only",
+      "rationale": "The server API tests cover it; no release spec calls it."
+    },
+    {
+      "name": "setTorrentsSeeding",
+      "owner": "torrents",
+      "oracle": "unit-only",
+      "rationale": "The server API tests cover it; no release spec calls it."
+    },
+    {
+      "name": "removeTorrents",
+      "owner": "torrents",
+      "oracle": "unit-only",
+      "rationale": "The server API tests cover it; no release spec calls it."
+    },
+    {
       "name": "removeTorrentTrackers",
       "owner": "torrents",
       "oracle": "unit-only",

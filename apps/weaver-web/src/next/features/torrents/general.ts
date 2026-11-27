@@ -198,7 +198,7 @@ function allInformationFields(
     {
       key: "route",
       label: t("next.torrent.route"),
-      value: text(torrent.route),
+      value: text(torrent.routeKey),
     },
     {
       key: "unpack",

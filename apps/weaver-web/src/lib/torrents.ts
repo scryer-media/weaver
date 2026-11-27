@@ -301,7 +301,8 @@ export interface TorrentData extends TorrentSummaryData {
   unpackOverride: boolean | null;
   /** How its unpacking came out, once over; null while it runs or with nothing to unpack. */
   unpacking: TorrentUnpackingData | null;
-  route: string | null;
+  /** The key of the torrent route it runs on, as `TorrentRoute.key`. */
+  routeKey: string | null;
   /** The networking route it takes, by consumer key: `torrent:default`, `torrent:category:<id>` or `torrent:tracker:<id>`. */
   routeConsumer: string;
   /** Whether its pieces are fetched in order. */

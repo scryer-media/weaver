@@ -148,7 +148,7 @@ was over the memory profile's ceiling.
 | `NEEDS_CERTIFICATE` | An SSL torrent with no certificate: connects to no peer, announces nowhere |
 | `FILES_MISSING` | None of its files were there at load (e.g. a drive not mounted). A start, recheck or move looks again |
 
-`stated` (`TorrentStatedReason`): `DISK_SPACE`, `DISK_TOO_SMALL`,
+`stateReason` (`TorrentStateReason`): `DISK_SPACE`, `DISK_TOO_SMALL`,
 `DISK_FULL` (a write found no room; fetches nothing, keeps seeding),
 `GOAL_MET`, `HELD_MANUAL`, `HELD_SCHEDULED`, `HELD_SPEED_TEST`,
 `FETCH_TRACKERS` (metadata from trackers only), `FETCH_DISCOVERY` (trackers,
@@ -184,3 +184,13 @@ exists; `running` means one is not paused or stopped; `windingDown` means
 torrents are off and the running ones are let finish.
 
 `unpacking.result`: `WHOLE`, `PART`, `FAILED`, `REFUSED`, with `reason`.
+`unpacking.reasonCode` (`TorrentUnpackReason`), null for `WHOLE`: `REFUSED`,
+`NOTHING_DELIVERED`, `NOT_PLACED`, `DELIVERED_IN_PART`, `UNWANTED_REMOVED`
+(files made with an unwanted extension were removed), `UNWANTED_NOT_REMOVED`
+(one could not be removed). Unpackings that ended before this code existed
+read null.
+
+`contentReady`: the download is complete and its unpacking, where one
+applies, is over, whatever its result. `seedingGoalMet` and `seedingGoals`
+(`RATIO`, `SEED_TIME`, `INACTIVE_TIME`, each with `met`, `current`,
+`target`) say where the torrent stands against its seeding goals.
