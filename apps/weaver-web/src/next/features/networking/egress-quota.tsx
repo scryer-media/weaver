@@ -143,12 +143,13 @@ export function quotaSearchText(t: Translate, egress: EgressQuotaRow): string {
  * first. The usage is the counter that holds transfers back, so this list and
  * what weaver enforces cannot disagree.
  */
-export function useEgressQuotas(t: Translate) {
+export function useEgressQuotas(t: Translate, pause = false) {
   const [{ data, fetching, error }] = useQuery<{
     egressInterfaces: EgressQuotaRow[];
   }>({
     query: EGRESS_QUOTAS_QUERY,
     requestPolicy: "cache-and-network",
+    pause,
   });
   const listed = data?.egressInterfaces ?? [];
   const rows: EgressQuotaRow[] = listed.some(

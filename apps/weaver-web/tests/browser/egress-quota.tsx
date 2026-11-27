@@ -14,6 +14,7 @@ import type {
   NetworkingData,
 } from "@/next/features/networking/data";
 import { EgressPage } from "@/next/features/networking/EgressPage";
+import { SpeedLimitControl } from "@/next/features/SpeedLimitDialog";
 import { nextEn } from "@/next/i18n/en";
 import {
   SettingsShellProvider,
@@ -200,7 +201,13 @@ const client = new Client({
                   ? { networking: { bandwidthSplit: splitState() } }
                   : name === "SetBandwidth"
                     ? { setBandwidth: bandwidth }
-                    : {};
+                    : name === "SetEgressQuota"
+                      ? {
+                          setEgressQuota: {
+                            id: (operation.variables as { id: number }).id,
+                          },
+                        }
+                      : {};
           return fromValue({
             operation,
             data: answer,
@@ -312,6 +319,31 @@ function Fixture() {
     );
   }
   if (screen === "redirect") return <Redirects />;
+  if (screen === "limits") {
+    // The queue header's button, with nothing holding downloads back; `torrents=off` turns torrents off.
+    const idle = blockedBy(null);
+    const off = query.get("torrents") === "off";
+    return (
+      <NextDataContext.Provider
+        value={{
+          ...idle,
+          ...(off
+            ? {
+                torrents: "off",
+                torrentPresence: {
+                  ...idle.torrentPresence,
+                  enabled: false,
+                },
+              }
+            : {}),
+          speedLimit: null,
+          downloadBlock: { ...idle.downloadBlock, kind: "NONE" },
+        }}
+      >
+        <SpeedLimitControl />
+      </NextDataContext.Provider>
+    );
+  }
   return (
     <NextDataContext.Provider value={torrentsOn}>
       <EgressPage
