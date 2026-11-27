@@ -195,19 +195,34 @@ const client = new Client({
           const answer =
             name === "EgressQuotas"
               ? { egressInterfaces: egresses }
-              : name === "Bandwidth"
-                ? { networking: { bandwidth } }
-                : name === "BandwidthSplit"
-                  ? { networking: { bandwidthSplit: splitState() } }
-                  : name === "SetBandwidth"
-                    ? { setBandwidth: bandwidth }
-                    : name === "SetEgressQuota"
-                      ? {
-                          setEgressQuota: {
-                            id: (operation.variables as { id: number }).id,
-                          },
-                        }
-                      : {};
+              : name === "EgressLimits"
+                ? {
+                    // `egresses=one` leaves System alone.
+                    egressInterfaces:
+                      new URLSearchParams(location.search).get("egresses") ===
+                      "one"
+                        ? egresses.filter((egress) => egress.id === 0)
+                        : egresses,
+                  }
+                : name === "Bandwidth"
+                  ? { networking: { bandwidth } }
+                  : name === "BandwidthSplit"
+                    ? { networking: { bandwidthSplit: splitState() } }
+                    : name === "SetBandwidth"
+                      ? { setBandwidth: bandwidth }
+                      : name === "SetEgressQuota"
+                        ? {
+                            setEgressQuota: {
+                              id: (operation.variables as { id: number }).id,
+                            },
+                          }
+                        : name === "UpdateEgress"
+                          ? {
+                              updateEgressInterface: {
+                                id: (operation.variables as { id: number }).id,
+                              },
+                            }
+                          : {};
           return fromValue({
             operation,
             data: answer,

@@ -403,28 +403,26 @@ test("the egress editor saves its limits and caps, and refuses a cap switched on
   await page.close();
 });
 
-test("the limits dialog edits each egress's quota behind a picker and saves every one edited", async () => {
+const inert = (locator) =>
+  locator.evaluate((element) => element.closest("[inert]") !== null);
+
+test("the limits dialog holds the global limits, and each egress's own limits and caps behind Per-egress settings", async () => {
   const { page, errors } = await open("limits");
   await page.getByTitle("Download speed limit", { exact: true }).click();
   const dialog = page.getByRole("dialog", { name: "Limits", exact: true });
+  await dialog.getByText("Global limits", { exact: true }).waitFor();
   assert.equal(await dialog.getByText("persists across restarts").count(), 0);
-  // The quotas start shut behind their header.
+  // What each egress holds starts shut behind its button, and the button goes once clicked.
   const disclose = dialog.getByRole("button", {
-    name: "Adjust bandwidth quotas",
+    name: "Per-egress settings",
     exact: true,
   });
   assert.equal(await disclose.getAttribute("aria-expanded"), "false");
   const picker = dialog.getByRole("button", { name: "Egress", exact: true });
-  assert.equal(
-    await picker.evaluate((element) => element.closest("[inert]") !== null),
-    true,
-  );
+  assert.equal(await inert(picker), true);
   await disclose.click();
-  // The button goes once the quotas are open.
-  assert.equal(
-    await disclose.evaluate((element) => element.closest("[inert]") !== null),
-    true,
-  );
+  assert.equal(await inert(disclose), true);
+  assert.equal(await inert(picker), false);
   const pick = async (name) => {
     await picker.click();
     await page.getByRole("menuitemradio", { name, exact: true }).click();
@@ -432,18 +430,28 @@ test("the limits dialog edits each egress's quota behind a picker and saves ever
   const cap = (name) => dialog.getByRole("switch", { name, exact: true });
   const allowance = (name) =>
     dialog.getByRole("textbox", { name, exact: true });
-  // System leads, with no cap of its own.
+  const rate = (name) => dialog.getByRole("spinbutton", { name, exact: true });
+  // System leads, with no limit or cap of its own.
   assert.equal(await cap("Download cap").getAttribute("aria-checked"), "false");
+  assert.equal(
+    await cap("Download limit").getAttribute("aria-checked"),
+    "false",
+  );
   await pick("LTE standby");
   await dialog.getByText("Used so far: 20.0 GB.", { exact: true }).waitFor();
+  assert.equal(await rate("Download limit").inputValue(), "2");
+  assert.equal(await cap("Upload limit").getAttribute("aria-checked"), "false");
+  await rate("Download limit").fill("4");
   assert.equal(await allowance("Download cap").inputValue(), "20");
   await allowance("Download cap").fill("30");
   // An edit survives a trip to another egress and back.
   await pick("WAN Fiber");
   assert.equal(await allowance("Download cap").inputValue(), "1");
+  assert.equal(await rate("Upload limit").inputValue(), "5");
   await cap("Upload hard cap").click();
   await pick("LTE standby");
   assert.equal(await allowance("Download cap").inputValue(), "30");
+  assert.equal(await rate("Download limit").inputValue(), "4");
   // A cap switched on with nothing typed is refused, and its egress is shown.
   await dialog.getByRole("button", { name: "Apply", exact: true }).click();
   await dialog
@@ -457,32 +465,88 @@ test("the limits dialog edits each egress's quota behind a picker and saves ever
   if (shot("limits")) await dialog.screenshot({ path: shot("limits") });
   await dialog.getByRole("button", { name: "Apply", exact: true }).click();
   await dialog.waitFor({ state: "detached" });
-  const [bandwidth, wan, lte, ...rest] = await sent(page);
+  const [bandwidth, wan, lteRates, lteQuota, ...rest] = await sent(page);
   assert.equal(bandwidth.name, "SetBandwidth");
   assert.equal(rest.length, 0);
   assert.deepEqual(
     [wan.name, wan.variables.id, wan.variables.input.uploadHardBytes],
     ["SetEgressQuota", 1, 50 * GIB],
   );
+  // The egress is sent whole, as its editor sends it, with only the edited limit changed.
+  assert.deepEqual(lteRates, {
+    name: "UpdateEgress",
+    variables: {
+      id: 2,
+      input: {
+        name: "LTE standby",
+        bindingKind: "SOURCE_ADDRESS",
+        interfaceName: null,
+        sourceAddress: "192.0.2.12",
+        enabled: true,
+        downloadBps: 4 * MIB,
+        uploadBps: null,
+      },
+    },
+  });
   assert.deepEqual(
-    [lte.name, lte.variables.id, lte.variables.input.downloadBytes],
+    [
+      lteQuota.name,
+      lteQuota.variables.id,
+      lteQuota.variables.input.downloadBytes,
+    ],
     ["SetEgressQuota", 2, 30 * GIB],
   );
   // The caps left alone go back as they were.
-  assert.equal(lte.variables.input.uploadHardBytes, 2 * GIB);
+  assert.equal(lteQuota.variables.input.uploadHardBytes, 2 * GIB);
   assert.equal(errors.length, 0, errors.join("\n"));
   await page.close();
 });
 
-test("with torrents off the limits dialog hides the upload caps and saves them as they were", async () => {
+test("with System alone the limits dialog offers its caps only, behind Adjust bandwidth caps", async () => {
+  const { page, errors } = await open("limits", { egresses: "one" });
+  await page.getByTitle("Download speed limit", { exact: true }).click();
+  const dialog = page.getByRole("dialog", { name: "Limits", exact: true });
+  const disclose = dialog.getByRole("button", {
+    name: "Adjust bandwidth caps",
+    exact: true,
+  });
+  await disclose.click();
+  assert.equal(await inert(disclose), true);
+  // Nothing to pick, and no speed limit that would repeat the global one.
+  for (const name of ["Egress", "Per-egress settings"]) {
+    assert.equal(await dialog.getByText(name, { exact: true }).count(), 0);
+  }
+  for (const name of ["Download limit", "Upload limit"]) {
+    assert.equal(
+      await dialog.getByRole("switch", { name, exact: true }).count(),
+      0,
+    );
+  }
+  await dialog
+    .getByRole("switch", { name: "Download cap", exact: true })
+    .click();
+  await dialog
+    .getByRole("textbox", { name: "Download cap", exact: true })
+    .fill("100");
+  await dialog.getByRole("button", { name: "Apply", exact: true }).click();
+  await dialog.waitFor({ state: "detached" });
+  const [bandwidth, quota, ...rest] = await sent(page);
+  assert.equal(bandwidth.name, "SetBandwidth");
+  assert.equal(rest.length, 0);
+  assert.deepEqual(
+    [quota.name, quota.variables.id, quota.variables.input.downloadBytes],
+    ["SetEgressQuota", 0, 100 * GIB],
+  );
+  assert.equal(errors.length, 0, errors.join("\n"));
+  await page.close();
+});
+
+test("with torrents off the limits dialog hides every upload limit and cap and saves them as they were", async () => {
   const { page, errors } = await open("limits", { torrents: "off" });
   await page.getByTitle("Download speed limit", { exact: true }).click();
   const dialog = page.getByRole("dialog", { name: "Limits", exact: true });
   await dialog
-    .getByRole("button", {
-      name: "Adjust bandwidth quotas",
-      exact: true,
-    })
+    .getByRole("button", { name: "Per-egress settings", exact: true })
     .click();
   await dialog.getByRole("button", { name: "Egress", exact: true }).click();
   await page
@@ -491,12 +555,19 @@ test("with torrents off the limits dialog hides the upload caps and saves them a
   await dialog
     .getByRole("textbox", { name: "Download cap", exact: true })
     .fill("30");
-  for (const name of ["Upload soft cap", "Upload hard cap", "Upload speed"]) {
+  for (const name of [
+    "Upload soft cap",
+    "Upload hard cap",
+    "Upload speed",
+    "Upload limit",
+  ]) {
     assert.equal(await dialog.getByText(name, { exact: true }).count(), 0);
   }
   await dialog.getByRole("button", { name: "Apply", exact: true }).click();
   await dialog.waitFor({ state: "detached" });
-  const [, lte] = await sent(page);
+  const [, lte, ...rest] = await sent(page);
+  assert.equal(rest.length, 0);
+  assert.equal(lte.name, "SetEgressQuota");
   assert.equal(lte.variables.id, 2);
   assert.equal(lte.variables.input.downloadBytes, 30 * GIB);
   assert.equal(lte.variables.input.uploadHardBytes, 2 * GIB);

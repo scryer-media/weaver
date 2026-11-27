@@ -5,11 +5,13 @@ import { useState } from "react";
 import { useMutation, useQuery } from "urql";
 import {
   BANDWIDTH_QUERY,
+  EGRESS_LIMITS_QUERY,
   SET_BANDWIDTH,
   SET_EGRESS_QUOTA,
+  UPDATE_EGRESS,
 } from "@/graphql/networking";
-import { useTranslate } from "@/lib/context/translate-context";
-import type { Bandwidth, BandwidthSplit } from "@/lib/networking";
+import { useTranslate, type Translate } from "@/lib/context/translate-context";
+import type { Bandwidth, BandwidthSplit, Egress } from "@/lib/networking";
 import { SectionHeader } from "@/next/components/chrome";
 import { PrimaryButton, SecondaryButton } from "@/next/components/controls";
 import { Dialog } from "@/next/components/Dialog";
@@ -17,37 +19,102 @@ import { FormRow } from "@/next/components/rows";
 import { formatRate } from "@/next/data/format";
 import { useNextData } from "@/next/data/next-data";
 import { useTorrentsShown } from "@/next/data/use-torrents-shown";
+import { egressInput } from "@/next/features/networking/data";
 import {
   egressQuotaChanged,
   egressQuotaDraft,
   egressQuotaFields,
   egressQuotaInput,
   egressQuotaProblem,
-  useEgressQuotas,
   type EgressQuotaDraft,
 } from "@/next/features/networking/egress-quota";
 import { LimitControl, SplitControl } from "@/next/features/networking/limits";
-import { FieldRows, Fold } from "@/next/pages/settings/framework";
+import {
+  FieldRows,
+  Fold,
+  type FieldSpec,
+} from "@/next/pages/settings/framework";
+
+/** The egress weaver falls back to; it always exists, so it is always listed. */
+const SYSTEM_EGRESS_ID = 0;
+
+/** An egress as the dialog reads it: what its update sends back, and its caps. */
+type EgressLimits = Pick<
+  Egress,
+  | "id"
+  | "name"
+  | "bindingKind"
+  | "interfaceName"
+  | "sourceAddress"
+  | "enabled"
+  | "downloadBps"
+  | "uploadBps"
+  | "quota"
+  | "quotaUsage"
+>;
+
+/** One egress's own speed limits as edited. */
+type EgressRates = Pick<Egress, "downloadBps" | "uploadBps">;
+
+/** Every egress with its own limits and caps, System first, read only while the dialog is open. */
+function useEgressLimits(t: Translate, open: boolean): EgressLimits[] {
+  const [{ data }] = useQuery<{ egressInterfaces: EgressLimits[] }>({
+    query: EGRESS_LIMITS_QUERY,
+    requestPolicy: "cache-and-network",
+    pause: !open,
+  });
+  const listed = data?.egressInterfaces;
+  if (!listed) {
+    return [];
+  }
+  const rows = listed.some((egress) => egress.id === SYSTEM_EGRESS_ID)
+    ? listed
+    : [
+        {
+          id: SYSTEM_EGRESS_ID,
+          name: t("next.networking.binding.system"),
+          bindingKind: "SYSTEM" as const,
+          interfaceName: null,
+          sourceAddress: null,
+          enabled: true,
+          downloadBps: null,
+          uploadBps: null,
+          quota: undefined,
+          quotaUsage: null,
+        },
+        ...listed,
+      ];
+  return [...rows].sort((left, right) => left.id - right.id);
+}
+
+/** The upload caps: only torrents upload, so with them off these are hidden and saved as they were. */
+const UPLOAD_CAP_FIELDS = [
+  "quota-uploadSoft",
+  "quota-trickle",
+  "quota-uploadHard",
+];
 
 /**
  * The speed limit dialog, opened from the queue header and the rail's
  * Throughput gauge.
  *
- * It writes the same global limits as Settings → Networking → Egress,
- * through `setBandwidth`, so the two never disagree and a limit set here
- * outlives a restart. While torrents are on it holds every limit that page
- * does: download, the split of it between usenet and torrents, and upload.
- * `setBandwidth` replaces both directions, so with torrents off the upload
- * limit is read when the dialog opens and sent back as it was, and the split
- * is left out, which keeps it. The download limit it starts from is the one
- * the live metrics stream carries, so every opener sees a change within a
- * tick without refetching the settings.
+ * Its global limits are the same ones Settings → Networking → Egress holds,
+ * written through `setBandwidth`, so the two never disagree and a limit set
+ * here outlives a restart. While torrents are on it holds every global limit
+ * that page does: download, the split of it between usenet and torrents, and
+ * upload. `setBandwidth` replaces both directions, so with torrents off the
+ * upload limit is read when the dialog opens and sent back as it was, and
+ * the split is left out, which keeps it. The download limit it starts from
+ * is the one the live metrics stream carries, so every opener sees a change
+ * within a tick without refetching the settings.
  *
- * Below the speeds an "Adjust bandwidth quotas" button slides open each
- * egress's quota, one egress at a time behind a picker, with the same fields
- * and `setEgressQuota` as the egress editor. It starts shut each time the
- * dialog opens, and the button goes once they are open. Every egress edited
- * since then is saved on Apply.
+ * Below them a button slides open what each egress holds of its own, with the
+ * same fields and mutations as the egress editor. With more than one egress
+ * it reads "Per-egress settings" and opens a picker, that egress's own speed
+ * limits and its caps. With only System there is nothing to pick and its
+ * speed limits would repeat the global ones, so it reads "Adjust bandwidth
+ * caps" and opens the caps alone. It starts shut each time the dialog opens,
+ * and goes once clicked. Every egress edited since then is saved on Apply.
  */
 export function useSpeedLimitDialog() {
   const t = useTranslate();
@@ -81,21 +148,29 @@ export function useSpeedLimitDialog() {
 
   const scheduled = downloadBlock.scheduledSpeedLimit;
 
-  // Quotas are per egress: one is shown at a time, and every egress edited
-  // since the dialog opened is saved on Apply.
-  const { rows: egresses } = useEgressQuotas(t, !open);
+  // One egress is shown at a time; every egress edited since the dialog opened is saved on Apply.
+  const egresses = useEgressLimits(t, open);
+  const perEgress = egresses.length > 1;
+  const [, updateEgress] = useMutation(UPDATE_EGRESS);
   const [, setEgressQuota] = useMutation(SET_EGRESS_QUOTA);
-  const [quotaEgressId, setQuotaEgressId] = useState(0);
+  const [egressId, setEgressId] = useState(SYSTEM_EGRESS_ID);
   const [quotaEdits, setQuotaEdits] = useState<
     Record<number, EgressQuotaDraft>
   >({});
-  const [savingQuotas, setSavingQuotas] = useState(false);
-  // The quotas stay shut until asked for; nothing can be edited, or refused, before.
-  const [quotaOpen, setQuotaOpen] = useState(false);
-  const quotaEgress =
-    egresses.find((egress) => egress.id === quotaEgressId) ?? egresses[0];
-  const quotaDraft = quotaEgress
-    ? (quotaEdits[quotaEgress.id] ?? egressQuotaDraft(quotaEgress.quota))
+  const [rateEdits, setRateEdits] = useState<Record<number, EgressRates>>({});
+  const [savingEgresses, setSavingEgresses] = useState(false);
+  // Shut until asked for; nothing below can be edited, or refused, before.
+  const [egressOpen, setEgressOpen] = useState(false);
+  const egress =
+    egresses.find((candidate) => candidate.id === egressId) ?? egresses[0];
+  const quotaDraft = egress
+    ? (quotaEdits[egress.id] ?? egressQuotaDraft(egress.quota))
+    : null;
+  const rates: EgressRates | null = egress
+    ? (rateEdits[egress.id] ?? {
+        downloadBps: egress.downloadBps,
+        uploadBps: egress.uploadBps,
+      })
     : null;
 
   const openDialog = () => {
@@ -103,7 +178,8 @@ export function useSpeedLimitDialog() {
     setUploadEdit(undefined);
     setSplitEdit(undefined);
     setQuotaEdits({});
-    setQuotaOpen(false);
+    setRateEdits({});
+    setEgressOpen(false);
     setError(null);
     setOpen(true);
   };
@@ -113,18 +189,14 @@ export function useSpeedLimitDialog() {
       return;
     }
     setError(null);
-    const edited = egresses.filter(
-      (egress) => quotaEdits[egress.id] !== undefined,
-    );
-    const changed = edited.filter((egress) =>
-      egressQuotaChanged(quotaEdits[egress.id]!, egress.quota),
-    );
     // A cap switched on with nothing typed saves as no cap, so it reads as unchanged: check every edit.
-    const invalid = edited.find(
-      (egress) => egressQuotaProblem(t, quotaEdits[egress.id]!) !== null,
+    const invalid = egresses.find(
+      (candidate) =>
+        quotaEdits[candidate.id] !== undefined &&
+        egressQuotaProblem(t, quotaEdits[candidate.id]!) !== null,
     );
     if (invalid) {
-      setQuotaEgressId(invalid.id);
+      setEgressId(invalid.id);
       setError(egressQuotaProblem(t, quotaEdits[invalid.id]!));
       return;
     }
@@ -138,46 +210,136 @@ export function useSpeedLimitDialog() {
       setError(result.error?.message ?? t("next.speedLimit.saveFailed"));
       return;
     }
-    setSavingQuotas(true);
+    setSavingEgresses(true);
     try {
-      for (const egress of changed) {
-        const quota = await setEgressQuota({
-          id: egress.id,
-          input: egressQuotaInput(quotaEdits[egress.id]!),
-        });
-        if (quota.error || !quota.data?.setEgressQuota) {
-          setQuotaEgressId(egress.id);
-          setError(quota.error?.message ?? t("next.speedLimit.saveFailed"));
+      for (const candidate of egresses) {
+        const rate = rateEdits[candidate.id];
+        const quota = quotaEdits[candidate.id];
+        const failed = async (
+          answer: Promise<{ error?: { message: string }; data?: unknown }>,
+        ) => {
+          const { error: failure, data } = await answer;
+          if (failure || !data) {
+            setEgressId(candidate.id);
+            setError(failure?.message ?? t("next.speedLimit.saveFailed"));
+            return true;
+          }
+          return false;
+        };
+        if (
+          rate &&
+          (rate.downloadBps !== candidate.downloadBps ||
+            rate.uploadBps !== candidate.uploadBps) &&
+          (await failed(
+            updateEgress({
+              id: candidate.id,
+              input: egressInput({ ...candidate, ...rate }),
+            }),
+          ))
+        ) {
+          return;
+        }
+        if (
+          quota &&
+          egressQuotaChanged(quota, candidate.quota) &&
+          (await failed(
+            setEgressQuota({
+              id: candidate.id,
+              input: egressQuotaInput(quota),
+            }),
+          ))
+        ) {
           return;
         }
       }
     } finally {
-      setSavingQuotas(false);
+      setSavingEgresses(false);
     }
     setOpen(false);
   };
 
-  // Only torrents upload: with them off the upload caps are hidden and saved as they were.
-  const quotaFields =
-    quotaEgress && quotaDraft
-      ? egressQuotaFields(
-          t,
-          quotaDraft,
-          (next) =>
-            setQuotaEdits((edits) => ({ ...edits, [quotaEgress.id]: next })),
-          {
-            down: quotaEgress.quotaUsage?.down.usedBytes,
-            up: quotaEgress.quotaUsage?.up.usedBytes,
-          },
-        ).filter(
-          (field) =>
-            torrentsOn ||
-            !["quota-uploadSoft", "quota-trickle", "quota-uploadHard"].includes(
-              field.id,
-            ),
-        )
+  const patchRates = (next: Partial<EgressRates>) => {
+    if (egress && rates) {
+      setRateEdits((edits) => ({
+        ...edits,
+        [egress.id]: { ...rates, ...next },
+      }));
+    }
+  };
+  const rateField = (
+    id: "downloadLimit" | "uploadLimit",
+    label: string,
+    value: number | null,
+    onChange: (next: number | null) => void,
+  ): FieldSpec => ({
+    id,
+    label,
+    control: {
+      kind: "custom",
+      control: (
+        <LimitControl
+          // A fresh control per egress, so a rate switched off comes back as that egress's.
+          key={`${egress?.id}-${id}`}
+          label={label}
+          fieldId={id}
+          value={value}
+          onChange={onChange}
+          suffix="MB/s"
+        />
+      ),
+    },
+  });
+  const egressFields: FieldSpec[] =
+    egress && quotaDraft && rates
+      ? [
+          ...(perEgress
+            ? [
+                {
+                  id: "egress",
+                  label: t("next.networking.egress.section"),
+                  control: {
+                    kind: "select" as const,
+                    value: String(egress.id),
+                    options: egresses.map((candidate) => ({
+                      value: String(candidate.id),
+                      label: candidate.name,
+                    })),
+                    onChange: (id: string) => setEgressId(Number(id)),
+                  },
+                },
+                rateField(
+                  "downloadLimit",
+                  t("next.networking.egress.downloadLimit"),
+                  rates.downloadBps,
+                  (downloadBps) => patchRates({ downloadBps }),
+                ),
+                ...(torrentsOn
+                  ? [
+                      rateField(
+                        "uploadLimit",
+                        t("next.networking.egress.uploadLimit"),
+                        rates.uploadBps,
+                        (next) => patchRates({ uploadBps: next }),
+                      ),
+                    ]
+                  : []),
+              ]
+            : []),
+          ...egressQuotaFields(
+            t,
+            quotaDraft,
+            (next) =>
+              setQuotaEdits((edits) => ({ ...edits, [egress.id]: next })),
+            {
+              down: egress.quotaUsage?.down.usedBytes,
+              up: egress.quotaUsage?.up.usedBytes,
+            },
+          ).filter(
+            (field) => torrentsOn || !UPLOAD_CAP_FIELDS.includes(field.id),
+          ),
+        ]
       : [];
-  const busy = saveState.fetching || savingQuotas;
+  const busy = saveState.fetching || savingEgresses;
 
   const dialog = (
     <Dialog
@@ -196,7 +358,7 @@ export function useSpeedLimitDialog() {
         </>
       }
     >
-      <SectionHeader label={t("next.speedLimit.speed")} sticky={false} />
+      <SectionHeader label={t("next.speedLimit.global")} sticky={false} />
       <FormRow label={t("next.speedLimit.ceiling")}>
         <LimitControl
           key={String(open)}
@@ -234,38 +396,29 @@ export function useSpeedLimitDialog() {
           </FormRow>
         </>
       ) : null}
-      {quotaEgress ? (
+      {egress ? (
         <>
-          {/* The button slides away as the quotas slide open in its place. */}
-          <Fold open={!quotaOpen}>
+          {/* The button slides away as the settings slide open in its place. */}
+          <Fold open={!egressOpen}>
             <div className="flex justify-center border-b border-wv-hairline px-4 py-[14px] sm:px-6">
               <SecondaryButton
-                expanded={quotaOpen}
-                onClick={() => setQuotaOpen(true)}
+                expanded={egressOpen}
+                onClick={() => setEgressOpen(true)}
               >
-                {t("next.speedLimit.adjustQuotas")}
+                {perEgress
+                  ? t("next.speedLimit.perEgress")
+                  : t("next.speedLimit.adjustCaps")}
               </SecondaryButton>
             </div>
           </Fold>
-          <Fold open={quotaOpen}>
-            <FieldRows
-              fields={[
-                {
-                  id: "quota-egress",
-                  label: t("next.networking.egress.section"),
-                  control: {
-                    kind: "select",
-                    value: String(quotaEgress.id),
-                    options: egresses.map((egress) => ({
-                      value: String(egress.id),
-                      label: egress.name,
-                    })),
-                    onChange: (id) => setQuotaEgressId(Number(id)),
-                  },
-                },
-                ...quotaFields,
-              ]}
-            />
+          <Fold open={egressOpen}>
+            {perEgress ? (
+              <SectionHeader
+                label={t("next.speedLimit.perEgress")}
+                sticky={false}
+              />
+            ) : null}
+            <FieldRows fields={egressFields} />
           </Fold>
         </>
       ) : null}
