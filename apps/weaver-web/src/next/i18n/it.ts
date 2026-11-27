@@ -226,8 +226,8 @@ export const nextIt: LocaleDictionary = {
   "next.speedLimit.bySchedule":
     "Limite di velocità impostato da una pianificazione",
   "next.speedLimit.buttonTitle": "Limite di velocità di download",
-  "next.speedLimit.title": "Limite di velocità",
-  "next.speedLimit.note": "resta dopo i riavvii",
+  "next.speedLimit.title": "Limiti",
+  "next.speedLimit.speed": "Velocità",
   "next.speedLimit.ceiling": "Velocità di download",
   "next.speedLimit.ceilingAria": "Limite di velocità in megabyte al secondo",
   "next.speedLimit.upload": "Velocità di upload",

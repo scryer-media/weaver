@@ -403,6 +403,86 @@ test("the egress editor saves its limits and caps, and refuses a cap switched on
   await page.close();
 });
 
+test("the limits dialog edits each egress's quota behind a picker and saves every one edited", async () => {
+  const { page, errors } = await open("limits");
+  await page.getByTitle("Download speed limit", { exact: true }).click();
+  const dialog = page.getByRole("dialog", { name: "Limits", exact: true });
+  await dialog.getByText("Quota", { exact: true }).waitFor();
+  assert.equal(await dialog.getByText("persists across restarts").count(), 0);
+  const picker = dialog.getByRole("button", { name: "Egress", exact: true });
+  const pick = async (name) => {
+    await picker.click();
+    await page.getByRole("menuitemradio", { name, exact: true }).click();
+  };
+  const cap = (name) => dialog.getByRole("switch", { name, exact: true });
+  const allowance = (name) =>
+    dialog.getByRole("textbox", { name, exact: true });
+  // System leads, with no cap of its own.
+  assert.equal(await cap("Download cap").getAttribute("aria-checked"), "false");
+  await pick("LTE standby");
+  await dialog.getByText("Used so far: 20.0 GB.", { exact: true }).waitFor();
+  assert.equal(await allowance("Download cap").inputValue(), "20");
+  await allowance("Download cap").fill("30");
+  // An edit survives a trip to another egress and back.
+  await pick("WAN Fiber");
+  assert.equal(await allowance("Download cap").inputValue(), "1");
+  await cap("Upload hard cap").click();
+  await pick("LTE standby");
+  assert.equal(await allowance("Download cap").inputValue(), "30");
+  // A cap switched on with nothing typed is refused, and its egress is shown.
+  await dialog.getByRole("button", { name: "Apply", exact: true }).click();
+  await dialog
+    .getByText("Set an allowance before switching the quota on.", {
+      exact: true,
+    })
+    .waitFor();
+  assert.equal((await sent(page)).length, 0);
+  assert.equal(await allowance("Download cap").inputValue(), "1");
+  await allowance("Upload hard cap").fill("50");
+  if (shot("limits")) await dialog.screenshot({ path: shot("limits") });
+  await dialog.getByRole("button", { name: "Apply", exact: true }).click();
+  await dialog.waitFor({ state: "detached" });
+  const [bandwidth, wan, lte, ...rest] = await sent(page);
+  assert.equal(bandwidth.name, "SetBandwidth");
+  assert.equal(rest.length, 0);
+  assert.deepEqual(
+    [wan.name, wan.variables.id, wan.variables.input.uploadHardBytes],
+    ["SetEgressQuota", 1, 50 * GIB],
+  );
+  assert.deepEqual(
+    [lte.name, lte.variables.id, lte.variables.input.downloadBytes],
+    ["SetEgressQuota", 2, 30 * GIB],
+  );
+  // The caps left alone go back as they were.
+  assert.equal(lte.variables.input.uploadHardBytes, 2 * GIB);
+  assert.equal(errors.length, 0, errors.join("\n"));
+  await page.close();
+});
+
+test("with torrents off the limits dialog hides the upload caps and saves them as they were", async () => {
+  const { page, errors } = await open("limits", { torrents: "off" });
+  await page.getByTitle("Download speed limit", { exact: true }).click();
+  const dialog = page.getByRole("dialog", { name: "Limits", exact: true });
+  await dialog.getByRole("button", { name: "Egress", exact: true }).click();
+  await page
+    .getByRole("menuitemradio", { name: "LTE standby", exact: true })
+    .click();
+  await dialog
+    .getByRole("textbox", { name: "Download cap", exact: true })
+    .fill("30");
+  for (const name of ["Upload soft cap", "Upload hard cap", "Upload speed"]) {
+    assert.equal(await dialog.getByText(name, { exact: true }).count(), 0);
+  }
+  await dialog.getByRole("button", { name: "Apply", exact: true }).click();
+  await dialog.waitFor({ state: "detached" });
+  const [, lte] = await sent(page);
+  assert.equal(lte.variables.id, 2);
+  assert.equal(lte.variables.input.downloadBytes, 30 * GIB);
+  assert.equal(lte.variables.input.uploadHardBytes, 2 * GIB);
+  assert.equal(errors.length, 0, errors.join("\n"));
+  await page.close();
+});
+
 test("an egress's editor has no DNS of its own: a route's DNS profile says who answers", async () => {
   const { page, errors } = await open("egress");
   await page.getByText("WAN Fiber", { exact: true }).click();

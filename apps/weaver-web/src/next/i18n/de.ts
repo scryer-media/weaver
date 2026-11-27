@@ -231,8 +231,8 @@ export const nextDe: LocaleDictionary = {
   "next.speedLimit.bySchedule":
     "Geschwindigkeitslimit durch einen Zeitplan gesetzt",
   "next.speedLimit.buttonTitle": "Download-Geschwindigkeitslimit",
-  "next.speedLimit.title": "Geschwindigkeitslimit",
-  "next.speedLimit.note": "bleibt nach Neustarts erhalten",
+  "next.speedLimit.title": "Limits",
+  "next.speedLimit.speed": "Geschwindigkeit",
   "next.speedLimit.ceiling": "Download-Geschwindigkeit",
   "next.speedLimit.ceilingAria":
     "Geschwindigkeitslimit in Megabyte pro Sekunde",
