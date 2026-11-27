@@ -227,7 +227,11 @@ fn state(grid: &Grid, block_size: u64, length: u64) -> (Vec<Option<Block>>, Load
     let blocks = (0..=length / block_size.min(length))
         .map(|index| file.and_then(|file| file.block(index)).cloned())
         .collect();
-    (blocks, file.map(|file| file.load).unwrap_or_default(), grid.load)
+    (
+        blocks,
+        file.map(|file| file.load).unwrap_or_default(),
+        grid.load,
+    )
 }
 
 // Out of order, overlapping and said again, with verified and unverified
@@ -267,14 +271,19 @@ fn overlapping_pieces_of_one_delivery_leave_their_stretch_unproven() {
         let mut grid = Grid::default();
         grid.offer_all(MEMBER, block_size, &[piece(0, 600), piece(400, 1024)]);
         let file = &grid.files[&(MEMBER, block_size)];
-        assert!(
-            file.block(0)
-                .is_none_or(|block| overlapping(block, ByteRange::new(400, 600))
-                    .next()
-                    .is_none())
+        assert!(file.block(0).is_none_or(|block| {
+            overlapping(block, ByteRange::new(400, 600))
+                .next()
+                .is_none()
+        }));
+        assert_eq!(
+            grid.fold(MEMBER, block_size, 0, ByteRange::new(0, 1024)),
+            None
         );
-        assert_eq!(grid.fold(MEMBER, block_size, 0, ByteRange::new(0, 1024)), None);
-        assert_eq!(grid.fold(MEMBER, block_size, 0, ByteRange::new(0, 600)), None);
+        assert_eq!(
+            grid.fold(MEMBER, block_size, 0, ByteRange::new(0, 600)),
+            None
+        );
         assert_eq!(file.load, Load::default());
         assert_eq!(grid.load, Load::default());
         // The same bytes delivered again, apart, are proven.

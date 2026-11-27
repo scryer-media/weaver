@@ -1275,9 +1275,11 @@ fn a_run_says_each_files_header_checksum_and_none_for_a_directory() {
     for (at, emit) in emits.iter().enumerate() {
         if let Emit::Checked { member, .. } = emit {
             assert!(matches!(emits[at + 1], Emit::MemberClosed(closed) if closed == *member));
-            assert!(!emits[at + 1..].iter().any(
-                |later| matches!(later, Emit::Bytes { member: of, .. } if of == member)
-            ));
+            assert!(
+                !emits[at + 1..]
+                    .iter()
+                    .any(|later| matches!(later, Emit::Bytes { member: of, .. } if of == member))
+            );
         }
     }
 }
@@ -1303,9 +1305,11 @@ fn a_member_that_fails_its_crc_is_not_said_checked() {
         weaver_graph::Budget::default(),
     );
     assert!(!checksums(&emits).iter().any(|(member, _)| *member == 1));
-    assert!(emits
-        .iter()
-        .any(|emit| matches!(emit, Emit::Retract(member) if member.0 == 1)));
+    assert!(
+        emits
+            .iter()
+            .any(|emit| matches!(emit, Emit::Retract(member) if member.0 == 1))
+    );
 }
 
 // A deflated member reaches the sink in pieces of a quarter megabyte, not

@@ -666,7 +666,11 @@ fn a_seeded_run_hands_out_and_keeps_what_it_always_did() {
         Provenance::Lost => 4,
     };
     let mut arrivals: Vec<(ByteRange, Provenance, bool)> = Vec::new();
-    arrivals.extend(frames(1200, 97).into_iter().map(|range| (range, Provenance::Fresh, false)));
+    arrivals.extend(
+        frames(1200, 97)
+            .into_iter()
+            .map(|range| (range, Provenance::Fresh, false)),
+    );
     for _ in 0..400 {
         let start = next(cipher_len);
         let range = ByteRange::new(start, (start + 1 + next(200)).min(cipher_len));
@@ -703,8 +707,10 @@ fn a_seeded_run_hands_out_and_keeps_what_it_always_did() {
         }
         if step % 97 == 50 {
             let from = block_floor(range.start);
-            out.coverage.erase(ByteRange::new(from.min(plain_len), plain_len));
-            out.padding.forget(plain_len, ByteRange::new(from, cipher_len));
+            out.coverage
+                .erase(ByteRange::new(from.min(plain_len), plain_len));
+            out.padding
+                .forget(plain_len, ByteRange::new(from, cipher_len));
         }
     }
     transcript.extend(rmp_serde::to_vec(&out.padding).unwrap());
