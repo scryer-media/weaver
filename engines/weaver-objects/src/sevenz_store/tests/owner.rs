@@ -317,6 +317,15 @@ impl Owner {
         self.settle();
     }
 
+    // The member's file failed its stated CRC, as the namespace's check of
+    // the file finds it: the store hears it, and what it says is applied.
+    pub fn refuted(&mut self, member: weaver_graph::MemberId) {
+        let mut out = Vec::new();
+        self.object.member_refuted(member, &mut out);
+        self.apply(out);
+        self.settle();
+    }
+
     pub fn held(&self) -> usize {
         self.held.len()
     }

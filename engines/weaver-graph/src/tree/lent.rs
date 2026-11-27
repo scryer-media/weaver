@@ -107,6 +107,10 @@ pub(super) enum Told {
         member: MemberId,
         range: ByteRange,
     },
+    // A member of its namespace whose file failed the checksum it stated.
+    Refuted {
+        member: MemberId,
+    },
     // A password the job offered while the object was out.
     Password(String),
 }
@@ -471,6 +475,26 @@ impl Tree {
         self.reach(node, Told::Lost { volume, range }, builder, effects);
     }
 
+    // A member of the namespace at `node` failed, as its file stands, the
+    // checksum the object there stated for it (`checksum_failed`): the
+    // object hears it, and what it says is applied as if it said it in
+    // `deliver`.
+    pub fn member_refuted(
+        &mut self,
+        node: NodeId,
+        member: MemberId,
+        builder: &mut dyn Builder,
+        effects: &mut Vec<Effect>,
+    ) {
+        let Some(member) = self
+            .namespace(node)
+            .map(|namespace| namespace.resolve(member))
+        else {
+            return;
+        };
+        self.reach(node, Told::Refuted { member }, builder, effects);
+    }
+
     // Keep what reached a lent object for its return; hand it back when the
     // object is in its node.
     pub(super) fn wait(&mut self, node: NodeId, waiting: Waiting) -> Option<Waiting> {
@@ -562,6 +586,7 @@ impl Tree {
                     object.volume_closed(volume, &mut emits);
                 }
                 Told::Lost { volume, range } => object.volume_lost(volume, range, &mut emits),
+                Told::Refuted { member } => object.member_refuted(member, &mut emits),
                 Told::Renamed { volume, name } => object.renamed(volume, &name, &mut emits),
                 Told::Pulled { seek, pull } => object.pulled(seek, pull, &mut emits),
                 Told::Fed {

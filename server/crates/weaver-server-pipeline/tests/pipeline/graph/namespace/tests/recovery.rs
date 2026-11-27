@@ -803,3 +803,182 @@ fn block_cuts_keep_only_the_distinct_boundaries() {
     assert_eq!(cuts.len(), (1 << 18) - 1);
     assert_eq!(cuts.capacity(), cuts.len());
 }
+
+// Builds a real 7z store, and everything else as the job's pretend builder.
+struct RealSevenZip(Build);
+
+impl Builder for RealSevenZip {
+    fn build(&mut self, kind: Kind, id: ObjectId) -> Option<Box<dyn Object>> {
+        match kind {
+            Kind::SevenZipStore => weaver_objects::build(kind, id, weaver_graph::Budget::default()),
+            kind => self.0.build(kind, id),
+        }
+    }
+
+    fn read(
+        &self,
+        tree: &weaver_graph::Tree,
+        node: NodeId,
+        volume: VolumeIndex,
+        placement: &Placement,
+        into: &mut Vec<u8>,
+    ) -> bool {
+        self.0.read(tree, node, volume, placement, into)
+    }
+}
+
+// What a job over one damaged stored 7z member came to, before and after
+// the set beside it repaired it: the root's damage before, and after it
+// whether the member's file is whole, its damage, whether it closed, whether
+// the set read its volume, and what the set ruled.
+#[derive(Debug, PartialEq)]
+struct Repaired7z {
+    damaged_before: Vec<(MemberId, ByteRange)>,
+    whole: bool,
+    inner_damaged: Vec<(MemberId, ByteRange)>,
+    closed: bool,
+    read: bool,
+    ruled: Vec<RepairOutcome>,
+}
+
+// One stored 7z member of more than twice the file run budget, a byte of
+// it wrong, under a set that fixes the byte: its body comes whole, or every
+// other byte first, so the store's fold goes over the budget and only the
+// namespace's check of the member's file can rule it. `Body::ReadBack`
+// leaves the member's file with no fold of its own either, so the check
+// reads it back.
+#[derive(Clone, Copy, PartialEq)]
+enum Body {
+    Whole,
+    Scattered,
+    ReadBack,
+}
+
+fn repaired_7z(body_order: Body) -> (Repaired7z, usize) {
+    use crate::pipeline::tests::engines::harness::payload;
+    let file = payload(2 * 4096 + 16, 61);
+    let mut writer = sevenz_turbo::ArchiveWriter::new(std::io::Cursor::new(Vec::new())).unwrap();
+    writer.set_content_methods(vec![sevenz_turbo::EncoderConfiguration::new(
+        sevenz_turbo::EncoderMethod::COPY,
+    )]);
+    writer
+        .push_archive_entry(
+            sevenz_turbo::ArchiveEntry::new_file("large.bin"),
+            Some(std::io::Cursor::new(file.clone())),
+        )
+        .unwrap();
+    let archive = writer.finish().unwrap().into_inner();
+    let body = ByteRange::at(32, file.len() as u64);
+    let flipped = body.start as usize + 100;
+    assert_eq!(archive[flipped], file[100]);
+    let mut posted = archive.clone();
+    posted[flipped] ^= 0x01;
+    let fixed: &'static [u8] = Box::leak(vec![archive[flipped]].into_boxed_slice());
+    let mut job = Job::new(PLENTY).with_set(Some(Fix {
+        name: "a.7z",
+        read: ByteRange::new(0, archive.len() as u64),
+        fix: (flipped as u64, fixed),
+    }));
+    let member = job.member("a.7z", Some(archive.len() as u64));
+    // The front builds the store; the end header gives it its map.
+    let mut build = RealSevenZip(job.build());
+    let arrival = Arrival {
+        node: NodeId::ROOT,
+        member,
+        offset: 0,
+        bytes: Bytes::copy_from_slice(&posted[..32]).into(),
+        provenance: Provenance::Fresh,
+    };
+    job.writer
+        .deliver(&mut job.tree, &mut build, &Source, arrival, &mut job.out)
+        .expect("deliver");
+    job.send(
+        member,
+        body.end,
+        &posted[body.end as usize..],
+        Provenance::Fresh,
+    );
+    let order: Vec<u64> = match body_order {
+        Body::Whole => vec![body.start],
+        Body::Scattered | Body::ReadBack => (body.start..body.end)
+            .step_by(2)
+            .chain((body.start + 1..body.end).step_by(2))
+            .collect(),
+    };
+    let (node, _) = job.tree.child_of(NodeId::ROOT, member).expect("a 7z");
+    let last = order.len() - 1;
+    for (index, at) in order.into_iter().enumerate() {
+        if index == last && body_order == Body::ReadBack {
+            // The file as a restore hands it back: its bytes, no fold.
+            let inner = job.tree.namespace(node).expect("its namespace");
+            let large = inner.find_by_name("large.bin").expect("the member").id;
+            job.writer
+                .files_mut(node)
+                .leaves
+                .insert(large, Leaf::at(job.dir.path(), "large.bin"));
+        }
+        let end = match body_order {
+            Body::Whole => body.end,
+            Body::Scattered | Body::ReadBack => at + 1,
+        };
+        job.send(
+            member,
+            at,
+            &posted[at as usize..end as usize],
+            Provenance::Fresh,
+        );
+    }
+    // A check the namespace could not make from its fold is read back.
+    let mut read_back = 0;
+    while let Some(check) = job.writer.take_verification(&job.tree) {
+        read_back += 1;
+        let verified = check.run(&Default::default());
+        let mut build = job.build();
+        job.writer
+            .verified(&mut job.tree, &mut build, &Source, verified, &mut job.out)
+            .expect("verified");
+    }
+    job.close(member);
+    let damaged_before = job.root().damaged_ranges().collect();
+    let mut build = job.build();
+    let ruled = job
+        .repair(&mut build, NodeId::ROOT, &[job.set_node()])
+        .into_iter()
+        .map(|(_, outcome)| outcome)
+        .collect();
+    let inner = job.tree.namespace(node).expect("its namespace");
+    let large = inner.find_by_name("large.bin").expect("the member");
+    let closed = large.closed;
+    let inner_damaged = inner.damaged_ranges().collect();
+    let read = job.par.lock().unwrap().read.is_some();
+    let ended = Repaired7z {
+        damaged_before,
+        whole: job.file("large.bin") == file,
+        inner_damaged,
+        closed,
+        read,
+        ruled,
+    };
+    (ended, read_back)
+}
+
+// A stored 7z member whose own fold went over the run budget is ruled by
+// the namespace's check of its file: the store hears the failure and says
+// the damage over its volume as its fold would have, the set beside it
+// repairs the volume, and the job ends as one whose store kept its fold,
+// whether the check folded the file as it was written or read it back.
+#[test]
+fn a_7z_member_refuted_past_its_fold_is_repaired_as_one_its_fold_ruled() {
+    let (folded, read_back) = repaired_7z(Body::Whole);
+    assert_eq!(read_back, 0);
+    assert!(!folded.damaged_before.is_empty(), "{folded:?}");
+    assert!(folded.whole && folded.closed && folded.read, "{folded:?}");
+    assert_eq!(folded.ruled, vec![RepairOutcome::Repaired { slices: 1 }]);
+    assert_eq!(folded.inner_damaged, Vec::new());
+    let (scattered, read_back) = repaired_7z(Body::Scattered);
+    assert_eq!(read_back, 0, "the check folds the file as written");
+    assert_eq!(scattered, folded);
+    let (checked, read_back) = repaired_7z(Body::ReadBack);
+    assert_eq!(read_back, 1, "the check reads the file back");
+    assert_eq!(checked, folded);
+}

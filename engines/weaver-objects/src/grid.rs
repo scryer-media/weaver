@@ -27,7 +27,7 @@ use weaver_graph::{ByteRange, Give, MemberId, Segment, Shelf, SliceVerdict, Take
 // the runs a grid holds past what ordered traffic leaves: a whole member's
 // grid holding one run from its start, as every member read in order ends
 // with, counts against none of them.
-const MAX_PENDING_RUNS_PER_FILE: usize = 4096;
+pub(crate) const MAX_PENDING_RUNS_PER_FILE: usize = 4096;
 const MAX_DERIVED_BLOCKS_PER_FILE: usize = 16_384;
 const MAX_PENDING_RUNS_PER_JOB: usize = 16_384;
 const MAX_DERIVED_BLOCKS_PER_JOB: usize = 65_536;

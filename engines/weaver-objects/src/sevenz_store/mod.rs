@@ -894,6 +894,11 @@ impl Object for SevenZipStore {
         }
     }
 
+    fn member_refuted(&mut self, member: MemberId, out: &mut Vec<Emit>) {
+        self.install(out);
+        self.refuted(member, out);
+    }
+
     fn wants(&self, out: &mut Vec<Seek>) {
         // Nothing is bid before the file's length is known: where its tail
         // lies, and which bytes are past it, follow from that length.

@@ -4063,6 +4063,9 @@ impl NamespaceWriter {
         }
         let mut effects = Vec::new();
         tree.checksum_failed(node, member, &mut effects);
+        // The object that stated the checksum hears the failure, for a
+        // member it closed with no ruling of its own.
+        tree.member_refuted(node, member, &mut self.placing(builder), &mut effects);
         self.apply_each(
             tree,
             builder,
