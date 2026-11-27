@@ -18,6 +18,9 @@ pub struct Database {
     sql_services: DatabaseServices,
     sql_worker: DatabaseRuntimeWorker,
     encryption_key: Option<crate::persistence::encryption::EncryptionKey>,
+    // The torrent listen port the environment pins for this run, handed
+    // over once at start-up. A database never handed one has none.
+    torrent_port_pin: Option<u16>,
     _ephemeral_dir: Option<Arc<tempfile::TempDir>>,
     // How many times the datastore was taken for a statement, read or write.
     #[cfg(any(test, feature = "test-support"))]
@@ -42,6 +45,7 @@ impl Database {
             #[cfg(any(test, feature = "test-support"))]
             datastore_takes: Arc::default(),
             encryption_key: None,
+            torrent_port_pin: None,
             _ephemeral_dir: None,
         })
     }
@@ -201,6 +205,18 @@ impl Database {
     // Set the encryption key used to protect sensitive fields (passwords).
     pub fn set_encryption_key(&mut self, key: crate::persistence::encryption::EncryptionKey) {
         self.encryption_key = Some(key);
+    }
+
+    // Set the torrent listen port the environment pins for this run. The
+    // settings load reports it as the listen port and the save keeps the
+    // stored one as it is.
+    pub fn set_torrent_port_pin(&mut self, pin: Option<u16>) {
+        self.torrent_port_pin = pin;
+    }
+
+    // The torrent listen port the environment pins, if it pins one.
+    pub fn torrent_port_pin(&self) -> Option<u16> {
+        self.torrent_port_pin
     }
 
     // Get a reference to the encryption key, if set.

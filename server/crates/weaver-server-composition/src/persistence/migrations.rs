@@ -199,8 +199,16 @@ impl Database {
                     .and_then(|t| t.get("base_port"))
                     .is_some()
             });
+        // While the environment pins the port, none is drawn: the pin is
+        // listened on and no port is stored for it.
         if !names_port {
-            config.torrent.base_port = self.chosen_base_port()?;
+            match self.torrent_port_pin() {
+                Some(pin) => {
+                    config.torrent.base_port = pin;
+                    config.torrent.base_port_pinned = true;
+                }
+                None => config.torrent.base_port = self.chosen_base_port()?,
+            }
         }
 
         self.save_config(&config)?;

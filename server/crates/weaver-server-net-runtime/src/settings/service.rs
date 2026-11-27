@@ -39,6 +39,25 @@ pub const RETIRED_SETTING_KEYS: &[&str] = &[
 // The torrent listen port. Absent until the first load draws one.
 const BASE_PORT_KEY: &str = "torrent.base_port";
 
+/// The environment variable that pins the torrent listen port for a run.
+/// It is read once at start-up and handed to the database
+/// (`Database::set_torrent_port_pin`); nothing below reads the environment
+/// for it.
+pub const TORRENT_PORT_ENV: &str = "WEAVER_TORRENT_PORT";
+
+/// The torrent listen port `value`, the value of [`TORRENT_PORT_ENV`], pins:
+/// none when it is unset or blank, else the port it names, valid as the
+/// stored port is. Anything else is refused.
+pub fn torrent_port_pin(value: Option<&str>) -> Result<Option<u16>, String> {
+    let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(None);
+    };
+    value
+        .parse()
+        .map(Some)
+        .map_err(|_| format!("{TORRENT_PORT_ENV} must be a port from 0 to 65535, not {value:?}"))
+}
+
 pub trait SettingsServiceInternalQueries {
     fn chosen_base_port(&self) -> Result<u16, StateError>;
 }
@@ -250,7 +269,12 @@ impl SettingsServiceQueries for SqlDatabase {
         let seeding = seeding_policy_from_settings(&settings);
         let upload_cap = parsed_setting(&settings, SEEDING_UPLOAD_CAP);
         let mut torrent = torrent_config_from_settings(&settings);
-        if !settings.contains_key(BASE_PORT_KEY) {
+        // A pinned port is the one listened on; the stored one, present or
+        // not, is left as it is and no port is drawn for it.
+        if let Some(pin) = self.torrent_port_pin() {
+            torrent.base_port = pin;
+            torrent.base_port_pinned = true;
+        } else if !settings.contains_key(BASE_PORT_KEY) {
             torrent.base_port = self.chosen_base_port()?;
         }
 
@@ -330,7 +354,11 @@ impl SettingsServiceQueries for SqlDatabase {
 
     fn save_torrent_config(&self, torrent: &TorrentConfig) -> Result<(), StateError> {
         self.set_setting("torrent.enabled", &torrent.enabled.to_string())?;
-        self.set_setting(BASE_PORT_KEY, &torrent.base_port.to_string())?;
+        // A pinned port is the environment's, not the operator's: the stored
+        // one stays as it is.
+        if !torrent.base_port_pinned {
+            self.set_setting(BASE_PORT_KEY, &torrent.base_port.to_string())?;
+        }
         match torrent.announce_port {
             Some(port) => self.set_setting("torrent.announce_port", &port.to_string())?,
             None => self.delete_setting("torrent.announce_port")?,
@@ -630,6 +658,7 @@ fn torrent_config_from_settings(
     TorrentConfig {
         enabled: parsed_setting(settings, "torrent.enabled").unwrap_or(defaults.enabled),
         base_port: parsed_setting(settings, BASE_PORT_KEY).unwrap_or(defaults.base_port),
+        base_port_pinned: false,
         announce_port: parsed_setting(settings, "torrent.announce_port"),
         upnp: parsed_setting(settings, "torrent.upnp").unwrap_or(defaults.upnp),
         encryption: settings
@@ -697,4 +726,35 @@ fn setting_duplicate_action(
     settings
         .get(key)
         .and_then(|value| DuplicateAction::from_persisted(value))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::torrent_port_pin;
+
+    #[test]
+    fn an_unset_or_blank_torrent_port_pins_nothing() {
+        assert_eq!(torrent_port_pin(None), Ok(None));
+        assert_eq!(torrent_port_pin(Some("")), Ok(None));
+        assert_eq!(torrent_port_pin(Some("  ")), Ok(None));
+    }
+
+    #[test]
+    fn a_torrent_port_pins_the_port_it_names() {
+        assert_eq!(torrent_port_pin(Some("51413")), Ok(Some(51_413)));
+        assert_eq!(torrent_port_pin(Some(" 6881 ")), Ok(Some(6881)));
+        assert_eq!(torrent_port_pin(Some("0")), Ok(Some(0)));
+        assert_eq!(torrent_port_pin(Some("65535")), Ok(Some(65_535)));
+    }
+
+    #[test]
+    fn a_torrent_port_that_is_not_a_port_is_refused() {
+        for value in ["65536", "-1", "port", "6881a", "1.5"] {
+            let error = torrent_port_pin(Some(value)).unwrap_err();
+            assert!(
+                error.starts_with("WEAVER_TORRENT_PORT must be a port"),
+                "{error}"
+            );
+        }
+    }
 }

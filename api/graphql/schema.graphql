@@ -7741,7 +7741,16 @@ type TorrentSeedingTerms {
 
 type TorrentSettings {
 	enabled: Boolean!
+	"""
+	The first route's listen port: the one `WEAVER_TORRENT_PORT` pins
+	while it is set, else the saved one.
+	"""
 	basePort: Int!
+	"""
+	Whether `WEAVER_TORRENT_PORT` pins `basePort` for this run. While it
+	does, a save naming another port is refused (`ENV_PINNED`).
+	"""
+	basePortPinned: Boolean!
 	announcePort: Int
 	upnp: Boolean!
 	encryption: TorrentEncryption!

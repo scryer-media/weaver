@@ -341,6 +341,46 @@ fn a_route_without_a_slot_listens_on_the_first_slots_port() {
     assert_eq!(listen_port(&db, &last, &second).unwrap(), None);
 }
 
+// A listen port pinned by `WEAVER_TORRENT_PORT` is where the first route
+// listens, and what it announces with no announce port set; a further route
+// listens on the next port, as it does from a saved one.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_pinned_listen_port_is_the_first_routes_and_a_further_route_is_offset() {
+    let dir = tempfile::tempdir().unwrap();
+    let pinned = TorrentConfig {
+        base_port: 51_413,
+        base_port_pinned: true,
+        announce_port: None,
+        ..TorrentConfig::default()
+    };
+    let (routes, sessions) = unbound_sessions(dir.path(), pinned);
+    // A listener on loopback announces no port, so the leg's address is
+    // another; `Unbound` binds nothing there.
+    routes.set_leg(
+        LegKind::SourceAddress("192.0.2.1".parse().unwrap()),
+        Arc::new(Unbound),
+    );
+    routes.route(TorrentScope::Default, 1);
+    routes.route(TorrentScope::Category(5), 2);
+    let first = routes.plan(TorrentScope::Default);
+    let second = routes.plan(TorrentScope::Category(5));
+
+    let one = sessions
+        .session(&first, &IDENTITY.identity())
+        .await
+        .unwrap();
+    let two = sessions
+        .session(&second, &IDENTITY.identity())
+        .await
+        .unwrap();
+    let listening = |session: &Arc<Session>| session.listen_addr().map(|listen| listen.port());
+    assert_eq!(listening(&one), Some(51_413));
+    assert_eq!(one.announce_port(), Some(51_413));
+    assert_eq!(listening(&two), Some(51_414));
+    assert_eq!(two.announce_port(), Some(51_414));
+    sessions.stop_all().await;
+}
+
 // A listening route's session announces the configured announce port.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_route_announces_the_configured_port() {

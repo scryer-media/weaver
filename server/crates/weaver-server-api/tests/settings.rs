@@ -1095,6 +1095,63 @@ async fn the_profile_in_force_is_reported_beside_the_choice() {
     assert!(profile["scheduled"].is_null());
 }
 
+// Without `WEAVER_TORRENT_PORT` the listen port is the saved one and is
+// not pinned.
+#[tokio::test]
+async fn an_unpinned_torrent_port_reads_as_not_pinned() {
+    let h = TestHarness::new().await;
+    let resp = h
+        .execute("{ settings { torrent { basePort basePortPinned } } }")
+        .await;
+    assert_no_errors(&resp);
+    let torrent = &response_data(&resp)["settings"]["torrent"];
+    assert_eq!(torrent["basePort"], 6881);
+    assert_eq!(torrent["basePortPinned"], false);
+}
+
+// While the environment pins the listen port, it is the port read, and a
+// save that names that same port is taken without writing the saved port.
+#[tokio::test]
+async fn a_pinned_torrent_port_reads_as_pinned_and_saves_unchanged() {
+    use weaver_server_core::settings::persistence::SettingsPersistenceQueries;
+    let h = TestHarness::new_with_torrent_port_pin(51_413).await;
+    let resp = h
+        .execute("{ settings { torrent { basePort basePortPinned } } }")
+        .await;
+    assert_no_errors(&resp);
+    let torrent = &response_data(&resp)["settings"]["torrent"];
+    assert_eq!(torrent["basePort"], 51413);
+    assert_eq!(torrent["basePortPinned"], true);
+
+    // No port saved: a save naming the pin writes none.
+    let saved = h
+        .execute(
+            "mutation { updateSettings(input: { torrent: { basePort: 51413, maxActiveDownloads: 9 } }) { torrent { basePort basePortPinned maxActiveDownloads } } }",
+        )
+        .await;
+    assert_no_errors(&saved);
+    let torrent = &response_data(&saved)["updateSettings"]["torrent"];
+    assert_eq!(torrent["basePort"], 51413);
+    assert_eq!(torrent["basePortPinned"], true);
+    assert_eq!(torrent["maxActiveDownloads"], 9);
+    assert_eq!(h.db.get_setting("torrent.base_port").unwrap(), None);
+    assert!(h.config.read().await.torrent.base_port_pinned);
+    assert_eq!(h.db.load_config().unwrap().torrent.max_active_downloads, 9);
+
+    // A saved port is kept as it was.
+    h.db.set_setting("torrent.base_port", "6881").unwrap();
+    let saved = h
+        .execute(
+            "mutation { updateSettings(input: { torrent: { basePort: 51413, upnp: false } }) { torrent { basePort } } }",
+        )
+        .await;
+    assert_no_errors(&saved);
+    assert_eq!(
+        h.db.get_setting("torrent.base_port").unwrap().as_deref(),
+        Some("6881")
+    );
+}
+
 #[tokio::test]
 async fn seeding_and_torrent_settings_default_then_persist_and_clear() {
     let h = TestHarness::new().await;
