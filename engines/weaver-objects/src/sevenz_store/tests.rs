@@ -775,6 +775,47 @@ fn a_damaged_member_byte_is_said_at_its_volume_range() {
     )));
 }
 
+// As many one-byte files as the job's pending run budget before a last
+// one: a byte of the last file wrong, delivered in order, is still said as
+// damage at its volume range.
+#[test]
+fn a_member_past_the_job_run_budget_still_says_its_damage() {
+    const MEMBERS: usize = 16_384;
+    let names: Vec<String> = (0..MEMBERS).map(|at| format!("m{at:05}.bin")).collect();
+    let small: Vec<[u8; 1]> = (0..MEMBERS).map(|at| [at as u8]).collect();
+    let last = payload(12, 4096);
+    let mut entries: Vec<_> = names
+        .iter()
+        .zip(&small)
+        .map(|(name, bytes)| (None, Entry::File(name, bytes)))
+        .collect();
+    entries.push((None, Entry::File("last.bin", &last)));
+    let bytes = write(copy(), false, &entries);
+    // The files' bytes lie in order right after the signature header.
+    let flipped = 32 + MEMBERS + 100;
+    assert_eq!(bytes[flipped], last[100]);
+    let mut bad = bytes.clone();
+    bad[flipped] ^= 0x01;
+    let mut owner = Owner::single(store(), bytes.clone());
+    let length = bytes.len() as u64;
+    let mut start = 0;
+    while start < length {
+        let end = (start + 4096).min(length);
+        owner.deliver_as(
+            0,
+            ByteRange::new(start, end),
+            Provenance::Fresh,
+            Some(&bad[start as usize..end as usize]),
+        );
+        start = end;
+    }
+    owner.close(0);
+    assert!(owner.said.iter().any(|emit| matches!(
+        emit,
+        Emit::Damaged { volume: VolumeIndex(0), range } if range.contains(flipped as u64)
+    )));
+}
+
 #[test]
 fn recovery_data_after_the_container_is_said() {
     let mut bytes = archive(copy(), false);

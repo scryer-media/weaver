@@ -2089,3 +2089,76 @@ fn ciphertext_kept_before_the_password_is_deciphered_by_the_loan() {
         assert_eq!(owner.refetched, refetched, "frame {frame}");
     }
 }
+
+// One-byte stored members, as many as the job's pending run budget, and an
+// encrypted member after them: it closes with its bytes, nothing is asked
+// for again and nothing is replayed.
+#[test]
+fn an_encrypted_member_past_the_job_run_budget_closes_without_asking_again() {
+    const MEMBERS: usize = 16_384;
+    let names: Vec<String> = (0..MEMBERS).map(|at| format!("m{at:05}.bin")).collect();
+    let bytes: Vec<[u8; 1]> = (0..MEMBERS).map(|at| [at as u8]).collect();
+    let last = payload(90, 70_003);
+    let options = stored()
+        .with_deprecated_encryption(PASSWORD.as_bytes())
+        .unwrap();
+    let mut entries: Vec<Entry<'_>> = names
+        .iter()
+        .zip(&bytes)
+        .map(|(name, bytes)| Entry::File(name, bytes, stored()))
+        .collect();
+    entries.push(Entry::File("last.bin", &last, options));
+    let archive = write(&entries);
+    let mut owner = Owner::single(Zip::new(), archive.clone());
+    offer(&mut owner, PASSWORD);
+    owner.whole(65_536);
+    let got = owner.member("last.bin");
+    assert!(got.closed);
+    assert!(got.bytes == last);
+    assert!(
+        !owner
+            .said
+            .iter()
+            .any(|emit| matches!(emit, Emit::Again { .. }))
+    );
+    assert_eq!(owner.replays, 0);
+}
+
+// An encrypted member whose grid went past the bound one member's grid
+// holds: it closes on its coverage, asks for nothing again, and every byte
+// it says carries its CRC32. Its deciphered bytes come in order, with the
+// chain's provenance, so they fold into one run: the grid is taken past its
+// bound by runs apart offered to it first.
+#[test]
+fn an_encrypted_member_past_its_run_bound_closes_on_coverage() {
+    let plain = payload(91, 9_000);
+    let archive = encrypted(&plain);
+    let mut owner = Owner::single(Zip::new(), archive.clone());
+    for at in 0..=4096 {
+        owner.object.grid.offer(
+            MemberId(0),
+            crate::grid::WHOLE,
+            &weaver_graph::Segment {
+                range: ByteRange::at(at * 2, 1),
+                crc32: 0,
+                verified: true,
+            },
+        );
+    }
+    assert!(owner.object.grid.dropped(MemberId(0), crate::grid::WHOLE));
+    offer(&mut owner, PASSWORD);
+    owner.whole(4096);
+    assert!(owner.object.grid.dropped(MemberId(0), crate::grid::WHOLE));
+    let got = owner.member("alpha.bin");
+    assert!(got.closed);
+    assert!(got.bytes == plain);
+    assert!(
+        !owner
+            .said
+            .iter()
+            .any(|emit| matches!(emit, Emit::Again { .. }))
+    );
+    assert_eq!(owner.replays, 0);
+    assert!(owner.emitted >= plain.len() as u64);
+    assert_eq!(owner.unproven, 0);
+}

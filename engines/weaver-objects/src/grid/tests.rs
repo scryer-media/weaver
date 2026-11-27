@@ -481,3 +481,84 @@ fn a_restored_grid_counts_its_loads_again() {
     assert_eq!(restored.load, small);
     assert_eq!(restored.load, counted(&restored, Load::of));
 }
+
+// A grid past its member's run bound is dropped: it records nothing more
+// and holds no load, a restart keeps it dropped, and only forgetting the
+// member clears it.
+#[test]
+fn a_grid_past_its_run_bound_stays_dropped_until_forgotten() {
+    let block = 1 << 20;
+    let piece = |at: u64| Segment {
+        range: ByteRange::at(at * 2, 1),
+        crc32: 0,
+        verified: true,
+    };
+    let mut grid = Grid::default();
+    for at in 0..MAX_PENDING_RUNS_PER_FILE as u64 {
+        grid.offer(MEMBER, block, &piece(at));
+    }
+    assert!(!grid.dropped(MEMBER, block));
+    grid.offer(MEMBER, block, &piece(MAX_PENDING_RUNS_PER_FILE as u64));
+    assert!(grid.dropped(MEMBER, block));
+    assert!(!grid.dropped(MEMBER, WHOLE));
+    let bytes = payload(11, 1000);
+    for segment in segments(0, &bytes, 1000, 1000, true) {
+        grid.offer(MEMBER, block, &segment);
+    }
+    let file = &grid.files[&(MEMBER, block)];
+    assert!(file.is_empty());
+    assert_eq!(file.load, Load::default());
+    assert_eq!(grid.load, Load::default());
+    assert_eq!(grid.fold(MEMBER, block, 0, ByteRange::new(0, 1000)), None);
+    let mut restored = round_trip(&grid);
+    assert!(restored.dropped(MEMBER, block));
+    for segment in segments(0, &bytes, 1000, 1000, true) {
+        restored.offer(MEMBER, block, &segment);
+    }
+    assert_eq!(
+        restored.fold(MEMBER, block, 0, ByteRange::new(0, 1000)),
+        None
+    );
+    restored.forget(MEMBER);
+    assert!(!restored.dropped(MEMBER, block));
+    for segment in segments(0, &bytes, 1000, 1000, true) {
+        restored.offer(MEMBER, block, &segment);
+    }
+    assert_eq!(
+        restored.fold(MEMBER, block, 0, ByteRange::new(0, 1000)),
+        Some(Folded {
+            crc32: crc32(&bytes),
+            verified: true,
+        })
+    );
+}
+
+// Facts written before a grid kept whether it was dropped read as grids
+// that were not.
+#[test]
+fn a_grid_from_facts_without_the_mark_is_not_dropped() {
+    #[derive(Serialize)]
+    struct Before {
+        blocks: Shelf<BTreeMap<u64, Block>>,
+        load: Load,
+    }
+    #[derive(Serialize)]
+    struct GridBefore {
+        files: BTreeMap<(MemberId, u64), Before>,
+        load: Load,
+    }
+    let before = GridBefore {
+        files: BTreeMap::from([(
+            (MEMBER, WHOLE),
+            Before {
+                blocks: Shelf::default(),
+                load: Load::default(),
+            },
+        )]),
+        load: Load::default(),
+    };
+    let bytes = rmp_serde::to_vec(&before).expect("encodes");
+    let grid: Grid = rmp_serde::from_slice(&bytes).expect("decodes");
+    assert!(grid.files.contains_key(&(MEMBER, WHOLE)));
+    assert!(!grid.dropped(MEMBER, WHOLE));
+}

@@ -4,9 +4,12 @@
 // Member bytes out. A delivery is routed through the map: a stored entry's
 // data is its member's bytes. Each member closes once its whole extent is
 // covered, and its CRC32 is folded as its bytes pass, so a checksum that
-// fails marks the member's extent damaged for the recovery beside it. Data
-// that arrived before its header placed it, in a range the object kept to
-// read the directory, is said from what was kept.
+// fails marks the member's extent damaged for the recovery beside it. A
+// member whose CRC the grid stopped folding, past its budget, closes on its
+// coverage, encrypted or not, and is asked for nothing again: its checksum
+// is judged where the member closes, against the one the directory said.
+// Data that arrived before its header placed it, in a range the object kept
+// to read the directory, is said from what was kept.
 
 use weaver_graph::{
     Algorithm, ByteRange, Emit, Evidenced, MemberId, Placement, Provenance, Segment, SliceVerdict,
@@ -174,6 +177,7 @@ impl Zip {
             verified: provenance.is_verified(),
         };
         self.grid.offer(member, WHOLE, &segment);
+        let dropped = self.grid.dropped(member, WHOLE);
         out.push(Emit::Bytes {
             member,
             offset,
@@ -222,7 +226,7 @@ impl Zip {
         };
         said.coverage.write(range, provenance);
         if !retry
-            && (!encrypted || verdict == SliceVerdict::Intact)
+            && (!encrypted || verdict == SliceVerdict::Intact || dropped)
             && !said.closed
             && said.coverage.covered(whole)
         {
@@ -246,6 +250,7 @@ impl Zip {
             || (encrypted
                 && crc_known
                 && folded.is_none()
+                && !dropped
                 && self.members[member.0 as usize].coverage.covered(whole))
         {
             let mut extents = Vec::new();
