@@ -734,6 +734,11 @@
       "oracle": "browser"
     },
     {
+      "name": "updateWebAppearance",
+      "owner": "ui-settings-crud",
+      "oracle": "browser"
+    },
+    {
       "name": "updateArchivePasswordSettings",
       "owner": "ui-settings-crud",
       "oracle": "browser"
