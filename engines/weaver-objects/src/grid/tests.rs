@@ -181,3 +181,98 @@ fn a_file_over_its_run_budget_forgets_the_block() {
             .is_none_or(FileGrid::is_empty)
     );
 }
+
+// The supersede the range probe replaced: every run of every block the
+// segment spans is tested against it.
+fn supersede_by_scan(grid: &mut Grid, member: MemberId, block_size: u64, segment: &Segment) {
+    if segment.range.is_empty() {
+        return;
+    }
+    let first = segment.range.start / block_size;
+    let last = (segment.range.end - 1) / block_size;
+    let file = grid.files.entry((member, block_size)).or_default();
+    for index in first..=last {
+        let bounds = block_bounds(index, block_size);
+        let overlaps = file.block(index).is_some_and(|block| {
+            block
+                .values()
+                .any(|run| run.range.intersect(segment.range).is_some())
+        });
+        if overlaps {
+            let (before, after) = file.change(index, |block| {
+                let before = Load::of(block, bounds);
+                block.retain(|_, run| run.range.intersect(segment.range).is_none());
+                (before, Load::of(block, bounds))
+            });
+            file.load.sub(before);
+            file.load.add(after);
+            grid.load.sub(before);
+            grid.load.add(after);
+        }
+    }
+}
+
+fn offer_by_scan(grid: &mut Grid, member: MemberId, block_size: u64, segments: &[Segment]) {
+    for segment in segments {
+        supersede_by_scan(grid, member, block_size, segment);
+    }
+    for segment in segments {
+        grid.record(member, block_size, segment);
+    }
+}
+
+// Every block of the member's grid of `block_size`, and the loads.
+fn state(grid: &Grid, block_size: u64, length: u64) -> (Vec<Option<Block>>, Load, Load) {
+    let file = grid.files.get(&(MEMBER, block_size));
+    let blocks = (0..=length / block_size.min(length))
+        .map(|index| file.and_then(|file| file.block(index)).cloned())
+        .collect();
+    (blocks, file.map(|file| file.load).unwrap_or_default(), grid.load)
+}
+
+// Out of order, overlapping and said again, with verified and unverified
+// pieces, on the whole member's grid and on a grid of small blocks: the
+// probe leaves the runs and loads the scan left, after every delivery.
+#[test]
+fn the_range_probe_supersedes_what_the_scan_did() {
+    const LENGTH: u64 = 4096;
+    let mut seed = 0x9e37_79b9_7f4a_7c15_u64;
+    let mut next = move |bound: u64| {
+        seed = seed
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        (seed >> 33) % bound
+    };
+    let mut deliveries = Vec::new();
+    for _ in 0..2000 {
+        let pieces = 1 + next(3);
+        let mut at = next(LENGTH);
+        let mut delivery = Vec::new();
+        for _ in 0..pieces {
+            let len = 1 + next(300);
+            let end = (at + len).min(LENGTH);
+            if at < end {
+                delivery.push(Segment {
+                    range: ByteRange::new(at, end),
+                    crc32: next(u64::from(u32::MAX)) as u32,
+                    verified: next(4) != 0,
+                });
+            }
+            at = end;
+        }
+        deliveries.push(delivery);
+    }
+    for block_size in [WHOLE, 64, 100] {
+        let mut probed = Grid::default();
+        let mut scanned = Grid::default();
+        for (at, delivery) in deliveries.iter().enumerate() {
+            probed.offer_all(MEMBER, block_size, delivery);
+            offer_by_scan(&mut scanned, MEMBER, block_size, delivery);
+            assert_eq!(
+                state(&probed, block_size, LENGTH),
+                state(&scanned, block_size, LENGTH),
+                "blocks of {block_size}, after delivery {at}"
+            );
+        }
+    }
+}

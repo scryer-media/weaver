@@ -229,15 +229,19 @@ impl Grid {
         let file = self.files.entry((member, block_size)).or_default();
         for index in first..=last {
             let bounds = block_bounds(index, block_size);
-            let overlaps = file.block(index).is_some_and(|block| {
-                block
-                    .values()
-                    .any(|run| run.range.intersect(segment.range).is_some())
-            });
+            let overlaps = file
+                .block(index)
+                .is_some_and(|block| overlapping(block, segment.range).next().is_some());
             if overlaps {
                 let (before, after) = file.change(index, |block| {
                     let before = Load::of(block, bounds);
-                    block.retain(|_, run| run.range.intersect(segment.range).is_none());
+                    loop {
+                        let next = overlapping(block, segment.range).next();
+                        let Some(start) = next.map(|run| run.range.start) else {
+                            break;
+                        };
+                        block.remove(&start);
+                    }
                     (before, Load::of(block, bounds))
                 });
                 file.load.sub(before);
@@ -382,6 +386,22 @@ pub(crate) fn verdict(
 fn block_bounds(index: u64, block_size: u64) -> ByteRange {
     let start = index.saturating_mul(block_size);
     ByteRange::new(start, start.saturating_add(block_size))
+}
+
+// The runs of `block` that `range` overlaps, in offset order. A block's runs
+// are disjoint: a delivery's segments are in order and none overlaps
+// another, and each is superseded before any is recorded. So no run before
+// the one at or before the range's start reaches it, and a probe reads only
+// the runs the range spans.
+fn overlapping(block: &Block, range: ByteRange) -> impl Iterator<Item = &Run> {
+    let from = block
+        .range(..=range.start)
+        .next_back()
+        .map_or(range.start, |(start, _)| *start);
+    block
+        .range(from..range.end.max(from))
+        .map(|(_, run)| run)
+        .filter(move |run| run.range.intersect(range).is_some())
 }
 
 // Insert a run into its block, folding it with a neighbour it abuts and
