@@ -8,7 +8,8 @@ use weaver_server_core::auth::repository::AuthRepositoryQueries;
 use weaver_server_core::settings::persistence::SettingsPersistenceQueries;
 
 use crate::auth::types::{ApiKey, ApiKeyScope, CreateApiKeyResult};
-use crate::auth::{FreshAdminGuard, generate_api_key, hash_api_key};
+use crate::auth::{FreshAdminGuard, generate_api_key, graphql_error, hash_api_key, invalid_input};
+use crate::observability::{spawn_blocking_with, state_error};
 use weaver_server_core::Database;
 use weaver_server_core::auth::{ApiKeyAuthRow, ApiKeyCache, SigningKeys};
 
@@ -35,12 +36,11 @@ impl AuthMutation {
         };
         let db = db.clone();
         let name_clone = name.clone();
-        let id = tokio::task::spawn_blocking(move || {
-            db.insert_api_key(&name_clone, &key_hash, scope_str)
-        })
-        .await
-        .map_err(|e| async_graphql::Error::new(e.to_string()))?
-        .map_err(|e| async_graphql::Error::new(e.to_string()))?;
+        let id = spawn_blocking_with(
+            move || db.insert_api_key(&name_clone, &key_hash, scope_str),
+            state_error,
+        )
+        .await?;
         ctx.data::<ApiKeyCache>()?.upsert(ApiKeyAuthRow {
             key_hash,
             id,
@@ -68,20 +68,14 @@ impl AuthMutation {
     async fn delete_api_key(&self, ctx: &Context<'_>, id: i64) -> Result<Vec<ApiKey>> {
         let db = ctx.data::<Database>()?;
         let db = db.clone();
-        let deleted = tokio::task::spawn_blocking(move || db.delete_api_key(id))
-            .await
-            .map_err(|e| async_graphql::Error::new(e.to_string()))?
-            .map_err(|e| async_graphql::Error::new(e.to_string()))?;
+        let deleted = spawn_blocking_with(move || db.delete_api_key(id), state_error).await?;
 
         if deleted {
             ctx.data::<ApiKeyCache>()?.remove_by_id(id);
             info!(id, "API key deleted");
         }
         let db = ctx.data::<Database>()?.clone();
-        let rows = tokio::task::spawn_blocking(move || db.list_api_keys())
-            .await
-            .map_err(|e| async_graphql::Error::new(e.to_string()))?
-            .map_err(|e| async_graphql::Error::new(e.to_string()))?;
+        let rows = spawn_blocking_with(move || db.list_api_keys(), state_error).await?;
         Ok(rows
             .into_iter()
             .map(|row| ApiKey {
@@ -114,7 +108,8 @@ impl AuthMutation {
 
         let security = ctx.data::<RuntimeSecurityConfig>()?;
         if matches!(security.bind_address_source, BindAddressSource::Environment) {
-            return Err(async_graphql::Error::new(
+            return Err(graphql_error(
+                "ENV_PINNED",
                 "WEAVER_HTTP_BIND_ADDRESS is set in this deployment's environment, \
                  which takes precedence; change it there instead",
             ));
@@ -128,7 +123,7 @@ impl AuthMutation {
         // falls back to loopback with a banner instead of refusing to start,
         // and why this mutation may accept a value the next boot cannot use.
         let (parsed, _) = resolve_bind_address(None, Some(trimmed.as_str()))
-            .map_err(|error| async_graphql::Error::new(error.to_string()))?;
+            .map_err(|error| graphql_error("INVALID_BIND_ADDRESS", error.to_string()))?;
 
         // Refuse a combination strict security will refuse at the next boot,
         // rather than storing a time bomb: under WEAVER_STRICT_SECURITY=1 a
@@ -139,7 +134,8 @@ impl AuthMutation {
                 .snapshot()
                 .is_some();
             if !login_enabled {
-                return Err(async_graphql::Error::new(
+                return Err(graphql_error(
+                    "STRICT_SECURITY",
                     "WEAVER_STRICT_SECURITY=1 refuses a non-loopback bind address while \
                      login is disabled; enable login first",
                 ));
@@ -148,16 +144,17 @@ impl AuthMutation {
 
         let db = ctx.data::<weaver_server_core::Database>()?.clone();
         let stored = trimmed.clone();
-        tokio::task::spawn_blocking(move || {
-            if stored.is_empty() {
-                db.delete_setting(SETTING_HTTP_BIND_ADDRESS)
-            } else {
-                db.set_setting(SETTING_HTTP_BIND_ADDRESS, &stored)
-            }
-        })
-        .await
-        .map_err(|e| async_graphql::Error::new(e.to_string()))?
-        .map_err(|e| async_graphql::Error::new(e.to_string()))?;
+        spawn_blocking_with(
+            move || {
+                if stored.is_empty() {
+                    db.delete_setting(SETTING_HTTP_BIND_ADDRESS)
+                } else {
+                    db.set_setting(SETTING_HTTP_BIND_ADDRESS, &stored)
+                }
+            },
+            state_error,
+        )
+        .await?;
 
         // The one mutation whose effect is invisible until a restart is the
         // one that most needs a log line when someone later asks why the
@@ -169,6 +166,43 @@ impl AuthMutation {
         }
 
         Ok(true)
+    }
+
+    /// Turn the MCP endpoint on or off. Applies to the next request.
+    ///
+    /// Refused when `WEAVER_MCP_ENABLED` is set, rather than stored and
+    /// silently overridden, as the bind address is.
+    #[graphql(guard = "FreshAdminGuard")]
+    async fn set_mcp_enabled(
+        &self,
+        ctx: &Context<'_>,
+        enabled: bool,
+    ) -> Result<crate::auth::types::McpServerStatus> {
+        use weaver_server_core::security::{
+            ENV_MCP_ENABLED, RuntimeSecurityConfig, SETTING_MCP_ENABLED,
+        };
+
+        let security = ctx.data::<RuntimeSecurityConfig>()?;
+        if security.mcp_enabled_env.is_some() {
+            return Err(graphql_error(
+                "ENV_PINNED",
+                format!(
+                    "{ENV_MCP_ENABLED} is set in this deployment's environment, which takes \
+                 precedence; change it there instead"
+                ),
+            ));
+        }
+        let db = ctx.data::<Database>()?.clone();
+        spawn_blocking_with(
+            move || db.set_setting(SETTING_MCP_ENABLED, if enabled { "true" } else { "false" }),
+            state_error,
+        )
+        .await?;
+        // Published after the write commits, so a failed write leaves the
+        // endpoint as it was.
+        security.set_stored_mcp_enabled(enabled);
+        info!(enabled, "MCP endpoint switch changed");
+        Ok(crate::auth::types::McpServerStatus::of(security))
     }
 
     /// Atomically update the authenticated browser policy and optional next
@@ -211,12 +245,12 @@ impl AuthMutation {
         let trusted_networks_json = (!security.trust_env_pinned)
             .then(|| serde_json::to_string(&preview.trusted_networks))
             .transpose()
-            .map_err(|error| async_graphql::Error::new(error.to_string()))?;
+            .map_err(|error| graphql_error("INTERNAL", error.to_string()))?;
         let trusted_proxies_json = (!security.proxies_env_pinned()
             && input.trusted_proxies.is_some())
         .then(|| serde_json::to_string(&preview.trusted_proxies))
         .transpose()
-        .map_err(|error| async_graphql::Error::new(error.to_string()))?;
+        .map_err(|error| graphql_error("INTERNAL", error.to_string()))?;
         let bind_address = if bind_status.editable {
             match input.bind_address.as_deref() {
                 None => NetworkBindAddressUpdate::Unchanged,
@@ -243,21 +277,22 @@ impl AuthMutation {
             .collect();
         let db = ctx.data::<Database>()?.clone();
         let live_security = security.clone();
-        tokio::task::spawn_blocking(move || {
-            let _update_guard = update_guard;
-            db.update_authenticated_network_access(&AuthenticatedNetworkAccessUpdate {
-                trusted_proxies_json,
-                trusted_networks_json,
-                bind_address,
-            })?;
-            // Keep commit and publication together even if the HTTP request is cancelled.
-            live_security.set_authenticated_network_policy(parsed_networks, parsed_proxies);
-            live_security.mark_security_configured();
-            Ok::<_, weaver_server_core::StateError>(())
-        })
-        .await
-        .map_err(|error| async_graphql::Error::new(error.to_string()))?
-        .map_err(|error| async_graphql::Error::new(error.to_string()))?;
+        spawn_blocking_with(
+            move || {
+                let _update_guard = update_guard;
+                db.update_authenticated_network_access(&AuthenticatedNetworkAccessUpdate {
+                    trusted_proxies_json,
+                    trusted_networks_json,
+                    bind_address,
+                })?;
+                // Keep commit and publication together even if the HTTP request is cancelled.
+                live_security.set_authenticated_network_policy(parsed_networks, parsed_proxies);
+                live_security.mark_security_configured();
+                Ok::<_, weaver_server_core::StateError>(())
+            },
+            state_error,
+        )
+        .await?;
 
         // Publish after commit only. Failed writes leave every router clone
         // on the prior policy and make a retry safe.
@@ -286,16 +321,18 @@ impl AuthMutation {
             ));
         }
         if security.trust_env_pinned {
-            return Err(async_graphql::Error::new(
+            return Err(graphql_error(
+                "ENV_PINNED",
                 "WEAVER_TRUSTED_CIDRS is set in this deployment's environment, which takes \
                  precedence; change it there instead",
             ));
         }
         let Some(parsed_mode) = AccessMode::parse_setting_value(&mode) else {
-            return Err(async_graphql::Error::new("unknown access mode"));
+            return Err(invalid_input("unknown access mode"));
         };
         if security.strict_security && !matches!(parsed_mode, AccessMode::LoginRequired) {
-            return Err(async_graphql::Error::new(
+            return Err(graphql_error(
+                "STRICT_SECURITY",
                 "WEAVER_STRICT_SECURITY=1 refuses trusting access modes",
             ));
         }
@@ -307,7 +344,8 @@ impl AuthMutation {
             .snapshot()
             .is_some();
         if matches!(parsed_mode, AccessMode::NoLogin) && login_enabled {
-            return Err(async_graphql::Error::new(
+            return Err(graphql_error(
+                "CONFLICT",
                 "disable login before switching to no-login mode",
             ));
         }
@@ -315,7 +353,7 @@ impl AuthMutation {
         let networks: Vec<String> = match (parsed_mode, trusted_networks) {
             (AccessMode::LoginExceptLocal, Some(entries)) => {
                 if entries.iter().all(|entry| entry.trim().is_empty()) {
-                    return Err(async_graphql::Error::new(
+                    return Err(invalid_input(
                         "trusted networks must not be empty for this access mode",
                     ));
                 }
@@ -336,25 +374,26 @@ impl AuthMutation {
         // Validate through the exact parser startup settles with — one JSON
         // round-trip, all-or-nothing, no second grammar to drift.
         let networks_json = serde_json::to_string(&networks)
-            .map_err(|e| async_graphql::Error::new(e.to_string()))?;
+            .map_err(|e| graphql_error("INTERNAL", e.to_string()))?;
         let parsed_networks =
             weaver_server_core::security::parse_trusted_networks_json(&networks_json)
-                .map_err(|error| async_graphql::Error::new(error.to_string()))?;
+                .map_err(|error| invalid_input(error.to_string()))?;
 
         let db = ctx.data::<weaver_server_core::Database>()?.clone();
         let mode_value = parsed_mode.as_setting_value().to_string();
         let json_for_store = networks_json.clone();
         let store_networks = matches!(parsed_mode, AccessMode::LoginExceptLocal);
-        tokio::task::spawn_blocking(move || {
-            db.set_setting(SETTING_ACCESS_MODE, &mode_value)?;
-            if store_networks {
-                db.set_setting(SETTING_TRUSTED_NETWORKS, &json_for_store)?;
-            }
-            Ok::<_, weaver_server_core::StateError>(())
-        })
-        .await
-        .map_err(|e| async_graphql::Error::new(e.to_string()))?
-        .map_err(|e| async_graphql::Error::new(e.to_string()))?;
+        spawn_blocking_with(
+            move || {
+                db.set_setting(SETTING_ACCESS_MODE, &mode_value)?;
+                if store_networks {
+                    db.set_setting(SETTING_TRUSTED_NETWORKS, &json_for_store)?;
+                }
+                Ok::<_, weaver_server_core::StateError>(())
+            },
+            state_error,
+        )
+        .await?;
 
         security.set_trusted_cidrs(parsed_networks);
         // The stored mode is now a decision, not a default: an operator who
@@ -381,38 +420,38 @@ impl AuthMutation {
             .data::<weaver_server_core::security::RuntimeSecurityConfig>()?
             .authenticated_access_mode()
         {
-            return Err(async_graphql::Error::new(
+            return Err(graphql_error(
+                "CONFLICT",
                 "login is already required; use changePassword to change credentials",
             ));
         }
         if username.is_empty() || password.is_empty() {
-            return Err(async_graphql::Error::new(
-                "username and password must not be empty",
-            ));
+            return Err(invalid_input("username and password must not be empty"));
         }
-        crate::auth::check_password_length(&password).map_err(async_graphql::Error::new)?;
+        crate::auth::check_password_length(&password).map_err(invalid_input)?;
         let permit = weaver_server_core::auth::service::password_work_permit()
             .map_err(|message| crate::auth::guards::graphql_error("AUTH_BUSY", message))?;
-        let hash = tokio::task::spawn_blocking(move || {
-            let _permit = permit;
-            crate::auth::hash_password(&password)
-        })
-        .await
-        .map_err(|e| async_graphql::Error::new(e.to_string()))?
-        .map_err(async_graphql::Error::new)?;
+        // Hashing fails only inside Weaver: a salt or argon2 fault.
+        let hash = spawn_blocking_with(
+            move || {
+                let _permit = permit;
+                crate::auth::hash_password(&password)
+            },
+            |message| graphql_error("INTERNAL", message),
+        )
+        .await?;
         let db = ctx.data::<Database>()?.clone();
         let auth_cache = ctx.data::<crate::auth::LoginAuthCache>()?.clone();
         // The new hash is a new signing key: nothing is stored for it.
         let signing_keys = SigningKeys::for_database(&db)
-            .map_err(|error| async_graphql::Error::new(error.to_string()))?;
+            .map_err(|error| graphql_error("INTERNAL", error.to_string()))?;
         let username_for_db = username.clone();
         let hash_for_db = hash.clone();
-        tokio::task::spawn_blocking(move || {
-            db.set_auth_credentials(&username_for_db, &hash_for_db)
-        })
-        .await
-        .map_err(|e| async_graphql::Error::new(e.to_string()))?
-        .map_err(|e| async_graphql::Error::new(e.to_string()))?;
+        spawn_blocking_with(
+            move || db.set_auth_credentials(&username_for_db, &hash_for_db),
+            state_error,
+        )
+        .await?;
         auth_cache.replace(Some(crate::auth::CachedLoginAuth::new(
             username,
             hash,
@@ -428,16 +467,14 @@ impl AuthMutation {
             .data::<weaver_server_core::security::RuntimeSecurityConfig>()?
             .authenticated_access_mode()
         {
-            return Err(async_graphql::Error::new(
+            return Err(graphql_error(
+                "CONFLICT",
                 "authenticated browser access cannot be downgraded by disabling login",
             ));
         }
         let db = ctx.data::<Database>()?.clone();
         let auth_cache = ctx.data::<crate::auth::LoginAuthCache>()?.clone();
-        tokio::task::spawn_blocking(move || db.clear_auth_credentials())
-            .await
-            .map_err(|e| async_graphql::Error::new(e.to_string()))?
-            .map_err(|e| async_graphql::Error::new(e.to_string()))?;
+        spawn_blocking_with(move || db.clear_auth_credentials(), state_error).await?;
         auth_cache.clear();
         info!("login protection disabled");
         Ok(true)
@@ -450,43 +487,51 @@ impl AuthMutation {
         current_password: String,
         new_password: String,
     ) -> Result<bool> {
-        crate::auth::check_password_length(&new_password).map_err(async_graphql::Error::new)?;
+        crate::auth::check_password_length(&new_password).map_err(invalid_input)?;
         let db = ctx.data::<Database>()?.clone();
         let auth_cache = ctx.data::<crate::auth::LoginAuthCache>()?.clone();
         let db2 = db.clone();
         let creds = auth_cache
             .snapshot()
-            .ok_or_else(|| async_graphql::Error::new("login is not enabled"))?;
+            .ok_or_else(|| graphql_error("LOGIN_NOT_ENABLED", "login is not enabled"))?;
 
         let hash = creds.password_hash.clone();
         let permit = weaver_server_core::auth::service::password_work_permit()
             .map_err(|message| crate::auth::guards::graphql_error("AUTH_BUSY", message))?;
-        let new_hash = tokio::task::spawn_blocking(move || {
-            let _permit = permit;
-            if !crate::auth::verify_password(&current_password, &hash) {
-                return Err("current password is incorrect".to_string());
-            }
-            crate::auth::hash_password(&new_password)
-        })
-        .await
-        .map_err(|e| async_graphql::Error::new(e.to_string()))?
-        .map_err(async_graphql::Error::new)?;
+        // A wrong current password is the caller's; a hash that failed is a
+        // fault inside Weaver.
+        let new_hash = spawn_blocking_with(
+            move || {
+                let _permit = permit;
+                if !crate::auth::verify_password(&current_password, &hash) {
+                    return Err(graphql_error(
+                        "INVALID_PASSWORD",
+                        "current password is incorrect",
+                    ));
+                }
+                crate::auth::hash_password(&new_password)
+                    .map_err(|message| graphql_error("INTERNAL", message))
+            },
+            |error| error,
+        )
+        .await?;
         // The new hash is a new signing key, so every token signed under the
         // old password stops verifying once the cache holds it.
         let signing_keys = SigningKeys::for_database(&db)
-            .map_err(|error| async_graphql::Error::new(error.to_string()))?;
+            .map_err(|error| graphql_error("INTERNAL", error.to_string()))?;
         let username = creds.username.clone();
         let new_hash_for_db = new_hash.clone();
-        tokio::task::spawn_blocking(move || {
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs() as i64;
-            db2.change_auth_credentials_and_revoke_sessions(&username, &new_hash_for_db, now)
-        })
-        .await
-        .map_err(|e| async_graphql::Error::new(e.to_string()))?
-        .map_err(|e| async_graphql::Error::new(e.to_string()))?;
+        spawn_blocking_with(
+            move || {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs() as i64;
+                db2.change_auth_credentials_and_revoke_sessions(&username, &new_hash_for_db, now)
+            },
+            state_error,
+        )
+        .await?;
         auth_cache.replace(Some(crate::auth::CachedLoginAuth::new(
             creds.username,
             new_hash,
@@ -504,10 +549,7 @@ impl AuthMutation {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs() as i64;
-        tokio::task::spawn_blocking(move || db.revoke_all_browser_sessions(now))
-            .await
-            .map_err(|error| async_graphql::Error::new(error.to_string()))?
-            .map_err(|error| async_graphql::Error::new(error.to_string()))?;
+        spawn_blocking_with(move || db.revoke_all_browser_sessions(now), state_error).await?;
         Ok(true)
     }
 }

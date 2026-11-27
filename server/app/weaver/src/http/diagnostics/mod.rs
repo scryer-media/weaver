@@ -47,11 +47,17 @@ mod archive;
 mod bounded;
 mod database_facts;
 mod graphql;
+mod names_cache;
 mod nzb_reports;
 mod pipeline_internals;
 mod redact;
 mod sanitize;
+mod section;
 mod stored_read;
+
+pub(crate) use self::section::{
+    DiagnosticsSection, DiagnosticsSources, MetricsRender, SectionRead, SectionValue,
+};
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -134,6 +140,30 @@ struct HostFacts {
     storage: Vec<HostStorage>,
 }
 
+// The caller a package is built for, or the coded refusal: a package holds
+// the whole server's state, so only an administrator may take one.
+pub(super) async fn admin_caller(
+    request_auth: &super::RequestAuthContext,
+    peer: Option<SocketAddr>,
+    headers: &HeaderMap,
+) -> Result<super::auth::ResolvedCaller, Response> {
+    let caller = super::auth::resolve_caller(
+        &request_auth.db,
+        &request_auth.auth_cache,
+        &request_auth.api_key_cache,
+        request_auth.session_token.0.as_str(),
+        &request_auth.security,
+        super::auth::BrowserSessionPolicy::TrustedPeer(peer),
+        headers,
+    )
+    .await
+    .map_err(|status| super::refusal_response(super::Refused::Caller(status), headers))?;
+    if !caller.scope.is_admin() {
+        return Err(super::refusal_response(super::Refused::Scope, headers));
+    }
+    Ok(caller)
+}
+
 #[allow(
     clippy::too_many_arguments,
     reason = "axum extractors: each runtime surface the package collects arrives as its own layer"
@@ -149,25 +179,16 @@ pub(super) async fn diagnostics_package_handler(
     peer: Option<Extension<ConnectInfo<SocketAddr>>>,
     headers: HeaderMap,
 ) -> Response {
-    let caller = match super::auth::resolve_caller(
-        &request_auth.db,
-        &request_auth.auth_cache,
-        &request_auth.api_key_cache,
-        request_auth.session_token.0.as_str(),
-        &request_auth.security,
-        super::auth::BrowserSessionPolicy::TrustedPeer(
-            peer.map(|Extension(ConnectInfo(peer))| peer),
-        ),
+    let caller = match admin_caller(
+        &request_auth,
+        peer.map(|Extension(ConnectInfo(peer))| peer),
         &headers,
     )
     .await
     {
         Ok(caller) => caller,
-        Err(status) => return status.into_response(),
+        Err(refusal) => return refusal,
     };
-    if !caller.scope.is_admin() {
-        return StatusCode::FORBIDDEN.into_response();
-    }
 
     let generated_at_utc = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
     let filename = archive::archive_filename(&generated_at_utc);
@@ -192,7 +213,7 @@ pub(super) async fn diagnostics_package_handler(
     ) {
         Ok(archive) => archive,
         Err(error) => {
-            return super::error_response(
+            return super::status_error_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 &format!("failed to write diagnostics archive: {error}"),
             );
@@ -231,18 +252,7 @@ async fn collect_components(
 
     // The table is read beside the collection, from its start, so the ten
     // seconds between the Prometheus samples are the read's too.
-    // It takes the queue's names when it begins, so a job that leaves the
-    // queue before its page is read is still known.
-    let read = Arc::new(stored_read::NameRead::new().with_queue({
-        let handle = handle.clone();
-        move || handle.diagnostic_queue_names()
-    }));
-    let read_deadline = tokio::time::Instant::now() + STORED_NAMES_WAIT;
-    let reader = {
-        let db = db.clone();
-        let read = read.clone();
-        tokio::task::spawn_blocking(move || stored_read::read_stored_names(&db, &read))
-    };
+    let names = NameTableRead::start(handle, db);
 
     components.push(Component::text(
         "metrics-1.txt",
@@ -266,53 +276,11 @@ async fn collect_components(
         // package as their report code wrote them, after the stand-in pass.
         let nzb_reports = nzb_reports::collect_nzb_reports(db, handle).await;
 
-        let (data_dir, intermediate_dir, complete_dir, watch_dir) = {
-            let config = config.read().await;
-            (
-                PathBuf::from(&config.data_dir),
-                PathBuf::from(config.intermediate_dir()),
-                PathBuf::from(config.complete_dir()),
-                config
-                    .watch_folder
-                    .path
-                    .as_deref()
-                    .filter(|path| !path.is_empty())
-                    .map(PathBuf::from),
-            )
-        };
-
-        let host_dirs = (
-            data_dir.clone(),
-            intermediate_dir.clone(),
-            complete_dir.clone(),
-        );
-        // Each directory's space and storage class come from the disk owner,
-        // looked at together, each within the owner's time limit.
-        let host_paths = [
-            data_dir.clone(),
-            intermediate_dir.clone(),
-            complete_dir.clone(),
-        ];
-        let host_asks = [
-            (data_dir.clone(), Reach::Exact),
-            (intermediate_dir.clone(), Reach::Exact),
-            (complete_dir.clone(), Reach::Exact),
-        ];
-        let (host_spaces, host_classes) = tokio::join!(
-            StorageCapacity::spaces(Some(disk_space.as_ref()), &host_asks),
-            StorageCapacity::classifications(Some(disk_space.as_ref()), &host_paths),
-        );
-        let host = tokio::task::spawn_blocking(move || {
-            collect_host_facts(host_dirs, host_spaces, host_classes)
-        })
-        .await;
-        components.push(match host {
-            Ok(facts) => Component::json("host.json", &facts),
-            Err(error) => Component::failed("host.json", error),
-        });
+        let dirs = ConfiguredDirs::current(config).await;
+        components.push(collect_host(Some(disk_space.as_ref()), &dirs).await);
 
         components.extend(collect_log_files().await);
-        components.extend(collect_config_files(&data_dir).await);
+        components.extend(collect_config_files(&dirs.data).await);
 
         // The second Prometheus sample is the last thing collected, so the gap
         // between the two is at least the configured one no matter how long the
@@ -321,21 +289,14 @@ async fn collect_components(
         if let Some(remaining) = METRICS_SAMPLE_GAP.checked_sub(elapsed) {
             tokio::time::sleep(remaining).await;
         }
-        (
-            nzb_reports,
-            data_dir,
-            intermediate_dir,
-            complete_dir,
-            watch_dir,
-        )
+        (nzb_reports, dirs)
     };
-    let ((nzb_reports, data_dir, intermediate_dir, complete_dir, watch_dir), phases) =
-        pipeline_internals::sample_turn_phases_while(
-            |now| handle.pipeline_turn(now),
-            pipeline_internals::PHASE_SAMPLE_EVERY,
-            gather,
-        )
-        .await;
+    let ((nzb_reports, dirs), phases) = pipeline_internals::sample_turn_phases_while(
+        |now| handle.pipeline_turn(now),
+        pipeline_internals::PHASE_SAMPLE_EVERY,
+        gather,
+    )
+    .await;
     components.push(phases.component());
     components.push(Component::text(
         "metrics-2.txt",
@@ -344,25 +305,153 @@ async fn collect_components(
 
     // Everything is collected; nothing leaves before the stand-ins replace
     // the names in it.
-    let local = sanitize::LocalNames::current(
-        data_dir,
-        intermediate_dir,
-        complete_dir,
-        watch_dir,
-        disk_space.volume_labels(),
-    );
+    let local = dirs.local_names(disk_space.volume_labels());
+    let names = names.finish(handle, config).await;
+    let (mut components, sanitized) = sanitize_components(components, names, local).await;
+    components.push(nzb_reports);
+    (components, sanitized)
+}
+
+// The stand-in table's read from the database, started beside a collection
+// and finished once it is collected.
+struct NameTableRead {
+    read: Arc<stored_read::NameRead>,
+    deadline: tokio::time::Instant,
+    reader: tokio::task::JoinHandle<()>,
+}
+
+impl NameTableRead {
+    // Takes the queue's names when it begins, so a job that leaves the
+    // queue before its page is read is still known.
+    fn start(handle: &SchedulerHandle, db: &Database) -> Self {
+        let read = Arc::new(stored_read::NameRead::new().with_queue({
+            let handle = handle.clone();
+            move || handle.diagnostic_queue_names()
+        }));
+        let deadline = tokio::time::Instant::now() + STORED_NAMES_WAIT;
+        let reader = {
+            let db = db.clone();
+            let read = read.clone();
+            tokio::task::spawn_blocking(move || stored_read::read_stored_names(&db, &read))
+        };
+        Self {
+            read,
+            deadline,
+            reader,
+        }
+    }
+
     // The read gets until its deadline; what it read by then is the table,
     // and memory covers the rest. A job that joined or left the queue
     // during the collection is not in the read: memory names it where it
     // can, and the guard covers it. A job in no list has no names in the
     // table, and every line naming it is left out.
-    let _ = tokio::time::timeout_at(read_deadline, reader).await;
-    let state = read.finish();
+    async fn finish(
+        self,
+        handle: &SchedulerHandle,
+        config: &SharedConfig,
+    ) -> stored_read::TableNames {
+        let state = self.stored().await;
+        let memory = stored_read::MemoryNames::current(handle, config).await;
+        stored_read::TableNames::from_read(state, memory)
+    }
+
+    // What the read gathered by its deadline, before memory is merged in.
+    async fn stored(self) -> stored_read::ReadState {
+        let _ = tokio::time::timeout_at(self.deadline, self.reader).await;
+        self.read.finish()
+    }
+}
+
+// The stored names for one MCP diagnostics call: those `cache` keeps, read
+// now when it holds none under their lifetime.
+async fn cached_stored_names(
+    cache: &names_cache::StoredNamesCache,
+    handle: &SchedulerHandle,
+    db: &Database,
+) -> Arc<stored_read::ReadState> {
+    cache
+        .get(|| NameTableRead::start(handle, db).stored())
+        .await
+}
+
+// The stand-in table over kept stored names, with the names in memory
+// gathered now, once the call's collection is in, and merged over them.
+async fn table_over(
+    stored: &stored_read::ReadState,
+    handle: &SchedulerHandle,
+    config: &SharedConfig,
+) -> stored_read::TableNames {
     let memory = stored_read::MemoryNames::current(handle, config).await;
-    let names = stored_read::TableNames::from_read(state, memory);
-    let (mut components, sanitized) = sanitize_components(components, names, local).await;
-    components.push(nzb_reports);
-    (components, sanitized)
+    stored_read::TableNames::from_read(stored.clone(), memory)
+}
+
+// The configured directories, as the collection reads them.
+#[derive(Clone)]
+struct ConfiguredDirs {
+    data: PathBuf,
+    intermediate: PathBuf,
+    complete: PathBuf,
+    watch: Option<PathBuf>,
+}
+
+impl ConfiguredDirs {
+    async fn current(config: &SharedConfig) -> Self {
+        let config = config.read().await;
+        Self {
+            data: PathBuf::from(&config.data_dir),
+            intermediate: PathBuf::from(config.intermediate_dir()),
+            complete: PathBuf::from(config.complete_dir()),
+            watch: config
+                .watch_folder
+                .path
+                .as_deref()
+                .filter(|path| !path.is_empty())
+                .map(PathBuf::from),
+        }
+    }
+
+    fn local_names(self, volumes: Vec<String>) -> sanitize::LocalNames {
+        sanitize::LocalNames::current(
+            self.data,
+            self.intermediate,
+            self.complete,
+            self.watch,
+            volumes,
+        )
+    }
+}
+
+// `host.json`. Each directory's space and storage class come from the disk
+// owner, looked at together, each within the owner's time limit.
+async fn collect_host(disk_space: Option<&StorageCapacity>, dirs: &ConfiguredDirs) -> Component {
+    let host_dirs = (
+        dirs.data.clone(),
+        dirs.intermediate.clone(),
+        dirs.complete.clone(),
+    );
+    let host_paths = [
+        dirs.data.clone(),
+        dirs.intermediate.clone(),
+        dirs.complete.clone(),
+    ];
+    let host_asks = [
+        (dirs.data.clone(), Reach::Exact),
+        (dirs.intermediate.clone(), Reach::Exact),
+        (dirs.complete.clone(), Reach::Exact),
+    ];
+    let (host_spaces, host_classes) = tokio::join!(
+        StorageCapacity::spaces(disk_space, &host_asks),
+        StorageCapacity::classifications(disk_space, &host_paths),
+    );
+    let host = tokio::task::spawn_blocking(move || {
+        collect_host_facts(host_dirs, host_spaces, host_classes)
+    })
+    .await;
+    match host {
+        Ok(facts) => Component::json("host.json", &facts),
+        Err(error) => Component::failed("host.json", error),
+    }
 }
 
 // The one sanitizing pass over a collected package, with the table as far

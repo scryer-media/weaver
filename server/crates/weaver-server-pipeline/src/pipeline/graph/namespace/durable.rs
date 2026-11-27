@@ -163,6 +163,7 @@ impl NamespaceWriter {
                     page_out.scratch_offset,
                     &page_out.bytes,
                     None,
+                    false,
                 )?;
             }
             for spill in &spills {

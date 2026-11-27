@@ -133,4 +133,23 @@ fn each_stored_word_of_a_torrent_reads_back_and_keeps_its_text() {
         HistoryEnd::ALL.map(HistoryEnd::as_str),
         ["complete", "failed", "cancelled"]
     );
+
+    // A cause this build does not know reads as no cause, not as an error.
+    use crate::torrents::model::UnpackCause;
+    for cause in UnpackCause::ALL {
+        assert_eq!(UnpackCause::parse(cause.as_str()), Some(cause));
+    }
+    assert_eq!(
+        UnpackCause::ALL.map(UnpackCause::as_str),
+        [
+            "refused",
+            "nothing_delivered",
+            "not_placed",
+            "delivered_in_part",
+            "unwanted_removed",
+            "unwanted_not_removed",
+        ]
+    );
+    assert_eq!(UnpackCause::parse("Refused"), None);
+    assert_eq!(UnpackCause::parse("later_cause"), None);
 }

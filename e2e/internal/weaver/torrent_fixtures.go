@@ -57,9 +57,6 @@ type torrentFixtureSpec struct {
 	// output must have. Payload files with no entry are expected to be
 	// delivered as they are.
 	ExpectedOutput map[string]string
-	// AbsentOutput are output-relative paths that must not be on disk once
-	// the torrent completes.
-	AbsentOutput []string
 	// RetainedOutput are payload paths whose bytes must stay on disk under
 	// the output directory while the torrent seeds, under whatever name
 	// Weaver keeps them.
@@ -83,7 +80,6 @@ type torrentFixture struct {
 	Files       []torrentFileInfo `json:"files"`
 	// Output is the BLAKE3 of every file Weaver's output must hold.
 	Output map[string]string `json:"output"`
-	Absent []string          `json:"absent,omitempty"`
 	// Retained is the BLAKE3 of every payload file whose bytes must stay
 	// under the output directory, by payload path, under any name.
 	Retained map[string]string `json:"retained,omitempty"`
@@ -138,7 +134,6 @@ func torrentFixtureSpecs() []torrentFixtureSpec {
 			ExpectedOutput: map[string]string{
 				"amber.trail.s01e02.mkv": "0f9527235f4aeccd73d0ef80e25572b51b96d4a9dfe96d24a73911590efed9ab",
 			},
-			AbsentOutput: []string{"archive.part1.rar", "archive.part2.rar", "archive.part3.rar", "archive.part4.rar"},
 		},
 		{
 			Slug: "rar-compressed", Name: "Nested.Compressed.Set", CorpusSlug: "nested-xz-rar",
@@ -172,6 +167,10 @@ func torrentFixtureSpecs() []torrentFixtureSpec {
 		{
 			Slug: "unwanted", Name: "Granite.Unwanted.Bundle", PieceLength: 32 * kib, Unseeded: true,
 			Files: []torrentFileSpec{synthetic("readme.txt", 40*kib), synthetic("extras/run.cmd", 8*kib)},
+		},
+		{
+			Slug: "executable", Name: "granite.setup.exe", Single: true, PieceLength: 32 * kib, Unseeded: true,
+			Files: []torrentFileSpec{synthetic("granite.setup.exe", 8*kib)},
 		},
 		{Slug: "magnet", Name: "Slate.Magnet.Bundle", PieceLength: 64 * kib,
 			Files: []torrentFileSpec{synthetic("slate.part.a.bin", 3*mib), synthetic("slate.part.b.bin", 1*mib+517)}},
@@ -209,13 +208,24 @@ func torrentFixtureSpecs() []torrentFixtureSpec {
 			Files: []torrentFileSpec{synthetic("pewter.bin", 1*mib)}},
 		{Slug: "facade-magnet", Name: "Tin.Facade.Magnet", PieceLength: 64 * kib,
 			Files: []torrentFileSpec{synthetic("tin.bin", 1*mib)}},
-		{Slug: "facade-refused", Name: "Lead.Facade.Refused", PieceLength: 32 * kib, Unseeded: true,
-			Files: []torrentFileSpec{synthetic("lead.txt", 16*kib), synthetic("setup.exe", 8*kib)}},
+		{Slug: "facade-refused", Name: "lead.facade.setup.exe", Single: true, PieceLength: 32 * kib, Unseeded: true,
+			Files: []torrentFileSpec{synthetic("lead.facade.setup.exe", 16*kib)}},
 		{Slug: "ui-magnet", Name: "Topaz.Browser.Magnet", PieceLength: 64 * kib,
 			Files: []torrentFileSpec{synthetic("topaz.bin", 2*mib)}},
 		{Slug: "ui-file", Name: "Beryl.Browser.File", Private: true, PieceLength: 64 * kib,
 			Files: []torrentFileSpec{synthetic("beryl.bin", 2*mib), synthetic("notes/beryl.txt", 12*kib)}},
+		// More files than one page of the job's file list holds.
+		{Slug: "ui-paged", Name: "Jade.Browser.Paged", PieceLength: 16 * kib, Files: pagedFiles(205)},
 	}
+}
+
+// pagedFiles is count small files, pages/file-000.bin onwards.
+func pagedFiles(count int) []torrentFileSpec {
+	files := make([]torrentFileSpec, 0, count)
+	for index := range count {
+		files = append(files, synthetic(fmt.Sprintf("pages/file-%03d.bin", index), 1*kib))
+	}
+	return files
 }
 
 func torrentFixturesRoot() string { return filepath.Join(fixturesDir(), "torrents") }
@@ -270,7 +280,7 @@ func buildTorrentFixture(spec torrentFixtureSpec) (*torrentFixture, error) {
 	_ = os.Chmod(payloadDir, 0o777)
 	fixture := &torrentFixture{
 		Slug: spec.Slug, Name: spec.Name, Private: spec.Private, PieceLength: spec.PieceLength,
-		Output: map[string]string{}, Absent: spec.AbsentOutput, Seeded: !spec.Unseeded,
+		Output: map[string]string{}, Seeded: !spec.Unseeded,
 	}
 	fixture.Tracker = torrentTrackerHTTP
 	if spec.UDP {
@@ -349,9 +359,6 @@ func buildTorrentFixture(spec torrentFixtureSpec) (*torrentFixture, error) {
 	// fixture names what unpacking leaves instead.
 	for _, file := range fixture.Files {
 		fixture.Output[file.Path] = file.BLAKE3
-	}
-	for _, absent := range spec.AbsentOutput {
-		delete(fixture.Output, absent)
 	}
 	for _, retained := range spec.RetainedOutput {
 		if fixture.Retained == nil {

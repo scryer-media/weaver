@@ -245,6 +245,7 @@ impl Tree {
                 coverage: Coverage::new(),
                 closed: member.closed,
                 crc32: member.crc32,
+                checked: false,
                 fronted: member.fronted,
                 refuted: member.refuted,
                 own: Tree::own_word(node.object.as_deref(), member.member).unwrap_or(false),

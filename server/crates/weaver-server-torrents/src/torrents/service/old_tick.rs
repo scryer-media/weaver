@@ -43,7 +43,7 @@ impl TorrentService {
     pub async fn old_tick(&self) {
         self.restore_jobs().await;
         self.follow_routes().await;
-        let now = self.inner.clock.unix_ms();
+        let now = self.tick_clock().await;
         self.old_read(now, false).await;
         let unsaved = self.inner.signal.take_unsaved();
         self.save_checkpoints(unsaved.jobs().clone()).await;

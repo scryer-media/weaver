@@ -267,6 +267,7 @@ fn rig_around(
     let context = TorrentFacadeContext::new(
         db.clone(),
         handle.clone(),
+        weaver_server_api::ScheduledResumeCoordinator::new(db.clone(), handle.clone()),
         config.clone(),
         LoginAuthCache::default(),
         keys.clone(),
@@ -517,14 +518,18 @@ fn view(state: TorrentState) -> TorrentView {
         files_dir: None,
         queue_position: None,
         seeding_left: None,
+        seeding_goals: Vec::new(),
+        seeding_goal_met: false,
         seeding_override: None,
         seeding_policy: Seeding::default(),
         seeding_levels: Default::default(),
         tracker_rule: None,
+        tracker_rule_id: None,
         upload_cap: None,
         unpack: true,
         unpack_override: None,
         unpack_end: None,
+        content_ready: false,
         route: None,
         files: Vec::new(),
         sequential: false,
@@ -4101,6 +4106,41 @@ async fn peers_are_listed_by_hash_and_a_ban_reaches_every_torrent() {
     );
 }
 
+// A ban saved while `WEAVER_TORRENT_PORT` pins the listen port saves the
+// banned addresses and leaves the saved port as it was.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_ban_while_the_listen_port_is_pinned_leaves_the_saved_port() {
+    use weaver_server_core::settings::persistence::SettingsPersistenceQueries;
+    use weaver_server_core::settings::queries::SettingsQueries;
+    let rig = rig().await;
+    rig.db.set_setting("torrent.base_port", "6881").unwrap();
+    {
+        let mut config = rig.config.write().await;
+        config.torrent.base_port = 51_413;
+        config.torrent.base_port_pinned = true;
+    }
+    assert_eq!(
+        rig.post("/api/v2/transfer/banPeers", "peers=127.0.0.3%3A6881")
+            .await
+            .status,
+        StatusCode::OK
+    );
+    let torrent = rig.config.read().await.torrent.clone();
+    assert_eq!(torrent.banned_ips, ["127.0.0.3"]);
+    assert_eq!(
+        (torrent.base_port, torrent.base_port_pinned),
+        (51_413, true)
+    );
+    assert_eq!(
+        rig.db.get_setting("torrent.base_port").unwrap().as_deref(),
+        Some("6881")
+    );
+    assert_eq!(
+        rig.db.load_config().unwrap().torrent.banned_ips,
+        ["127.0.0.3"]
+    );
+}
+
 // A file's level reads as the client's number and back; the client's other
 // numbers are no level (qBittorrent `downloadpriority.h`).
 #[test]
@@ -4169,6 +4209,7 @@ fn unpacked_files_list_after_the_torrents_own_and_never_touch_its_state() {
     let end = |result, why: Option<&str>| UnpackEnd {
         result,
         why: why.map(str::to_owned),
+        cause: None,
     };
     for end in [
         end(UnpackResult::Whole, None),
@@ -5767,4 +5808,48 @@ async fn answers_over_every_torrent_wait_for_the_load() {
         rig.post("/api/v2/torrents/stop", "hashes=all").await.status,
         StatusCode::OK
     );
+}
+
+// Stopping or starting every torrent here ends a timed pause of them set in
+// Weaver, so its deadline lifts nothing later.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn every_torrent_stopped_or_started_here_ends_a_timed_pause() {
+    use weaver_server_core::jobs::{HoldOrigin, HoldOwner};
+    let rig = rig().await;
+    let class = weaver_server_core::torrents::CLASS;
+    let coordinator = &rig.context.inner.scheduled_resume;
+    let in_an_hour = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        + 3600;
+    for (path, held) in [
+        ("/api/v2/torrents/start", false),
+        ("/api/v2/torrents/stop", true),
+        ("/api/v2/transfer/resumeSession", false),
+        ("/api/v2/transfer/pauseSession", true),
+    ] {
+        coordinator
+            .pause_class_until(class, in_an_hour)
+            .await
+            .unwrap();
+        let body = if path.contains("/torrents/") {
+            "hashes=all"
+        } else {
+            ""
+        };
+        let status = rig.post(path, body).await.status;
+        assert!(status.is_success(), "{path}: {status}");
+        assert_eq!(coordinator.class_resume_at(class).await, 0, "{path}");
+        assert_eq!(
+            rig.context
+                .inner
+                .handle
+                .state()
+                .holds()
+                .held_by(HoldOrigin::Manual, HoldOwner::Class(class)),
+            held,
+            "{path}"
+        );
+    }
 }

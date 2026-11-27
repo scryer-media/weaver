@@ -375,7 +375,7 @@ impl SpeedTestService {
         let draft = runtime
             .network
             .draft_route(consumer, policy, DRAFT_TIMEOUT)
-            .map_err(SpeedTestError::Invalid)?;
+            .map_err(|error| SpeedTestError::Invalid(error.to_string()))?;
         let leg = first_leg_up(&tested).ok_or(NetworkRefusal::SpeedTestLegDownAll)?;
         let http = HttpLeg {
             stage: draft.leg_stage(leg).map_err(SpeedTestError::Invalid)?,
@@ -583,7 +583,7 @@ impl SpeedTestService {
                 DRAFT_TIMEOUT,
                 &request.overrides.down_proxies,
             )
-            .map_err(SpeedTestError::Invalid)?;
+            .map_err(|error| SpeedTestError::Invalid(error.to_string()))?;
 
         let legs: Vec<PlannedLeg> = tested
             .legs

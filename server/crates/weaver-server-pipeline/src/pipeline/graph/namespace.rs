@@ -34,8 +34,9 @@ use weaver_graph::holds::{
 };
 use weaver_graph::member::FIRST_BYTES;
 use weaver_graph::{
-    Algorithm, Builder, ByteRange, Coverage, Effect, Emit, Evidenced, Kind, Marked, MemberId,
-    NodeId, Object, ObjectId, Placement, Provenance, Segment, Took, Tree, VolumeIndex, Why,
+    Algorithm, Builder, ByteRange, Coverage, Digest, Effect, Emit, Evidenced, Kind, Marked,
+    MemberId, NodeId, Object, ObjectId, Placement, Provenance, Segment, Took, Tree, VolumeIndex,
+    Why,
 };
 
 use super::checkpoint::why_name;
@@ -555,6 +556,14 @@ pub struct NamespaceWriter {
     // reads none of it from the member's file. Each names the object and
     // the volume of it the bytes went to.
     reached_now: Vec<(NodeId, MemberId, (NodeId, VolumeIndex), ByteRange)>,
+    // A repair's read may still be checked (`moved_since`): set as a repair
+    // is lent, cleared once its return is taken back or given up and no
+    // other is out or kept (`end_repair_reads`). Only then do members'
+    // leaves keep what their writes changed.
+    repair_reads: bool,
+    // The members whose leaves kept a change while a repair's read could be
+    // checked, each once: what `end_repair_reads` empties.
+    changes_kept: BTreeSet<(NodeId, MemberId)>,
     // How many requests are being answered at once, and the most there
     // ever were.
     #[cfg(any(test, feature = "pipeline-test-fixtures"))]
@@ -680,8 +689,39 @@ impl NamespaceWriter {
             held_want: None,
             withheld_said: BTreeMap::new(),
             reached_now: Vec::new(),
+            repair_reads: false,
+            changes_kept: BTreeSet::new(),
             #[cfg(any(test, feature = "pipeline-test-fixtures"))]
             answering: (0, 0),
+        }
+    }
+
+    // Whether the member's leaf, about to be written, keeps what the write
+    // changes: while a repair's read may be checked it does, and it is
+    // emptied with the rest when none is left (`end_repair_reads`). Noted
+    // before the write, so a write that fails part way is noted too.
+    fn keeps_changes(&mut self, node: NodeId, member: MemberId) -> bool {
+        if self.repair_reads {
+            self.changes_kept.insert((node, member));
+        }
+        self.repair_reads
+    }
+
+    // No repair's read is left to check: the leaves that kept a change for
+    // one forget it, and nothing more is kept until the next is lent. A
+    // leaf gone since is passed over.
+    pub(crate) fn end_repair_reads(&mut self) {
+        self.repair_reads = false;
+        // What a leaf kept for a check is neither recorded nor part of its
+        // file's state: forgetting it marks nothing for a checkpoint.
+        for (node, member) in std::mem::take(&mut self.changes_kept) {
+            if let Some(leaf) = self
+                .files
+                .get_mut_unmarked(&node)
+                .and_then(|files| files.leaves.get_mut_unmarked(&member))
+            {
+                leaf.forget_changes();
+            }
         }
     }
 
@@ -2761,6 +2801,7 @@ impl NamespaceWriter {
             } else {
                 let mut retained = kept.coverage.clone();
                 let envelope = kept.into_leaf();
+                let record = self.keeps_changes(node, member);
                 if let Some(leaf) = self.files_mut(node).leaves.get_mut(&member) {
                     let length = leaf.len(LoopSite::GivenBack)?;
                     // A leaf awaiting replay owns the member's recorded
@@ -2794,9 +2835,12 @@ impl NamespaceWriter {
                                         &bytes,
                                         algorithm,
                                         None,
+                                        record,
                                     )?;
                                 }
-                                None => leaf.write(LoopSite::GivenBack, at, &bytes, None)?,
+                                None => {
+                                    leaf.write(LoopSite::GivenBack, at, &bytes, None, record)?
+                                }
                             }
                             at += take;
                         }
@@ -2976,6 +3020,7 @@ impl NamespaceWriter {
                 page_out.scratch_offset,
                 &page_out.bytes,
                 None,
+                false,
             )?;
         }
         if let Placed::Spilled(budget) = outcome.placed {
@@ -3017,7 +3062,7 @@ impl NamespaceWriter {
         let files = self.files_mut(node);
         if let std::collections::btree_map::Entry::Vacant(vacant) = files.spills.entry(member) {
             let mut spill = Leaf::at(&dir, &spill_name(node, member)).through(to.as_ref());
-            spill.truncate()?;
+            spill.truncate(false)?;
             vacant.insert(spill);
             files.spills_empty.insert(member);
         }
@@ -3035,7 +3080,7 @@ impl NamespaceWriter {
     ) -> Result<(), WriteError> {
         if let Err(error) =
             self.spill_file(node, member)?
-                .write(LoopSite::Spill, offset, bytes, None)
+                .write(LoopSite::Spill, offset, bytes, None, false)
         {
             // A spill the disk had no room for: the job waits for the room
             // of what was being spilled.
@@ -3095,7 +3140,7 @@ impl NamespaceWriter {
                 continue;
             }
             if let Some(spill) = files.spills.get_mut(&member) {
-                spill.truncate()?;
+                spill.truncate(false)?;
                 spill.release_handle();
             }
         }
@@ -3841,6 +3886,7 @@ impl NamespaceWriter {
             .max(record.length.unwrap_or(0));
         let landing = if lands { bytes.len() as u64 } else { 0 };
         self.admit_file(tree, node, member, end, landing)?;
+        let keeps = self.keeps_changes(node, member);
         let leaf = self.leaf(tree, node, member)?;
         // The leaf folds the digest the member's stated check needs, from
         // the evidence the bytes came with, hashing only bytes no level above
@@ -3853,8 +3899,10 @@ impl NamespaceWriter {
             bytes.proven(algorithm).then_some(algorithm)
         };
         let wrote = match record.check().or_else(proven) {
-            Some(algorithm) => leaf.write_folding(site, offset, bytes, algorithm, record.length),
-            None => leaf.write(site, offset, bytes, record.length),
+            Some(algorithm) => {
+                leaf.write_folding(site, offset, bytes, algorithm, record.length, keeps)
+            }
+            None => leaf.write(site, offset, bytes, record.length, keeps),
         };
         if let Err(error) = wrote {
             // A write the disk had no room for: the job waits for the room
@@ -3879,7 +3927,7 @@ impl NamespaceWriter {
         // never cuts the parts after it.
         if let Some(length) = record.length.filter(|_| record.is_complete()) {
             let reached = record.coverage.runs().last().map_or(0, |run| run.range.end);
-            leaf.close(site, length.max(reached))?;
+            leaf.close(site, length.max(reached), keeps)?;
             self.caps.closed(node, member);
         }
         Ok(())
@@ -3922,7 +3970,8 @@ impl NamespaceWriter {
             return Ok(());
         }
         self.admit_file(tree, node, member, length, 0)?;
-        self.leaf(tree, node, member)?.close(site, length)?;
+        let keeps = self.keeps_changes(node, member);
+        self.leaf(tree, node, member)?.close(site, length, keeps)?;
         self.caps.closed(node, member);
         Ok(())
     }
@@ -4094,6 +4143,9 @@ impl NamespaceWriter {
         }
         let mut effects = Vec::new();
         tree.checksum_failed(node, member, &mut effects);
+        // The object that stated the checksum hears the failure, for a
+        // member it closed with no ruling of its own.
+        tree.member_refuted(node, member, &mut self.placing(builder), &mut effects);
         self.apply_each(
             tree,
             builder,
@@ -4133,13 +4185,18 @@ impl NamespaceWriter {
             self.verifications.insert((node, member));
             return Ok(false);
         }
+        // A member its producer checked as it decoded it folds the stated
+        // CRC32 onto what was written of it, once.
         let Some(leaf) = self
             .files
-            .get(&node)
-            .and_then(|files| files.leaves.get(&member))
+            .get_mut(&node)
+            .and_then(|files| files.leaves.get_mut(&member))
         else {
             return Ok(false);
         };
+        if record.checked {
+            leaf.fold_checked(length, Digest::crc32(stated));
+        }
         match leaf.folded(length, Algorithm::Crc32) {
             Some(actual) => {
                 self.verifications.remove(&(node, member));
@@ -4688,7 +4745,7 @@ impl NamespaceWriter {
         let files = self.files_mut(node);
         if files.scratch.is_none() {
             let mut scratch = Leaf::at(&dir, &scratch_name(node)).through(to.as_ref());
-            scratch.truncate()?;
+            scratch.truncate(false)?;
             files.scratch = Some(scratch);
         }
         Ok(files.scratch.as_mut().expect("created above"))

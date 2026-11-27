@@ -472,8 +472,9 @@ pub struct CertificateSummary {
 
 // A client a torrent may name itself as, for the trackers that admit only
 // some clients.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum Client {
+    #[default]
     Weaver,
     QBittorrent,
 }
@@ -832,6 +833,11 @@ pub struct TorrentConfig {
     // The first route's listen port; each further route listens on the
     // next port its slot names.
     pub base_port: u16,
+    // Whether the environment pins `base_port` for this run
+    // (`WEAVER_TORRENT_PORT`): the port shown and listened on is the pin,
+    // and the stored port is kept as it is. Never stored.
+    #[serde(skip)]
+    pub base_port_pinned: bool,
     // The port announced to trackers, when it differs from the one listened
     // on (a forwarded port).
     pub announce_port: Option<u16>,
@@ -983,6 +989,7 @@ impl Default for TorrentConfig {
         Self {
             enabled: false,
             base_port: 6881,
+            base_port_pinned: false,
             announce_port: None,
             upnp: true,
             encryption: TorrentEncryption::Prefer,

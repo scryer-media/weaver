@@ -1,0 +1,18 @@
+# Global script settings: the scripts directory, whether scripts run at all,
+# and the values SetScriptSettings must send back unchanged. Scope: ADMIN.
+# Variables: none.
+query ScriptSettings {
+  postProcessingSettings {
+    scriptDirectory
+    executionEnabled
+    strictSecurityRefusesExecution
+    concurrency
+    terminationGraceSeconds
+    eventScriptTimeoutSeconds
+    globalScriptsRun
+    pythonInterpreter
+    powershellInterpreter
+    batchInterpreter
+    goInterpreter
+  }
+}

@@ -56,6 +56,8 @@ pub const ENV_TRUSTED_PROXIES: &str = "WEAVER_TRUSTED_PROXIES";
 // Pins browser access to authenticated sessions. The legacy CIDR bypass is
 // retained only for installations that have not opted into this policy.
 pub const ENV_ACCESS_MODE: &str = "WEAVER_ACCESS_MODE";
+// Forces the MCP endpoint on or off while set, over the stored switch.
+pub const ENV_MCP_ENABLED: &str = "WEAVER_MCP_ENABLED";
 
 pub const DEFAULT_HTTP_BIND_ADDRESS: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
 
@@ -106,6 +108,9 @@ pub const AUTHENTICATED_INSTALL_GENERATION: &str = "authenticated-v1";
 // backing [`AccessMode::LoginExceptLocal`].
 pub const SETTING_TRUSTED_NETWORKS: &str = "trusted_networks";
 pub const SETTING_TRUSTED_PROXIES: &str = "trusted_proxies";
+// Settings-table key holding the operator's MCP switch, `true` or `false`.
+// Absent means on.
+pub const SETTING_MCP_ENABLED: &str = "mcp_enabled";
 type NetworkPolicySnapshot = (Vec<IpNet>, Vec<IpNet>);
 
 // How browsers are admitted, chosen in the first-run wizard and editable in
@@ -444,6 +449,12 @@ pub struct RuntimeSecurityConfig {
     // fell back to loopback instead of refusing to start. Shown as a banner
     // so the deviation is impossible to miss from the UI that still works.
     pub bind_fallback: Option<String>,
+    // The value `WEAVER_MCP_ENABLED` forces, which wins over the stored
+    // switch; `None` while the variable is unset.
+    pub mcp_enabled_env: Option<bool>,
+    // The stored MCP switch, shared across clones so a change applies to the
+    // next request.
+    mcp_enabled_stored: Arc<AtomicBool>,
 }
 
 impl RuntimeSecurityConfig {
@@ -497,6 +508,11 @@ impl RuntimeSecurityConfig {
             security_configured: Arc::new(AtomicBool::new(trust_env_pinned)),
             trust_env_pinned,
             bind_fallback: None,
+            mcp_enabled_env: parse_optional_bool(
+                ENV_MCP_ENABLED,
+                env::var(ENV_MCP_ENABLED).ok().as_deref(),
+            )?,
+            mcp_enabled_stored: Arc::new(AtomicBool::new(true)),
         })
     }
 
@@ -710,6 +726,43 @@ impl RuntimeSecurityConfig {
     // at runtime: the first-run wizard and the access-policy mutation.
     pub fn mark_security_configured(&self) {
         self.security_configured.store(true, Ordering::Relaxed);
+    }
+
+    // Whether the MCP endpoint answers: `WEAVER_MCP_ENABLED` while set,
+    // otherwise the stored switch, which is on unless the operator turned it
+    // off. A read of in-memory state, cheap enough for every request.
+    pub fn mcp_enabled(&self) -> bool {
+        self.mcp_enabled_env
+            .unwrap_or_else(|| self.stored_mcp_enabled())
+    }
+
+    // The stored switch, whatever the environment forces.
+    pub fn stored_mcp_enabled(&self) -> bool {
+        self.mcp_enabled_stored.load(Ordering::Relaxed)
+    }
+
+    // Record a stored switch the operator just saved, visible to every clone.
+    pub fn set_stored_mcp_enabled(&self, enabled: bool) {
+        self.mcp_enabled_stored.store(enabled, Ordering::Relaxed);
+    }
+
+    // Settle the stored switch once the database is readable. Absent is on.
+    // A value other than `true` or `false` turns the endpoint off with a
+    // warning: only the switch's own mutation writes it, so anything else is
+    // damage, and the endpoint fails closed until the operator saves again.
+    pub fn apply_stored_mcp_enabled(&self, stored: Option<&str>) {
+        let enabled = match stored.map(str::trim) {
+            None => true,
+            Some("true") => true,
+            Some("false") => false,
+            Some(_) => {
+                tracing::warn!(
+                    "stored {SETTING_MCP_ENABLED} is not true or false; the MCP endpoint is off"
+                );
+                false
+            }
+        };
+        self.set_stored_mcp_enabled(enabled);
     }
 
     pub fn has_trusted_cidrs(&self) -> bool {
@@ -1135,6 +1188,8 @@ impl Default for RuntimeSecurityConfig {
             security_configured: Arc::new(AtomicBool::new(false)),
             trust_env_pinned: false,
             bind_fallback: None,
+            mcp_enabled_env: None,
+            mcp_enabled_stored: Arc::new(AtomicBool::new(true)),
         }
     }
 }
@@ -1168,6 +1223,26 @@ pub fn parse_bool_env(name: &str, default: bool) -> Result<bool, SecurityConfigE
         "" => Ok(default),
         "1" | "true" | "yes" | "on" => Ok(true),
         "0" | "false" | "no" | "off" => Ok(false),
+        _ => Err(SecurityConfigError::new(format!(
+            "{name} must be a boolean value (true/false, 1/0, yes/no, on/off)"
+        ))),
+    }
+}
+
+// A boolean variable that, while set, overrides a stored setting. Unset or
+// blank is `None`; any other value that is not a boolean is refused, as
+// `parse_bool_env` refuses it. Takes the raw value so tests never touch the
+// process environment.
+pub fn parse_optional_bool(
+    name: &str,
+    raw: Option<&str>,
+) -> Result<Option<bool>, SecurityConfigError> {
+    let Some(value) = raw.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(None);
+    };
+    match value.to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Ok(Some(true)),
+        "0" | "false" | "no" | "off" => Ok(Some(false)),
         _ => Err(SecurityConfigError::new(format!(
             "{name} must be a boolean value (true/false, 1/0, yes/no, on/off)"
         ))),
@@ -1348,6 +1423,53 @@ mod tests {
     use super::*;
     use std::sync::{Mutex, OnceLock};
 
+    #[test]
+    fn the_mcp_variable_is_unset_blank_or_a_boolean() {
+        assert_eq!(parse_optional_bool(ENV_MCP_ENABLED, None), Ok(None));
+        assert_eq!(parse_optional_bool(ENV_MCP_ENABLED, Some("  ")), Ok(None));
+        for on in ["1", "true", "TRUE", " yes ", "on"] {
+            assert_eq!(
+                parse_optional_bool(ENV_MCP_ENABLED, Some(on)),
+                Ok(Some(true))
+            );
+        }
+        for off in ["0", "false", "False", "no", "off"] {
+            assert_eq!(
+                parse_optional_bool(ENV_MCP_ENABLED, Some(off)),
+                Ok(Some(false))
+            );
+        }
+        assert!(parse_optional_bool(ENV_MCP_ENABLED, Some("disabled")).is_err());
+    }
+
+    #[test]
+    fn the_mcp_variable_wins_over_the_stored_switch() {
+        let mut security = RuntimeSecurityConfig::default();
+        assert!(security.mcp_enabled(), "on by default");
+        security.apply_stored_mcp_enabled(Some("false"));
+        assert!(!security.mcp_enabled());
+        security.mcp_enabled_env = Some(true);
+        assert!(security.mcp_enabled(), "forced on over a stored off");
+        assert!(!security.stored_mcp_enabled());
+        security.mcp_enabled_env = Some(false);
+        security.apply_stored_mcp_enabled(Some("true"));
+        assert!(!security.mcp_enabled(), "forced off over a stored on");
+        security.mcp_enabled_env = None;
+        assert!(security.mcp_enabled());
+    }
+
+    #[test]
+    fn a_stored_mcp_switch_is_shared_and_fails_closed() {
+        let security = RuntimeSecurityConfig::default();
+        let clone = security.clone();
+        security.set_stored_mcp_enabled(false);
+        assert!(!clone.mcp_enabled(), "every clone sees a saved change");
+        security.apply_stored_mcp_enabled(None);
+        assert!(clone.mcp_enabled(), "absent is on");
+        security.apply_stored_mcp_enabled(Some("maybe"));
+        assert!(!clone.mcp_enabled(), "damage turns it off");
+    }
+
     fn env_lock() -> std::sync::MutexGuard<'static, ()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| Mutex::new(())).lock().unwrap()
@@ -1368,6 +1490,7 @@ mod tests {
             ENV_TRUSTED_CIDRS,
             ENV_TRUSTED_PROXIES,
             ENV_ACCESS_MODE,
+            ENV_MCP_ENABLED,
         ] {
             unsafe { env::remove_var(name) };
         }

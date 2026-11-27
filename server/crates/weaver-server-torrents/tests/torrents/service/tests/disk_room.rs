@@ -509,7 +509,9 @@ async fn judged_past(judged: &mut tokio::sync::watch::Receiver<u64>, at: u64) {
 // session it joins finds none of the files it wants, it is short of
 // complete again: it shows downloading, not seeding, its disk is looked up,
 // and its start is promised every byte it has left, all before any block
-// arrives (no peer has one to send).
+// arrives (no peer has one to send). Its content reads as ready only while
+// it seeds: not while its files are missing, though it is still stored
+// complete then, and not once it downloads again.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_recheck_that_finds_a_complete_torrent_gone_downloads_it_again() {
     let disks = tempfile::tempdir().unwrap();
@@ -527,8 +529,26 @@ async fn a_recheck_that_finds_a_complete_torrent_gone_downloads_it_again() {
     let ledger = capacity.ledger(StorageRoot::Complete);
     let rig = rig(set_clock());
     rig.service.open().await.unwrap();
-    let (job_id, dir) = with_every_piece(&rig).await;
+    // Nothing to unpack: its content reads as ready once it seeds.
+    let job_id = rig
+        .service
+        .add_opened(AddRequest {
+            unpack: Some(false),
+            ..request(AddSource::Metainfo(plain("set", 1)))
+        })
+        .await
+        .unwrap();
+    fetch_every_piece(&rig.service, job_id, &[1; 3000]).await;
+    let dir = PathBuf::from(
+        rig.service
+            .torrent(job_id)
+            .await
+            .unwrap()
+            .storage_dir
+            .unwrap(),
+    );
     view_once(&rig.service, job_id, |view| view.completed_at_ms.is_some()).await;
+    view_once(&rig.service, job_id, |view| view.content_ready).await;
     rig.service.stop().await;
     rig.db.prune_orphan_active_state(JobId(u64::MAX)).unwrap();
     std::fs::remove_dir_all(&dir).unwrap();
@@ -545,6 +565,7 @@ async fn a_recheck_that_finds_a_complete_torrent_gone_downloads_it_again() {
     let view = again.torrent(job_id).await.unwrap();
     assert_eq!(view.state, TorrentState::FilesMissing);
     assert!(view.completed_at_ms.is_some());
+    assert!(!view.content_ready, "its files are missing");
     assert_eq!(ledger.promised_total(), 0);
 
     let (mut judged, at) = checks_judged(&again);
@@ -552,6 +573,7 @@ async fn a_recheck_that_finds_a_complete_torrent_gone_downloads_it_again() {
     judged_past(&mut judged, at).await;
     let view = again.torrent(job_id).await.unwrap();
     assert_eq!(view.completed_at_ms, None, "short of complete again");
+    assert!(!view.content_ready, "it downloads again");
     assert!(
         matches!(
             view.state,

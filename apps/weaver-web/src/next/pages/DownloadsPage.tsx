@@ -207,24 +207,62 @@ const PAUSE_FOR_OPTIONS: { seconds: number; label: string }[] = [
   { seconds: 8 * 60 * 60, label: "next.downloads.pauseFor8h" },
 ];
 
-/** Pause all, split with a menu of timed pauses that resume on their own. */
-function PauseAllControl({
+/** What one pause control reads and names: Weaver's, or every torrent's. */
+type PauseTarget = {
+  pause: string;
+  resume: string;
+  /** The countdown while a timed pause runs, with `{{time}}`. */
+  resumingIn: string;
+  testIds: { pause: string; resume: string; resumeTimed: string };
+};
+
+const WEAVER_PAUSE: PauseTarget = {
+  pause: "next.downloads.pauseAll",
+  resume: "next.downloads.resumeAll",
+  resumingIn: "next.downloads.resumingIn",
+  testIds: {
+    pause: testIds.queuePauseAll,
+    resume: testIds.queueResumeAll,
+    resumeTimed: testIds.queueResumeTimed,
+  },
+};
+
+const TORRENTS_PAUSE: PauseTarget = {
+  pause: "next.downloads.pauseTorrents",
+  resume: "next.downloads.resumeTorrents",
+  resumingIn: "next.downloads.torrentsResumingIn",
+  testIds: {
+    pause: torrentTestIds.pauseTorrents,
+    resume: torrentTestIds.resumeTorrents,
+    resumeTimed: torrentTestIds.resumeTorrentsTimed,
+  },
+};
+
+/** A pause, split with a menu of timed pauses that resume on their own. */
+function PauseControl({
+  target,
   paused,
   resumeAt,
+  onPause,
+  onResume,
 }: {
+  target: PauseTarget;
   paused: boolean;
   resumeAt: number | null;
+  /** Pause now; with seconds, resume on its own after them. */
+  onPause: (resumeAfterSecs?: number) => void;
+  onResume: () => void;
 }) {
   const t = useTranslate();
-  const [, pauseAll] = useMutation(PAUSE_ALL_MUTATION);
-  const [, resumeAll] = useMutation(RESUME_ALL_MUTATION);
   const [open, setOpen] = useState(false);
 
   if (paused && resumeAt !== null) {
     return (
       <TimedResumeButton
         resumeAt={resumeAt}
-        onResume={() => void resumeAll({})}
+        countdownKey={target.resumingIn}
+        testId={target.testIds.resumeTimed}
+        onResume={onResume}
       />
     );
   }
@@ -232,8 +270,8 @@ function PauseAllControl({
     return (
       <button
         type="button"
-        data-testid={testIds.queueResumeAll}
-        onClick={() => void resumeAll({})}
+        data-testid={target.testIds.resume}
+        onClick={onResume}
         className={PAUSED_BUTTON}
       >
         <Icon
@@ -241,7 +279,7 @@ function PauseAllControl({
           size={14}
           className="-ml-[2px] mr-[7px] flex-none"
         />
-        {t("next.downloads.resumeAll")}
+        {t(target.resume)}
       </button>
     );
   }
@@ -250,17 +288,17 @@ function PauseAllControl({
     <div className="relative flex">
       <SecondaryButton
         icon="pause"
-        onClick={() => void pauseAll({})}
-        testId={testIds.queuePauseAll}
+        onClick={() => onPause()}
+        testId={target.testIds.pause}
       >
-        {t("next.downloads.pauseAll")}
+        {t(target.pause)}
       </SecondaryButton>
       <button
         type="button"
         data-wv-menu-trigger=""
         aria-haspopup="menu"
         aria-expanded={open}
-        aria-label={t("next.downloads.pauseForMenu")}
+        aria-label={`${t(target.pause)}: ${t("next.downloads.pauseForMenu")}`}
         onClick={() => setOpen((previous) => !previous)}
         className="-ml-px flex h-[34px] cursor-pointer items-center border border-wv-control bg-wv-button px-[9px] text-wv-fg hover:border-wv-control-hover hover:bg-wv-button-hover"
       >
@@ -277,7 +315,7 @@ function PauseAllControl({
             key={option.seconds}
             onSelect={() => {
               setOpen(false);
-              void pauseAll({ resumeAfterSecs: option.seconds });
+              onPause(option.seconds);
             }}
           >
             {t(option.label)}
@@ -305,9 +343,13 @@ function formatResumeCountdown(msLeft: number): string {
  */
 function TimedResumeButton({
   resumeAt,
+  countdownKey,
+  testId,
   onResume,
 }: {
   resumeAt: number;
+  countdownKey: string;
+  testId: string;
   onResume: () => void;
 }) {
   const t = useTranslate();
@@ -316,7 +358,7 @@ function TimedResumeButton({
     const timer = window.setInterval(() => setNow(Date.now()), 1000);
     return () => window.clearInterval(timer);
   }, []);
-  const countdown = t("next.downloads.resumingIn", {
+  const countdown = t(countdownKey, {
     time: formatResumeCountdown(resumeAt - now),
   });
   const resumeNow = t("next.downloads.resumeNow");
@@ -324,7 +366,7 @@ function TimedResumeButton({
   return (
     <button
       type="button"
-      data-testid={testIds.queueResumeTimed}
+      data-testid={testId}
       onClick={onResume}
       aria-label={`${resumeNow} (${countdown})`}
       className={cn("group", PAUSED_BUTTON)}
@@ -350,6 +392,7 @@ export function DownloadsPage() {
     isPaused,
     pausedClasses,
     resumeAt,
+    torrentsResumeAt,
     downloadBlock,
     diskVolumes,
   } = useNextData();
@@ -417,6 +460,8 @@ export function DownloadsPage() {
 
   const client = useClient();
 
+  const [, pauseAll] = useMutation(PAUSE_ALL_MUTATION);
+  const [, resumeAll] = useMutation(RESUME_ALL_MUTATION);
   const [, pauseClass] = useMutation(PAUSE_CLASS_MUTATION);
   const [, resumeClass] = useMutation(RESUME_CLASS_MUTATION);
   const torrentsPaused = pausedClasses.includes("TORRENT");
@@ -956,27 +1001,25 @@ export function DownloadsPage() {
             onChange={(next) => reset(() => setQuery(next))}
             className="w-[132px] sm:w-[224px]"
           />
-          <PauseAllControl paused={isPaused} resumeAt={resumeAt} />
+          <PauseControl
+            target={WEAVER_PAUSE}
+            paused={isPaused}
+            resumeAt={resumeAt}
+            onPause={(resumeAfterSecs) => void pauseAll({ resumeAfterSecs })}
+            onResume={() => void resumeAll({})}
+          />
           {torrentsOn ? (
             <>
               <ScheduleSeedingNote torrents={torrents} />
-              <SecondaryButton
-                icon={torrentsPaused ? "resume" : "pause"}
-                testId={
-                  torrentsPaused
-                    ? torrentTestIds.resumeTorrents
-                    : torrentTestIds.pauseTorrents
+              <PauseControl
+                target={TORRENTS_PAUSE}
+                paused={torrentsPaused}
+                resumeAt={torrentsResumeAt}
+                onPause={(resumeAfterSecs) =>
+                  void pauseClass({ class: "TORRENT", resumeAfterSecs })
                 }
-                onClick={() => {
-                  void (torrentsPaused
-                    ? resumeClass({ class: "TORRENT" })
-                    : pauseClass({ class: "TORRENT" }));
-                }}
-              >
-                {torrentsPaused
-                  ? t("next.downloads.resumeTorrents")
-                  : t("next.downloads.pauseTorrents")}
-              </SecondaryButton>
+                onResume={() => void resumeClass({ class: "TORRENT" })}
+              />
             </>
           ) : null}
           <SpeedLimitControl />

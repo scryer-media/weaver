@@ -7,34 +7,34 @@ import { statusToken, type StatusToken } from "@/lib/status-tokens";
  * The design's colour vocabulary, resolved in JS.
  *
  * Tailwind classes cover everything declared in markup, but squares, bars and
- * SVG series take their colour from data, so those reach for these constants.
- * Every value is a handoff token; the accent reads from the CSS variable so a
- * rebrand still only changes one place.
+ * SVG series take their colour from data, so those reach for these CSS tokens.
  */
 
 export const WV = {
   accent: "var(--wv-accent)",
-  info: "#6aa9cf",
-  warn: "#d3a43e",
-  error: "#e0745a",
-  violet: "#a98ad6",
-  green: "#5fbf94",
-  gold: "#c2ad5e",
-  idle: "#8d8a82",
-  slate: "#7f8692",
-  inert: "#4e4f56",
-  track: "#33343a",
+  progress: "var(--color-wv-progress)",
+  ok: "var(--color-wv-ok)",
+  info: "var(--color-wv-info)",
+  warn: "var(--color-wv-warn)",
+  error: "var(--color-wv-error)",
+  violet: "var(--color-wv-violet)",
+  green: "var(--color-wv-green)",
+  gold: "var(--color-wv-gold)",
+  idle: "var(--color-wv-idle)",
+  slate: "var(--color-wv-slate)",
+  inert: "var(--color-wv-inert)",
+  track: "var(--color-wv-track)",
   /** The block bar's dashed track. */
-  trackDash: "#3d3e45",
+  trackDash: "var(--color-wv-track-dash)",
   /** Gridlines behind a waterfall track. */
-  gridline: "#26272c",
+  gridline: "var(--color-wv-hairline)",
   /** Text on a solid span — the waterfall's duration chip. */
-  onSpan: "#11201d",
+  onSpan: "var(--color-wv-on-span)",
   /** A stage that has not run yet. */
-  pending: "#34353b",
-  muted: "#a09d96",
-  disabled: "#75726b",
-  faint: "#84817a",
+  pending: "var(--color-wv-pending)",
+  muted: "var(--color-wv-muted)",
+  disabled: "var(--color-wv-disabled)",
+  faint: "var(--color-wv-faint)",
 } as const;
 
 /**
@@ -46,26 +46,28 @@ export const WV = {
 export function usageColor(percent: number): string {
   if (percent >= 85) return WV.error;
   if (percent >= 65) return WV.warn;
-  return WV.accent;
+  return WV.ok;
 }
 
 /** Area fills under the lead series of a chart. */
 export const WV_FILL = {
-  accent: "rgba(63, 179, 156, 0.13)",
-  info: "rgba(106, 169, 207, 0.12)",
-  violet: "rgba(169, 138, 214, 0.12)",
+  accent: "color-mix(in srgb, var(--color-wv-accent) 13%, transparent)",
+  info: "color-mix(in srgb, var(--color-wv-info) 12%, transparent)",
+  violet: "color-mix(in srgb, var(--color-wv-violet) 12%, transparent)",
 } as const;
 
+// Every stage but queued takes the operator's pick for the palette in use
+// (`lib/appearance.ts`), else the palette's own default (`theme.css`).
 const STATUS_COLORS: Record<StatusToken, string> = {
-  downloading: WV.accent,
+  downloading: "var(--wv-stage-downloading)",
   queued: WV.idle,
-  paused: WV.warn,
-  verifying: WV.info,
-  repairing: WV.info,
-  extracting: WV.violet,
-  copying: WV.info,
-  completed: WV.green,
-  failed: WV.error,
+  paused: "var(--wv-stage-paused)",
+  verifying: "var(--wv-stage-checking)",
+  repairing: "var(--wv-stage-checking)",
+  extracting: "var(--wv-stage-extracting)",
+  copying: "var(--wv-stage-copying)",
+  completed: "var(--wv-stage-completed)",
+  failed: "var(--wv-stage-failed)",
 };
 
 /** Colour for a backend job state, via the shared status-token mapping. */
@@ -76,17 +78,15 @@ export function statusColor(status: string): string {
 /**
  * Category colours.
  *
- * The prototype hard-codes four categories; weaver's are user-defined, so a
- * stable hash picks from the same four hues. Deterministic on the name, which
- * is what keeps a category the same colour in the rail, in the list and in the
- * settings table.
+ * A stable hash of the name keeps each category the same colour in the rail,
+ * list and settings table across accent choices.
  */
 const CATEGORY_COLORS = [
   WV.info,
   WV.violet,
   WV.green,
   WV.gold,
-  WV.accent,
+  "var(--color-wv-teal)",
 ] as const;
 
 export const UNCATEGORISED_COLOR = WV.inert;

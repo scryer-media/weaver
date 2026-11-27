@@ -348,6 +348,52 @@ fn rev_clean_is_revoked_when_bound_source_loses_coverage() {
     );
 }
 
+// A data volume whose grid went past its run bound, then fed again in
+// order, is judged as a volume fed only in order is: the set rules alike,
+// and reads back alike, whether the volume is whole or changed.
+#[test]
+fn a_volume_past_its_run_bound_fed_again_in_order_is_judged_as_any() {
+    const SIZE: u64 = 9000;
+    let whole = payload(5, SIZE as usize);
+    let mut changed = whole.clone();
+    changed[4000] ^= 0x5a;
+    for bytes in [&whole, &changed] {
+        let ruled = |dropped: bool| {
+            let mut job = job();
+            rev(
+                &mut job,
+                "lantern.part1.rev",
+                &rev5(3, 1, 3, &[SIZE, SIZE, SIZE]),
+            );
+            let first = volume(&mut job, "lantern.part01.rar", bytes);
+            volume(&mut job, "lantern.part02.rar", &whole);
+            volume(&mut job, "lantern.part03.rar", &whole);
+            bind(&mut job);
+            if dropped {
+                for at in 0..=4096 {
+                    job.object.feed(
+                        first,
+                        &[Segment {
+                            range: ByteRange::at(at * 2, 1),
+                            crc32: 0,
+                            verified: true,
+                        }],
+                    );
+                }
+                assert!(job.object.grid.dropped(first, WHOLE));
+            }
+            for member in job.object.bound.values().copied().collect::<Vec<_>>() {
+                fed(&mut job, member);
+            }
+            let outcome = job
+                .object
+                .repair(&mut job.store, weaver_graph::Budget::default());
+            (verdict(&job, first), outcome, job.store.reads)
+        };
+        assert_eq!(ruled(true), ruled(false));
+    }
+}
+
 #[test]
 fn a_set_rules_on_how_many_volumes_are_missing_against_its_recovery_volumes() {
     let mut job = job();

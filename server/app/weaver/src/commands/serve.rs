@@ -87,6 +87,10 @@ pub(crate) async fn run(
         db.get_setting(weaver_server_core::security::SETTING_TRUSTED_PROXIES)?
             .as_deref(),
     );
+    security.apply_stored_mcp_enabled(
+        db.get_setting(weaver_server_core::security::SETTING_MCP_ENABLED)?
+            .as_deref(),
+    );
     if let Some(reason) = security.bind_fallback.as_deref() {
         warn!(reason, "stored bind address could not be honored");
     }
@@ -215,9 +219,9 @@ pub(crate) async fn run(
         handle.note_server_probe_latency(server_id, latency);
     }
 
-    // Whether this run has torrents at all: the first of their two opt-ins,
-    // read here once and handed down. Nothing below reads the environment
-    // for it.
+    // Whether this run has torrents at all: yes unless the variable turns
+    // them off, read here once and handed down. Nothing below reads the
+    // environment for it.
     let torrent_availability = weaver_server_core::torrents::TorrentAvailability::of_env_value(
         std::env::var(weaver_server_core::torrents::TORRENTS_ENV)
             .ok()
@@ -373,7 +377,7 @@ pub(crate) async fn run(
     if !torrent_availability.available() {
         info!(
             variable = weaver_server_core::torrents::TORRENTS_ENV,
-            "torrents are not available in this run; set the variable to 1 to make them available"
+            "torrents are turned off in this run; remove the variable or set it to 1 to make them available"
         );
     }
     let torrents = torrent_availability
@@ -518,6 +522,13 @@ pub(crate) async fn run(
     usage::prime(&usage_recorder, &usage_sources, &db).await;
 
     // Build the GraphQL schema now that the live NNTP pool exists (for server-health metrics).
+    let appearance = {
+        let db = db.clone();
+        tokio::task::spawn_blocking(move || {
+            weaver_server_api::settings::appearance::AppearanceStore::load(&db)
+        })
+        .await??
+    };
     let schema = weaver_server_api::context::build_schema_with_backup(
         weaver_server_api::SchemaContext {
             handle: handle.clone(),
@@ -526,6 +537,7 @@ pub(crate) async fn run(
             config: shared_config.clone(),
             db: db.clone(),
             server_transfer_policy: Arc::clone(&server_transfer_policy),
+            appearance,
             auth_cache: login_auth_cache.clone(),
             api_key_cache: api_key_cache.clone(),
             security: security.clone(),
@@ -534,7 +546,7 @@ pub(crate) async fn run(
             update_check: update_check.clone(),
             application_upgrade: application_upgrade.clone(),
             schedules: shared_schedules.clone(),
-            log_buffer: log_ring_buffer,
+            log_buffer: log_ring_buffer.clone(),
             system_runtime: weaver_server_api::SystemRuntimeContext {
                 profile: Arc::clone(&system_profile),
                 started_at,
@@ -621,6 +633,7 @@ pub(crate) async fn run(
         restart: restart_controller.clone(),
         torrents: torrents.clone(),
         torrent_availability,
+        log_buffer: log_ring_buffer,
     };
     let mut server_task = tokio::spawn(http::run_server(server_runtime, listener));
     // Start-up housekeeping nothing serving a request waits on runs once the

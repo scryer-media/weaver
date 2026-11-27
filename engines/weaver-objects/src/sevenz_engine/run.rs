@@ -333,9 +333,17 @@ impl Walk<'_, '_> {
             UnorderedEntry::End { file_index } => {
                 if let Some(id) = self.id(file_index) {
                     self.ended[id as usize] = true;
+                    // sevenz-turbo ends an entry with a CRC only once that CRC
+                    // matched, so the member is said checked as it closes and
+                    // the namespace does not check it again. The end can come
+                    // after later entries of its folder began or ended.
                     while self.closed < self.announced && self.ended[self.closed as usize] {
                         let member = self.members[self.closed as usize].id;
+                        let crc32 = self.members[self.closed as usize].crc32;
                         self.closed += 1;
+                        if let Some(crc32) = crc32 {
+                            self.say(Emit::Checked { member, crc32 })?;
+                        }
                         self.say(Emit::MemberClosed(member))?;
                     }
                 }
@@ -349,22 +357,18 @@ impl Walk<'_, '_> {
         self.ids.get(file_index).copied().flatten()
     }
 
-    // Announces every member up to `id` not yet announced, in order, each
-    // with the checksum its header gives.
+    // Announces every member up to `id` not yet announced, in order.
     fn announce_through(&mut self, id: u32) -> Result<(), Error> {
         while self.announced <= id {
             let named = &self.members[self.announced as usize];
             let member = named.id;
-            let (name, length, crc32) = (named.name.clone(), named.length, named.crc32);
+            let (name, length) = (named.name.clone(), named.length);
             self.announced += 1;
             self.say(Emit::Member {
                 member,
                 name,
                 length: Some(length),
             })?;
-            if let Some(crc32) = crc32 {
-                self.say(Emit::Checksum { member, crc32 })?;
-            }
         }
         Ok(())
     }

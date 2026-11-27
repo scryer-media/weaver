@@ -1,0 +1,31 @@
+{{- $sm := .Values.metrics.serviceMonitor }}
+{{- if $sm.enabled }}
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: {{ include "weaver.fullname" . }}
+  labels:
+    {{- include "weaver.labels" . | nindent 4 }}
+    {{- with $sm.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+  {{- with include "weaver.annotations" (dict "root" .) }}{{ . | nindent 2 }}{{- end }}
+spec:
+  selector:
+    matchLabels:
+      {{- include "weaver.selectorLabels" . | nindent 6 }}
+  endpoints:
+    - port: http
+      path: {{ printf "%s/metrics" (include "weaver.basePath" .) }}
+      {{- with $sm.interval }}
+      interval: {{ . }}
+      {{- end }}
+      {{- with $sm.apiKeySecret.name }}
+      # Weaver takes a read-scoped API key as a bearer token.
+      authorization:
+        type: Bearer
+        credentials:
+          name: {{ . }}
+          key: {{ $sm.apiKeySecret.key }}
+      {{- end }}
+{{- end }}

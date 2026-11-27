@@ -565,6 +565,23 @@ impl Pipeline {
             "a lease holds an article already excluded from the server it is pinned to"
         );
         let completion_critical = reserved.iter().any(|work| work.completion_critical);
+        // One plan per file in the batch, not per article: a batch is cut
+        // from few files.
+        let mut checkpoint_plans = CheckpointPlans::default();
+        if let Some(graph) = self.graph_jobs.get(&job_id) {
+            for work in &reserved {
+                let file_index = work.segment_id.file_id.file_index;
+                if !checkpoint_plans.holds(file_index) {
+                    checkpoint_plans.insert(
+                        file_index,
+                        weaver_yenc::CheckpointPlan::from_slice_sizes(
+                            graph.block_sizes(file_index),
+                        )
+                        .plan,
+                    );
+                }
+            }
+        }
         let dial_exclude_servers = (0..self.nntp.pool().server_count())
             .filter(|idx| *idx != server_idx)
             .collect();
@@ -579,12 +596,7 @@ impl Pipeline {
             effective_exclude_servers: self
                 .effective_exclude_servers(job_id, weaver_nntp::ServerSet::EMPTY),
             dial_exclude_servers,
-            checkpoint_plan: self
-                .graph_jobs
-                .get(&job_id)
-                .map_or(weaver_yenc::CheckpointPlan::None, |graph| {
-                    weaver_yenc::CheckpointPlan::from_slice_sizes(graph.block_sizes()).plan
-                }),
+            checkpoint_plans,
             pressure_clear: pressure.state == DownloadPressureState::Clear,
             repeated: self.repeated_articles.get(&job_id).cloned(),
             works: reserved,

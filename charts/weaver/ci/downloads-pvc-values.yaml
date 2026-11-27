@@ -1,0 +1,4 @@
+persistence:
+  downloads:
+    type: pvc
+    size: 1Gi

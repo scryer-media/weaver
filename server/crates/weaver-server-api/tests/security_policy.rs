@@ -10,6 +10,7 @@ mod common;
 use common::{TestHarness, assert_has_errors, assert_no_errors, response_data};
 use weaver_server_api::auth::CallerScope;
 use weaver_server_core::security::{BindAddressSource, RuntimeSecurityConfig};
+use weaver_server_core::settings::queries::SettingsQueries;
 
 const ACCESS_POLICY_QUERY: &str = r#"query {
     accessPolicy { mode trustedNetworks editable envPinned configured strictSecurity }
@@ -245,4 +246,91 @@ async fn a_policy_change_settles_the_live_configured_flag_too() {
     assert_no_errors(&response);
 
     assert!(harness.security.security_configured());
+}
+
+const MCP_SERVER_QUERY: &str = r#"query {
+    mcpServer { enabled storedEnabled editable envPinned }
+}"#;
+
+fn mcp_env_forced(forced: bool) -> RuntimeSecurityConfig {
+    let mut security = RuntimeSecurityConfig::default();
+    security.mcp_enabled_env = Some(forced);
+    security
+}
+
+#[tokio::test]
+async fn the_mcp_switch_is_admin_only_on_by_default_and_applies_live() {
+    let harness = TestHarness::new().await;
+    assert_admin_only(&harness, MCP_SERVER_QUERY).await;
+
+    let data = response_data(&harness.execute(MCP_SERVER_QUERY).await);
+    assert_eq!(
+        data["mcpServer"],
+        serde_json::json!({"enabled": true, "storedEnabled": true, "editable": true, "envPinned": false})
+    );
+
+    for scope in [CallerScope::Read, CallerScope::Control] {
+        let response = harness
+            .execute_as(
+                "mutation { setMcpEnabled(enabled: false) { enabled } }",
+                scope,
+            )
+            .await;
+        assert_has_errors(&response);
+    }
+    assert!(harness.security.mcp_enabled());
+
+    let response = harness
+        .execute("mutation { setMcpEnabled(enabled: false) { enabled storedEnabled } }")
+        .await;
+    assert_no_errors(&response);
+    let data = response_data(&response);
+    assert_eq!(data["setMcpEnabled"]["enabled"], false);
+    assert_eq!(data["setMcpEnabled"]["storedEnabled"], false);
+    // Live in every clone the router holds, and stored for the next start.
+    assert!(!harness.security.mcp_enabled());
+    assert_eq!(
+        harness
+            .db
+            .get_setting(weaver_server_core::security::SETTING_MCP_ENABLED)
+            .unwrap()
+            .as_deref(),
+        Some("false")
+    );
+}
+
+#[tokio::test]
+async fn the_mcp_variable_locks_the_switch_and_names_itself() {
+    for forced in [true, false] {
+        let security = mcp_env_forced(forced);
+        // The stored switch says the opposite; the variable wins.
+        security.set_stored_mcp_enabled(!forced);
+        let harness = TestHarness::new_with_security(security).await;
+        let data = response_data(&harness.execute(MCP_SERVER_QUERY).await);
+        assert_eq!(
+            data["mcpServer"],
+            serde_json::json!({
+                "enabled": forced,
+                "storedEnabled": !forced,
+                "editable": false,
+                "envPinned": true,
+            })
+        );
+        let response = harness
+            .execute("mutation { setMcpEnabled(enabled: true) { enabled } }")
+            .await;
+        assert_has_errors(&response);
+        assert!(
+            error_messages(&response).contains("WEAVER_MCP_ENABLED"),
+            "refusal must name the variable: {}",
+            error_messages(&response)
+        );
+        assert_eq!(
+            harness
+                .db
+                .get_setting(weaver_server_core::security::SETTING_MCP_ENABLED)
+                .unwrap(),
+            None
+        );
+    }
 }

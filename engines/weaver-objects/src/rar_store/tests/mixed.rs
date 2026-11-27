@@ -115,7 +115,7 @@ pub(super) fn engine_run(
                 assert_eq!(offset, got.len() as u64);
                 got.extend_from_slice(&bytes);
             }
-            Emit::Checksum { member, crc32 } => {
+            Emit::Checksum { member, crc32 } | Emit::Checked { member, crc32 } => {
                 said.get_mut(&names[&member.0]).unwrap().crc32 = Some(crc32);
             }
             Emit::MemberClosed(member) => {
@@ -137,7 +137,11 @@ pub(super) fn run_said(owner: &Owner, name: &str) -> Said {
     Said {
         bytes: got.bytes.clone(),
         crc32: owner.said.iter().find_map(|emit| match emit {
-            Emit::Checksum { member, crc32 } if member.0 == *id => Some(*crc32),
+            Emit::Checksum { member, crc32 } | Emit::Checked { member, crc32 }
+                if member.0 == *id =>
+            {
+                Some(*crc32)
+            }
             _ => None,
         }),
         closed: got.closed,

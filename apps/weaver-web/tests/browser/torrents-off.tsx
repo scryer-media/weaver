@@ -60,7 +60,8 @@ const PRESENCES: Record<string, TorrentPresence> = {
     windingDown: false,
     windDown: null,
   },
-  // A server started without torrents, whatever its saved setting and rows say.
+  // A server started with torrents turned off, whatever its saved setting and
+  // rows say.
   unavailable: {
     available: false,
     enabled: true,

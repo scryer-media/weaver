@@ -468,7 +468,12 @@ function RunDetail({
   const series = legs.map((leg, index) => ({
     key: `leg-${leg}`,
     label: t("next.networking.speed.legRate", { position: leg + 1 }),
-    color: ["var(--wv-accent)", "#6aa7e8", "#b48ef0", "#d3a43e"][index % 4]!,
+    color: [
+      "var(--wv-accent)",
+      "var(--color-wv-dns)",
+      "var(--color-wv-violet)",
+      "var(--color-wv-warn)",
+    ][index % 4]!,
     values: seconds.map((at) =>
       (result?.samples ?? [])
         .filter((sample) => sample.leg === leg && sample.atMs === at)

@@ -958,6 +958,7 @@ name = "tv"
         config.torrent = TorrentConfig {
             enabled: true,
             base_port: 51_413,
+            base_port_pinned: false,
             announce_port: Some(40_000),
             upnp: false,
             encryption: TorrentEncryption::Require,

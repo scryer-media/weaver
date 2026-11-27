@@ -465,66 +465,147 @@ pub fn load_integrity_history(
 }
 
 #[derive(Debug, Clone, Copy, Default, SimpleObject)]
-pub struct TorrentPeers {
+pub struct TorrentLiveTotals {
     /// Torrents the client holds now.
     pub torrents: u32,
     /// Peers connected now, across every torrent.
-    pub connected: u32,
+    pub connected_peers: u32,
     /// Of those, the ones that have every piece.
-    pub seeds: u32,
+    pub connected_seeds: u32,
 }
 
-impl TorrentPeers {
+impl TorrentLiveTotals {
     pub fn of(published: &Published) -> Self {
         published
             .torrents
             .iter()
             .fold(Self::default(), |sum, torrent| Self {
                 torrents: sum.torrents.saturating_add(1),
-                connected: sum.connected.saturating_add(torrent.peers_established),
-                seeds: sum.seeds.saturating_add(torrent.peer_seeders),
+                connected_peers: sum
+                    .connected_peers
+                    .saturating_add(torrent.peers_established),
+                connected_seeds: sum.connected_seeds.saturating_add(torrent.peer_seeders),
             })
     }
 }
 
-#[derive(Debug, Clone, SimpleObject)]
+/// The torrent ledger over a range. Each part is read only when a field
+/// of it is selected: the total and the range's days from the torrents'
+/// own rows, the trackers from theirs and the tracker rules, and the live
+/// totals from what the torrent client last published.
+#[derive(Debug, Clone)]
 pub struct TorrentHistory {
+    span: Option<TorrentSpan>,
+    tracker_rows: Vec<UsageConsumer>,
+    live_totals: TorrentLiveTotals,
+}
+
+// The days of a range and every torrent's use over it.
+#[derive(Debug, Clone)]
+struct TorrentSpan {
+    today: String,
+    range_start: String,
+    range_end: String,
+    total: UsageConsumer,
+}
+
+#[async_graphql::Object]
+impl TorrentHistory {
     /// This host's local date, `YYYY-MM-DD`.
-    pub today: String,
-    pub range_start: String,
-    pub range_end: String,
+    async fn today(&self) -> async_graphql::Result<&str> {
+        Ok(&self.span()?.today)
+    }
+
+    async fn range_start(&self) -> async_graphql::Result<&str> {
+        Ok(&self.span()?.range_start)
+    }
+
+    async fn range_end(&self) -> async_graphql::Result<&str> {
+        Ok(&self.span()?.range_end)
+    }
+
     /// Every torrent together: from peers in `bytes`, to peers in
     /// `bytesUploaded`, seeding time in `durationMs`.
-    pub total: UsageConsumer,
+    async fn total(&self) -> async_graphql::Result<&UsageConsumer> {
+        Ok(&self.span()?.total)
+    }
+
     /// Each tracker rule by name, and each host no rule covers, by the
     /// torrents that list it; the empty id is the torrents that list none.
     /// A torrent counts under its rule once, or under each host it lists,
     /// so trackers are never added together.
-    pub trackers: Vec<UsageConsumer>,
+    async fn trackers(&self) -> &[UsageConsumer] {
+        &self.tracker_rows
+    }
+
     /// Now, as the torrent client last published its torrents.
-    pub peers: TorrentPeers,
+    async fn live(&self) -> TorrentLiveTotals {
+        self.live_totals
+    }
 }
 
-/// Read the torrent ledger for one request, against `today`.
+impl TorrentHistory {
+    /// The ledger with nothing read from the database: for a request that
+    /// selects `live` alone.
+    pub fn live_only(live: TorrentLiveTotals) -> Self {
+        Self {
+            span: None,
+            tracker_rows: Vec::new(),
+            live_totals: live,
+        }
+    }
+
+    fn span(&self) -> async_graphql::Result<&TorrentSpan> {
+        self.span
+            .as_ref()
+            .ok_or_else(|| async_graphql::Error::new("the torrent ledger's range was not read"))
+    }
+}
+
+/// Which parts of the torrent ledger a request selects.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct TorrentHistoryWants {
+    /// `today`, `rangeStart`, `rangeEnd` or `total`.
+    pub span: bool,
+    pub trackers: bool,
+}
+
+/// Read the parts of the torrent ledger `wants` names for one request,
+/// against `today`.
 pub fn load_torrent_history(
     db: &Database,
     today: NaiveDate,
     period: UsagePeriod,
-    peers: TorrentPeers,
+    wants: TorrentHistoryWants,
+    live: TorrentLiveTotals,
 ) -> Result<TorrentHistory, StateError> {
-    let total = read_summary(db, today, period, Some(CoreKind::Torrent))?;
-    let trackers = read_summary(db, today, period, Some(CoreKind::Tracker))?;
-    let rules = db.list_tracker_rules()?;
+    let span = match wants.span {
+        true => {
+            let total = read_summary(db, today, period, Some(CoreKind::Torrent))?;
+            Some(TorrentSpan {
+                today: day_text(total.today),
+                range_start: day_text(total.range_start),
+                range_end: day_text(total.range_end),
+                total: total.total.into(),
+            })
+        }
+        false => None,
+    };
+    let tracker_rows = match wants.trackers {
+        true => {
+            let trackers = read_summary(db, today, period, Some(CoreKind::Tracker))?;
+            let rules = db.list_tracker_rules()?;
+            under_rules(rules, trackers.consumers)
+                .into_iter()
+                .map(Into::into)
+                .collect()
+        }
+        false => Vec::new(),
+    };
     Ok(TorrentHistory {
-        today: day_text(total.today),
-        range_start: day_text(total.range_start),
-        range_end: day_text(total.range_end),
-        total: total.total.into(),
-        trackers: under_rules(rules, trackers.consumers)
-            .into_iter()
-            .map(Into::into)
-            .collect(),
-        peers,
+        span,
+        tracker_rows,
+        live_totals: live,
     })
 }
 

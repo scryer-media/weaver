@@ -175,6 +175,9 @@ pub struct Snapshot {
     // one it holds, so a publish that read every torrent and lands after a
     // newer reading of one does not take that torrent back.
     stamps: AtomicU64,
+    // How many times `rows_of` has read the rows, for tests that count it.
+    #[cfg(any(test, feature = "test-support"))]
+    rows_of_reads: AtomicU64,
 }
 
 #[derive(Default)]
@@ -274,6 +277,8 @@ impl Snapshot {
 
     /// The rows of `ids` there are, in the order the torrents were added.
     pub fn rows_of<'a>(&self, ids: impl IntoIterator<Item = &'a JobId>) -> Vec<Arc<TorrentRow>> {
+        #[cfg(any(test, feature = "test-support"))]
+        self.rows_of_reads.fetch_add(1, Ordering::Relaxed);
         let mut rows: Vec<Arc<TorrentRow>> = {
             let rows = self.read();
             ids.into_iter()
@@ -282,6 +287,12 @@ impl Snapshot {
         };
         rows.sort_unstable_by_key(|row| row.place());
         rows
+    }
+
+    /// How many times `rows_of` has read the rows.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn rows_of_reads(&self) -> u64 {
+        self.rows_of_reads.load(Ordering::Relaxed)
     }
 
     /// Every row, in the order the torrents were added, at the revision

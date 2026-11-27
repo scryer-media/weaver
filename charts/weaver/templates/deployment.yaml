@@ -1,0 +1,217 @@
+{{- $basePath := include "weaver.basePath" . }}
+{{- $downloads := .Values.persistence.downloads }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "weaver.fullname" . }}
+  labels:
+    {{- include "weaver.labels" . | nindent 4 }}
+  {{- with include "weaver.annotations" (dict "root" .) }}{{ . | nindent 2 }}{{- end }}
+spec:
+  # One writer to the database: never more than one pod, and the old pod
+  # stops before the new one starts.
+  replicas: 1
+  revisionHistoryLimit: 3
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      {{- include "weaver.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "weaver.labels" . | nindent 8 }}
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      {{- with include "weaver.annotations" (dict "root" . "extra" .Values.podAnnotations) }}{{ . | nindent 6 }}{{- end }}
+    spec:
+      serviceAccountName: {{ include "weaver.serviceAccountName" . }}
+      automountServiceAccountToken: false
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.priorityClassName }}
+      priorityClassName: {{ . }}
+      {{- end }}
+      terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: {{ .Values.securityContext.runAsUser }}
+        runAsGroup: {{ .Values.securityContext.runAsGroup }}
+        fsGroup: {{ .Values.securityContext.fsGroup }}
+        fsGroupChangePolicy: OnRootMismatch
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: weaver
+          image: {{ include "weaver.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          # The image's entrypoint runs Weaver directly when started as a
+          # non-root user. These are the image's own arguments.
+          args:
+            - --config
+            - /config
+            - serve
+            - --port
+            - "9090"
+            {{- if $basePath }}
+            - --base-url
+            - {{ $basePath | quote }}
+            {{- end }}
+          securityContext:
+            {{- include "weaver.containerSecurityContext" . | nindent 12 }}
+          ports:
+            - name: http
+              containerPort: 9090
+              protocol: TCP
+            {{- if .Values.torrents.enabled }}
+            - name: torrent-tcp
+              containerPort: {{ .Values.torrents.port }}
+              protocol: TCP
+            - name: torrent-udp
+              containerPort: {{ .Values.torrents.port }}
+              protocol: UDP
+            {{- end }}
+          env:
+            - name: TZ
+              value: {{ .Values.timezone | quote }}
+            - name: WEAVER_HTTP_ALLOWED_HOSTS
+              value: {{ include "weaver.allowedHosts" . | quote }}
+            # Seeds for a new database; settings already saved win.
+            - name: WEAVER_INTERMEDIATE_DIR
+              value: /downloads/intermediate
+            - name: WEAVER_COMPLETE_DIR
+              value: /downloads/complete
+            # The chart, not Weaver, replaces the image.
+            - name: WEAVER_DISABLE_SELF_UPGRADE
+              value: "1"
+            {{- with .Values.encryptionKey.existingSecret }}
+            - name: WEAVER_ENCRYPTION_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ . }}
+                  key: {{ $.Values.encryptionKey.key }}
+            {{- end }}
+            {{- with .Values.bootstrapLogin.existingSecret }}
+            - name: WEAVER_BOOTSTRAP_LOGIN_USERNAME
+              valueFrom:
+                secretKeyRef:
+                  name: {{ . }}
+                  key: {{ $.Values.bootstrapLogin.usernameKey }}
+            - name: WEAVER_BOOTSTRAP_LOGIN_PASSWORD_FILE
+              value: /run/secrets/weaver-bootstrap/password
+            {{- end }}
+            {{- with .Values.database.existingSecret }}
+            - name: WEAVER_DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ . }}
+                  key: {{ $.Values.database.key }}
+            {{- end }}
+            {{- if .Values.torrents.enabled }}
+            # Weaver listens on the port the pod and the Service expose.
+            - name: WEAVER_TORRENT_PORT
+              value: {{ .Values.torrents.port | quote }}
+            {{- end }}
+            {{- range $name, $value := .Values.env }}
+            - name: {{ $name }}
+              value: {{ $value | quote }}
+            {{- end }}
+            {{- with .Values.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          {{- with .Values.envFrom }}
+          envFrom:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          # Weaver answers /healthz while a database upgrade runs, so a long
+          # migration is not restarted; /readyz waits for the database.
+          startupProbe:
+            httpGet:
+              path: {{ printf "%s/healthz" $basePath }}
+              port: http
+            periodSeconds: 5
+            failureThreshold: 60
+          livenessProbe:
+            httpGet:
+              path: {{ printf "%s/healthz" $basePath }}
+              port: http
+            periodSeconds: 20
+            timeoutSeconds: 5
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: {{ printf "%s/readyz" $basePath }}
+              port: http
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          {{- with .Values.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          volumeMounts:
+            - name: config
+              mountPath: /config
+            - name: downloads
+              mountPath: /downloads
+            - name: tmp
+              mountPath: /tmp
+            {{- if .Values.bootstrapLogin.existingSecret }}
+            - name: bootstrap-login
+              mountPath: /run/secrets/weaver-bootstrap
+              readOnly: true
+            {{- end }}
+            {{- with .Values.extraVolumeMounts }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+      volumes:
+        - name: config
+          persistentVolumeClaim:
+            claimName: {{ default (printf "%s-config" (include "weaver.fullname" .)) .Values.persistence.config.existingClaim }}
+        - name: downloads
+          {{- if eq $downloads.type "pvc" }}
+          persistentVolumeClaim:
+            claimName: {{ printf "%s-downloads" (include "weaver.fullname" .) }}
+          {{- else if eq $downloads.type "existingClaim" }}
+          persistentVolumeClaim:
+            claimName: {{ required "persistence.downloads.existingClaim is required when type is existingClaim" $downloads.existingClaim }}
+          {{- else if eq $downloads.type "hostPath" }}
+          hostPath:
+            path: {{ required "persistence.downloads.hostPath is required when type is hostPath" $downloads.hostPath }}
+            type: Directory
+          {{- else if eq $downloads.type "nfs" }}
+          nfs:
+            server: {{ required "persistence.downloads.nfs.server is required when type is nfs" $downloads.nfs.server }}
+            path: {{ required "persistence.downloads.nfs.path is required when type is nfs" $downloads.nfs.path }}
+          {{- else }}
+          emptyDir: {}
+          {{- end }}
+        - name: tmp
+          emptyDir: {}
+        {{- with .Values.bootstrapLogin.existingSecret }}
+        - name: bootstrap-login
+          secret:
+            secretName: {{ . }}
+            defaultMode: 0440
+            items:
+              - key: {{ $.Values.bootstrapLogin.passwordKey }}
+                path: password
+        {{- end }}
+        {{- with .Values.extraVolumes }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

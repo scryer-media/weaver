@@ -17,6 +17,7 @@ use weaver_graph::{
 };
 
 use super::SevenZipStore;
+use crate::grid::WHOLE;
 use crate::keys::Keys;
 use crate::testing::payload;
 use owner::Owner;
@@ -908,6 +909,223 @@ fn a_damaged_member_byte_is_said_at_its_volume_range() {
         emit,
         Emit::Damaged { volume: VolumeIndex(0), range } if range.contains(132)
     )));
+}
+
+// As many one-byte files as the job's pending run budget before a last
+// one: a byte of the last file wrong, delivered in order, is still said as
+// damage at its volume range.
+#[test]
+fn a_member_past_the_job_run_budget_still_says_its_damage() {
+    const MEMBERS: usize = 16_384;
+    let names: Vec<String> = (0..MEMBERS).map(|at| format!("m{at:05}.bin")).collect();
+    let small: Vec<[u8; 1]> = (0..MEMBERS).map(|at| [at as u8]).collect();
+    let last = payload(12, 4096);
+    let mut entries: Vec<_> = names
+        .iter()
+        .zip(&small)
+        .map(|(name, bytes)| (None, Entry::File(name, bytes)))
+        .collect();
+    entries.push((None, Entry::File("last.bin", &last)));
+    let bytes = write(copy(), false, &entries);
+    // The files' bytes lie in order right after the signature header.
+    let flipped = 32 + MEMBERS + 100;
+    assert_eq!(bytes[flipped], last[100]);
+    let mut bad = bytes.clone();
+    bad[flipped] ^= 0x01;
+    let mut owner = Owner::single(store(), bytes.clone());
+    let length = bytes.len() as u64;
+    let mut start = 0;
+    while start < length {
+        let end = (start + 4096).min(length);
+        owner.deliver_as(
+            0,
+            ByteRange::new(start, end),
+            Provenance::Fresh,
+            Some(&bad[start as usize..end as usize]),
+        );
+        start = end;
+    }
+    owner.close(0);
+    assert!(owner.said.iter().any(|emit| matches!(
+        emit,
+        Emit::Damaged { volume: VolumeIndex(0), range } if range.contains(flipped as u64)
+    )));
+}
+
+// One stored member of more than twice the file run budget, a byte of it
+// wrong: in order, its fold rules it damaged; delivered every other byte
+// first, its fold goes over the budget and is dropped, so the member closes
+// with no ruling of its own.
+fn over_budget_member() -> (Vec<u8>, Vec<u8>, u64) {
+    let file = payload(61, 2 * crate::grid::MAX_PENDING_RUNS_PER_FILE + 16);
+    let bytes = write(copy(), false, &[(None, Entry::File("large.bin", &file))]);
+    // The member's bytes lie right after the signature header.
+    let flipped = 32 + 100;
+    assert_eq!(bytes[flipped], file[100]);
+    let mut bad = bytes.clone();
+    bad[flipped] ^= 0x01;
+    (bytes, bad, file.len() as u64)
+}
+
+fn damage(owner: &Owner) -> Vec<Emit> {
+    owner
+        .said
+        .iter()
+        .filter(|emit| matches!(emit, Emit::Damaged { .. }))
+        .cloned()
+        .collect()
+}
+
+// The volume's signature header and end header, then the member's bytes in
+// `order`, one delivery per range, each with the bytes `posted` holds.
+fn scattered(owner: &mut Owner, posted: &[u8], body: ByteRange, order: &[ByteRange]) {
+    owner.pull = Pull::Moved(0);
+    let length = posted.len() as u64;
+    for range in [
+        ByteRange::new(0, body.start),
+        ByteRange::new(body.end, length),
+    ] {
+        let at = range.start as usize..range.end as usize;
+        owner.deliver_as(0, range, Provenance::Fresh, Some(&posted[at]));
+    }
+    for range in order {
+        let at = range.start as usize..range.end as usize;
+        owner.deliver_as(0, *range, Provenance::Fresh, Some(&posted[at]));
+    }
+}
+
+// Every other `step` bytes of `body` from its start, then the rest.
+fn every_other(body: ByteRange, step: u64) -> Vec<ByteRange> {
+    let piece = |at: u64| ByteRange::new(at, (at + step).min(body.end));
+    let starts: Vec<u64> = (body.start..body.end).step_by(step as usize).collect();
+    let (first, second): (Vec<_>, Vec<_>) = starts
+        .into_iter()
+        .enumerate()
+        .partition(|(index, _)| index % 2 == 0);
+    first
+        .into_iter()
+        .chain(second)
+        .map(|(_, at)| piece(at))
+        .collect()
+}
+
+// A member closed with no fold of its own, whose file the namespace finds
+// failing its CRC, is damaged over its volume extent as its own fold would
+// have said it, once: a second word changes nothing.
+#[test]
+fn a_member_refuted_with_its_fold_dropped_says_its_damage_once() {
+    let (_, bad, length) = over_budget_member();
+    let body = ByteRange::at(32, length);
+    let mut folded = Owner::single(store(), bad.clone());
+    scattered(&mut folded, &bad, body, &[body]);
+    let said = damage(&folded);
+    assert!(!said.is_empty(), "the fold rules the member damaged");
+
+    let mut owner = Owner::single(store(), bad.clone());
+    scattered(&mut owner, &bad, body, &every_other(body, 1));
+    let member = member_id(&owner, "large.bin");
+    assert!(owner.member("large.bin").closed);
+    assert!(owner.object.grid.dropped(member, WHOLE));
+    assert_eq!(
+        owner
+            .object
+            .grid
+            .fold(member, WHOLE, 0, ByteRange::new(0, length)),
+        None
+    );
+    assert_eq!(damage(&owner), Vec::new(), "nothing ruled the member");
+
+    owner.refuted(member);
+    assert_eq!(damage(&owner), said, "said as its fold says it");
+    let before = owner.said.len();
+    owner.refuted(member);
+    assert_eq!(owner.said.len(), before, "said once");
+    assert_eq!(condemned(&owner), 0);
+}
+
+// A member whose fold ruled has nothing more to say when the namespace's
+// check of its file fails or passes: damaged, it stays as its fold said it;
+// whole, nothing is said.
+#[test]
+fn a_member_refuted_with_its_fold_in_hand_changes_nothing() {
+    let (bytes, bad, length) = over_budget_member();
+    let body = ByteRange::at(32, length);
+    for posted in [bad, bytes] {
+        let mut owner = Owner::single(store(), posted.clone());
+        scattered(&mut owner, &posted, body, &[body]);
+        let member = member_id(&owner, "large.bin");
+        assert!(
+            owner
+                .object
+                .grid
+                .fold(member, WHOLE, 0, ByteRange::new(0, length))
+                .is_some()
+        );
+        let said = owner.said.clone();
+        owner.refuted(member);
+        assert_eq!(owner.said, said);
+    }
+}
+
+// An enciphered member too large to prove its candidate by, delivered so its
+// fold goes over the budget: closed under a wrong first candidate with no
+// ruling of its own, the namespace's failed check condemns the candidate,
+// the folder comes again, and the next candidate opens the member clean.
+#[test]
+fn a_member_refuted_with_its_fold_dropped_condemns_a_key_on_trial() {
+    let (bytes, file) = unprovable();
+    let length = file.len() as u64;
+    let mut owner = Owner::single(store(), bytes.clone());
+    owner.offer("not-the-passphrase");
+    owner.offer(PASSWORD);
+    owner.pull = Pull::Moved(0);
+    let tail = end_header(&bytes);
+    owner.deliver(0, ByteRange::new(0, 32));
+    owner.deliver(0, ByteRange::new(tail.start, bytes.len() as u64));
+    let pack = owner.object.map.as_ref().expect("the map").folders[0].pack;
+    // Two cipher blocks of every three first: each lets out one block of
+    // plaintext alone, too many runs for the fold to keep.
+    let block = crate::crypt::BLOCK;
+    let runs = crate::grid::MAX_PENDING_RUNS_PER_FILE as u64 + 64;
+    let scattered = ByteRange::new(pack.start, pack.start + runs * 3 * block);
+    let mut order = Vec::new();
+    for at in (scattered.start..scattered.end).step_by(3 * block as usize) {
+        order.push(ByteRange::at(at, 2 * block));
+    }
+    for at in (scattered.start..scattered.end).step_by(3 * block as usize) {
+        order.push(ByteRange::at(at + 2 * block, block));
+    }
+    for start in (scattered.end..tail.start).step_by(256 << 10) {
+        order.push(ByteRange::new(start, (start + (256 << 10)).min(tail.start)));
+    }
+    for range in order {
+        owner.deliver(0, range);
+    }
+    let member = member_id(&owner, "large.bin");
+    let got = owner.member("large.bin");
+    assert!(got.closed);
+    assert_ne!(got.bytes, file, "opened under the wrong candidate");
+    assert!(owner.object.grid.dropped(member, WHOLE));
+    assert_eq!(condemned(&owner), 0, "nothing ruled the member");
+
+    owner.refuted(member);
+    no_trouble(&owner);
+    assert_eq!(condemned(&owner), 1);
+    let got = owner.member("large.bin");
+    assert!(got.closed);
+    assert_eq!(got.bytes, file);
+    assert!(got.coverage.verified(ByteRange::new(0, length)));
+    assert!(
+        owner
+            .object
+            .grid
+            .fold(member, WHOLE, 0, ByteRange::new(0, length))
+            .is_some()
+    );
+    // The right candidate's fold rules now: a second word changes nothing.
+    let said = owner.said.len();
+    owner.refuted(member);
+    assert_eq!(owner.said.len(), said);
 }
 
 #[test]

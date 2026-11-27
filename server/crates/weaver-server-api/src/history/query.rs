@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
+use crate::observability::{spawn_blocking_with, state_error};
+
 #[cfg(test)]
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
@@ -66,50 +68,51 @@ impl HistoryQuery {
         };
         let want_delete_states = ctx.look_ahead().field("deleteOperation").exists();
         let want_duplicates = ctx.look_ahead().field("duplicateSummary").exists();
-        let items = tokio::task::spawn_blocking(move || {
-            // Live rows are left out in SQL, before the page is cut, so a page
-            // comes back full and the cursor's offset counts only rows that are
-            // history.
-            let live_in_history = live_jobs_in_history(&db, &live_jobs)?;
-            if !live_in_history.is_empty() {
-                let mut ids: Vec<u64> = live_in_history.into_iter().collect();
-                ids.sort_unstable();
-                history_filter.item_ids_not_in = Some(ids);
-            }
-            let rows = db.list_job_history(&history_filter)?;
-            let delete_states = if want_delete_states {
-                load_history_delete_states(&db, rows.iter().map(|row| row.job_id))?
-            } else {
-                HashMap::new()
-            };
-            let duplicate_summaries = if want_duplicates {
-                load_duplicate_summaries_chunked(
-                    &db,
-                    rows.iter()
-                        .map(|row| weaver_server_core::jobs::ids::JobId(row.job_id)),
-                )?
-            } else {
-                Default::default()
-            };
-            Ok::<_, weaver_server_core::StateError>(
-                rows.into_iter()
-                    .map(|row| {
-                        let delete_state = delete_states
-                            .get(&row.job_id)
-                            .cloned()
-                            .map(history_delete_row_state_from_core);
-                        let mut item = history_item_from_row(&row, delete_state);
-                        item.duplicate_summary = duplicate_summaries
-                            .get(&weaver_server_core::jobs::ids::JobId(row.job_id))
-                            .map(crate::jobs::types::DuplicateSummaryInfo::from_summary);
-                        item
-                    })
-                    .collect::<Vec<_>>(),
-            )
-        })
-        .await
-        .map_err(|e| graphql_error("INTERNAL", e.to_string()))?
-        .map_err(|e| graphql_error("INTERNAL", e.to_string()))?;
+        let items = spawn_blocking_with(
+            move || {
+                // Live rows are left out in SQL, before the page is cut, so a page
+                // comes back full and the cursor's offset counts only rows that are
+                // history.
+                let live_in_history = live_jobs_in_history(&db, &live_jobs)?;
+                if !live_in_history.is_empty() {
+                    let mut ids: Vec<u64> = live_in_history.into_iter().collect();
+                    ids.sort_unstable();
+                    history_filter.item_ids_not_in = Some(ids);
+                }
+                let rows = db.list_job_history(&history_filter)?;
+                let delete_states = if want_delete_states {
+                    load_history_delete_states(&db, rows.iter().map(|row| row.job_id))?
+                } else {
+                    HashMap::new()
+                };
+                let duplicate_summaries = if want_duplicates {
+                    load_duplicate_summaries_chunked(
+                        &db,
+                        rows.iter()
+                            .map(|row| weaver_server_core::jobs::ids::JobId(row.job_id)),
+                    )?
+                } else {
+                    Default::default()
+                };
+                Ok::<_, weaver_server_core::StateError>(
+                    rows.into_iter()
+                        .map(|row| {
+                            let delete_state = delete_states
+                                .get(&row.job_id)
+                                .cloned()
+                                .map(history_delete_row_state_from_core);
+                            let mut item = history_item_from_row(&row, delete_state);
+                            item.duplicate_summary = duplicate_summaries
+                                .get(&weaver_server_core::jobs::ids::JobId(row.job_id))
+                                .map(crate::jobs::types::DuplicateSummaryInfo::from_summary);
+                            item
+                        })
+                        .collect::<Vec<_>>(),
+                )
+            },
+            state_error,
+        )
+        .await?;
         Ok(items)
     }
     /// Server-backed history table page with search, counts, sorting, and pagination.
@@ -131,20 +134,21 @@ impl HistoryQuery {
             return Ok(None);
         }
         let db = ctx.data::<Database>()?.clone();
-        let row = tokio::task::spawn_blocking(move || {
-            let row = db.get_job_history_profiled(id, "db.get_job_history.api_history_item")?;
-            let delete_states =
-                load_history_delete_states(&db, row.iter().map(|entry| entry.job_id))?;
-            let duplicate_summaries = load_duplicate_summaries_chunked(
-                &db,
-                row.iter()
-                    .map(|entry| weaver_server_core::jobs::ids::JobId(entry.job_id)),
-            )?;
-            Ok::<_, weaver_server_core::StateError>((row, delete_states, duplicate_summaries))
-        })
-        .await
-        .map_err(|e| graphql_error("INTERNAL", e.to_string()))?
-        .map_err(|e| graphql_error("INTERNAL", e.to_string()))?;
+        let row = spawn_blocking_with(
+            move || {
+                let row = db.get_job_history_profiled(id, "db.get_job_history.api_history_item")?;
+                let delete_states =
+                    load_history_delete_states(&db, row.iter().map(|entry| entry.job_id))?;
+                let duplicate_summaries = load_duplicate_summaries_chunked(
+                    &db,
+                    row.iter()
+                        .map(|entry| weaver_server_core::jobs::ids::JobId(entry.job_id)),
+                )?;
+                Ok::<_, weaver_server_core::StateError>((row, delete_states, duplicate_summaries))
+            },
+            state_error,
+        )
+        .await?;
         Ok(row.0.as_ref().map(|history_row| {
             let mut item = history_item_from_row(
                 history_row,
@@ -175,14 +179,15 @@ impl HistoryQuery {
         };
         // The count answers for the same rows the list returns, so the rows the
         // list excludes as still-live are taken off it too.
-        let count = tokio::task::spawn_blocking(move || {
-            let counted = db.count_job_history(&history_filter)?;
-            let live = count_live_rows_matching(&db, &history_filter, &live_jobs)?;
-            Ok::<_, weaver_server_core::StateError>(counted.saturating_sub(live))
-        })
-        .await
-        .map_err(|e| graphql_error("INTERNAL", e.to_string()))?
-        .map_err(|e| graphql_error("INTERNAL", e.to_string()))?;
+        let count = spawn_blocking_with(
+            move || {
+                let counted = db.count_job_history(&history_filter)?;
+                let live = count_live_rows_matching(&db, &history_filter, &live_jobs)?;
+                Ok::<_, weaver_server_core::StateError>(counted.saturating_sub(live))
+            },
+            state_error,
+        )
+        .await?;
         Ok(count)
     }
     /// Compatibility facade for recent queue lifecycle history.
@@ -217,7 +222,8 @@ impl HistoryQuery {
         let handle = ctx.data::<SchedulerHandle>()?.clone();
         let db = ctx.data::<weaver_server_core::Database>()?.clone();
         let server_hosts = server_hosts_by_id(ctx.data::<SharedConfig>()?).await;
-        load_job_detail_snapshot(handle, db, job_id, server_hosts).await
+        let event_read = JobDetailEventRead::for_selection(ctx.look_ahead());
+        load_job_detail_snapshot(handle, db, job_id, server_hosts, event_read).await
     }
     /// Active or recent background history delete operations.
     #[graphql(guard = "ReadGuard")]
@@ -227,16 +233,17 @@ impl HistoryQuery {
         #[graphql(default = true)] active_only: bool,
     ) -> Result<Vec<crate::history::types::HistoryDeleteOperation>> {
         let db = ctx.data::<Database>()?.clone();
-        tokio::task::spawn_blocking(move || db.list_history_delete_operations(active_only))
-            .await
-            .map_err(|error| graphql_error("INTERNAL", error.to_string()))?
-            .map_err(|error| graphql_error("INTERNAL", error.to_string()))
-            .map(|operations| {
-                operations
-                    .into_iter()
-                    .map(crate::history::types::history_delete_operation_from_core)
-                    .collect()
-            })
+        spawn_blocking_with(
+            move || db.list_history_delete_operations(active_only),
+            state_error,
+        )
+        .await
+        .map(|operations| {
+            operations
+                .into_iter()
+                .map(crate::history::types::history_delete_operation_from_core)
+                .collect()
+        })
     }
     /// Get synthesized waterfall/timeline data for a job.
     #[graphql(guard = "ReadGuard")]
@@ -247,25 +254,28 @@ impl HistoryQuery {
         let live_job = match handle.get_job(JobId(job_id)) {
             Ok(info) => Some(info),
             Err(weaver_server_core::SchedulerError::JobNotFound(_)) => None,
-            Err(e) => return Err(e.into()),
+            Err(e) => return Err(crate::observability::scheduler_error(e)),
         };
         let live_only = live_job.is_some();
 
-        let (events, history) = tokio::task::spawn_blocking(move || {
-            // Every event the timeline acts on, however old: a newest-N
-            // window would drop the early stage and member boundaries.
-            let events =
-                db.get_job_events_of_kinds(job_id, crate::history::timeline::TIMELINE_EVENT_KINDS)?;
-            let history = if live_only {
-                None
-            } else {
-                db.get_job_history_profiled(job_id, "db.get_job_history.api_history_events")?
-            };
-            Ok::<_, weaver_server_core::StateError>((events, history))
-        })
-        .await
-        .map_err(|e| async_graphql::Error::new(e.to_string()))?
-        .map_err(|e| async_graphql::Error::new(e.to_string()))?;
+        let (events, history) = spawn_blocking_with(
+            move || {
+                // Every event the timeline acts on, however old: a newest-N
+                // window would drop the early stage and member boundaries.
+                let events = db.get_job_events_of_kinds(
+                    job_id,
+                    crate::history::timeline::TIMELINE_EVENT_KINDS,
+                )?;
+                let history = if live_only {
+                    None
+                } else {
+                    db.get_job_history_profiled(job_id, "db.get_job_history.api_history_events")?
+                };
+                Ok::<_, weaver_server_core::StateError>((events, history))
+            },
+            state_error,
+        )
+        .await?;
 
         let Some(job) = live_job.or_else(|| history.as_ref().map(job_info_from_history_row)) else {
             return Ok(None);
@@ -297,12 +307,11 @@ impl HistoryQuery {
             .unwrap_or(JOB_EVENTS_DEFAULT_LIMIT)
             .min(JOB_DETAIL_EVENT_CAP);
         let offset = offset.unwrap_or(0);
-        let events = tokio::task::spawn_blocking(move || {
-            db.get_job_event_records_window(job_id, limit, offset, before)
-        })
-        .await
-        .map_err(|e| async_graphql::Error::new(e.to_string()))?
-        .map_err(|e| async_graphql::Error::new(e.to_string()))?;
+        let events = spawn_blocking_with(
+            move || db.get_job_event_records_window(job_id, limit, offset, before),
+            state_error,
+        )
+        .await?;
         Ok(events
             .into_iter()
             .filter_map(crate::history::types::job_event_from_record)
@@ -326,40 +335,107 @@ pub(crate) async fn server_hosts_by_id(config: &SharedConfig) -> HashMap<u32, St
     .await
 }
 
+// How much of a job's event log a detail snapshot reads: nothing when the
+// query selects neither `jobTimeline` nor `jobEvents`, only the page's newest
+// window when it selects `jobEvents` alone, and the timeline's wider tail
+// when it selects `jobTimeline`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum JobDetailEventRead {
+    Nothing,
+    Window,
+    Timeline,
+}
+
+impl JobDetailEventRead {
+    pub(crate) fn for_selection(selection: async_graphql::Lookahead<'_>) -> Self {
+        if selection.field("jobTimeline").exists() {
+            Self::Timeline
+        } else if selection.field("jobEvents").exists() {
+            Self::Window
+        } else {
+            Self::Nothing
+        }
+    }
+
+    // The newest rows to read, or `None` for no read.
+    fn rows(self) -> Option<u32> {
+        match self {
+            Self::Nothing => None,
+            Self::Window => Some(JOB_DETAIL_EVENT_WINDOW as u32),
+            Self::Timeline => Some(JOB_DETAIL_EVENT_CAP),
+        }
+    }
+}
+
+type JobEventRecords = Vec<weaver_server_core::history::timeline::JobEventRecord>;
+
 pub(crate) async fn load_job_detail_snapshot(
     handle: SchedulerHandle,
     db: weaver_server_core::Database,
     job_id: u64,
     server_hosts: HashMap<u32, String>,
+    event_read: JobDetailEventRead,
+) -> Result<JobDetailSnapshot> {
+    load_job_detail_snapshot_with(
+        handle,
+        db,
+        job_id,
+        server_hosts,
+        event_read,
+        |db, job_id, rows| db.get_job_event_records_window(job_id, rows, 0, None),
+    )
+    .await
+}
+
+// `load_job_detail_snapshot` with the event read passed in, so a test can
+// see which read a selection makes.
+async fn load_job_detail_snapshot_with(
+    handle: SchedulerHandle,
+    db: weaver_server_core::Database,
+    job_id: u64,
+    server_hosts: HashMap<u32, String>,
+    event_read: JobDetailEventRead,
+    read_events: impl FnOnce(
+        &weaver_server_core::Database,
+        u64,
+        u32,
+    ) -> Result<JobEventRecords, weaver_server_core::StateError>
+    + Send
+    + 'static,
 ) -> Result<JobDetailSnapshot> {
     let snapshot_started = Instant::now();
     let live_job = match handle.get_job(JobId(job_id)) {
         Ok(info) => Some(info),
         Err(weaver_server_core::SchedulerError::JobNotFound(_)) => None,
-        Err(error) => return Err(error.into()),
+        Err(error) => return Err(crate::observability::scheduler_error(error)),
     };
     let live_only = live_job.is_some();
 
-    let (events, history, delete_states) = tokio::task::spawn_blocking(move || {
-        // The detail view is a read-only, high-frequency poll (heartbeat + event
-        // triggers, up to a few Hz per open tab). Large RAR jobs write thousands
-        // of event rows, so read only the newest slice instead of scanning the
-        // whole log.
-        let events = db.get_job_event_records_window(job_id, JOB_DETAIL_EVENT_CAP, 0, None)?;
-        let history = if live_only {
-            None
-        } else {
-            db.get_job_history_profiled(
-                job_id,
-                "db.get_job_history.api_history_integration_events",
-            )?
-        };
-        let delete_states = load_history_delete_states(&db, history.iter().map(|row| row.job_id))?;
-        Ok::<_, weaver_server_core::StateError>((events, history, delete_states))
-    })
-    .await
-    .map_err(|error| async_graphql::Error::new(error.to_string()))?
-    .map_err(|error| async_graphql::Error::new(error.to_string()))?;
+    let (events, history, delete_states) = spawn_blocking_with(
+        move || {
+            // The detail view is a read-only, high-frequency poll (heartbeat + event
+            // triggers, up to a few Hz per open tab). Large RAR jobs write thousands
+            // of event rows, so read only the newest slice instead of scanning the
+            // whole log, and only as much of it as the selection shows.
+            let events = match event_read.rows() {
+                Some(rows) => read_events(&db, job_id, rows)?,
+                None => Vec::new(),
+            };
+            let history = if live_only {
+                None
+            } else {
+                db.get_job_history_profiled(
+                    job_id,
+                    "db.get_job_history.api_history_integration_events",
+                )?
+            };
+            let delete_states =
+                load_history_delete_states(&db, history.iter().map(|row| row.job_id))?;
+            Ok::<_, weaver_server_core::StateError>((events, history, delete_states))
+        },
+        state_error,
+    )
+    .await?;
 
     // Prefer the live counters while the job is still resident; once it has been
     // archived they only exist in the history row. Both are already aggregated
@@ -396,10 +472,15 @@ pub(crate) async fn load_job_detail_snapshot(
                 .map(history_delete_row_state_from_core),
         )
     });
-    let job_timeline = live_job
-        .as_ref()
-        .cloned()
-        .or_else(|| history.as_ref().map(job_info_from_history_row))
+    // Built only when selected: it is the one part that reads the wide tail.
+    let job_timeline = (event_read == JobDetailEventRead::Timeline)
+        .then(|| {
+            live_job
+                .as_ref()
+                .cloned()
+                .or_else(|| history.as_ref().map(job_info_from_history_row))
+        })
+        .flatten()
         .map(|job| {
             let events = events
                 .iter()
@@ -485,24 +566,25 @@ async fn load_history_page(
     input: HistoryPageInput,
     fields: HistoryPageFields,
 ) -> Result<HistoryPage> {
-    tokio::task::spawn_blocking(move || {
-        // Rows for jobs the scheduler still owns are not history. They are
-        // excluded before counting and pagination, on whichever path builds the
-        // page, so `total_count` and the bucket counts describe exactly the
-        // rows the page draws from. The overlap is normally empty and costs one
-        // indexed lookup over the live ids; when it is not, the SQL path still
-        // pages in SQL with a `NOT IN` over that handful of ids.
-        let live_in_history = live_jobs_in_history(&db, &live_jobs)?;
-        // The search, the status and category filters, the order, the counts
-        // and LIMIT/OFFSET all run in the database, each order served by its
-        // own index.
-        let plan = HistoryPageSqlPlan::for_input(&input);
-        let page = build_history_page_sql(&db, plan, &live_in_history, fields)?;
-        attach_history_page_badges(&db, page, fields)
-    })
+    spawn_blocking_with(
+        move || {
+            // Rows for jobs the scheduler still owns are not history. They are
+            // excluded before counting and pagination, on whichever path builds the
+            // page, so `total_count` and the bucket counts describe exactly the
+            // rows the page draws from. The overlap is normally empty and costs one
+            // indexed lookup over the live ids; when it is not, the SQL path still
+            // pages in SQL with a `NOT IN` over that handful of ids.
+            let live_in_history = live_jobs_in_history(&db, &live_jobs)?;
+            // The search, the status and category filters, the order, the counts
+            // and LIMIT/OFFSET all run in the database, each order served by its
+            // own index.
+            let plan = HistoryPageSqlPlan::for_input(&input);
+            let page = build_history_page_sql(&db, plan, &live_in_history, fields)?;
+            attach_history_page_badges(&db, page, fields)
+        },
+        state_error,
+    )
     .await
-    .map_err(|error| graphql_error("INTERNAL", error.to_string()))?
-    .map_err(|error| graphql_error("INTERNAL", error.to_string()))
 }
 
 // The page built in Rust over every history row, for a request the
@@ -2259,5 +2341,136 @@ mod tests {
         };
         assert_eq!(page(0), vec![7, 5, 3]);
         assert_eq!(page(3), vec![2, 1]);
+    }
+
+    // An archived job with more events than the page's window, and more
+    // than one kind, so the timeline has stages to build.
+    fn seed_job_with_events(db: &Database, job_id: u64) {
+        use weaver_server_core::history::timeline::HistoryTimelineQueries;
+        db.insert_job_history(&history_row(job_id, "complete", 5_000))
+            .unwrap();
+        let events = (0..(JOB_DETAIL_EVENT_WINDOW as i64 + 50))
+            .map(|index| weaver_server_core::JobEvent {
+                job_id,
+                timestamp: 4_000 + index,
+                kind: match index {
+                    0 => "JobCreated",
+                    149 => "JobCompleted",
+                    _ => "ExtractionMemberFinished",
+                }
+                .to_string(),
+                message: format!("fixture event {index}"),
+                file_id: None,
+            })
+            .collect::<Vec<_>>();
+        db.insert_job_events(&events).unwrap();
+    }
+
+    // The snapshot for `event_read`, with the limits of every event read it
+    // made.
+    async fn snapshot_reading(
+        db: &Database,
+        job_id: u64,
+        event_read: JobDetailEventRead,
+    ) -> (serde_json::Value, Vec<u32>) {
+        let reads = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorded = std::sync::Arc::clone(&reads);
+        let snapshot = load_job_detail_snapshot_with(
+            scheduler_with_jobs(Vec::new()),
+            db.clone(),
+            job_id,
+            HashMap::new(),
+            event_read,
+            move |db, job_id, rows| {
+                recorded.lock().unwrap().push(rows);
+                db.get_job_event_records_window(job_id, rows, 0, None)
+            },
+        )
+        .await
+        .unwrap();
+        let reads = reads.lock().unwrap().clone();
+        (serde_json::to_value(snapshot).unwrap(), reads)
+    }
+
+    // Each selection gives the fields it selects as the full path does, and
+    // reads no more of the event log than they show.
+    #[tokio::test]
+    async fn a_job_detail_snapshot_reads_only_the_events_its_selection_shows() {
+        let db = Database::open_in_memory().unwrap();
+        seed_job_with_events(&db, 7);
+
+        let (full, reads) = snapshot_reading(&db, 7, JobDetailEventRead::Timeline).await;
+        assert_eq!(reads, vec![JOB_DETAIL_EVENT_CAP]);
+        assert!(full["job_timeline"].is_object(), "{full}");
+        assert_eq!(
+            full["job_events"].as_array().unwrap().len(),
+            JOB_DETAIL_EVENT_WINDOW
+        );
+
+        let (window, reads) = snapshot_reading(&db, 7, JobDetailEventRead::Window).await;
+        assert_eq!(reads, vec![JOB_DETAIL_EVENT_WINDOW as u32]);
+        assert_eq!(window["job_events"], full["job_events"]);
+
+        let (nothing, reads) = snapshot_reading(&db, 7, JobDetailEventRead::Nothing).await;
+        assert!(reads.is_empty(), "{reads:?}");
+        for field in ["queue_item", "history_item", "server_attribution"] {
+            assert_eq!(nothing[field], full[field], "{field}");
+            assert_eq!(window[field], full[field], "{field}");
+        }
+        assert!(full["history_item"].is_object(), "{full}");
+    }
+
+    // The read follows the fields the query names, through fragments too.
+    #[tokio::test]
+    async fn the_event_read_follows_the_selected_fields() {
+        type Seen = std::sync::Arc<std::sync::Mutex<Vec<JobDetailEventRead>>>;
+        struct Probe;
+        #[async_graphql::Object]
+        impl Probe {
+            async fn snapshot(&self, ctx: &Context<'_>) -> JobDetailSnapshot {
+                ctx.data_unchecked::<Seen>()
+                    .lock()
+                    .unwrap()
+                    .push(JobDetailEventRead::for_selection(ctx.look_ahead()));
+                JobDetailSnapshot {
+                    queue_item: None,
+                    history_item: None,
+                    job_timeline: None,
+                    job_events: Vec::new(),
+                    server_attribution: Vec::new(),
+                    job_id: 0,
+                }
+            }
+        }
+        let seen = Seen::default();
+        let schema = async_graphql::Schema::build(
+            Probe,
+            async_graphql::EmptyMutation,
+            async_graphql::EmptySubscription,
+        )
+        .data(seen.clone())
+        .finish();
+        for (query, want) in [
+            (
+                "{ snapshot { serverAttribution { serverId } } }",
+                JobDetailEventRead::Nothing,
+            ),
+            (
+                "{ snapshot { jobEvents { message } } }",
+                JobDetailEventRead::Window,
+            ),
+            (
+                "{ snapshot { jobEvents { message } jobTimeline { startedAt } } }",
+                JobDetailEventRead::Timeline,
+            ),
+            (
+                "{ snapshot { ...F } } fragment F on JobDetailSnapshot { jobTimeline { startedAt } }",
+                JobDetailEventRead::Timeline,
+            ),
+        ] {
+            let response = schema.execute(query).await;
+            assert!(response.errors.is_empty(), "{query}: {:?}", response.errors);
+            assert_eq!(seen.lock().unwrap().pop(), Some(want), "{query}");
+        }
     }
 }

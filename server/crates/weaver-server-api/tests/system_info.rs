@@ -378,6 +378,82 @@ async fn storage_queries_answer_configured_folders_from_the_cache() {
     );
 }
 
+// `systemInfo` looks at the configured folders only when the query selects
+// `configuredStorage`; the other fields answer the same either way.
+#[tokio::test]
+async fn system_info_looks_at_storage_only_when_asked() {
+    use weaver_server_core::operations::disk::disk_looks_for_test;
+    let h = TestHarness::new().await;
+    let (data_dir, intermediate_dir, complete_dir, category_dir) = {
+        let mut config = h.config.write().await;
+        let data_dir = std::path::PathBuf::from(&config.data_dir);
+        let complete_dir = std::path::PathBuf::from(config.complete_dir());
+        config.categories = vec![CategoryConfig {
+            id: 1,
+            name: "TV".to_string(),
+            dest_dir: None,
+            aliases: String::new(),
+            upload_cap: Default::default(),
+            seeding: None,
+            torrent_route: false,
+            unpack: None,
+        }];
+        (
+            data_dir,
+            std::path::PathBuf::from(config.intermediate_dir()),
+            complete_dir.clone(),
+            complete_dir.join("TV"),
+        )
+    };
+    std::fs::create_dir_all(&category_dir).unwrap();
+    wait_for_storage_readings(&h, &data_dir, &intermediate_dir, &complete_dir).await;
+    let storage = h
+        .shared_state
+        .storage_capacity()
+        .expect("the pipeline's samplers");
+    {
+        let storage = std::sync::Arc::clone(&storage);
+        let folder = category_dir.clone();
+        tokio::task::spawn_blocking(move || storage.wait_for_folder_read_for_test(&folder))
+            .await
+            .unwrap();
+    }
+    storage.stop_clock_for_test();
+
+    const WITHOUT_STORAGE: &str =
+        "{ systemInfo { version architecture databaseEngine compute { logicalCores } } }";
+    const WITH_STORAGE: &str = "{ systemInfo { version architecture databaseEngine compute { logicalCores } configuredStorage { labels path error } } }";
+
+    let looks = disk_looks_for_test();
+    let without = h.execute(WITHOUT_STORAGE).await;
+    assert_no_errors(&without);
+    assert_eq!(disk_looks_for_test(), looks, "no folder is looked at");
+
+    let with = h.execute(WITH_STORAGE).await;
+    assert_no_errors(&with);
+    assert!(
+        disk_looks_for_test() > looks,
+        "the category folder is looked at"
+    );
+    let without = &response_data(&without)["systemInfo"];
+    let mut with = response_data(&with)["systemInfo"].clone();
+    let rows = with
+        .as_object_mut()
+        .unwrap()
+        .remove("configuredStorage")
+        .unwrap();
+    assert_eq!(&with, without);
+    let paths = rows
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| row["path"].as_str().unwrap().to_string())
+        .collect::<Vec<_>>();
+    for dir in [&data_dir, &intermediate_dir, &complete_dir, &category_dir] {
+        assert!(paths.contains(&dir.display().to_string()), "{paths:?}");
+    }
+}
+
 // A configured folder that does not exist yet: `systemInfo` reports its
 // latest look failed, and `pathStorage` reports the disk it would be
 // created on, its nearest existing parent's, as each always did.

@@ -489,8 +489,9 @@ impl TorrentRates {
 /// Whether torrents are on, and the torrents there are.
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, SimpleObject)]
 pub struct TorrentPresence {
-    /// This run of the server has torrents at all: it was started with the
-    /// environment variable `WEAVER_TORRENTS` set to `1` or `true`. While
+    /// This run of the server has torrents at all: it was started without
+    /// the environment variable `WEAVER_TORRENTS`, or with it set to `1` or
+    /// `true`. While
     /// false no torrent runs, none is listed, turning torrents on is
     /// refused, and every other field here is false or null whatever the
     /// settings say.

@@ -449,6 +449,13 @@ pub trait Object: Send + Sync {
     // each time it settles. A loss told again is the one already held.
     fn volume_lost(&mut self, volume: VolumeIndex, range: ByteRange, out: &mut Vec<Emit>);
 
+    // My member's file failed the checksum I stated for it, as the job
+    // checked the file it wrote. Told only of a failure, once per ruling.
+    // An object whose own fold already ruled on the member has nothing to
+    // add; one that closed the member with no ruling of its own says now
+    // what its own failed check would have said.
+    fn member_refuted(&mut self, _member: MemberId, _out: &mut Vec<Emit>) {}
+
     // The job is quiet: nothing more will arrive and no repair will come,
     // and every lost range of my volumes was told through `volume_lost`
     // just before. An object that cannot finish gives its volumes back now,

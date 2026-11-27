@@ -270,7 +270,7 @@ impl ProxyProfileInput {
         };
         profile.revision = profile
             .saved_revision(existing)
-            .ok_or("proxy revision exhausted")?;
+            .ok_or_else(|| crate::auth::graphql_error("INTERNAL", "proxy revision exhausted"))?;
         profile.validate().map_err(refusal_error)?;
         Ok(profile)
     }
@@ -279,7 +279,7 @@ impl ProxyProfileInput {
 pub(crate) fn runtime(ctx: &Context<'_>) -> Result<Arc<ProxyRuntime>> {
     ctx.data::<SchedulerHandle>()?
         .proxy_runtime()
-        .ok_or_else(|| "proxy runtime unavailable".into())
+        .ok_or_else(|| crate::auth::graphql_error("INTERNAL", "proxy runtime unavailable"))
 }
 pub(crate) fn draft_route(
     ctx: &Context<'_>,
@@ -289,7 +289,7 @@ pub(crate) fn draft_route(
     let runtime = runtime(ctx)?;
     let policy = input.unwrap_or_else(|| runtime.policy(consumer));
     // A route the operator may not save is refused by its code; a draft that
-    // cannot be built for any other reason is reported as it stands.
+    // cannot be built for any other reason answers the code of its kind.
     runtime
         .network
         .validate_policy(&policy)
@@ -297,7 +297,59 @@ pub(crate) fn draft_route(
     runtime
         .network
         .draft_route(consumer, policy, Duration::from_secs(30))
-        .map_err(async_graphql::Error::new)
+        .map_err(route_error)
+}
+
+// A route that could not be built, worded as it stands, under the code of
+// its kind.
+pub(crate) fn route_error(error: proxies::RouteError) -> async_graphql::Error {
+    use proxies::RouteError;
+    let message = error.to_string();
+    match error {
+        RouteError::Refused(refusal) => refusal_error(refusal),
+        RouteError::Missing(_) | RouteError::ConsumerGone => {
+            crate::auth::graphql_error("NOT_FOUND", message)
+        }
+        RouteError::Invalid(_) => crate::auth::graphql_error("INVALID_INPUT", message),
+        RouteError::Changing | RouteError::Stopped | RouteError::Full => {
+            crate::auth::graphql_error("CONFLICT", message)
+        }
+        RouteError::Fault(_) => crate::auth::graphql_error("INTERNAL", message),
+    }
+}
+
+#[cfg(test)]
+mod route_error_tests {
+    use super::*;
+    use proxies::RouteError;
+
+    // Each kind of route failure answers with its code and its sentence.
+    #[test]
+    fn each_route_failure_carries_the_code_of_its_kind() {
+        let refusal = proxies::NetworkRefusal::PoolGone;
+        let refused = route_error(RouteError::Refused(refusal.clone()));
+        let direct = refusal_error(refusal);
+        assert_eq!(refused.message, direct.message);
+        assert_eq!(refused.extensions, direct.extensions);
+        let cases = [
+            (RouteError::Missing("proxy does not exist"), "NOT_FOUND"),
+            (RouteError::ConsumerGone, "NOT_FOUND"),
+            (RouteError::Invalid("bad hop".into()), "INVALID_INPUT"),
+            (RouteError::Changing, "CONFLICT"),
+            (RouteError::Stopped, "CONFLICT"),
+            (RouteError::Full, "CONFLICT"),
+            (RouteError::Fault("boom".into()), "INTERNAL"),
+        ];
+        for (error, code) in cases {
+            let message = error.to_string();
+            let refused = route_error(error);
+            assert_eq!(refused.message, message);
+            assert_eq!(
+                refused.extensions.as_ref().and_then(|ext| ext.get("code")),
+                Some(&async_graphql::Value::from(code))
+            );
+        }
+    }
 }
 pub(crate) fn refresh<'a>(
     ctx: &'a Context<'_>,
@@ -308,7 +360,10 @@ pub(crate) fn refresh<'a>(
 // Reload the routes from what is saved, when the server runs them.
 pub(crate) async fn reload_routes(handle: &SchedulerHandle) -> Result<()> {
     if let Some(runtime) = handle.proxy_runtime() {
-        runtime.reload().await.map_err(async_graphql::Error::new)?;
+        runtime
+            .reload()
+            .await
+            .map_err(|error| crate::auth::graphql_error("INTERNAL", error))?;
     }
     Ok(())
 }
@@ -328,7 +383,7 @@ fn refresh_profile<'a>(
         if feeds_servers && handle.server_transfer_policy().is_some() {
             weaver_server_core::runtime::rebuild_nntp_from_config(ctx.data()?, handle)
                 .await
-                .map_err(|e| async_graphql::Error::new(e.to_string()))?;
+                .map_err(crate::observability::scheduler_error)?;
         }
         Ok(())
     })
@@ -396,7 +451,7 @@ impl ProxiesMutation {
                 .max()
                 .unwrap_or(0)
                 .checked_add(1)
-                .ok_or("proxy IDs exhausted")?,
+                .ok_or_else(|| crate::auth::graphql_error("INTERNAL", "proxy IDs exhausted"))?,
         );
         let profile = input.profile(id, existing)?;
         // A save that changes nothing keeps the revision, and everything
@@ -444,7 +499,7 @@ impl ProxiesMutation {
         profile.revision = profile
             .revision
             .checked_add(1)
-            .ok_or("proxy revision exhausted")?;
+            .ok_or_else(|| crate::auth::graphql_error("INTERNAL", "proxy revision exhausted"))?;
         let saved = profile.clone();
         let profile = spawn_blocking_db("proxies.reset_trust", move || {
             db.reset_proxy_host_key(&saved)
@@ -488,7 +543,7 @@ fn status_for(ctx: &Context<'_>, consumer: Consumer) -> Result<RoutingStatus> {
     let status = match ctx.data::<SchedulerHandle>()?.proxy_runtime() {
         Some(runtime) => runtime
             .route(consumer, Duration::from_secs(30))
-            .map_err(async_graphql::Error::new)?
+            .map_err(route_error)?
             .status(),
         None => proxies::RoutingStatus::default(),
     };

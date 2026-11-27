@@ -332,6 +332,15 @@ pub enum Emit {
         member: MemberId,
         crc32: u32,
     },
+    // "My headers say member M's bytes have this CRC32, and my decoder
+    // checked every byte I said for M against it as it made them": the
+    // checksum of a member decoded whole without a mismatch, said in place
+    // of `Checksum`. The member's own check takes it as what its file
+    // holds, and hashes and reads nothing.
+    Checked {
+        member: MemberId,
+        crc32: u32,
+    },
     // "Member M ends at `length`, short of the length I announced it with:
     // its checksum proved its bytes whole there." Said just before its
     // close, which takes it as the member's length.

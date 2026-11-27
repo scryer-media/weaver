@@ -46,6 +46,7 @@ impl GraphJob {
             }
             Heard::Repaired(returned) => {
                 self.loans.returned(said.node, said.generation);
+                self.end_repair_reads();
                 returned.repaired.remove().map_err(WriteError::from)?;
             }
             Heard::Replayed(replayed) => {
@@ -530,6 +531,7 @@ impl GraphJob {
         limit: usize,
     ) -> Result<(), GraphError> {
         if !self.loans.returned(set, serial) {
+            self.end_repair_reads();
             return Ok(returned.repaired.remove().map_err(WriteError::from)?);
         }
         // A repair the stop ended while a volume's writer still holds
@@ -565,6 +567,7 @@ impl GraphJob {
         };
         if self.disk().is_some_and(|disk| !disk.quiet()) {
             self.pending().left_at_stop();
+            self.end_repair_reads();
             let _ = returned.repaired.remove();
             return Ok(false);
         }
@@ -586,7 +589,17 @@ impl GraphJob {
     pub(in crate::pipeline) fn leave_stopped_repair(&mut self) {
         if let Some(returned) = self.stopped_repair.take() {
             self.pending().left_at_stop();
+            self.end_repair_reads();
             let _ = returned.repaired.remove();
+        }
+    }
+
+    // A repair's return was taken back or given up: once no other repair is
+    // out or kept, no read is left to check, and the leaves let go of what
+    // they kept for one (`NamespaceWriter::end_repair_reads`).
+    fn end_repair_reads(&mut self) {
+        if !self.loans.repair_out() && self.stopped_repair.is_none() {
+            self.writer.end_repair_reads();
         }
     }
 
@@ -606,7 +619,11 @@ impl GraphJob {
             &objects,
             returned,
             &mut out,
-        )?;
+        );
+        // The return's read was checked, or never will be: before what it
+        // came to is applied and the next repair goes out.
+        self.end_repair_reads();
+        let tailed = tailed?;
         // The return is applied a slice at a time, from its staged output
         // read back off the loop (`Loans::apply`): its tail runs as the
         // reader is done (`Heard::RepairRead`).

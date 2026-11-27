@@ -1328,10 +1328,10 @@ impl<T: InputType> LeafInput<T> {
             (LeafStateGql::Inherit, None) => Ok(Leaf::Inherit),
             (LeafStateGql::Off, None) => Ok(Leaf::Off),
             (LeafStateGql::Set, Some(value)) => Ok(Leaf::Set(value.into())),
-            (LeafStateGql::Set, None) => Err(async_graphql::Error::new(
+            (LeafStateGql::Set, None) => Err(crate::auth::invalid_input(
                 "a setting that is set needs its value",
             )),
-            (_, Some(_)) => Err(async_graphql::Error::new(
+            (_, Some(_)) => Err(crate::auth::invalid_input(
                 "only a setting that is set takes a value",
             )),
         }
@@ -1411,7 +1411,7 @@ impl SeedingPolicyInput {
             action: leaf_of(self.action)?,
             seed_time_counting: leaf_of(self.seed_time_counting)?,
         };
-        policy.validate().map_err(async_graphql::Error::new)?;
+        policy.validate().map_err(crate::auth::invalid_input)?;
         Ok(policy)
     }
 }
@@ -1682,7 +1682,7 @@ impl TrackerRuleInput {
             }),
         }
         .checked()
-        .map_err(async_graphql::Error::new)
+        .map_err(crate::auth::invalid_input)
     }
 }
 
@@ -1774,7 +1774,12 @@ impl From<PeerTransportGql> for weaver_server_core::settings::PeerTransport {
 #[derive(Debug, Clone, PartialEq, Eq, SimpleObject)]
 pub struct TorrentSettings {
     pub enabled: bool,
+    /// The first route's listen port: the one `WEAVER_TORRENT_PORT` pins
+    /// while it is set, else the saved one.
     pub base_port: u16,
+    /// Whether `WEAVER_TORRENT_PORT` pins `basePort` for this run. While it
+    /// does, a save naming another port is refused (`ENV_PINNED`).
+    pub base_port_pinned: bool,
     pub announce_port: Option<u16>,
     pub upnp: bool,
     pub encryption: TorrentEncryptionGql,
@@ -1821,6 +1826,7 @@ impl From<&weaver_server_core::settings::TorrentConfig> for TorrentSettings {
         Self {
             enabled: value.enabled,
             base_port: value.base_port,
+            base_port_pinned: value.base_port_pinned,
             announce_port: value.announce_port,
             upnp: value.upnp,
             encryption: value.encryption.into(),

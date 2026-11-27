@@ -98,7 +98,7 @@ async fn require_admin(
     security: &RuntimeSecurityConfig,
     peer: Option<SocketAddr>,
     headers: &HeaderMap,
-) -> Result<(), StatusCode> {
+) -> Result<(), super::Refused> {
     let scope = super::auth::resolve_scope(
         db,
         auth_cache,
@@ -108,11 +108,12 @@ async fn require_admin(
         super::auth::BrowserSessionPolicy::TrustedPeer(peer),
         headers,
     )
-    .await?;
+    .await
+    .map_err(super::Refused::Caller)?;
     if scope.is_admin() {
         Ok(())
     } else {
-        Err(StatusCode::FORBIDDEN)
+        Err(super::Refused::Scope)
     }
 }
 
@@ -121,8 +122,8 @@ pub(super) async fn backup_status_handler(
     Extension(request_auth): Extension<super::RequestAuthContext>,
     peer: Option<Extension<ConnectInfo<SocketAddr>>>,
     headers: HeaderMap,
-) -> Result<Json<BackupStatus>, StatusCode> {
-    require_admin(
+) -> Response {
+    if let Err(refused) = require_admin(
         &request_auth.db,
         &request_auth.auth_cache,
         &request_auth.api_key_cache,
@@ -131,17 +132,22 @@ pub(super) async fn backup_status_handler(
         peer.map(|Extension(ConnectInfo(peer))| peer),
         &headers,
     )
-    .await?;
-    let status = backup
-        .status()
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    Ok(Json(status))
+    .await
+    {
+        return super::refusal_response(refused, &headers);
+    }
+    match backup.status() {
+        Ok(status) => Json::<BackupStatus>(status).into_response(),
+        Err(_) => super::coded_status_response(StatusCode::INTERNAL_SERVER_ERROR),
+    }
 }
 
-fn backup_auth_error(status: StatusCode) -> Response {
-    if status == StatusCode::PRECONDITION_REQUIRED {
+// A refused backup request: the coded refusal, or `REAUTH_REQUIRED` when the
+// administrator's password check is due.
+fn backup_auth_error(refused: super::Refused, headers: &HeaderMap) -> Response {
+    if refused == super::Refused::Caller(StatusCode::PRECONDITION_REQUIRED) {
         return (
-            status,
+            StatusCode::PRECONDITION_REQUIRED,
             Json(serde_json::json!({
                 "error": "recent password verification required",
                 "code": "REAUTH_REQUIRED",
@@ -149,7 +155,7 @@ fn backup_auth_error(status: StatusCode) -> Response {
         )
             .into_response();
     }
-    status.into_response()
+    super::refusal_response(refused, headers)
 }
 
 pub(super) async fn backup_export_handler(
@@ -159,14 +165,14 @@ pub(super) async fn backup_export_handler(
     headers: HeaderMap,
     Json(body): Json<BackupExportRequest>,
 ) -> Response {
-    if let Err(status) = super::auth::require_fresh_admin(
+    if let Err(refused) = super::auth::require_fresh_admin(
         &request_auth,
         peer.map(|Extension(ConnectInfo(peer))| peer),
         &headers,
     )
     .await
     {
-        return backup_auth_error(status);
+        return backup_auth_error(refused, &headers);
     }
     match backup.create_backup(body.password).await {
         Ok(artifact) => {
@@ -186,13 +192,15 @@ pub(super) async fn backup_export_handler(
                     })),
                 )
                     .into_response(),
-                Err(error) => super::error_response(
+                Err(error) => super::status_error_response(
                     StatusCode::INTERNAL_SERVER_ERROR,
                     &format!("failed to open backup artifact: {error}"),
                 ),
             }
         }
-        Err(error) => super::error_response(backup_error_status_code(&error), &error.to_string()),
+        Err(error) => {
+            super::status_error_response(backup_error_status_code(&error), &error.to_string())
+        }
     }
 }
 
@@ -203,18 +211,20 @@ pub(super) async fn backup_create_handler(
     headers: HeaderMap,
     Json(body): Json<BackupExportRequest>,
 ) -> Response {
-    if let Err(status) = super::auth::require_fresh_admin(
+    if let Err(refused) = super::auth::require_fresh_admin(
         &auth,
         peer.map(|Extension(ConnectInfo(peer))| peer),
         &headers,
     )
     .await
     {
-        return backup_auth_error(status);
+        return backup_auth_error(refused, &headers);
     }
     match backup.create_stored_backup(body.password).await {
         Ok(info) => (StatusCode::ACCEPTED, Json(info)).into_response(),
-        Err(error) => super::error_response(backup_error_status_code(&error), &error.to_string()),
+        Err(error) => {
+            super::status_error_response(backup_error_status_code(&error), &error.to_string())
+        }
     }
 }
 
@@ -225,7 +235,7 @@ pub(super) async fn backup_download_handler(
     headers: HeaderMap,
     Path(filename): Path<String>,
 ) -> Response {
-    if let Err(status) = require_admin(
+    if let Err(refused) = require_admin(
         &auth.db,
         &auth.auth_cache,
         &auth.api_key_cache,
@@ -236,16 +246,20 @@ pub(super) async fn backup_download_handler(
     )
     .await
     {
-        return backup_auth_error(status);
+        return backup_auth_error(refused, &headers);
     }
     let token = headers
         .get("x-weaver-backup-token")
         .and_then(|value| value.to_str().ok());
-    let Some(token) = token else {
-        return StatusCode::FORBIDDEN.into_response();
-    };
-    if !backup.consume_download_token(&filename, token).await {
-        return StatusCode::FORBIDDEN.into_response();
+    if !match token {
+        Some(token) => backup.consume_download_token(&filename, token).await,
+        None => false,
+    } {
+        return super::coded_error_response(
+            StatusCode::FORBIDDEN,
+            super::graphql::refusal::FORBIDDEN,
+            "a valid backup download token is required",
+        );
     }
     match backup.backup_artifact(&filename).await {
         Ok(artifact) => {
@@ -266,12 +280,15 @@ pub(super) async fn backup_download_handler(
                     })),
                 )
                     .into_response(),
-                Err(error) => {
-                    super::error_response(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string())
-                }
+                Err(error) => super::status_error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    &error.to_string(),
+                ),
             }
         }
-        Err(error) => super::error_response(backup_error_status_code(&error), &error.to_string()),
+        Err(error) => {
+            super::status_error_response(backup_error_status_code(&error), &error.to_string())
+        }
     }
 }
 
@@ -282,19 +299,21 @@ pub(super) async fn backup_delete_handler(
     headers: HeaderMap,
     Path(filename): Path<String>,
 ) -> Response {
-    if let Err(status) = super::auth::require_fresh_admin(
+    if let Err(refused) = super::auth::require_fresh_admin(
         &auth,
         peer.map(|Extension(ConnectInfo(peer))| peer),
         &headers,
     )
     .await
     {
-        return backup_auth_error(status);
+        return backup_auth_error(refused, &headers);
     }
     match backup.delete_backup(&filename).await {
         Ok(true) => StatusCode::NO_CONTENT.into_response(),
-        Ok(false) => StatusCode::NOT_FOUND.into_response(),
-        Err(error) => super::error_response(backup_error_status_code(&error), &error.to_string()),
+        Ok(false) => super::coded_status_response(StatusCode::NOT_FOUND),
+        Err(error) => {
+            super::status_error_response(backup_error_status_code(&error), &error.to_string())
+        }
     }
 }
 
@@ -318,14 +337,14 @@ pub(super) async fn backup_inspect_handler(
         session_token: super::SessionToken(session_token.clone()),
         security: Arc::new(security.clone()),
     };
-    if let Err(status) = super::auth::require_fresh_admin(
+    if let Err(refused) = super::auth::require_fresh_admin(
         &request_auth,
         peer.map(|Extension(ConnectInfo(peer))| peer),
         &headers,
     )
     .await
     {
-        return backup_auth_error(status);
+        return backup_auth_error(refused, &headers);
     }
     match parse_backup_upload(multipart, security.backup_upload_limit_bytes).await {
         Ok(upload) => {
@@ -353,12 +372,13 @@ pub(super) async fn backup_inspect_handler(
             };
             match result {
                 Ok(result) => Json(result).into_response(),
-                Err(error) => {
-                    super::error_response(backup_error_status_code(&error), &error.to_string())
-                }
+                Err(error) => super::status_error_response(
+                    backup_error_status_code(&error),
+                    &error.to_string(),
+                ),
             }
         }
-        Err((status, message)) => super::error_response(status, &message),
+        Err((status, message)) => super::status_error_response(status, &message),
     }
 }
 
@@ -382,14 +402,14 @@ pub(super) async fn backup_restore_handler(
         session_token: super::SessionToken(session_token.clone()),
         security: Arc::new(security.clone()),
     };
-    if let Err(status) = super::auth::require_fresh_admin(
+    if let Err(refused) = super::auth::require_fresh_admin(
         &request_auth,
         peer.map(|Extension(ConnectInfo(peer))| peer),
         &headers,
     )
     .await
     {
-        return backup_auth_error(status);
+        return backup_auth_error(refused, &headers);
     }
     match parse_backup_upload(multipart, security.backup_upload_limit_bytes).await {
         Ok(upload) => {
@@ -400,19 +420,23 @@ pub(super) async fn backup_restore_handler(
                 category_remaps: upload.category_remaps,
             };
             if options.data_dir.trim().is_empty() {
-                return super::error_response(StatusCode::BAD_REQUEST, "data_dir is required");
+                return super::status_error_response(
+                    StatusCode::BAD_REQUEST,
+                    "data_dir is required",
+                );
             }
             match backup
                 .restore_backup(&upload.file_path, upload.password, options)
                 .await
             {
                 Ok(report) => Json(report).into_response(),
-                Err(error) => {
-                    super::error_response(backup_error_status_code(&error), &error.to_string())
-                }
+                Err(error) => super::status_error_response(
+                    backup_error_status_code(&error),
+                    &error.to_string(),
+                ),
             }
         }
-        Err((status, message)) => super::error_response(status, &message),
+        Err((status, message)) => super::status_error_response(status, &message),
     }
 }
 

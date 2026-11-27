@@ -207,8 +207,8 @@ fn said(emits: &[Emit]) -> Vec<Said> {
             Emit::Retract(member) => out.push(Said::Retract(member.0)),
             Emit::NeedsPassword => out.push(Said::NeedsPassword),
             Emit::Refuse(why) => out.push(Said::Refuse(*why)),
-            // Said beside the walk; `checksums` reads them.
-            Emit::Checksum { .. } => {}
+            // Said right before a close; `checksums` reads them.
+            Emit::Checked { .. } => {}
             // Text for the log, which changes nothing.
             Emit::Failed(_) => {}
             other => panic!("an engine run does not say {other:?}"),
@@ -370,12 +370,20 @@ fn a_member_whose_checksum_fails_is_retracted_and_refused() {
         .position(|window| window == NOTES)
         .unwrap();
     archive[at + 3] ^= 0x20;
-    let said = run(&mut SevenZipEngine::new(), vec![archive]);
+    let emits = run_with(Gate::whole(vec![archive]), weaver_graph::Budget::default());
+    let said = said(&emits);
     assert_eq!(
         said[said.len() - 2..],
         [Said::Retract(0), Said::Refuse(Why::Unrepairable)]
     );
     assert!(!said.contains(&Said::Closed(0)));
+    // Never said checked, nor stated for the namespace to check.
+    assert!(
+        !emits
+            .iter()
+            .any(|emit| matches!(emit, Emit::Checked { .. } | Emit::Checksum { .. })),
+        "{emits:?}"
+    );
 }
 
 #[test]
@@ -471,12 +479,12 @@ fn the_object_is_an_engine_that_reads_in_order_and_keeps_nothing() {
     assert_eq!(object.envelope(2, ByteRange::new(5, 9)), None);
 }
 
-// Each member's checksum as the run said it, in the order it was said.
+// Each member's checked CRC as the run said it, in the order it was said.
 fn checksums(emits: &[Emit]) -> Vec<(u32, u32)> {
     emits
         .iter()
         .filter_map(|emit| match emit {
-            Emit::Checksum { member, crc32 } => Some((member.0, *crc32)),
+            Emit::Checked { member, crc32 } => Some((member.0, *crc32)),
             _ => None,
         })
         .collect()
@@ -486,21 +494,117 @@ fn crc(bytes: &[u8]) -> u32 {
     crate::grid::crc32(bytes)
 }
 
-#[test]
-fn a_run_says_each_files_header_checksum_and_none_for_a_directory() {
-    let mut emits = Vec::new();
-    let mut sink = |emit| {
-        emits.push(emit);
-        true
-    };
-    SevenZipEngine::new().start().run(
-        Gate::whole(vec![store()]),
-        &mut sink,
-        weaver_graph::Budget::default(),
+// sevenz-turbo ends an entry with a CRC only once the CRC matched, so the
+// run states no checksum for the namespace to check again: it says each
+// member checked right before its close.
+#[track_caller]
+fn assert_checked_right_before_each_close(emits: &[Emit]) {
+    assert!(
+        !emits
+            .iter()
+            .any(|emit| matches!(emit, Emit::Checksum { .. })),
+        "a 7z engine run states no checksum to check again: {emits:?}"
     );
+    for (at, emit) in emits.iter().enumerate() {
+        if let Emit::Checked { member, .. } = emit {
+            assert_eq!(
+                emits.get(at + 1),
+                Some(&Emit::MemberClosed(*member)),
+                "member {} is checked right before its close",
+                member.0
+            );
+        }
+    }
+}
+
+#[test]
+fn a_member_with_a_crc_is_checked_as_it_closes_and_one_without_says_neither() {
+    let archive = archive(
+        vec![EncoderConfiguration::new(EncoderMethod::COPY)],
+        &[
+            ("notes.txt", NOTES),
+            ("empty.txt", b""),
+            ("deep/second.bin", &second()),
+        ],
+    );
+    let emits = run_with(Gate::whole(vec![archive]), weaver_graph::Budget::default());
+    assert_checked_right_before_each_close(&emits);
     assert_eq!(
         checksums(&emits),
-        vec![(0, crc(NOTES)), (1, crc(&second()))]
+        vec![(0, crc(NOTES)), (2, crc(&second()))]
+    );
+    // The empty file and the directory state no CRC: each closes, unchecked.
+    let closed: Vec<u32> = emits
+        .iter()
+        .filter_map(|emit| match emit {
+            Emit::MemberClosed(member) => Some(member.0),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(closed, [0, 1, 2, 3]);
+    assert!(said(&emits).contains(&Said::Member(1, "empty.txt".into(), Some(0))));
+    assert!(said(&emits).contains(&Said::Member(3, "deep/".into(), Some(0))));
+}
+
+// A stored 7z of `notes.txt` and `second.bin` whose header states a CRC for
+// the second file only. The writer states one for every file that has bytes,
+// so the header's digests are written again with the first left undefined,
+// and the start header's size and CRCs with them.
+fn first_without_a_crc() -> Vec<u8> {
+    let mut writer = ArchiveWriter::new(Cursor::new(Vec::new())).unwrap();
+    writer.set_content_methods(vec![EncoderConfiguration::new(EncoderMethod::COPY)]);
+    for (name, bytes) in [("notes.txt", NOTES.to_vec()), ("second.bin", second())] {
+        writer
+            .push_archive_entry(ArchiveEntry::new_file(name), Some(Cursor::new(bytes)))
+            .unwrap();
+    }
+    let mut archive = writer.finish().unwrap().into_inner();
+    let header_at = 32 + u64::from_le_bytes(archive[12..20].try_into().unwrap()) as usize;
+    assert_eq!(archive[header_at], 0x01, "the header is not encoded");
+    // kCRC, all defined, then each file's CRC. Stored bytes pack to
+    // themselves, so the packed streams state the same digests first: the
+    // files' are the last.
+    let mut stated = vec![0x0A, 0x01];
+    stated.extend(crc(NOTES).to_le_bytes());
+    stated.extend(crc(&second()).to_le_bytes());
+    let at = header_at
+        + archive[header_at..]
+            .windows(stated.len())
+            .rposition(|window| window == stated)
+            .expect("the header states both CRCs");
+    // kCRC, not all defined, the second file's bit, then its CRC.
+    let mut one = vec![0x0A, 0x00, 0b0100_0000];
+    one.extend(crc(&second()).to_le_bytes());
+    archive.splice(at..at + stated.len(), one);
+    let header = archive[header_at..].to_vec();
+    archive[20..28].copy_from_slice(&(header.len() as u64).to_le_bytes());
+    archive[28..32].copy_from_slice(&crc(&header).to_le_bytes());
+    let start = crc(&archive[12..32]);
+    archive[8..12].copy_from_slice(&start.to_le_bytes());
+    archive
+}
+
+// A file with bytes whose header states no CRC has nothing for the decoder
+// to check: its bytes are said and it closes, and it is not said checked.
+#[test]
+fn a_member_with_bytes_and_no_crc_closes_unchecked() {
+    let archive = first_without_a_crc();
+    let read = parsed(&archive);
+    assert!(!read.files[0].has_crc, "notes.txt states no CRC");
+    assert!(read.files[1].has_crc, "second.bin states its CRC");
+    let emits = run_with(Gate::whole(vec![archive]), weaver_graph::Budget::default());
+    assert_checked_right_before_each_close(&emits);
+    assert_eq!(checksums(&emits), vec![(1, crc(&second()))]);
+    assert_eq!(
+        said(&emits),
+        vec![
+            Said::Member(0, "notes.txt".into(), Some(NOTES.len() as u64)),
+            Said::Bytes(0, NOTES.to_vec()),
+            Said::Closed(0),
+            Said::Member(1, "second.bin".into(), Some(64)),
+            Said::Bytes(1, second()),
+            Said::Closed(1),
+        ]
     );
 }
 
@@ -608,7 +712,7 @@ fn heard(emits: &[Emit]) -> Heard {
                 joined.extend_from_slice(bytes);
             }
             Emit::MemberClosed(member) => heard.closed.push(member.0),
-            Emit::Checksum { .. } => {}
+            Emit::Checked { .. } => {}
             other => panic!("a clean run does not say {other:?}"),
         }
     }
@@ -910,7 +1014,8 @@ fn a_failed_folder_retracts_every_member_left_open_and_closes_only_those_before(
         Gate::whole(vec![archive.clone()]),
         weaver_graph::Budget::default(),
     ));
-    let wide = said(&run_with(Gate::whole(vec![archive]), wide()));
+    let wide_emits = run_with(Gate::whole(vec![archive]), wide());
+    let wide = said(&wide_emits);
     let closed = |said: &[Said]| {
         said.iter()
             .filter_map(|said| match said {
@@ -945,6 +1050,13 @@ fn a_failed_folder_retracts_every_member_left_open_and_closes_only_those_before(
         .collect();
     assert_eq!(retracted, open);
     assert_eq!(retracted.first(), Some(&(damaged as u32)));
+    // Only the members closed were said checked.
+    assert_checked_right_before_each_close(&wide_emits);
+    let checked: Vec<u32> = checksums(&wide_emits)
+        .into_iter()
+        .map(|(id, _)| id)
+        .collect();
+    assert_eq!(checked, before);
     assert_eq!(
         one[one.len() - 2..],
         [
@@ -973,6 +1085,78 @@ fn a_sink_that_says_stop_ends_a_wide_run() {
         .count();
     assert_eq!(bytes, 1, "nothing after the stop: {emits:?}");
     assert!(matches!(emits.last(), Some(Emit::Bytes { .. })));
+}
+
+// One solid LZMA2 folder of members larger than its coder's runs: decoded on
+// more than one thread, the coder reports the folder's checksums only at the
+// end of its stream (as sevenz-turbo's own late-end tests build it).
+fn solid() -> (Vec<u8>, Vec<(String, Vec<u8>)>) {
+    let members: Vec<(String, Vec<u8>)> = [3usize << 20, 2 << 20, 2 << 20]
+        .into_iter()
+        .zip(31u64..)
+        .map(|(len, seed)| (format!("slate/{seed}.bin"), payload(seed, len)))
+        .collect();
+    let mut options = Lzma2Options::from_level(1);
+    options.set_dictionary_size(1 << 16);
+    let mut writer = ArchiveWriter::new(Cursor::new(Vec::new())).unwrap();
+    writer.set_content_methods(vec![EncoderConfiguration::from(options)]);
+    writer
+        .push_archive_entries(
+            members
+                .iter()
+                .map(|(name, _)| ArchiveEntry::new_file(name))
+                .collect(),
+            members
+                .iter()
+                .map(|(_, bytes)| Cursor::new(bytes.clone()).into())
+                .collect(),
+        )
+        .unwrap();
+    (writer.finish().unwrap().into_inner(), members)
+}
+
+// The ends of a solid folder's members come only at the end of its stream,
+// after the later members began and took their bytes: each still closes in
+// archive order, checked right before its close, with every byte it was
+// handed.
+#[test]
+fn a_solid_folder_whose_checksums_come_at_its_end_closes_its_members_in_order() {
+    let (archive, members) = solid();
+    let emits = run_with(
+        Gate::whole(vec![archive]),
+        weaver_graph::Budget {
+            memory_bytes: Some(1 << 30),
+            threads: 2,
+            ..Default::default()
+        },
+    );
+    // The late path was taken: the first member closes after the last
+    // member's bytes.
+    let last_bytes = emits
+        .iter()
+        .rposition(|emit| matches!(emit, Emit::Bytes { member, .. } if member.0 == 2))
+        .unwrap();
+    let first_close = emits
+        .iter()
+        .position(|emit| *emit == Emit::MemberClosed(MemberId(0)))
+        .unwrap();
+    assert!(
+        last_bytes < first_close,
+        "the folder's checksums came before its stream's end"
+    );
+    assert_checked_right_before_each_close(&emits);
+    let heard = heard(&emits);
+    assert_eq!(heard.closed, [0, 1, 2]);
+    let expected: Vec<(u32, u32)> = members
+        .iter()
+        .enumerate()
+        .map(|(id, (_, bytes))| (id as u32, crc(bytes)))
+        .collect();
+    assert_eq!(heard.checksums, expected);
+    for (id, (name, bytes)) in members.iter().enumerate() {
+        assert_eq!(heard.announced[id].1, *name);
+        assert!(heard.bytes[&(id as u32)] == *bytes, "{name}");
+    }
 }
 
 #[test]

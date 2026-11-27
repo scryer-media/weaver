@@ -283,7 +283,7 @@ async fn read_scope_can_analyze_a_torrent_and_its_magnet() {
     let response = h
         .execute_as(
             &format!(
-                r#"mutation {{ analyzeTorrent(input: {{ torrentBase64: "{encoded}" }}) {{ text json }} }}"#
+                r#"mutation {{ analyzeTorrent(input: {{ source: {{ metainfoBase64: "{encoded}" }} }}) {{ text json }} }}"#
             ),
             CallerScope::Read,
         )
@@ -302,7 +302,7 @@ async fn read_scope_can_analyze_a_torrent_and_its_magnet() {
     let response = h
         .execute_as(
             &format!(
-                r#"mutation {{ analyzeTorrent(input: {{ magnet: "{magnet}" }}) {{ text json }} }}"#
+                r#"mutation {{ analyzeTorrent(input: {{ source: {{ magnet: "{magnet}" }} }}) {{ text json }} }}"#
             ),
             CallerScope::Read,
         )
@@ -331,10 +331,10 @@ async fn analyze_torrent_accepts_an_upload_and_refuses_two_sources() {
     .data(CallerScope::Read)
     .data(CallerIdentity::Local([9; 32]))
     .variables(Variables::from_json(
-        json!({ "input": { "torrentUpload": null } }),
+        json!({ "input": { "source": { "metainfoUpload": null } } }),
     ));
     request.set_upload(
-        "variables.input.torrentUpload",
+        "variables.input.source.metainfoUpload",
         UploadValue {
             filename: format!("{SENTINEL}.torrent"),
             content_type: Some("application/x-bittorrent".to_string()),
@@ -347,7 +347,7 @@ async fn analyze_torrent_accepts_an_upload_and_refuses_two_sources() {
 
     let response = h
         .execute_as(
-            r#"mutation { analyzeTorrent(input: {}) { text } }"#,
+            r#"mutation { analyzeTorrent(input: { source: {} }) { text } }"#,
             CallerScope::Read,
         )
         .await;
@@ -357,7 +357,7 @@ async fn analyze_torrent_accepts_an_upload_and_refuses_two_sources() {
     let response = h
         .execute_as(
             &format!(
-                r#"mutation {{ analyzeTorrent(input: {{ torrentBase64: "ZGU=", magnet: "{magnet}" }}) {{ text }} }}"#
+                r#"mutation {{ analyzeTorrent(input: {{ source: {{ metainfoBase64: "ZGU=", magnet: "{magnet}" }} }}) {{ text }} }}"#
             ),
             CallerScope::Read,
         )
@@ -366,7 +366,7 @@ async fn analyze_torrent_accepts_an_upload_and_refuses_two_sources() {
 
     let response = h
         .execute_as(
-            r#"mutation { analyzeTorrent(input: { torrentBase64: "bm90IGEgdG9ycmVudA==" }) { text } }"#,
+            r#"mutation { analyzeTorrent(input: { source: { metainfoBase64: "bm90IGEgdG9ycmVudA==" } }) { text } }"#,
             CallerScope::Read,
         )
         .await;

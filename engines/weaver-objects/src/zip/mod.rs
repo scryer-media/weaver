@@ -665,6 +665,10 @@ impl Object for Zip {
         }
     }
 
+    fn member_refuted(&mut self, member: MemberId, out: &mut Vec<Emit>) {
+        self.refuted(member, out);
+    }
+
     // Nothing more will arrive. A member still damaged, or one named and
     // never placed, leaves the archive unread.
     fn quiet(&mut self, standing: &dyn Standing, out: &mut Vec<Emit>) {

@@ -4,6 +4,7 @@
 use super::*;
 use crate::jobs::queries::JobsQueries;
 use crate::settings::persistence::SettingsPersistenceQueries;
+use crate::settings::queries::SettingsQueries;
 use crate::settings::service::SettingsServiceQueries;
 use std::io::Write;
 
@@ -73,6 +74,59 @@ active = true
 
     // Cleanup.
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+// Import `contents` as `weaver.toml` into a new database pinned to `pin`.
+fn imported_with_pin(contents: &str, pin: Option<u16>) -> Database {
+    let dir = tempfile::tempdir().unwrap();
+    let toml_path = dir.path().join("weaver.toml");
+    std::fs::write(&toml_path, contents).unwrap();
+    let mut db = Database::open_in_memory().unwrap();
+    db.set_encryption_key(crate::persistence::encryption::EncryptionKey::generate());
+    db.set_torrent_port_pin(pin);
+    assert!(db.migrate_from_toml(&toml_path).unwrap());
+    db
+}
+
+// A file naming no listen port, imported while the environment pins one,
+// draws none and stores none: the pin is listened on.
+#[test]
+fn a_pinned_toml_import_naming_no_port_stores_none() {
+    let db = imported_with_pin("data_dir = \"/tmp/weaver-data\"\n", Some(51_413));
+    assert_eq!(db.get_setting("torrent.base_port").unwrap(), None);
+    let torrent = db.load_config().unwrap().torrent;
+    assert_eq!(torrent.base_port, 51_413);
+    assert!(torrent.base_port_pinned);
+}
+
+// A port the file names is the operator's own and is stored, pin or not.
+#[test]
+fn a_pinned_toml_import_naming_a_port_stores_it() {
+    let db = imported_with_pin(
+        "data_dir = \"/tmp/weaver-data\"\n[torrent]\nbase_port = 6881\n",
+        Some(51_413),
+    );
+    assert_eq!(
+        db.get_setting("torrent.base_port").unwrap().as_deref(),
+        Some("6881")
+    );
+    assert_eq!(db.load_config().unwrap().torrent.base_port, 51_413);
+}
+
+// Without a pin, a file naming no port has one drawn and stored, as today.
+#[test]
+fn an_unpinned_toml_import_naming_no_port_draws_one() {
+    let db = imported_with_pin("data_dir = \"/tmp/weaver-data\"\n", None);
+    let stored: u16 = db
+        .get_setting("torrent.base_port")
+        .unwrap()
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert!(crate::torrents::sessions::LISTEN_PORTS.contains(&stored));
+    let torrent = db.load_config().unwrap().torrent;
+    assert_eq!(torrent.base_port, stored);
+    assert!(!torrent.base_port_pinned);
 }
 
 #[test]

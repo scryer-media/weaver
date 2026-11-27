@@ -7,7 +7,16 @@ import { App } from "./App";
 import { AppErrorBoundary } from "./lib/error-page";
 import { watchForSignOut } from "./lib/login-required";
 import "./next/fonts.css";
-import "./next/theme.css";
+import {
+  applyAppearance,
+  readEntryAppearance,
+  syncBrowserThemeColor,
+} from "./lib/appearance";
+
+applyAppearance(readEntryAppearance());
+window
+  .matchMedia("(prefers-color-scheme: dark)")
+  .addEventListener("change", syncBrowserThemeColor);
 
 if (import.meta.env.DEV) {
   // React 19's dev builds emit a `performance.measure` per component per

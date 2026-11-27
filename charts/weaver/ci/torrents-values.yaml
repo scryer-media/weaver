@@ -1,0 +1,8 @@
+# The chart pins Weaver's listen port to 30881. The node port is the same, so
+# the announce port, which follows the listen port, needs no setting.
+torrents:
+  enabled: true
+  port: 30881
+  service:
+    type: NodePort
+    nodePort: 30881

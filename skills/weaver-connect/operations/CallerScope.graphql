@@ -1,0 +1,5 @@
+# The scope this key runs with: READ, CONTROL or ADMIN. Any key may ask.
+# Variables: none.
+query CallerScope {
+  callerScope
+}

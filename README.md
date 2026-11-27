@@ -23,7 +23,7 @@
 </p>
 
 <p align="center">
-  <a href="https://www.scryer.media/weaver/"><img src="docs/img/weaver-overview-0-12.webp" alt="Weaver web interface" width="800" /></a>
+  <a href="https://www.scryer.media/weaver/"><img src="docs/img/weaver-download-queue.png" alt="Weaver’s download queue in Light and Graphite, with active Usenet downloads and seeding torrents" width="800" /></a>
 </p>
 
 ## What is Weaver?
@@ -48,7 +48,7 @@ Weaver runs a highly efficient pipeline that not only unpacks archives while dow
 ## Advanced Networking
 Weaver has an incredibly powerful networking sub system. It enables you to compose different building blocks into highly sophisticated netflows to ensure you're maximizing your bandwidth and privacy.
 
-![advanced networking overview picture](docs/img/networking.png)
+![Weaver’s network flow highlighting a Usenet route and a private tracker route with their DNS paths](docs/img/weaver-network-flow.webp)
 
 ### Features
 - **Multiple interface support** (have two ISPs? one Weaver can max them both!)
@@ -87,6 +87,17 @@ See [Installation](https://www.scryer.media/weaver/docs/installation/) for insta
 ## API
 
 Weaver exposes a **GraphQL API** at `/graphql` with full query, mutation, and subscription support. The same API powers the web UI, so anything you can do in the interface is available programmatically.
+
+## For agents
+
+An agent helping someone run Weaver should start from the operator skills in [`skills/`](skills/). Each is a folder with a `SKILL.md`, the GraphQL operations it uses, and helper scripts. Read `weaver-connect` first.
+
+| Skill | Use it to |
+|---|---|
+| [`weaver-connect`](skills/weaver-connect/SKILL.md) | Connect with an API key, over `/graphql` or the MCP endpoint at `/mcp`. Sets the rules the other skills follow. |
+| [`weaver-troubleshoot`](skills/weaver-troubleshoot/SKILL.md) | Diagnose a stuck or failed download, an unreachable server, a full disk or a torrent that will not connect. Read-only. |
+| [`weaver-configure`](skills/weaver-configure/SKILL.md) | Add or change news servers and categories. |
+| [`weaver-migrate`](skills/weaver-migrate/SKILL.md) | Move from SABnzbd, NZBGet or qBittorrent, scripts included. |
 
 ## Metrics & dashboards
 

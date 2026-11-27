@@ -1,0 +1,30 @@
+{{- if .Values.ingress.enabled }}
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ include "weaver.fullname" . }}
+  labels:
+    {{- include "weaver.labels" . | nindent 4 }}
+  {{- with include "weaver.annotations" (dict "root" . "extra" .Values.ingress.annotations) }}{{ . | nindent 2 }}{{- end }}
+spec:
+  {{- with .Values.ingress.className }}
+  ingressClassName: {{ . }}
+  {{- end }}
+  {{- with .Values.ingress.tls }}
+  tls:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  rules:
+    {{- range .Values.ingress.hosts }}
+    - host: {{ . | quote }}
+      http:
+        paths:
+          - path: {{ include "weaver.routePath" $ }}
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ include "weaver.fullname" $ }}
+                port:
+                  name: http
+    {{- end }}
+{{- end }}

@@ -181,7 +181,7 @@ fn written(emits: &[Emit], members: usize) -> (Vec<Vec<u8>>, Vec<MemberId>) {
                 into.extend_from_slice(bytes);
             }
             Emit::MemberClosed(member) => closed.push(*member),
-            Emit::Member { .. } | Emit::Checksum { .. } => {}
+            Emit::Member { .. } | Emit::Checksum { .. } | Emit::Checked { .. } => {}
             other => panic!("the run said {other:?}"),
         }
     }
@@ -377,6 +377,7 @@ fn a_coded_folder_that_fails_its_crc_says_what_the_engine_says() {
         .filter(|emit| match emit {
             Emit::Member { member, .. }
             | Emit::Checksum { member, .. }
+            | Emit::Checked { member, .. }
             | Emit::Bytes { member, .. }
             | Emit::Retract(member)
             | Emit::MemberClosed(member) => coded_member(member),
@@ -430,6 +431,7 @@ fn a_coded_folder_under_aes_runs_as_the_engine_does_under_the_same_password() {
             .filter(|emit| match emit {
                 Emit::Member { member, .. }
                 | Emit::Checksum { member, .. }
+                | Emit::Checked { member, .. }
                 | Emit::Bytes { member, .. }
                 | Emit::Retract(member)
                 | Emit::MemberClosed(member) => coded_member(member),

@@ -11,9 +11,10 @@ use async_graphql::{Context, Object, Result};
 use base64::Engine;
 use tracing::info;
 
-use crate::auth::AdminGuard;
+use crate::auth::{AdminGuard, graphql_error, invalid_input};
 use crate::observability::{
-    persist_then_update_config, spawn_blocking_db, with_timed_config_read, with_timed_config_write,
+    join_error, persist_then_update_config, spawn_blocking_db, with_timed_config_read,
+    with_timed_config_write,
 };
 use crate::servers::query::load_tls_diagnostics_by_server;
 use crate::servers::types::{Server, ServerInput, TestConnectionResult};
@@ -51,8 +52,7 @@ impl ServersMutation {
             weaver_server_core::proxies::Consumer::Server(0),
             crate::networking::selected_policy(input.routing.clone(), input.route.clone())?,
         )?;
-        let normalized =
-            NormalizedServerInput::from_input(input, None).map_err(async_graphql::Error::new)?;
+        let normalized = NormalizedServerInput::from_input(input, None).map_err(invalid_input)?;
 
         let probe = validate_server_before_save(&normalized, &route).await?;
 
@@ -148,11 +148,11 @@ impl ServersMutation {
                     .iter()
                     .find(|s| s.id == id)
                     .cloned()
-                    .ok_or_else(|| async_graphql::Error::new(format!("server {id} not found")))
+                    .ok_or_else(|| graphql_error("NOT_FOUND", format!("server {id} not found")))
             })
             .await?;
-        let normalized = NormalizedServerInput::from_input(input, Some(&existing))
-            .map_err(async_graphql::Error::new)?;
+        let normalized =
+            NormalizedServerInput::from_input(input, Some(&existing)).map_err(invalid_input)?;
 
         let routing_changed = routing.as_ref().is_some_and(|routing| {
             proxy_runtime.as_ref().is_some_and(|runtime| {
@@ -239,9 +239,7 @@ impl ServersMutation {
         // The removal runs in its own task: a request that goes away part way
         // leaves it to finish, so a server is never deleted with its config,
         // schedules and connections left behind.
-        tokio::spawn(removal.run(id))
-            .await
-            .map_err(|error| async_graphql::Error::new(error.to_string()))?
+        tokio::spawn(removal.run(id)).await.map_err(join_error)?
     }
     /// Reset this server's quota baseline without clearing lifetime usage.
     #[graphql(guard = "AdminGuard")]
@@ -266,7 +264,7 @@ impl ServersMutation {
                     .iter()
                     .find(|server| server.id == id)
                     .cloned()
-                    .ok_or_else(|| async_graphql::Error::new(format!("server {id} not found")))
+                    .ok_or_else(|| graphql_error("NOT_FOUND", format!("server {id} not found")))
             },
         )
         .await?;
@@ -300,7 +298,7 @@ impl ServersMutation {
                     .iter()
                     .find(|server| server.id == id)
                     .cloned()
-                    .ok_or_else(|| async_graphql::Error::new(format!("server {id} not found")))
+                    .ok_or_else(|| graphql_error("NOT_FOUND", format!("server {id} not found")))
             },
         )
         .await?;
@@ -368,9 +366,12 @@ async fn activate_nntp_runtime(
     handle: &SchedulerHandle,
 ) -> Result<()> {
     let activation = rebuild_nntp_from_config(config, handle).await.map_err(|error| {
-        async_graphql::Error::new(format!(
-            "server setting was saved, but the runtime remains on the prior NNTP generation; retry the change or restart Weaver ({error})"
-        ))
+        graphql_error(
+            "INTERNAL",
+            format!(
+                "server setting was saved, but the runtime remains on the prior NNTP generation; retry the change or restart Weaver ({error})"
+            ),
+        )
     })?;
     info!(
         operation,
@@ -412,6 +413,12 @@ impl NormalizedServerInput {
 
         let password = normalize_optional_string(input.password)
             .or_else(|| fallback.and_then(|server| server.password.clone()));
+        // An update that leaves the username out keeps the stored one, as it
+        // keeps the password; an empty one clears it.
+        let username = match input.username {
+            Some(username) => normalize_optional_string(Some(username)),
+            None => fallback.and_then(|server| server.username.clone()),
+        };
         let max_download_speed = input
             .max_download_speed
             .or_else(|| fallback.map(|server| server.max_download_speed))
@@ -437,7 +444,7 @@ impl NormalizedServerInput {
             host,
             port: input.port,
             tls: input.tls,
-            username: normalize_optional_string(input.username),
+            username,
             password,
             connections: input.connections,
             active: input.active,
@@ -526,7 +533,7 @@ impl ServerRemoval {
             if cfg.servers.iter().any(|server| server.id == id) {
                 Ok(())
             } else {
-                Err(async_graphql::Error::new(format!("server {id} not found")))
+                Err(graphql_error("NOT_FOUND", format!("server {id} not found")))
             }
         })
         .await?;
@@ -563,7 +570,7 @@ impl ServerRemoval {
             })
             .await?;
             if !removal.removed {
-                return Err(async_graphql::Error::new(format!("server {id} not found")));
+                return Err(graphql_error("NOT_FOUND", format!("server {id} not found")));
             }
         }
 
@@ -648,7 +655,7 @@ fn probe_through_route<'a>(
     Box::pin(async move {
         let mut results = weaver_server_core::servers::probe_server_route(server, route)
             .await
-            .map_err(async_graphql::Error::new)?;
+            .map_err(|message| graphql_error("SERVER_TEST_FAILED", message))?;
         let legs = results
             .iter()
             .enumerate()
@@ -666,7 +673,10 @@ fn probe_through_route<'a>(
             .position(|result| result.success)
             .unwrap_or(0);
         if results.is_empty() {
-            return Err("route has no legs to test".into());
+            return Err(graphql_error(
+                "SERVER_TEST_FAILED",
+                "route has no legs to test",
+            ));
         }
         Ok(RoutedProbe {
             summary: results.swap_remove(selected),
@@ -693,11 +703,23 @@ async fn validate_server_before_save(
     if result.success {
         Ok(Some(result.summary))
     } else {
-        Err(async_graphql::Error::new(format!(
-            "server connection test failed: {}",
-            result.message
-        )))
+        Err(probe_failed_error(&result))
     }
+}
+
+// A save refused because its probe failed. The certificate naming another
+// host is its own code, so a form can offer that certificate for review
+// without reading the sentence.
+fn probe_failed_error(result: &ServerConnectivityResult) -> async_graphql::Error {
+    let code = if result.certificate_names_another_host() {
+        "TLS_NAME_MISMATCH"
+    } else {
+        "SERVER_TEST_FAILED"
+    };
+    graphql_error(
+        code,
+        format!("server connection test failed: {}", result.message),
+    )
 }
 
 // Record what the save-time probe learned about this server's TLS suite.
@@ -974,5 +996,42 @@ mod tests {
         update_task
             .await
             .expect("update task should finish cleanly");
+    }
+
+    // A save whose probe failed is SERVER_TEST_FAILED, and TLS_NAME_MISMATCH
+    // only when the certificate on offer names another host; the sentence
+    // is the probe's, as it stands.
+    #[test]
+    fn a_failed_save_probe_names_its_cause_by_code() {
+        let code_and_message = |result: &ServerConnectivityResult| {
+            let error = probe_failed_error(result).into_server_error(Default::default());
+            let extensions = serde_json::to_value(&error.extensions).unwrap();
+            (
+                extensions["code"].as_str().unwrap().to_string(),
+                error.message,
+            )
+        };
+
+        let refused = ServerConnectivityResult::failed("authentication failed".into());
+        assert_eq!(
+            code_and_message(&refused),
+            (
+                "SERVER_TEST_FAILED".to_string(),
+                "server connection test failed: authentication failed".to_string()
+            )
+        );
+
+        let mut mismatch = ServerConnectivityResult::failed(
+            "its certificate belongs to a different hostname".into(),
+        );
+        mismatch.adoptable_tls_name_mismatch_certificate_der = Some(vec![1, 2, 3]);
+        assert_eq!(
+            code_and_message(&mismatch),
+            (
+                "TLS_NAME_MISMATCH".to_string(),
+                "server connection test failed: its certificate belongs to a different hostname"
+                    .to_string()
+            )
+        );
     }
 }

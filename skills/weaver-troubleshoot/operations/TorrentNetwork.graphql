@@ -1,0 +1,37 @@
+# Whether the torrent client is available and running, and each torrent
+# route: open or not, why, and what it exposes. No addresses. Scope: READ.
+# Variables: none.
+query TorrentNetwork {
+  torrentPresence {
+    available
+    enabled
+    jobs
+    running
+    windingDown
+  }
+  torrentRoutes {
+    key
+    open
+    reason
+    detail
+    utp
+    resolvedBy
+    scopes {
+      scope
+      name
+    }
+    mappings {
+      state
+      mapper
+      protocol
+    }
+    exposure {
+      inbound
+      announcedPort
+      udpTrackers
+      dht
+      utp
+      resolvedBy
+    }
+  }
+}

@@ -172,7 +172,9 @@ pub(crate) fn export_query(table: &str, columns: &[String]) -> String {
         .collect::<Vec<_>>()
         .join(", ");
     let predicate = match table {
-        "settings" => "key <> 'nzbget.scheduled_resume_at'",
+        "settings" => {
+            "key <> 'nzbget.scheduled_resume_at' AND key NOT LIKE 'scheduled_resume_at.class.%'"
+        }
         "job_history_attributes"
         | "job_events"
         | "job_tags"

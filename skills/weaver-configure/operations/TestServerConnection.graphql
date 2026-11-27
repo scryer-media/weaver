@@ -1,0 +1,24 @@
+# Contacts the news provider with a saved server's stored login, over its
+# saved route. Saves nothing. Needs the operator's yes naming the host.
+# Scope: ADMIN.
+# Variables: {"id": 1}
+mutation TestServerConnection($id: Int!) {
+  testConfiguredServerConnection(id: $id) {
+    success
+    message
+    latencyMs
+    firstByteLatencyMs
+    supportsPipelining
+    tlsCipherSuite
+    legs {
+      position
+      success
+      message
+      latencyMs
+    }
+    adoptableTlsNameMismatchCertificate {
+      sha256Fingerprint
+      names
+    }
+  }
+}

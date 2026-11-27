@@ -5,6 +5,7 @@
 //! Nothing in Weaver reads a tag to decide anything. A tag is trimmed, and
 //! one that is empty or holds a comma is left out (qBittorrent's rules).
 
+use crate::observability::{spawn_blocking_with, state_error};
 use std::sync::Arc;
 use weaver_server_core::tags::TagsQueries;
 
@@ -13,17 +14,13 @@ use weaver_server_core::Database;
 use weaver_server_core::jobs::ids::JobId;
 use weaver_server_core::tags::TagSnapshot;
 
-use crate::auth::{ControlGuard, ReadGuard, graphql_error};
+use crate::auth::{ControlGuard, ReadGuard};
 
 /// A tag, with how many jobs carry it, queued or in history.
 #[derive(Debug, Clone, PartialEq, Eq, SimpleObject)]
 pub struct JobTag {
     pub name: String,
     pub count: u64,
-}
-
-fn internal(error: impl std::fmt::Display) -> async_graphql::Error {
-    graphql_error("INTERNAL", error.to_string())
 }
 
 // The tags as stored: from memory when nothing changed them since the last
@@ -33,10 +30,7 @@ pub(crate) async fn tag_snapshot(db: &Database) -> Result<Arc<TagSnapshot>> {
         return Ok(snapshot);
     }
     let db = db.clone();
-    tokio::task::spawn_blocking(move || db.tag_snapshot())
-        .await
-        .map_err(internal)?
-        .map_err(internal)
+    spawn_blocking_with(move || db.tag_snapshot(), state_error).await
 }
 
 // The tags a tag filter reads: read only when a filter names a tag.
@@ -60,10 +54,7 @@ async fn job_tags(db: &Database) -> Result<Vec<JobTag>> {
         Some(snapshot) => snapshot.counts(),
         None => {
             let db = db.clone();
-            tokio::task::spawn_blocking(move || db.tag_counts())
-                .await
-                .map_err(internal)?
-                .map_err(internal)?
+            spawn_blocking_with(move || db.tag_counts(), state_error).await?
         }
     };
     Ok(counts
@@ -82,10 +73,7 @@ async fn change(
 ) -> Result<Vec<JobTag>> {
     let db = ctx.data::<Database>()?.clone();
     let worker = db.clone();
-    tokio::task::spawn_blocking(move || op(&worker))
-        .await
-        .map_err(internal)?
-        .map_err(internal)?;
+    spawn_blocking_with(move || op(&worker), state_error).await?;
     job_tags(&db).await
 }
 

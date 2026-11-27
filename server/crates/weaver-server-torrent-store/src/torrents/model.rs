@@ -276,6 +276,50 @@ impl UnpackResult {
     }
 }
 
+/// Why a torrent's unpacking came out short, as a code: one per unpacking,
+/// beside its reason.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum UnpackCause {
+    /// The unpacking refused the torrent's files before it ended.
+    Refused,
+    /// It delivered no usable file whole.
+    NothingDelivered,
+    /// What it made was not all placed beside the torrent's files.
+    NotPlaced,
+    /// It delivered in part.
+    DeliveredInPart,
+    /// The policy removed files it made.
+    UnwantedRemoved,
+    /// A file the policy would remove could not be removed.
+    UnwantedNotRemoved,
+}
+
+impl UnpackCause {
+    pub const ALL: [Self; 6] = [
+        Self::Refused,
+        Self::NothingDelivered,
+        Self::NotPlaced,
+        Self::DeliveredInPart,
+        Self::UnwantedRemoved,
+        Self::UnwantedNotRemoved,
+    ];
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Refused => "refused",
+            Self::NothingDelivered => "nothing_delivered",
+            Self::NotPlaced => "not_placed",
+            Self::DeliveredInPart => "delivered_in_part",
+            Self::UnwantedRemoved => "unwanted_removed",
+            Self::UnwantedNotRemoved => "unwanted_not_removed",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|cause| cause.as_str() == value)
+    }
+}
+
 /// A file a torrent's unpacking placed beside the torrent's own: its name
 /// under the directory they are in, and its length on disk. It is listed
 /// after the torrent's files and is none of them: no piece, no peer and no
@@ -295,6 +339,9 @@ pub const UNPACK_WHY_MAX: usize = 4096;
 pub struct UnpackEnd {
     pub result: UnpackResult,
     pub why: Option<String>,
+    /// Why it is short, as a code; none when whole, and for a row written
+    /// before the code was kept.
+    pub cause: Option<UnpackCause>,
 }
 
 impl UnpackEnd {
@@ -302,24 +349,26 @@ impl UnpackEnd {
         Self {
             result: UnpackResult::Whole,
             why: None,
+            cause: None,
         }
     }
 
     pub fn refused(why: String) -> Self {
-        Self::said(UnpackResult::Refused, why)
+        Self::said(UnpackResult::Refused, UnpackCause::Refused, why)
     }
 
-    /// Short for `why`: in part when it placed any file, failed otherwise.
-    pub fn short(placed_any: bool, why: String) -> Self {
+    /// Short for `why`, by `cause`: in part when it placed any file, failed
+    /// otherwise.
+    pub fn short(placed_any: bool, cause: UnpackCause, why: String) -> Self {
         let result = if placed_any {
             UnpackResult::Part
         } else {
             UnpackResult::Failed
         };
-        Self::said(result, why)
+        Self::said(result, cause, why)
     }
 
-    fn said(result: UnpackResult, mut why: String) -> Self {
+    fn said(result: UnpackResult, cause: UnpackCause, mut why: String) -> Self {
         if why.len() > UNPACK_WHY_MAX {
             let mut cut = UNPACK_WHY_MAX;
             while !why.is_char_boundary(cut) {
@@ -330,6 +379,7 @@ impl UnpackEnd {
         Self {
             result,
             why: Some(why),
+            cause: Some(cause),
         }
     }
 }

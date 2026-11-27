@@ -94,10 +94,12 @@ impl TorrentView {
             seeding_policy,
             seeding_levels,
             tracker_rule,
+            tracker_rule_id,
             upload_cap,
             unpack,
             unpack_override,
             unpack_end,
+            content_ready,
             route,
             files,
             sequential,
@@ -118,6 +120,8 @@ impl TorrentView {
             reannounce_seconds,
             eta_seconds,
             seeding_left,
+            seeding_goals,
+            seeding_goal_met,
             last_seen_complete_ms,
             last_activity_ms,
             // When it was read moves with the clock alone; whether its time
@@ -182,10 +186,12 @@ impl TorrentView {
         (
             seeding_levels,
             tracker_rule,
+            tracker_rule_id,
             upload_cap,
             unpack,
             unpack_override,
             unpack_end,
+            content_ready,
         )
             .hash(hasher);
         (route, sequential, first_last_piece_first).hash(hasher);
@@ -197,6 +203,11 @@ impl TorrentView {
             (active_seconds, seeding_seconds, consecutive_seeding_seconds).hash(hasher);
             (download_avg_bps, upload_avg_bps, reannounce_seconds).hash(hasher);
             (eta_seconds, seeding_left, last_seen_complete_ms).hash(hasher);
+            for goal in seeding_goals {
+                (goal.kind, goal.met).hash(hasher);
+                (goal.current.to_bits(), goal.target.to_bits()).hash(hasher);
+            }
+            (seeding_goals.len(), seeding_goal_met).hash(hasher);
             last_activity_ms.hash(hasher);
             (clock.active, clock.next_announce_ms).hash(hasher);
         }

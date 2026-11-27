@@ -1,0 +1,55 @@
+# One torrent's state, route, swarm, unpack result and tracker status. Never
+# selects tracker URLs, peer addresses or file lists. Scope: READ.
+# Variables: {"id": 42}
+query TorrentDetail($id: Int!) {
+  torrent(id: $id) {
+    id
+    name
+    state
+    stateReason
+    stateDetail
+    routeReason
+    routeKey
+    routeConsumer
+    private
+    progress
+    totalBytes
+    haveBytes
+    wastedBytes
+    connectedPeers
+    connectedSeeds
+    connectedLeechers
+    swarmSeeds
+    swarmLeechers
+    reannounceSeconds
+    lastSeenCompleteAt
+    activeSeconds
+    seedingGoalLeft
+    seedingGoalMet
+    seedingGoals {
+      kind
+      met
+      current
+      target
+    }
+    contentReady
+    unpacking {
+      result
+      reason
+      reasonCode
+    }
+    trackers {
+      tier
+      source
+      status
+      updating
+      message
+      fails
+      seeders
+      leechers
+      lastAnnounceAt
+      nextAnnounceAt
+      resolvedBy
+    }
+  }
+}

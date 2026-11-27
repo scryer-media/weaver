@@ -41,7 +41,7 @@ use crate::torrents::sessions::tests::{
 use crate::torrents::storage::PieceStorage;
 use crate::torrents::storage::Pieces;
 use crate::torrents::{ContentLayout, TorrentSource, TorrentTracker};
-use crate::torrents::{UnpackEnd, UnpackResult};
+use crate::torrents::{UnpackCause, UnpackEnd, UnpackResult};
 use bytes::Bytes;
 use weaver_server_base::clock::{ManualClock, RuntimeClock};
 use weaver_server_settings::categories::CategoryConfig;

@@ -141,9 +141,10 @@ fn verdicts_and_wants_read_the_order_and_the_damage_the_object_keeps() {
     assert_eq!((orderings, reads), (0, 0), "orderings, slice reads");
 }
 
-// Sets that share a slice size name it once, after what the caller holds.
+// A member is cut at the slices of the set that binds it, and a member no
+// set binds at every set's, each size once, after what the caller holds.
 #[test]
-fn block_sizes_names_each_size_once() {
+fn block_sizes_names_the_sizes_of_the_members_own_set() {
     let one = payload(34, 5000);
     let two = payload(35, 6000);
     let three = payload(36, 7000);
@@ -151,12 +152,40 @@ fn block_sizes_names_each_size_once() {
     files.extend(par2_set("second", &[("two.bin", &two)], BLOCK, 2, 1));
     files.extend(par2_set("third", &[("three.bin", &three)], 1024, 2, 1));
     let mut job = job(&files);
-    job.member("one.bin", &one);
-    job.member("two.bin", &two);
+    let first = job.member("one.bin", &one);
+    let second = job.member("two.bin", &two);
     job.member("three.bin", &three);
+    let other = job.member("other.bin", &payload(37, 3000));
     bind(&mut job);
     assert_eq!(job.object.slice_sizes().count(), 3);
-    let mut sizes = vec![1024];
-    Recovery::block_sizes(&job.object, &mut sizes);
-    assert_eq!(sizes, [1024, BLOCK, 1024]);
+    let sizes = |member| {
+        let mut sizes = vec![7];
+        Recovery::block_sizes(&job.object, member, &mut sizes);
+        sizes
+    };
+    assert_eq!(sizes(first), [7, 1024]);
+    assert_eq!(sizes(second), [7, BLOCK]);
+    assert_eq!(sizes(other), [7, BLOCK, 1024]);
+}
+
+// A member two sets describe is cut for both: the set that binds it, and
+// the set it moves to if that one cannot rebuild it.
+#[test]
+fn block_sizes_names_every_set_that_describes_the_member() {
+    let shared = payload(38, 5000);
+    let alone = payload(39, 5000);
+    let mut files = par2_set("first", &[("shared.bin", &shared)], BLOCK, 1, 1);
+    files.extend(par2_set("second", &[("shared.bin", &shared)], 1024, 4, 1));
+    files.extend(par2_set("third", &[("alone.bin", &alone)], 2048, 2, 1));
+    let mut job = job(&files);
+    let member = job.member("shared.bin", &shared);
+    let single = job.member("alone.bin", &alone);
+    bind(&mut job);
+    let sizes = |member| {
+        let mut sizes = Vec::new();
+        Recovery::block_sizes(&job.object, member, &mut sizes);
+        sizes
+    };
+    assert_eq!(sizes(member), [BLOCK, 1024]);
+    assert_eq!(sizes(single), [2048]);
 }

@@ -33,7 +33,7 @@ export function useTorrentSummaries(
   const active = key !== "";
   // Each push carries only what moved, so the torrents are kept between them.
   const [{ data }] = useSubscription<
-    { torrentUpdates: TorrentChangesData<TorrentSummaryData> },
+    { torrentRowUpdates: TorrentChangesData<TorrentSummaryData> },
     ReadonlyMap<number, TorrentSummaryData>
   >(
     {
@@ -41,7 +41,7 @@ export function useTorrentSummaries(
       variables,
       pause: !active || !visible || connection.isDisconnected,
     },
-    (held, pushed) => applyTorrentChanges(held, pushed.torrentUpdates),
+    (held, pushed) => applyTorrentChanges(held, pushed.torrentRowUpdates),
   );
   return useMemo(() => (active && data ? data : NO_TORRENTS), [active, data]);
 }

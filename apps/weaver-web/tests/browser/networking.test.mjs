@@ -201,7 +201,10 @@ test("flow displays route evidence, opens editors, and edits weights without los
       .textContent(),
     "Connects in 20 ms · 0.95 MiB/s per connection",
   );
-  assert.equal(await members.locator("rect[fill='#1f2b29']").count(), 1);
+  assert.equal(
+    await members.locator("rect[fill='var(--color-wv-ok-bg)']").count(),
+    1,
+  );
   const pool = diagram.locator("a").filter({ hasText: "Europe · pool" });
   assert.deepEqual(await pool.locator("text").allTextContents(), [
     "Europe · pool",
@@ -439,7 +442,7 @@ test("flow displays route evidence, opens editors, and edits weights without los
   assert.equal(await snakes.count(), 6);
   assert.equal(await ribbons.count(), 6);
   // The pool's traffic goes in and out at the member carrying it, not at the pool's head.
-  const carrier = members.locator("rect[fill='#1f2b29']");
+  const carrier = members.locator("rect[fill='var(--color-wv-ok-bg)']");
   const carrierMiddle =
     Number(await carrier.getAttribute("y")) +
     Number(await carrier.getAttribute("height")) / 2;

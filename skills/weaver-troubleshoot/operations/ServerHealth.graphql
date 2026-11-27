@@ -1,0 +1,29 @@
+# Live state of each news server connection pool: health, activity,
+# connections, failures and article counts. No credentials. Scope: READ.
+# Variables: none.
+query ServerHealth {
+  serverHealth {
+    serverId
+    label
+    host
+    port
+    tier
+    state
+    stateSinceEpochMs
+    activity
+    activityUntilEpochMs
+    down
+    connectionsOpen
+    connectionsBusy
+    connectionsMax
+    connectionsConfigured
+    capacityPenaltyUntilEpochMs
+    latencyMs
+    successCount
+    failureCount
+    consecutiveFailures
+    prematureDeaths
+    articlesFound
+    articlesNotFound
+  }
+}

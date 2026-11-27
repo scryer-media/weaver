@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
+use crate::observability::{spawn_blocking_with, state_error};
+
 use super::*;
 use crate::observability::with_timed_config_read;
 use weaver_server_core::settings::SettingsArchivePasswordsQueries;
@@ -14,13 +16,23 @@ pub(crate) struct SettingsQuery;
 #[Object]
 impl SettingsQuery {
     #[graphql(guard = "AdminGuard")]
+    async fn web_appearance(
+        &self,
+        ctx: &Context<'_>,
+    ) -> Result<crate::settings::appearance::WebAppearance> {
+        Ok(ctx
+            .data::<crate::settings::appearance::AppearanceStore>()?
+            .current())
+    }
+
+    #[graphql(guard = "AdminGuard")]
     async fn archive_password_settings(
         &self,
         ctx: &Context<'_>,
     ) -> Result<crate::settings::types::ArchivePasswordSettings> {
         let db = ctx.data::<Database>()?.clone();
         let (has_passwords, password_file) =
-            tokio::task::spawn_blocking(move || db.archive_password_settings()).await??;
+            spawn_blocking_with(move || db.archive_password_settings(), state_error).await?;
         Ok(crate::settings::types::ArchivePasswordSettings {
             has_passwords,
             password_file,
@@ -52,7 +64,7 @@ impl SettingsQuery {
         let probe = system
             .profile
             .read()
-            .map_err(|_| async_graphql::Error::new("system profile unavailable"))?
+            .map_err(|_| crate::auth::graphql_error("INTERNAL", "system profile unavailable"))?
             .clone();
 
         let selected = with_timed_config_read(config, "settings.query.hardwareProfile", |cfg| {
@@ -96,7 +108,7 @@ impl SettingsQuery {
         ctx: &Context<'_>,
     ) -> Result<Vec<crate::settings::types::TrackerRule>> {
         let db = ctx.data::<Database>()?.clone();
-        let rules = tokio::task::spawn_blocking(move || db.list_tracker_rules()).await??;
+        let rules = spawn_blocking_with(move || db.list_tracker_rules(), state_error).await?;
         Ok(rules.into_iter().map(Into::into).collect())
     }
 
@@ -105,17 +117,14 @@ impl SettingsQuery {
     #[graphql(guard = "AdminGuard")]
     async fn tracker_hosts(&self, ctx: &Context<'_>) -> Result<Vec<String>> {
         let db = ctx.data::<Database>()?.clone();
-        Ok(tokio::task::spawn_blocking(move || db.list_tracker_hosts()).await??)
+        spawn_blocking_with(move || db.list_tracker_hosts(), state_error).await
     }
 
     #[graphql(guard = "AdminGuard")]
     async fn schedules(&self, ctx: &Context<'_>) -> Result<Vec<crate::settings::types::Schedule>> {
         let db = ctx.data::<Database>()?.clone();
         let entries: Vec<weaver_server_core::bandwidth::ScheduleEntry> =
-            tokio::task::spawn_blocking(move || db.list_schedules())
-                .await
-                .map_err(|e| async_graphql::Error::new(e.to_string()))?
-                .map_err(|e| async_graphql::Error::new(e.to_string()))?;
+            spawn_blocking_with(move || db.list_schedules(), state_error).await?;
         Ok(entries
             .into_iter()
             .map(crate::settings::types::Schedule::from)

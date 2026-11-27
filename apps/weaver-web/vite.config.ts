@@ -6,6 +6,11 @@ import react, { reactCompilerPreset } from "@vitejs/plugin-react";
 import babel from "@rolldown/plugin-babel";
 import { compression } from "vite-plugin-compression2";
 import path from "path";
+import { ACCENTS, MODES, PALETTES } from "./src/lib/appearance.ts";
+import {
+  OFFLINE_APPEARANCE_CACHE,
+  OFFLINE_APPEARANCE_PATH,
+} from "./src/lib/offline-appearance.ts";
 
 const BACKEND_ORIGIN =
   process.env.WEAVER_DEV_PROXY_TARGET?.trim() || "http://127.0.0.1:9090";
@@ -76,15 +81,20 @@ function buildManualPwaPlugin(): Plugin {
       const swSource = `const CACHE_NAME = ${JSON.stringify(cacheVersion)};
 const CACHE_PREFIX = ${JSON.stringify(PWA_CACHE_PREFIX)};
 const PRECACHE_URLS = ${JSON.stringify(precacheUrls, null, 2)};
+const APPEARANCE_CACHE = ${JSON.stringify(OFFLINE_APPEARANCE_CACHE)};
+const APPEARANCE_URL = new URL(${JSON.stringify(OFFLINE_APPEARANCE_PATH)}, self.registration.scope);
+const PALETTES = ${JSON.stringify(PALETTES)};
+const MODES = ${JSON.stringify(MODES)};
+const ACCENTS = ${JSON.stringify(ACCENTS)};
+const SHELL_APPEARANCE = /^(\\s*<!doctype html>\\s*<html\\b[^>]*? )data-palette="(?:${PALETTES.join("|")})" data-mode="(?:${MODES.join("|")})" data-accent="(?:${ACCENTS.join("|")})?"/;
+const SHELL_REQUEST_TIME = "x-weaver-shell-request-time";
 const STATIC_ASSET_RE = /\\.(?:js|css|woff2?|png|webp|svg|ico)$/i;
 const BYPASS_SUFFIXES = ["/graphql", "/metrics"];
 
-function isSameOrigin(url) {
-  return url.origin === self.location.origin;
-}
+const BASE_PATH = new URL(self.registration.scope).pathname;
 
-function getBasePath() {
-  return new URL(self.registration.scope).pathname;
+function inScope(url) {
+  return url.origin === self.location.origin && url.pathname.startsWith(BASE_PATH);
 }
 
 function shouldBypass(request) {
@@ -92,14 +102,88 @@ function shouldBypass(request) {
     return true;
   }
   const url = new URL(request.url);
-  if (!isSameOrigin(url)) {
+  if (!inScope(url)) {
     return true;
   }
-  const base = getBasePath();
-  const localPath = url.pathname.startsWith(base)
-    ? "/" + url.pathname.slice(base.length)
-    : url.pathname;
+  const localPath = "/" + url.pathname.slice(BASE_PATH.length);
   return BYPASS_SUFFIXES.some((suffix) => localPath.startsWith(suffix));
+}
+
+function shellResponse(response, body) {
+  const headers = new Headers(response.headers);
+  headers.delete("content-encoding");
+  headers.delete("content-length");
+  headers.delete("etag");
+  return new Response(body, {
+    headers,
+    status: response.status,
+    statusText: response.statusText,
+  });
+}
+
+function stampShell(response, started) {
+  const cached = shellResponse(response, response.body);
+  cached.headers.set(SHELL_REQUEST_TIME, String(started));
+  return cached;
+}
+
+async function cacheNavigation(response, started) {
+  if (
+    !response.headers.get("content-type")?.startsWith("text/html") ||
+    !response.url ||
+    !inScope(new URL(response.url))
+  ) {
+    return;
+  }
+  const cache = await caches.open(CACHE_NAME);
+  await cache.put(self.registration.scope, stampShell(response, started));
+}
+
+async function installShell() {
+  const started = Date.now();
+  const cache = await caches.open(CACHE_NAME);
+  await cache.addAll(PRECACHE_URLS);
+  const shell = await cache.match(self.registration.scope);
+  if (shell) {
+    await cache.put(self.registration.scope, stampShell(shell, started));
+  }
+}
+
+async function offlineShell() {
+  const cache = await caches.open(CACHE_NAME);
+  const shell =
+    (await cache.match(self.registration.scope)) ||
+    (await cache.match(new URL("index.html", self.registration.scope)));
+  if (!shell) {
+    return Response.error();
+  }
+  try {
+    const snapshot = await caches.match(APPEARANCE_URL, { cacheName: APPEARANCE_CACHE });
+    if (!snapshot) {
+      return shell;
+    }
+    const { appearance, savedAt } = await snapshot.json();
+    // A save confirmed during the navigation still supersedes that request.
+    if (
+      !Number.isFinite(savedAt) ||
+      savedAt < Number(shell.headers.get(SHELL_REQUEST_TIME)) ||
+      !PALETTES.includes(appearance?.palette) ||
+      !MODES.includes(appearance.mode) ||
+      (appearance.accent !== null && !ACCENTS.includes(appearance.accent))
+    ) {
+      return shell;
+    }
+    const markup = await shell.clone().text();
+    const updated = markup.replace(SHELL_APPEARANCE, (_, prefix) =>
+      prefix +
+      'data-palette="' + appearance.palette +
+      '" data-mode="' + appearance.mode +
+      '" data-accent="' + (appearance.accent ?? "") + '"',
+    );
+    return updated === markup ? shell : shellResponse(shell, updated);
+  } catch {
+    return shell;
+  }
 }
 
 async function deleteOldCaches() {
@@ -112,9 +196,7 @@ async function deleteOldCaches() {
 }
 
 self.addEventListener("install", (event) => {
-  event.waitUntil(
-    caches.open(CACHE_NAME).then((cache) => cache.addAll(PRECACHE_URLS)),
-  );
+  event.waitUntil(installShell());
 });
 
 self.addEventListener("activate", (event) => {
@@ -135,26 +217,14 @@ self.addEventListener("fetch", (event) => {
 
   const url = new URL(request.url);
   if (request.mode === "navigate") {
-    event.respondWith(
-      fetch(request)
-        .then((response) => {
-          const copy = response.clone();
-          event.waitUntil(
-            caches.open(CACHE_NAME).then((cache) => cache.put(${JSON.stringify(
-              normalize("/"),
-            )}, copy)),
-          );
-          return response;
-        })
-        .catch(async () => {
-          const cache = await caches.open(CACHE_NAME);
-          return (
-            (await cache.match(request)) ||
-            (await cache.match(${JSON.stringify(normalize("/"))})) ||
-            (await cache.match(${JSON.stringify(normalize("/index.html"))}))
-          );
-        }),
+    const started = Date.now();
+    const network = fetch(request);
+    event.waitUntil(
+      network
+        .then((response) => cacheNavigation(response.clone(), started))
+        .catch(() => undefined),
     );
+    event.respondWith(network.catch(offlineShell));
     return;
   }
 

@@ -204,4 +204,59 @@ impl SevenZipStore {
             _ => {}
         }
     }
+
+    // The job's check of a member's file failed the CRC the member states.
+    // Said only where the store has no ruling of its own: a closed member
+    // whose fold went over the run budget, and that it has not said
+    // damaged. It then rules as `record` would have on its fold: a key on
+    // trial that read verified bytes is condemned, and otherwise the
+    // member's extent is damaged for the recovery beside it, once.
+    pub(super) fn refuted(&mut self, member: MemberId, out: &mut Vec<Emit>) {
+        let Some(map) = self.map.take() else {
+            return;
+        };
+        self.rule_refuted(&map, member, out);
+        self.map = Some(map);
+        if std::mem::take(&mut self.wrong_key) {
+            self.condemn(out);
+        }
+    }
+
+    fn rule_refuted(&mut self, map: &Map, member: MemberId, out: &mut Vec<Emit>) {
+        let Some(entry) = map.entry(member) else {
+            return;
+        };
+        let Some(said) = self.members.get(member.0 as usize) else {
+            return;
+        };
+        let whole = ByteRange::new(0, entry.length);
+        if self.gone
+            || entry.crc.is_none()
+            || !said.closed
+            || said.damaged
+            || self.grid.fold(member, WHOLE, 0, whole).is_some()
+        {
+            return;
+        }
+        // The bytes the fold would have called verified, from what the
+        // member was written with.
+        let verified = said.coverage.verified(whole);
+        let enciphered = entry
+            .folder
+            .is_some_and(|folder| map.folders[folder].aes.is_some());
+        if enciphered && self.on_trial() && verified {
+            self.wrong_key = true;
+            return;
+        }
+        let Some(said) = Arc::make_mut(&mut self.members).get_mut(member.0 as usize) else {
+            return;
+        };
+        said.damaged = true;
+        let mut extents = Vec::new();
+        self.extent_in(map, member, whole, &mut extents);
+        out.extend(extents.into_iter().map(|extent| Emit::Damaged {
+            volume: extent.volume,
+            range: extent.range,
+        }));
+    }
 }

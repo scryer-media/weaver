@@ -12,8 +12,8 @@ use std::io;
 use std::sync::{Arc, Mutex};
 
 use weaver_graph::{
-    Budget, ByteRange, Coverage, Delivery, Digest, Emit, Evidence, Evidenced, Object, Placement,
-    Provenance, Pull, Seek, Standing, VolumeIndex, Volumes,
+    Budget, ByteRange, Coverage, Delivery, Digest, Emit, Evidence, Evidenced, MemberId, Object,
+    Placement, Provenance, Pull, Seek, Standing, VolumeIndex, Volumes,
 };
 
 use super::super::RarStore;
@@ -538,6 +538,15 @@ impl Owner {
         let mut out = Vec::new();
         self.object.offer_password(secret, &mut out);
         self.apply(out);
+    }
+
+    // The namespace's check of the member's file failed.
+    pub fn refuted(&mut self, member: MemberId) {
+        self.doing = ("refuted", 0);
+        let mut out = Vec::new();
+        self.object.member_refuted(member, &mut out);
+        self.apply(out);
+        self.settle();
     }
 
     pub fn held(&self) -> usize {

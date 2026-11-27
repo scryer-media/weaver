@@ -117,6 +117,15 @@ export interface TorrentUnpackedFileData {
   length: number;
 }
 
+/** One page of a torrent's files, in file-index order. */
+export interface TorrentFilePageData {
+  items: TorrentFileData[];
+  /** Every file of the torrent, on this page or not. */
+  totalCount: number;
+  /** Where the next page starts; null on the last. */
+  nextCursor: string | null;
+}
+
 /** Who named a tracker: the torrent itself, or the operator who added it. */
 export type TrackerSource = "TORRENT" | "OPERATOR";
 
@@ -140,7 +149,7 @@ export interface TorrentTrackerData {
   seeders: number | null;
   leechers: number | null;
   /** The peers its last answer named. */
-  peers: number | null;
+  announcedPeers: number | null;
 }
 
 /** One connection to a peer of a torrent. */
@@ -207,7 +216,7 @@ export function seedingGoalProgress(
 }
 
 /**
- * A `torrentUpdates` push: every followed torrent with `fullUpdate`, else
+ * A `torrentRowUpdates` push: every followed torrent with `fullUpdate`, else
  * the torrents that changed or came and the ids of the ones gone.
  */
 export interface TorrentChangesData<T> {
@@ -230,12 +239,13 @@ export function applyTorrentChanges<T extends { id: number }>(
 /** A torrent as its detail reads it. */
 export interface TorrentData extends TorrentSummaryData {
   name: string;
-  infohash: string;
+  /** Null when it has no v1 info hash. */
+  infohashV1: string | null;
   infohashV2: string | null;
   /** Why it is in its state, when the server states the reason itself. */
-  stated: TorrentStatedReason | null;
+  stateReason: TorrentStatedReason | null;
   /** Why it is in its state in the server's free words: an error, a refusal, a route's cause. */
-  detail: string | null;
+  stateDetail: string | null;
   /** Why its route holds it, while its state comes from that hold. */
   routeReason: TorrentRouteReason | null;
   category: string | null;
@@ -247,12 +257,12 @@ export interface TorrentData extends TorrentSummaryData {
   downloadedBytes: number;
   downloadBps: number;
   /** The torrent's own limits in bytes per second; null is unlimited and 0 closed. */
-  uploadLimit: number | null;
-  downloadLimit: number | null;
+  uploadLimitBps: number | null;
+  downloadLimitBps: number | null;
   etaSeconds: number | null;
-  peers: number;
-  seeds: number;
-  leechers: number;
+  connectedPeers: number;
+  connectedSeeds: number;
+  connectedLeechers: number;
   /** The most peers a torrent connects to. */
   maxPeers: number;
   /** The swarm as its trackers last counted it. */
@@ -268,33 +278,33 @@ export interface TorrentData extends TorrentSummaryData {
   downloadAvgBps: number;
   uploadAvgBps: number;
   wastedBytes: number;
-  lastSeenCompleteMs: number | null;
+  /** ISO-8601, as every `DateTime` comes. */
+  lastSeenCompleteAt: string | null;
   pieceCount: number | null;
   pieceSize: number | null;
   piecesHave: number | null;
   createdBy: string | null;
-  createdAtMs: number | null;
+  metainfoCreatedAt: string | null;
   comment: string | null;
-  addedAtMs: number;
-  completedAtMs: number | null;
+  addedAt: string;
+  completedAt: string | null;
   savePath: string | null;
-  seedingLeft: string | null;
   /** The torrent's own terms; null when it inherits every one. */
   seedingOverride: SeedingPolicyData | null;
   /** The terms in effect. */
   seedingPolicy: SeedingTermsData;
-  /** The host pattern of the tracker rule the torrent is under, when it is. */
-  trackerRule: string | null;
+  /** The name of the tracker rule the torrent is under, when it is. */
+  trackerRuleName: string | null;
   /** Whether its archives are extracted. */
   unpack: boolean;
   /** The torrent's own unpack; null inherits. */
   unpackOverride: boolean | null;
   /** How its unpacking came out, once over; null while it runs or with nothing to unpack. */
   unpacking: TorrentUnpackingData | null;
-  route: string | null;
+  /** The key of the torrent route it runs on, as `TorrentRoute.key`. */
+  routeKey: string | null;
   /** The networking route it takes, by consumer key: `torrent:default`, `torrent:category:<id>` or `torrent:tracker:<id>`. */
   routeConsumer: string;
-  files: TorrentFileData[];
   /** Whether its pieces are fetched in order. */
   sequential: boolean;
   /** Whether each file's first and last pieces are fetched first. */
@@ -361,8 +371,8 @@ export interface TorrentExposure {
   resolvedBy: ResolvedBy | null;
   /** The address a tracker sees; none until one is known. */
   address: string | null;
-  /** The port announced; 0 when none is. */
-  announcedPort: number;
+  /** The port announced; null when none is. */
+  announcedPort: number | null;
   inbound: boolean;
   udpTrackers: boolean;
   dht: boolean;
@@ -389,7 +399,10 @@ export function exposureValues(
     },
     {
       label: t("next.exposure.announcedPort"),
-      value: String(exposure.announcedPort),
+      value:
+        exposure.announcedPort === null
+          ? "\u2014"
+          : String(exposure.announcedPort),
     },
     { label: t("next.exposure.inbound"), value: yesNo(exposure.inbound) },
     {

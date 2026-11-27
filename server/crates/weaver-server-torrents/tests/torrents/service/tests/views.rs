@@ -622,8 +622,8 @@ async fn a_torrent_given_its_session_is_published_in_it_open() {
 }
 
 // A file's level changed on a paused torrent moves nothing a list's row
-// shows: one torrent's follower is told of it, with the new level, and the
-// row is not marked moved for a list.
+// shows: the follower of the torrent's files is told of it, with the new
+// level, and the row is not marked moved for a list.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_files_level_reaches_its_torrents_follower_and_no_list() {
     use FilePriority::*;
@@ -660,17 +660,17 @@ async fn a_files_level_reaches_its_torrents_follower_and_no_list() {
         .await
         .unwrap();
     rig.service.publish().await;
-    let mut one = rig.service.updates(job_id);
-    let first = one.next().await.torrents;
-    assert_eq!(first[0].files[0].priority, Normal);
+    let mut one = rig.service.file_updates(job_id, 0, 10);
+    let first = one.next().await.unwrap();
+    assert_eq!(first.files[0].0.priority, Normal);
     let row = rig.service.snapshot().row(job_id).unwrap();
 
     rig.service
         .set_file_priorities(job_id, &[(0, High)])
         .await
         .unwrap();
-    let told = one.next().await.torrents;
-    assert_eq!(told[0].files[0].priority, High);
+    let told = one.next().await.unwrap();
+    assert_eq!(told.files[0].0.priority, High);
     let after = rig.service.snapshot().row(job_id).unwrap();
     assert_eq!((after.moved, after.listed), (row.moved, row.listed));
     rig.service.stop().await;

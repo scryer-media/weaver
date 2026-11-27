@@ -1495,7 +1495,7 @@ async fn a_wireguard_chain_rides_one_tunnel_inside_another() {
         Err(error) => error,
     };
     assert_eq!(
-        error,
+        error.to_string(),
         "WireGuard must be the first hop on an egress or sit directly on another WireGuard hop"
     );
     runtime.shutdown().await;

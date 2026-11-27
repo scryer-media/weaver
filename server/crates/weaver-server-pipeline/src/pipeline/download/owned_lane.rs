@@ -1416,7 +1416,7 @@ pub struct LaneLeaseContext {
     pub retention_excludes: weaver_nntp::ServerSet,
     pressure_clear: bool,
     mode: DownloadLaneMode,
-    pub checkpoint_plan: weaver_yenc::CheckpointPlan,
+    pub checkpoint_plans: CheckpointPlans,
     // The job's repeated-article cache, when its files share articles.
     repeated: Option<Arc<super::repeated::RepeatedArticles>>,
 }
@@ -1443,7 +1443,7 @@ impl LaneLeaseContext {
                 server_idx,
                 supports_pipelining,
             ),
-            checkpoint_plan: std::mem::take(&mut lease.checkpoint_plan),
+            checkpoint_plans: std::mem::take(&mut lease.checkpoint_plans),
             repeated: lease.repeated.take(),
         }
     }
@@ -2271,12 +2271,17 @@ pub fn run_owned_lane(
             }
         }
 
-        // The plan is immutable per lease and only read when a response is
-        // decoded, so applying the head request's plan here is what keeps two
-        // leases' geometries apart on one ring.
-        if let Some((_, head_context)) = inflight.front() {
+        // A file's plan is immutable per lease and only read when a response
+        // is decoded, so applying the head request's plan here is what keeps
+        // two files' and two leases' geometries apart on one ring.
+        if let Some((head, head_context)) = inflight.front() {
             lane.set_body_activity(head_context.body_activity.clone());
-            lane.set_checkpoint_plan(head_context.checkpoint_plan.clone());
+            lane.set_checkpoint_plan(
+                head_context
+                    .checkpoint_plans
+                    .of(head.segment_id.file_id.file_index)
+                    .clone(),
+            );
         }
         // What the lane holds as this response is read, the response's own
         // request among it: a full rung means the pipe never waited on the

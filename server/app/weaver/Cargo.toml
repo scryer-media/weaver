@@ -53,11 +53,18 @@ axum = { workspace = true, features = ["multipart"] }
 tower-http = { workspace = true, default-features = false }
 async-graphql = { workspace = true }
 async-graphql-axum = { workspace = true, default-features = false }
+# The MCP endpoint, and its confirmation tokens: random bytes from aws-lc-rs,
+# kept only as BLAKE3 digests.
+rmcp = { workspace = true }
+aws-lc-rs = { workspace = true }
+blake3 = { workspace = true }
 reqwest = { workspace = true }
 quick-xml = { workspace = true, default-features = false }
 # The diagnostics filter: one automaton over its stand-in table, and the
 # SHA-256 fingerprint a provider's pinned TLS certificate is written as.
 aho-corasick = { workspace = true }
+# The MCP log search's size-limited pattern.
+regex = { workspace = true }
 sha2 = { workspace = true }
 libc = { workspace = true }
 rayon = { workspace = true, default-features = false }

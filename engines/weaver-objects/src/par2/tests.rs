@@ -412,8 +412,11 @@ fn evidence_fed_piece_by_piece_says_what_one_fold_of_the_whole_does() {
         }
         let mut whole = job(&files);
         let other = whole.member("payload.bin", bytes);
-        feed(&mut whole, other, bytes, None);
         bind(&mut whole);
+        feed(&mut whole, other, bytes, None);
+        // Every verdict thrown away and folded afresh from the grid.
+        let key = whole.object.order[0];
+        whole.object.fold_set(key);
         let seen = verdicts(&piecewise, member);
         assert_eq!(seen, verdicts(&whole, other));
         assert_eq!(seen.contains(&SliceVerdict::Damaged), damaged);
@@ -541,6 +544,122 @@ fn two_sets_in_one_namespace_bind_and_repair_apart() {
     ));
     assert!(job.store.members[&second] == two);
     assert!(job.store.members[&first] == one);
+}
+
+// Each member's evidence is kept on the slices of the set that binds it,
+// and on no other set's: sets of other slice sizes cost it nothing.
+#[test]
+fn a_member_is_recorded_on_the_slices_of_its_own_set_alone() {
+    let one = payload(41, 5000);
+    let two = payload(42, 6000);
+    let mut files = par2_set("first", &[("one.bin", &one)], BLOCK, 2, 1);
+    files.extend(par2_set("second", &[("two.bin", &two)], 1024, 2, 1));
+    let mut job = job(&files);
+    let first = job.member("one.bin", &one);
+    let second = job.member("two.bin", &two);
+    bind(&mut job);
+    feed(&mut job, first, &one, None);
+    feed(&mut job, second, &two, None);
+    assert_eq!(
+        job.object.grid.sizes(first),
+        vec![BLOCK, crate::grid::WHOLE]
+    );
+    assert_eq!(
+        job.object.grid.sizes(second),
+        vec![1024, crate::grid::WHOLE]
+    );
+    for member in [first, second] {
+        assert!(
+            verdicts(&job, member)
+                .iter()
+                .all(|verdict| *verdict == SliceVerdict::Intact)
+        );
+    }
+    assert_eq!(
+        job.object
+            .repair(&mut job.store, weaver_graph::Budget::default()),
+        RepairOutcome::Clean
+    );
+    assert_eq!((job.store.reads, job.store.volume_reads), (0, 0));
+}
+
+// A member two sets describe is recorded on the slices of both, so the
+// set that cannot rebuild it gives it to one that already holds what
+// arrived: nothing is asked for again, and nothing is unknown to it.
+#[test]
+fn a_member_that_moves_to_a_set_of_other_slices_takes_its_evidence_along() {
+    let shared = payload(43, 5000);
+    let mut files = par2_set("first", &[("shared.bin", &shared)], BLOCK, 1, 1);
+    files.extend(par2_set("second", &[("shared.bin", &shared)], 1024, 4, 1));
+    let mut job = job(&files);
+    let member = job.member("shared.bin", &shared);
+    bind(&mut job);
+    let (first, second) = (job.object.order[0], job.object.order[1]);
+    assert!(job.object.sets[&first].bound(member).is_some());
+    // Two of the first set's slices, one of the second's.
+    let lost = ByteRange::new(400, 600);
+    let mut pieces = segments(0, &shared, ARTICLE, BLOCK, true);
+    for piece in &mut pieces {
+        piece.verified = piece.range.intersect(lost).is_none();
+    }
+    // Cut at the first set's slices, which the second's are made of.
+    job.object.feed(member, &pieces);
+    assert_eq!(
+        job.object.grid.sizes(member),
+        vec![BLOCK, 1024, crate::grid::WHOLE]
+    );
+    Recovery::refused(&mut job.object, member, lost);
+    assert!(job.object.sets[&first].bound(member).is_none());
+    assert!(job.object.sets[&second].bound(member).is_some());
+    let mut unfed = Vec::new();
+    job.object.unfed(&mut unfed);
+    assert!(unfed.is_empty(), "the second set holds what arrived");
+    let said = verdicts(&job, member);
+    assert_eq!(said.len(), 5);
+    assert!(
+        said[1..]
+            .iter()
+            .all(|verdict| *verdict == SliceVerdict::Intact)
+    );
+}
+
+// A set whose index comes after a member's bytes describes a member the
+// first set binds. What arrived was recorded on the first set's slices
+// alone, so the member is asked for again, once, and said again it is
+// recorded on the later set's slices too.
+#[test]
+fn a_set_that_comes_to_describe_a_member_asks_for_what_came_before() {
+    let shared = payload(44, 5000);
+    let first = par2_set("first", &[("shared.bin", &shared)], BLOCK, 1, 1);
+    let second = par2_set("second", &[("shared.bin", &shared)], 1024, 4, 1);
+    let mut job = job(&first);
+    let member = job.member("shared.bin", &shared);
+    bind(&mut job);
+    feed(&mut job, member, &shared, None);
+    assert_eq!(
+        job.object.grid.sizes(member),
+        vec![BLOCK, crate::grid::WHOLE]
+    );
+    let mut unfed = Vec::new();
+    job.object.unfed(&mut unfed);
+    assert!(unfed.is_empty(), "one set describes it");
+    for (name, bytes) in &second {
+        job.volume(name, bytes, ARTICLE as usize, false);
+    }
+    bind(&mut job);
+    assert!(job.object.moved());
+    job.object.unfed(&mut unfed);
+    assert_eq!(unfed, vec![member]);
+    job.object
+        .feed(member, &segments(0, &shared, ARTICLE, 1024, true));
+    assert_eq!(
+        job.object.grid.sizes(member),
+        vec![BLOCK, 1024, crate::grid::WHOLE]
+    );
+    unfed.clear();
+    job.object.unfed(&mut unfed);
+    assert!(unfed.is_empty(), "asked for once");
+    assert!(!job.object.moved());
 }
 
 #[test]

@@ -392,7 +392,18 @@ export function liveAddresses(egress: Egress, data: NetworkingData): string[] {
 }
 
 /** An egress as its save sends it. */
-export function egressInput(egress: Egress) {
+export function egressInput(
+  egress: Pick<
+    Egress,
+    | "name"
+    | "bindingKind"
+    | "interfaceName"
+    | "sourceAddress"
+    | "enabled"
+    | "downloadBps"
+    | "uploadBps"
+  >,
+) {
   return {
     name: egress.name,
     bindingKind: egress.bindingKind,

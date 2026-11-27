@@ -175,7 +175,8 @@ fn a_result_carries_the_ledger_and_the_retention_exclusions() {
     assert_eq!(result.exclude_servers, [1]);
 }
 
-// The context takes the lease's retention exclusions and checkpoint plan.
+// The context takes the lease's retention exclusions and each file's
+// checkpoint plan; a file the lease holds nothing of has none.
 #[test]
 fn a_lease_context_takes_the_lease_s_exclusions() {
     let mut lease = test_lease(
@@ -184,13 +185,20 @@ fn a_lease_context_takes_the_lease_s_exclusions() {
         weaver_nntp::ServerSet::from([2, 5]),
         vec![tail_work(1, 0)],
     );
-    lease.checkpoint_plan =
-        weaver_yenc::CheckpointPlan::Single(std::num::NonZeroU64::new(4096).unwrap());
+    let file = lease.works[0].segment_id.file_id.file_index;
+    lease.checkpoint_plans.insert(
+        file,
+        weaver_yenc::CheckpointPlan::Single(std::num::NonZeroU64::new(4096).unwrap()),
+    );
     let context = LaneLeaseContext::from_lease(&mut lease, 0, true);
     assert_eq!(context.retention_excludes, [2, 5]);
     assert_eq!(
-        context.checkpoint_plan,
+        *context.checkpoint_plans.of(file),
         weaver_yenc::CheckpointPlan::Single(std::num::NonZeroU64::new(4096).unwrap())
+    );
+    assert_eq!(
+        *context.checkpoint_plans.of(file + 1),
+        weaver_yenc::CheckpointPlan::None
     );
     assert_eq!(lease.dial_exclude_servers, [2, 5]);
     assert_eq!(lease.works.len(), 1);

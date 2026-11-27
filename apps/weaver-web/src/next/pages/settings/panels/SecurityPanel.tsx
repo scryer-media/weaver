@@ -13,10 +13,12 @@ import {
   ENABLE_LOGIN_MUTATION,
   HTTP_BIND_ADDRESS_QUERY,
   LOGIN_STATUS_QUERY,
+  MCP_SERVER_QUERY,
   NETWORK_ACCESS_QUERY,
   PREVIEW_NETWORK_ACCESS_QUERY,
   SET_ACCESS_POLICY_MUTATION,
   SET_HTTP_BIND_ADDRESS_MUTATION,
+  SET_MCP_ENABLED_MUTATION,
   UPDATE_NETWORK_ACCESS_MUTATION,
 } from "@/graphql/queries";
 import { authHeaders } from "@/graphql/client";
@@ -86,6 +88,13 @@ interface AccessPolicyStatus {
   trustedNetworks: string[];
   editable: boolean;
   envPinned: boolean;
+}
+
+/** The MCP endpoint's switch; `editable` is false while WEAVER_MCP_ENABLED forces it. */
+interface McpServerStatus {
+  enabled: boolean;
+  storedEnabled: boolean;
+  editable: boolean;
 }
 
 interface NetworkAccessStatus {
@@ -234,6 +243,10 @@ function SecurityPanelBody({
   }>({
     query: API_KEYS_QUERY,
   });
+  const [{ data: mcpData }] = useQuery<{ mcpServer: McpServerStatus }>({
+    query: MCP_SERVER_QUERY,
+    requestPolicy: "network-only",
+  });
 
   const [, setBindAddress] = useMutation(SET_HTTP_BIND_ADDRESS_MUTATION);
   const [, setAccessPolicy] = useMutation(SET_ACCESS_POLICY_MUTATION);
@@ -243,6 +256,9 @@ function SecurityPanelBody({
   const [, changePassword] = useMutation(CHANGE_PASSWORD_MUTATION);
   const [, createApiKey] = useMutation(CREATE_API_KEY_MUTATION);
   const [, deleteApiKey] = useMutation(DELETE_API_KEY_MUTATION);
+  const [, setMcpEnabled] = useMutation<{ setMcpEnabled: McpServerStatus }>(
+    SET_MCP_ENABLED_MUTATION,
+  );
 
   const login = loginData?.adminLoginStatus;
   const loginEnabled = login?.enabled;
@@ -262,6 +278,10 @@ function SecurityPanelBody({
   const [networks, setNetworks] = useState("");
   const [proxies, setProxies] = useState("");
   const [dirty, setDirty] = useState(false);
+  // The switch's draft; null while it matches what is stored. The status a
+  // save returns replaces the one the page loaded, so nothing is fetched twice.
+  const [mcpDraft, setMcpDraft] = useState<boolean | null>(null);
+  const [mcpSaved, setMcpSaved] = useState<McpServerStatus | null>(null);
   const [busy, setBusy] = useState(false);
   const [status, setStatus] = useState<string | null>(null);
   const [failed, setFailed] = useState(false);
@@ -306,7 +326,51 @@ function SecurityPanelBody({
     setFailed(false);
   };
 
+  const mcp = mcpSaved ?? mcpData?.mcpServer;
+  const mcpChanged =
+    Boolean(mcp?.editable) &&
+    mcpDraft !== null &&
+    mcpDraft !== mcp?.storedEnabled;
+
+  const editMcp = (next: boolean) => {
+    setMcpDraft(next);
+    setStatus(null);
+    setFailed(false);
+  };
+
+  // Saves the switch when it changed: "skipped" when it did not.
+  const saveMcp = async (): Promise<
+    "saved" | "skipped" | "password" | "failed"
+  > => {
+    if (!mcpChanged || mcpDraft === null) return "skipped";
+    const result = await setMcpEnabled({ enabled: mcpDraft });
+    if (needsPasswordCheck(result.error)) return "password";
+    if (result.error || !result.data) {
+      fail(cleanMessage(result.error?.message ?? ""));
+      return "failed";
+    }
+    setMcpSaved(result.data.setMcpEnabled);
+    setMcpDraft(null);
+    return "saved";
+  };
+
+  const saveMcpOnly = async (): Promise<CheckedOutcome> => {
+    setBusy(true);
+    setFailed(false);
+    const outcome = await saveMcp();
+    if (outcome === "password") {
+      setBusy(false);
+      return "password";
+    }
+    if (outcome !== "failed") {
+      setBusy(false);
+      setStatus(t("next.settings.saved"));
+    }
+    return "done";
+  };
+
   const revert = () => {
+    setMcpDraft(null);
     setAddress(bind?.storedAddress ?? "");
     setMode(policy?.mode ?? "");
     setNetworks(storedNetworks);
@@ -379,6 +443,14 @@ function SecurityPanelBody({
   const commitNetwork = async (): Promise<"done" | "password"> => {
     setBusy(true);
     setFailed(false);
+    const mcpOutcome = await saveMcp();
+    if (mcpOutcome === "password") {
+      setBusy(false);
+      return "password";
+    }
+    if (mcpOutcome === "failed") {
+      return "done";
+    }
     const result = await updateNetworkAccess({ input: networkInput() });
     if (needsPasswordCheck(result.error)) {
       setBusy(false);
@@ -425,6 +497,14 @@ function SecurityPanelBody({
     setBusy(true);
     setFailed(false);
     const messages: string[] = [];
+    const mcpOutcome = await saveMcp();
+    if (mcpOutcome === "password") {
+      setBusy(false);
+      return "password";
+    }
+    if (mcpOutcome === "failed") {
+      return "done";
+    }
     if (bind?.editable && address.trim() !== (bind.storedAddress ?? "")) {
       const result = await setBindAddress({ address: address.trim() });
       if (needsPasswordCheck(result.error)) {
@@ -470,13 +550,19 @@ function SecurityPanelBody({
   };
 
   usePanelState({
-    dirty,
+    dirty: dirty || mcpChanged,
     busy,
     status,
     failed,
     revert,
     save: () => {
-      void (authenticated ? saveNetwork() : passwordCheck.run(saveLegacy));
+      if (!authenticated) {
+        void passwordCheck.run(saveLegacy);
+      } else if (dirty) {
+        void saveNetwork();
+      } else {
+        void passwordCheck.run(saveMcpOnly);
+      }
     },
   });
 
@@ -727,6 +813,25 @@ function SecurityPanelBody({
           onChange: (next) => edit(() => setAddress(next)),
         }
       : { kind: "static", value: bind?.address ?? "—" },
+  };
+
+  // Locked to the forced value while WEAVER_MCP_ENABLED is set, as the other
+  // environment-managed settings here are.
+  const mcpField: FieldSpec = {
+    id: "mcpEnabled",
+    label: t("next.security.mcpEnabled"),
+    help: mcp?.editable
+      ? t("next.security.mcpEnabledHelp")
+      : t("next.security.accessPinnedHelp", { variable: "WEAVER_MCP_ENABLED" }),
+    keywords: "mcp agent model context protocol skills api key",
+    control: {
+      kind: "toggle",
+      value: mcp?.editable
+        ? (mcpDraft ?? mcp.storedEnabled)
+        : (mcp?.enabled ?? false),
+      disabled: !mcp?.editable,
+      onChange: editMcp,
+    },
   };
 
   const legacyAccessFields: FieldSpec[] = [
@@ -990,7 +1095,10 @@ function SecurityPanelBody({
       kind: "section",
       id: "access",
       title: t("next.security.networkAccess"),
-      fields: authenticated ? authenticatedAccessFields : legacyAccessFields,
+      fields: [
+        ...(authenticated ? authenticatedAccessFields : legacyAccessFields),
+        ...(mcp ? [mcpField] : []),
+      ],
     },
     {
       kind: "table",

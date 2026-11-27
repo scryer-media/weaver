@@ -97,6 +97,9 @@ pub(super) struct TorrentFacadeContext {
 struct Inner {
     db: Database,
     handle: SchedulerHandle,
+    // Every torrent's pause goes through it, so a stop or start here ends a
+    // timed pause set elsewhere.
+    scheduled_resume: weaver_server_api::ScheduledResumeCoordinator,
     config: SharedConfig,
     auth_cache: LoginAuthCache,
     api_key_cache: ApiKeyCache,
@@ -153,6 +156,7 @@ impl TorrentFacadeContext {
     pub(super) fn new(
         db: Database,
         handle: SchedulerHandle,
+        scheduled_resume: weaver_server_api::ScheduledResumeCoordinator,
         config: SharedConfig,
         auth_cache: LoginAuthCache,
         api_key_cache: ApiKeyCache,
@@ -168,6 +172,7 @@ impl TorrentFacadeContext {
             inner: Arc::new(Inner {
                 db,
                 handle,
+                scheduled_resume,
                 config,
                 auth_cache,
                 api_key_cache,
@@ -628,7 +633,7 @@ fn names_all(params: &Params) -> bool {
     params.get("hashes").unwrap_or_default().trim() == "all"
 }
 
-fn held(result: Result<(), weaver_server_core::SchedulerError>) -> Response {
+fn held(result: Result<(), weaver_server_api::ScheduledResumeError>) -> Response {
     match result {
         Ok(()) => ok(),
         Err(error) => internal(error),
@@ -1238,13 +1243,13 @@ async fn torrents(
         // own stop or start standing; named torrents are each stopped.
         "stop" if names_all(params) => held(
             ctx.inner
-                .handle
+                .scheduled_resume
                 .pause_class(weaver_server_core::torrents::CLASS)
                 .await,
         ),
         "start" if names_all(params) => held(
             ctx.inner
-                .handle
+                .scheduled_resume
                 .resume_class(weaver_server_core::torrents::CLASS)
                 .await,
         ),
@@ -1402,13 +1407,13 @@ async fn transfer_action(ctx: &TorrentFacadeContext, action: &str, params: &Para
         "banPeers" => ban_peers(ctx, params).await,
         "pauseSession" => ctx.api().without_result(held(
             ctx.inner
-                .handle
+                .scheduled_resume
                 .pause_class(weaver_server_core::torrents::CLASS)
                 .await,
         )),
         "resumeSession" => ctx.api().without_result(held(
             ctx.inner
-                .handle
+                .scheduled_resume
                 .resume_class(weaver_server_core::torrents::CLASS)
                 .await,
         )),

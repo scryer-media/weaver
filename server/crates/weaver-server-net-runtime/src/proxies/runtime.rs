@@ -375,13 +375,13 @@ impl ProxyRuntime {
         &self,
         consumer: Consumer,
         timeout: Duration,
-    ) -> Result<Arc<ConsumerRoute>, String> {
+    ) -> Result<Arc<ConsumerRoute>, RouteError> {
         let mut routes = self.routes.lock().expect("proxy routes");
         if self.stopped.load(Ordering::Acquire) {
-            return Err("proxy runtime is stopped".into());
+            return Err(RouteError::Stopped);
         }
         if self.changing(consumer) {
-            return Err(ROUTES_CHANGING.into());
+            return Err(RouteError::Changing);
         }
         if !self
             .consumers
@@ -389,14 +389,14 @@ impl ProxyRuntime {
             .expect("proxy consumers")
             .contains(&consumer)
         {
-            return Err("routing consumer no longer exists".into());
+            return Err(RouteError::ConsumerGone);
         }
         if let Some(route) = routes.get(&consumer) {
             return Ok(route.clone());
         }
         let route = self.draft_route(self.policy(consumer), timeout)?;
         if routes.len() >= 4096 {
-            return Err("too many active consumer routes".into());
+            return Err(RouteError::Full);
         }
         routes.insert(consumer, route.clone());
         Ok(route)
@@ -405,7 +405,7 @@ impl ProxyRuntime {
         &self,
         policy: RoutingPolicy,
         timeout: Duration,
-    ) -> Result<Arc<ConsumerRoute>, String> {
+    ) -> Result<Arc<ConsumerRoute>, RouteError> {
         policy.validate()?;
         Ok(Arc::new(ConsumerRoute {
             policy,

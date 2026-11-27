@@ -83,10 +83,10 @@ const STAGE_COLOR: Record<string, string> = {
   DOWNLOADING: WV.info,
   PAUSED: WV.warn,
   FINALIZING_DOWNLOAD: WV.info,
-  VERIFYING: WV.accent,
+  VERIFYING: WV.ok,
   REPAIRING: WV.info,
   EXTRACTING: WV.violet,
-  FINAL_MOVE: WV.accent,
+  FINAL_MOVE: WV.ok,
   INTERRUPTED: WV.error,
 };
 

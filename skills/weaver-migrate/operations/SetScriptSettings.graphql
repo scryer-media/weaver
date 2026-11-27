@@ -1,0 +1,22 @@
+# Write. Saves global script settings. executionEnabled, concurrency and
+# terminationGraceSeconds are required. An interpreter left out is CLEARED:
+# copy all four from ScriptSettings. Leave unacceptableExtensions out (kept).
+# Needs a yes that names each changed setting. Scope: ADMIN.
+# Variables: {"input": {"executionEnabled": true, "concurrency": 32,
+#   "terminationGraceSeconds": 10, "pythonInterpreter": null,
+#   "powershellInterpreter": null, "batchInterpreter": null,
+#   "goInterpreter": null, "globalScriptsRun": "ALWAYS"}}
+mutation SetScriptSettings($input: PostProcessingSettingsInput!) {
+  setPostProcessingSettings(input: $input) {
+    scriptDirectory
+    executionEnabled
+    concurrency
+    terminationGraceSeconds
+    eventScriptTimeoutSeconds
+    globalScriptsRun
+    pythonInterpreter
+    powershellInterpreter
+    batchInterpreter
+    goInterpreter
+  }
+}
