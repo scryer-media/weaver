@@ -514,7 +514,17 @@ impl TorrentService {
                                 .is_some_and(|open| Arc::ptr_eq(open, &attached.session))
                     })
                 {
-                    self.move_out(torrent).await;
+                    // A new client is a new peer to its trackers: they hear
+                    // the old one stop. Any other change is a move.
+                    let new_client = torrent
+                        .attached
+                        .as_ref()
+                        .is_some_and(|attached| attached.terms.client != terms.client);
+                    if new_client {
+                        self.detach(torrent).await;
+                    } else {
+                        self.move_out(torrent).await;
+                    }
                     // A torrent placed on another route reads as that route
                     // from here, opening, while the torrents before it take
                     // their turn. One whose route's session could not be

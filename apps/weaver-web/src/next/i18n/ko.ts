@@ -2478,7 +2478,7 @@ export const nextKo: LocaleDictionary = {
   "next.torrents.trackerRuleName": "이름",
   "next.torrents.trackerRuleHosts": "호스트",
   "next.torrents.trackerRuleHostsNote":
-    "트래커 중 하나가 체크한 호스트에 있는 토렌트가 이 규칙을 따릅니다. 변경 사항은 지금부터 추가되는 토렌트에, Weaver를 재시작한 뒤에는 모든 토렌트에 적용됩니다.",
+    "트래커 중 하나가 체크한 호스트에 있는 토렌트가 이 규칙을 따릅니다. 변경 사항은 기존 토렌트와 새 토렌트 모두에 바로 적용됩니다.",
   "next.torrents.trackerRuleHostUnder": "및 그 아래의 모든 호스트",
   "next.torrents.trackerRuleHostOnly": "이 호스트만",
   "next.torrents.trackerRuleHostLocked": "{{name}} 트래커 파일이 설정함",

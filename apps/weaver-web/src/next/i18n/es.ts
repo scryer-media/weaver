@@ -2567,7 +2567,7 @@ export const nextEs: LocaleDictionary = {
   "next.torrents.trackerRuleName": "Nombre",
   "next.torrents.trackerRuleHosts": "Hosts",
   "next.torrents.trackerRuleHostsNote":
-    "Un torrent sigue esta regla cuando uno de sus trackers está en un host marcado. Los cambios se aplican a los torrents añadidos a partir de ahora, y a todos tras reiniciar Weaver.",
+    "Un torrent sigue esta regla cuando uno de sus trackers está en un host marcado. Los cambios se aplican al instante, a los torrents que ya están y a los nuevos.",
   "next.torrents.trackerRuleHostUnder": "y todos los hosts por debajo",
   "next.torrents.trackerRuleHostOnly": "solo este host",
   "next.torrents.trackerRuleHostLocked":

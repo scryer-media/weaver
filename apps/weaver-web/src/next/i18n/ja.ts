@@ -2533,7 +2533,7 @@ export const nextJa: LocaleDictionary = {
   "next.torrents.trackerRuleName": "名前",
   "next.torrents.trackerRuleHosts": "ホスト",
   "next.torrents.trackerRuleHostsNote":
-    "トラッカーのいずれかがチェックしたホストにあるトレントがこのルールに従います。変更はこれ以降に追加されたトレントと、Weaver の再起動後はすべてのトレントに適用されます。",
+    "トラッカーのいずれかがチェックしたホストにあるトレントがこのルールに従います。変更は既存のトレントにも新しいトレントにもすぐに適用されます。",
   "next.torrents.trackerRuleHostUnder": "およびその配下のすべてのホスト",
   "next.torrents.trackerRuleHostOnly": "このホストのみ",
   "next.torrents.trackerRuleHostLocked": "{{name}} のトラッカーファイルで設定",

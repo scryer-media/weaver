@@ -472,8 +472,9 @@ pub struct CertificateSummary {
 
 // A client a torrent may name itself as, for the trackers that admit only
 // some clients.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum Client {
+    #[default]
     Weaver,
     QBittorrent,
 }

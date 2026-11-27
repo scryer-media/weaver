@@ -31,7 +31,7 @@ use crate::pipeline::ExtractionLimits;
 use crate::pipeline::graph::engine::{DecodePool, Outside, RunMail, Said};
 use crate::pipeline::graph::status::RepairSlots;
 use crate::settings::model::{TrackerCertificate, TrackerRule};
-use crate::settings::{Config, TorrentEncryption, TransportRule};
+use crate::settings::{Client, Config, TorrentEncryption, TransportRule};
 use crate::torrents::identity::TorrentIdentity;
 use crate::torrents::intake::Heard as IntakeHeard;
 use crate::torrents::layout::PieceLayout;
@@ -148,8 +148,13 @@ pub const CHECKPOINT_PIECES: u32 = 16;
 // exchange, each switch on its own, and the encryption its connections are
 // made under and the transport order they are dialed in, each over the
 // session's. A change of any takes the torrent through its session again.
+// The client it names itself as is one of them: its peers and trackers see
+// its peer id, and a change of client stops the torrent and starts it
+// again, so each tracker hears `stopped` from the old id and `started` from
+// the new.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct PeerTerms {
+    client: Client,
     disable_dht: bool,
     disable_pex: bool,
     disable_lsd: bool,
@@ -164,6 +169,7 @@ impl PeerTerms {
         let off =
             |field: &Field<bool>| settings.levels(field, None, None, rule).resolve() == Some(false);
         Self {
+            client: rule.and_then(|rule| rule.client).unwrap_or_default(),
             disable_dht: off(&DHT),
             disable_pex: off(&PEX),
             disable_lsd: off(&LSD),

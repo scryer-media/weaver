@@ -17,7 +17,7 @@ use crate::post_processing::settings::PostProcessingSettingsQueries;
 use crate::proxies::TorrentScope;
 use crate::settings::model::TrackerRule;
 use crate::settings::persistence::SettingsPersistenceQueries;
-use crate::settings::{Client, SeedingPolicy, TorrentConfig};
+use crate::settings::{SeedingPolicy, TorrentConfig};
 use crate::tags::TagsQueries;
 use crate::torrents::admission::{Manifest, Refusal};
 use crate::torrents::identity::ClientIdentity;
@@ -57,9 +57,7 @@ use weaver_torrent::{
 // The client a torrent under `rule` claims to be on every surface that
 // names one: the client its tracker rule names, else Weaver.
 pub(super) fn client_of(rule: Option<&TrackerRule>) -> ClientIdentity {
-    rule.and_then(|rule| rule.client)
-        .unwrap_or(Client::Weaver)
-        .name()
+    rule.and_then(|rule| rule.client).unwrap_or_default().name()
 }
 
 /// Where a torrent comes from.

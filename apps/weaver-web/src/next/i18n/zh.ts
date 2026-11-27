@@ -2332,7 +2332,7 @@ export const nextZh: LocaleDictionary = {
   "next.torrents.trackerRuleName": "名称",
   "next.torrents.trackerRuleHosts": "主机",
   "next.torrents.trackerRuleHostsNote":
-    "种子的任一 Tracker 位于已勾选的主机时，种子遵循此规则。更改对此后添加的种子生效，Weaver 重启后对所有种子生效。",
+    "种子的任一 Tracker 位于已勾选的主机时，种子遵循此规则。更改立即生效，对已有和新添加的种子都适用。",
   "next.torrents.trackerRuleHostUnder": "及其下的所有主机",
   "next.torrents.trackerRuleHostOnly": "仅此主机",
   "next.torrents.trackerRuleHostLocked": "由 {{name}} 的 Tracker 文件设定",

@@ -2592,7 +2592,7 @@ export const nextDe: LocaleDictionary = {
   "next.torrents.trackerRuleName": "Name",
   "next.torrents.trackerRuleHosts": "Hosts",
   "next.torrents.trackerRuleHostsNote":
-    "Ein Torrent folgt dieser Regel, wenn einer seiner Tracker auf einem angehakten Host liegt. Änderungen gelten für ab jetzt hinzugefügte Torrents und nach einem Neustart von Weaver für alle.",
+    "Ein Torrent folgt dieser Regel, wenn einer seiner Tracker auf einem angehakten Host liegt. Änderungen gelten sofort, für vorhandene wie für neue Torrents.",
   "next.torrents.trackerRuleHostUnder": "und jeder Host darunter",
   "next.torrents.trackerRuleHostOnly": "nur dieser Host",
   "next.torrents.trackerRuleHostLocked":
