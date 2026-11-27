@@ -482,12 +482,12 @@ fn a_restored_grid_counts_its_loads_again() {
     assert_eq!(restored.load, counted(&restored, Load::of));
 }
 
-// A grid past its member's run bound is dropped: it records nothing more
-// and holds no load, a restart keeps it dropped, and only forgetting the
-// member clears it.
+// A whole member's grid past its run bound is dropped: it records nothing
+// more and holds no load, a restart keeps it dropped, and only forgetting
+// the member clears it.
 #[test]
 fn a_grid_past_its_run_bound_stays_dropped_until_forgotten() {
-    let block = 1 << 20;
+    let block = WHOLE;
     let piece = |at: u64| Segment {
         range: ByteRange::at(at * 2, 1),
         crc32: 0,
@@ -500,7 +500,6 @@ fn a_grid_past_its_run_bound_stays_dropped_until_forgotten() {
     assert!(!grid.dropped(MEMBER, block));
     grid.offer(MEMBER, block, &piece(MAX_PENDING_RUNS_PER_FILE as u64));
     assert!(grid.dropped(MEMBER, block));
-    assert!(!grid.dropped(MEMBER, WHOLE));
     let bytes = payload(11, 1000);
     for segment in segments(0, &bytes, 1000, 1000, true) {
         grid.offer(MEMBER, block, &segment);
@@ -531,6 +530,83 @@ fn a_grid_past_its_run_bound_stays_dropped_until_forgotten() {
             verified: true,
         })
     );
+}
+
+// A grid of small blocks with one block past the member's run bound forgets
+// that block only, as it did before a whole grid could be dropped: it is
+// not dropped, a block it held runs in before keeps them, and a block read
+// in order after, that one again included, is recorded and folds. Its loads
+// are what the accounting before counted, at every step.
+#[test]
+fn a_small_block_grid_past_its_run_bound_forgets_only_that_block() {
+    const BLOCK: u64 = 16_384;
+    let bytes = payload(12, 3 * BLOCK as usize);
+    let block = |index: u64| ByteRange::at(index * BLOCK, BLOCK);
+    let said = |range: ByteRange| {
+        segments(
+            range.start,
+            &bytes[range.start as usize..range.end as usize],
+            3000,
+            BLOCK,
+            true,
+        )
+    };
+    let folds = |grid: &Grid, index: u64| {
+        let range = block(index);
+        grid.fold(MEMBER, BLOCK, index, range)
+            == Some(Folded {
+                crc32: crc32(&bytes[range.start as usize..range.end as usize]),
+                verified: true,
+            })
+    };
+    let counts_as_before = |grid: &Grid| {
+        let before = counted(grid, |block, index, block_size| {
+            load_before(block, block_bounds(index, block_size))
+        });
+        assert_eq!(grid.load, before);
+        assert_eq!(grid.files[&(MEMBER, BLOCK)].load, before);
+    };
+    let mut grid = Grid::default();
+    // The front half of block 2, before block 0 goes over.
+    let half = ByteRange::at(2 * BLOCK, BLOCK / 2);
+    for segment in said(half) {
+        grid.offer(MEMBER, BLOCK, &segment);
+    }
+    let piece = |at: u64| Segment {
+        range: ByteRange::at(at * 2, 1),
+        crc32: 0,
+        verified: true,
+    };
+    // Runs apart in block 0 until the file's bound forgets it.
+    for at in 0.. {
+        assert!(at <= MAX_PENDING_RUNS_PER_FILE as u64, "the bound holds");
+        grid.offer(MEMBER, BLOCK, &piece(at));
+        counts_as_before(&grid);
+        if grid.files[&(MEMBER, BLOCK)].block(0).is_none() {
+            break;
+        }
+    }
+    let file = &grid.files[&(MEMBER, BLOCK)];
+    assert!(file.block(0).is_none(), "the block over the bound goes");
+    assert!(file.block(2).is_some(), "another block keeps its runs");
+    assert!(!grid.dropped(MEMBER, BLOCK));
+    // Block 1 read in order, and the rest of block 2.
+    for range in [block(1), ByteRange::new(half.end, block(2).end)] {
+        for segment in said(range) {
+            grid.offer(MEMBER, BLOCK, &segment);
+            counts_as_before(&grid);
+        }
+    }
+    assert!(folds(&grid, 1));
+    assert!(folds(&grid, 2));
+    // The forgotten block read again in order.
+    for segment in said(block(0)) {
+        grid.offer(MEMBER, BLOCK, &segment);
+        counts_as_before(&grid);
+    }
+    assert!(folds(&grid, 0));
+    assert!(!grid.dropped(MEMBER, BLOCK));
+    assert!(!round_trip(&grid).dropped(MEMBER, BLOCK));
 }
 
 // Facts written before a grid kept whether it was dropped read as grids

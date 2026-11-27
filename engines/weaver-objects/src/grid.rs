@@ -153,9 +153,11 @@ struct FileGrid {
     // chunk.
     blocks: Shelf<BTreeMap<u64, Block>>,
     load: Load,
-    // A block went over a budget and was forgotten: nothing more is
-    // recorded on this grid until its member is forgotten. Absent from
-    // facts written before it was kept, which read as not dropped.
+    // A whole member's grid went over a budget and was forgotten: nothing
+    // more is recorded on it until its member is forgotten. Never set on a
+    // grid of smaller blocks, which forgets only the block over budget and
+    // goes on recording the others. Absent from facts written before it was
+    // kept, which read as not dropped.
     #[serde(default)]
     dropped: bool,
 }
@@ -278,7 +280,7 @@ impl Grid {
             return;
         }
         let file = self.files.entry((member, block_size)).or_default();
-        if file.dropped {
+        if block_size == WHOLE && file.dropped {
             return;
         }
         let (before, after) = file.change(first, |block| {
@@ -312,20 +314,26 @@ impl Grid {
             self.load = job_load;
             return;
         }
-        // Over budget: the block is forgotten, so its slice is read back,
-        // and the grid records nothing more.
+        // Over budget: the block is forgotten, so its slice is read back. A
+        // whole member's grid records nothing more; a grid of smaller blocks
+        // goes on recording its other blocks, and this one again.
         file.change(first, Block::clear);
         file.load.sub(before);
         self.load.sub(before);
-        file.dropped = true;
+        if block_size == WHOLE {
+            file.dropped = true;
+        }
     }
 
-    // Whether the member's grid of `block_size` went over a budget and
-    // records nothing until the member is forgotten.
+    // Whether the member's whole grid went over a budget and records
+    // nothing until the member is forgotten. Never for a grid of smaller
+    // blocks, which is never dropped whole.
     pub(crate) fn dropped(&self, member: MemberId, block_size: u64) -> bool {
-        self.files
-            .get(&(member, block_size))
-            .is_some_and(|file| file.dropped)
+        block_size == WHOLE
+            && self
+                .files
+                .get(&(member, block_size))
+                .is_some_and(|file| file.dropped)
     }
 
     // The fold of the member's block `index` on the grid of `block_size`,
