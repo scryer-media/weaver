@@ -8,8 +8,9 @@
 // member whose fold the grid threw away, past its budget, closes on its
 // coverage while the fold is missing, encrypted or not, and is asked for
 // nothing again: its checksum is judged where the member closes, against
-// the one the directory said. Its bytes said again in order fold once more
-// and are judged as any member's are.
+// the one the directory said, and a failure there is ruled here as a failed
+// fold would be. Its bytes said again in order fold once more and are
+// judged as any member's are.
 // Data that arrived before its header placed it, in a range the object kept
 // to read the directory, is said from what was kept.
 
@@ -304,5 +305,76 @@ impl Zip {
                 range: extent.range,
             }));
         }
+    }
+
+    // The member's file failed the check of the namespace above it. Only a
+    // member closed with no ruling of the store's own is touched: one that
+    // states its CRC, was not said damaged, and has no fold, which was
+    // dropped past its budget. It is ruled as `record` rules a failed fold
+    // over the same bytes: a candidate nothing proved, over verified bytes,
+    // gives way to another that passes the header's check and the member is
+    // read again under it; otherwise its extent is damaged for the recovery
+    // beside it, once, and with no other candidate a password is asked for.
+    pub(super) fn refuted(&mut self, member: MemberId, out: &mut Vec<Emit>) {
+        if self.gone {
+            return;
+        }
+        let Some((length, crc_known)) = self
+            .map
+            .as_ref()
+            .and_then(|map| map.entry(member))
+            .map(|entry| (entry.length, entry.crc_known))
+        else {
+            return;
+        };
+        let Some(said) = self.members.get(member.0 as usize) else {
+            return;
+        };
+        let whole = ByteRange::new(0, length);
+        if !crc_known
+            || !said.closed
+            || said.damaged
+            || self.grid.fold(member, WHOLE, 0, whole).is_some()
+        {
+            return;
+        }
+        // The bytes the fold would have called verified, from what the
+        // member was written with.
+        let verified = said.coverage.verified(whole);
+        let mut retry = false;
+        let mut doubted = false;
+        if let Some(map) = &mut self.map {
+            let index = map.members[member.0 as usize];
+            if let Some(cipher) = &mut map.entries[index].cipher
+                && !cipher.proven
+                && verified
+            {
+                if cipher.alternative(&self.candidates) {
+                    cipher.retry = true;
+                    retry = true;
+                } else {
+                    doubted = true;
+                }
+            }
+        }
+        if doubted && !self.asked {
+            self.asked = true;
+            out.push(Emit::NeedsPassword);
+        }
+        let mut extents = Vec::new();
+        self.member_extent(member, whole, &mut extents);
+        if retry {
+            out.extend(extents.into_iter().map(|extent| Emit::Again {
+                volume: extent.volume,
+                range: extent.range,
+            }));
+            self.asked = false;
+            return;
+        }
+        self.members[member.0 as usize].damaged = true;
+        out.extend(extents.into_iter().map(|extent| Emit::Damaged {
+            volume: extent.volume,
+            range: extent.range,
+        }));
     }
 }

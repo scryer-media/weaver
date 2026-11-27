@@ -2249,3 +2249,101 @@ fn an_encrypted_member_dropped_then_said_again_in_order_is_judged_on_its_checksu
     assert_eq!(owner.said[0], Emit::NeedsPassword);
     assert!(!again(&owner));
 }
+
+// An encrypted member under a candidate that passes the header's check but
+// is wrong, its fold thrown away past the job's run budget once unchanged
+// bytes said again as repaired split its one run: it closes on its coverage
+// with no ruling of its own. The namespace's failed check gives the candidate up for the next one
+// that passes, the member is read again under it in order, folds once more
+// and closes clean; a second word changes nothing.
+#[test]
+fn an_encrypted_member_refuted_with_its_fold_dropped_tries_the_next_password() {
+    use crate::grid::WHOLE;
+    let plain = payload(95, 9_000);
+    let archive = encrypted(&plain);
+    let wrong = false_password(&archive);
+    let start = records::local_len(&archive).unwrap() + 12;
+    let end = start + plain.len() as u64;
+    let whole = ByteRange::new(0, plain.len() as u64);
+    let mut owner = Owner::single(Zip::new(), archive.clone());
+    owner.pull = Pull::Unseekable;
+    // Other members' runs apart, as many as the job's pending budget holds.
+    for other in 1..=4 {
+        for at in 0..4096 {
+            owner.object.grid.offer(
+                MemberId(other),
+                WHOLE,
+                &weaver_graph::Segment {
+                    range: ByteRange::at(at * 2, 1),
+                    crc32: 0,
+                    verified: true,
+                },
+            );
+        }
+    }
+    offer(&mut owner, &wrong);
+    offer(&mut owner, PASSWORD);
+    owner.deliver(0, ByteRange::new(0, end - 1));
+    assert!(!owner.object.grid.dropped(MemberId(0), WHOLE));
+    owner.deliver_as(
+        0,
+        ByteRange::at(start + 4000, 1),
+        Provenance::Repaired,
+        None,
+    );
+    owner.deliver(0, ByteRange::new(end - 1, archive.len() as u64));
+    owner.close(0);
+    let member = member_id(&owner, "alpha.bin");
+    let got = owner.member("alpha.bin");
+    assert!(got.closed);
+    assert!(got.bytes != plain, "opened under the wrong candidate");
+    assert!(got.coverage.verified(whole));
+    assert!(owner.object.grid.dropped(member, WHOLE));
+    assert_eq!(owner.object.grid.fold(member, WHOLE, 0, whole), None);
+    let again = |owner: &Owner| {
+        owner
+            .said
+            .iter()
+            .filter(|emit| matches!(emit, Emit::Again { .. }))
+            .count()
+    };
+    assert_eq!(again(&owner), 0, "nothing ruled the member");
+    assert_eq!(owner.replays, 0);
+
+    owner.refuted(member);
+    no_trouble_but_retract(&owner);
+    let retracted = |owner: &Owner| {
+        owner
+            .said
+            .iter()
+            .filter(|emit| matches!(emit, Emit::Retract(_)))
+            .count()
+    };
+    assert_eq!(retracted(&owner), 1, "read again once: {:?}", owner.said);
+    assert_eq!(again(&owner), 1, "{:?}", owner.said);
+    assert!(owner.replays > 0);
+    let got = owner.member("alpha.bin");
+    assert!(got.closed);
+    assert!(got.bytes == plain);
+    assert!(got.coverage.verified(whole));
+    // Read again in order, it folds into one run the full budget does not
+    // count: it cannot be thrown away again.
+    assert!(owner.object.grid.fold(member, WHOLE, 0, whole).is_some());
+    assert!(owner.posted(0) == Some(archive));
+    // The right candidate's fold rules now: a second word changes nothing.
+    let (said, replays) = (owner.said.len(), owner.replays);
+    owner.refuted(member);
+    assert_eq!((owner.said.len(), owner.replays), (said, replays));
+}
+
+fn no_trouble_but_retract(owner: &Owner) {
+    for emit in &owner.said {
+        assert!(
+            !matches!(
+                emit,
+                Emit::Damaged { .. } | Emit::NeedsEngine(_) | Emit::Refuse(_) | Emit::NeedsPassword
+            ),
+            "unexpected {emit:?}"
+        );
+    }
+}

@@ -860,3 +860,129 @@ fn a_delivery_looks_at_the_local_headers_it_brings_not_every_waiting_one() {
          {took:?} in a test build, which also runs the old looks to check the new"
     );
 }
+
+// One stored member too long for its fold to survive one-byte pieces apart,
+// as posted and with one byte of it flipped, and where its data lies.
+fn over_budget_member() -> (Vec<u8>, Vec<u8>, ByteRange) {
+    let file = payload(62, 2 * crate::grid::MAX_PENDING_RUNS_PER_FILE + 16);
+    // A member after it puts its data before the window the end record is
+    // looked for in, so the directory is read before the data arrives.
+    let after = payload(63, 80_000);
+    let bytes = write(&[
+        Entry::File("large.bin", &file, stored()),
+        Entry::File("after.bin", &after, stored()),
+    ]);
+    let data = records::local_len(&bytes).unwrap();
+    let body = ByteRange::at(data, file.len() as u64);
+    assert_eq!(bytes[data as usize + 100], file[100]);
+    let mut bad = bytes.clone();
+    bad[data as usize + 100] ^= 0x01;
+    (bytes, bad, body)
+}
+
+fn damage(owner: &Owner) -> Vec<Emit> {
+    owner
+        .said
+        .iter()
+        .filter(|emit| matches!(emit, Emit::Damaged { .. }))
+        .cloned()
+        .collect()
+}
+
+// The volume's tail and its local header, then the member's bytes in
+// `order`, one delivery per range, each with the bytes `posted` holds.
+fn scattered(owner: &mut Owner, posted: &[u8], body: ByteRange, order: &[ByteRange]) {
+    owner.pull = Pull::Moved(0);
+    let length = posted.len() as u64;
+    for range in [
+        ByteRange::new(body.end, length),
+        ByteRange::new(0, body.start),
+    ] {
+        let at = range.start as usize..range.end as usize;
+        owner.deliver_as(0, range, Provenance::Fresh, Some(&posted[at]));
+    }
+    for range in order {
+        let at = range.start as usize..range.end as usize;
+        owner.deliver_as(0, *range, Provenance::Fresh, Some(&posted[at]));
+    }
+}
+
+// Every other `step` bytes of `body` from its start, then the rest.
+fn every_other(body: ByteRange, step: u64) -> Vec<ByteRange> {
+    let piece = |at: u64| ByteRange::new(at, (at + step).min(body.end));
+    let starts: Vec<u64> = (body.start..body.end).step_by(step as usize).collect();
+    let (first, second): (Vec<_>, Vec<_>) = starts
+        .into_iter()
+        .enumerate()
+        .partition(|(index, _)| index % 2 == 0);
+    first
+        .into_iter()
+        .chain(second)
+        .map(|(_, at)| piece(at))
+        .collect()
+}
+
+// A member closed with no fold of its own, whose file the namespace finds
+// failing its CRC, is damaged over its volume extent as its own fold would
+// have said it, once: a second word changes nothing.
+#[test]
+fn a_member_refuted_with_its_fold_dropped_says_its_damage_once() {
+    use crate::grid::WHOLE;
+    let (_, bad, body) = over_budget_member();
+    let whole = ByteRange::new(0, body.len());
+    let mut folded = Owner::alone(Zip::new(), bad.clone());
+    scattered(&mut folded, &bad, body, &[body]);
+    let said = damage(&folded);
+    assert_eq!(
+        said,
+        vec![Emit::Damaged {
+            volume: VolumeIndex(crate::zip_engine::naming::LAST),
+            range: body
+        }],
+        "the fold rules the member damaged"
+    );
+
+    let mut owner = Owner::alone(Zip::new(), bad.clone());
+    scattered(&mut owner, &bad, body, &every_other(body, 1));
+    let member = member_id(&owner, "large.bin");
+    assert!(owner.member("large.bin").closed);
+    assert!(owner.object.grid.dropped(member, WHOLE));
+    assert_eq!(owner.object.grid.fold(member, WHOLE, 0, whole), None);
+    assert_eq!(damage(&owner), Vec::new(), "nothing ruled the member");
+
+    owner.refuted(member);
+    assert_eq!(damage(&owner), said, "said as its fold says it");
+    let before = owner.said.len();
+    owner.refuted(member);
+    assert_eq!(owner.said.len(), before, "said once");
+    assert!(!owner.said.contains(&Emit::NeedsPassword));
+}
+
+// A member whose fold ruled has nothing more to say when the namespace's
+// check of its file fails: damaged, it stays as its fold said it; whole,
+// nothing is said.
+#[test]
+fn a_member_refuted_with_its_fold_in_hand_changes_nothing() {
+    use crate::grid::WHOLE;
+    let (bytes, bad, body) = over_budget_member();
+    for posted in [bad, bytes] {
+        let mut owner = Owner::alone(Zip::new(), posted.clone());
+        scattered(&mut owner, &posted, body, &[body]);
+        let member = member_id(&owner, "large.bin");
+        assert!(
+            owner
+                .object
+                .grid
+                .fold(member, WHOLE, 0, ByteRange::new(0, body.len()))
+                .is_some()
+        );
+        let said = owner.said.clone();
+        let got = owner.member("large.bin");
+        let (bytes, closed) = (got.bytes.clone(), got.closed);
+        owner.refuted(member);
+        assert_eq!(owner.said, said);
+        let got = owner.member("large.bin");
+        assert_eq!((&got.bytes, got.closed), (&bytes, closed));
+        assert!(closed);
+    }
+}

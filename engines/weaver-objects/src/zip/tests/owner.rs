@@ -405,6 +405,15 @@ impl Owner {
             .expect("the facts restore");
     }
 
+    // The namespace's check of the member's file failed, as the tree tells
+    // the store.
+    pub fn refuted(&mut self, member: weaver_graph::MemberId) {
+        let mut out = Vec::new();
+        self.object.member_refuted(member, &mut out);
+        self.apply(out);
+        self.settle();
+    }
+
     pub fn held(&self) -> usize {
         self.held.len()
     }
