@@ -1462,6 +1462,8 @@ async fn finished_by_ignoring() -> FinishedByIgnoring {
         .service
         .add_opened(AddRequest {
             paused: true,
+            // Nothing to unpack: its content reads as ready once it seeds.
+            unpack: Some(false),
             ..request(AddSource::Metainfo(meta.clone()))
         })
         .await
@@ -1604,19 +1606,21 @@ async fn an_ignored_file_wanted_again_downloads_and_completes_once() {
         .unwrap()
         .completed_at_ms
         .unwrap();
+    assert!(rig.service.torrent(job_id).await.unwrap().content_ready);
     let mut settled = rig.service.inner.settled.subscribe();
     rig.service
         .set_file_priorities(job_id, &[(1, FilePriority::Normal)])
         .await
         .unwrap();
     // Its job is short of complete again, as stored and as shown: it is
-    // downloading, not seeding.
+    // downloading, not seeding, and its content is not ready.
     assert_eq!(
         rig.db.get_torrent(job_id).unwrap().unwrap().completed_at_ms,
         None
     );
     let view = rig.service.torrent(job_id).await.unwrap();
     assert_eq!(view.completed_at_ms, None);
+    assert!(!view.content_ready);
     assert_ne!(view.state, TorrentState::Seeding);
     assert!(matches!(
         job_status(&view),
@@ -1648,6 +1652,7 @@ async fn an_ignored_file_wanted_again_downloads_and_completes_once() {
     let view = rig.service.torrent(job_id).await.unwrap();
     assert!(view.completed_at_ms.is_some_and(|at| at >= first));
     assert_eq!(view.state, TorrentState::Seeding);
+    assert!(view.content_ready);
     assert_eq!(job_status(&view), JobStatus::Seeding);
 
     rig.service.stop().await;

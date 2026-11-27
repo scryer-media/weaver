@@ -58,6 +58,9 @@ pub use scripts::ScriptDirs;
 pub mod batch;
 mod checkpoints;
 mod completion;
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub use completion::placing_end;
 pub mod disk_room;
 pub mod intake;
 pub mod live;

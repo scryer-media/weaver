@@ -1907,14 +1907,7 @@ export const TORRENT_ROUTES_QUERY = gql`
       key
       scopes {
         scope
-        category {
-          id
-          name
-        }
-        trackerRule {
-          id
-          name
-        }
+        name
       }
       open
       listenAddress
@@ -2123,7 +2116,7 @@ export const TORRENT_UPDATES_SUBSCRIPTION = gql`
           uploadCap
         }
       }
-      trackerRule
+      trackerRuleName
       unpack
       unpackOverride
       unpacking {

@@ -949,8 +949,7 @@ interface TorrentRoute {
   key: string;
   scopes: {
     scope: "DEFAULT" | "CATEGORY" | "TRACKER_RULE";
-    category: { id: number; name: string } | null;
-    trackerRule: { id: number; name: string } | null;
+    name: string | null;
   }[];
   open: boolean;
   listenAddress: string | null;
@@ -994,7 +993,7 @@ function useTorrentRoutes(t: Translate): SettingsBlock {
   const scopeName = (scope: TorrentRoute["scopes"][number]) =>
     scope.scope === "DEFAULT"
       ? t("next.torrents.routeDefault")
-      : (scope.category?.name ?? scope.trackerRule?.name ?? EM_DASH);
+      : (scope.name ?? EM_DASH);
   return {
     kind: "table",
     id: "torrentRoutes",

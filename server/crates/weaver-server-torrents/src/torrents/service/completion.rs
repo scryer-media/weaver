@@ -206,38 +206,11 @@ impl TorrentService {
                     .await;
             }
         };
-        // What the policy left out, worded as the job's reason; a file it
-        // could not remove stays where unpacking made it, and says why.
-        let removed = match removed {
-            Ok(removed) => crate::post_processing::model::unwanted_files_removed_reason(&removed)
-                .map(|why| (UnpackCause::UnwantedRemoved, why)),
-            Err(why) => Some((UnpackCause::UnwantedNotRemoved, why)),
-        };
-        // How it came out: short when a file did not move beside the
-        // torrent's, or the delivery was in part, or the policy left a file
-        // out; whole otherwise.
-        let placed_any = !placed.names.is_empty();
-        let end = match placed.failed.as_ref().map(ToString::to_string) {
-            Some(error) => {
-                tracing::warn!(job_id = job_id.0, error = %error, "a torrent's unpacked files did not all move beside it");
-                let why = unplaced(&work, &error);
-                UnpackEnd::short(
-                    placed_any,
-                    UnpackCause::NotPlaced,
-                    match removed {
-                        Some((_, removed)) => format!("{why}; {removed}"),
-                        None => why,
-                    },
-                )
-            }
-            None => match part
-                .map(|why| (UnpackCause::DeliveredInPart, why))
-                .or(removed)
-            {
-                Some((cause, why)) => UnpackEnd::short(placed_any, cause, why),
-                None => UnpackEnd::whole(),
-            },
-        };
+        let unplaced_why = placed.failed.as_ref().map(|error| {
+            tracing::warn!(job_id = job_id.0, error = %error, "a torrent's unpacked files did not all move beside it");
+            unplaced(&work, &error.to_string())
+        });
+        let end = placing_end(!placed.names.is_empty(), unplaced_why, part, removed);
         // The one write of this placing, after its moves: the row keeps
         // exactly the names of the files it moved and how it came out, what
         // the torrent holds gains them, and the job's checkpoint goes.
@@ -304,7 +277,11 @@ impl TorrentService {
         there: Vec<String>,
     ) -> Placing {
         tracing::warn!(job_id = job_id.0, error = %error, "a torrent's unpacked files were not placed");
-        let end = UnpackEnd::short(!there.is_empty(), UnpackCause::NotPlaced, unplaced(work, &error));
+        let end = UnpackEnd::short(
+            !there.is_empty(),
+            UnpackCause::NotPlaced,
+            unplaced(work, &error),
+        );
         let ending = end.clone();
         let recorded = self.queue_save(job_id, "finish_torrent_unpack", move |db| {
             db.finish_torrent_unpack(job_id, &[], &dropped, &[], &ending)
@@ -656,4 +633,39 @@ fn held_of(dir: &Path, names: &[String]) -> Vec<String> {
                 .collect()
         },
     )
+}
+
+// How a placing of a torrent's unpacked files came out: short when a file
+// did not move beside the torrent's (`unplaced`, why), or the delivery was
+// in part (`part`, why), or the policy left a file out; whole otherwise.
+// What the policy left out is worded as the job's reason; a file it could
+// not remove stays where unpacking made it, and says why.
+pub fn placing_end(
+    placed_any: bool,
+    unplaced: Option<String>,
+    part: Option<String>,
+    removed: Result<Vec<String>, String>,
+) -> UnpackEnd {
+    let removed = match removed {
+        Ok(removed) => crate::post_processing::model::unwanted_files_removed_reason(&removed)
+            .map(|why| (UnpackCause::UnwantedRemoved, why)),
+        Err(why) => Some((UnpackCause::UnwantedNotRemoved, why)),
+    };
+    match unplaced {
+        Some(why) => UnpackEnd::short(
+            placed_any,
+            UnpackCause::NotPlaced,
+            match removed {
+                Some((_, removed)) => format!("{why}; {removed}"),
+                None => why,
+            },
+        ),
+        None => match part
+            .map(|why| (UnpackCause::DeliveredInPart, why))
+            .or(removed)
+        {
+            Some((cause, why)) => UnpackEnd::short(placed_any, cause, why),
+            None => UnpackEnd::whole(),
+        },
+    }
 }

@@ -18,6 +18,12 @@ query TorrentNetwork {
     resolvedBy
     scopes {
       scope
+      name
+    }
+    mappings {
+      state
+      mapper
+      protocol
     }
     exposure {
       inbound

@@ -1525,7 +1525,7 @@ async fn a_server_without_torrents_says_so_whatever_is_saved() {
     // Every torrent query answers as it does while torrents are off.
     let listed = h
         .schema
-        .execute(without_torrents("{ torrents { id } }"))
+        .execute(without_torrents("{ torrents { items { id } } }"))
         .await;
     assert_eq!(error_code(&listed).as_deref(), Some("TORRENTS_DISABLED"));
 }

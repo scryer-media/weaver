@@ -2117,9 +2117,7 @@ impl<T: TorrentDatabase> TorrentsPersistenceInsertPlacedTorrentInternalQueries f
                 &[SqlArg::I64(id), SqlArg::I64(limit), SqlArg::I64(offset)],
             )
             .await?;
-            rows.into_iter()
-                .map(|row| row.text("name"))
-                .collect()
+            rows.into_iter().map(|row| row.text("name")).collect()
         })
     }
 

@@ -369,7 +369,10 @@ async fn a_torrents_files_page_by_first_and_an_offset_cursor() {
         .map(|file| file["path"].as_str().unwrap().to_owned())
         .collect();
     assert_eq!(names.len(), 5);
-    assert!(names[0].ends_with("f0.bin") && names[4].ends_with("f4.bin"), "{names:?}");
+    assert!(
+        names[0].ends_with("f0.bin") && names[4].ends_with("f4.bin"),
+        "{names:?}"
+    );
 
     let mut walked = Vec::new();
     let mut after = None::<String>;
@@ -527,7 +530,10 @@ async fn torrent_file_updates_give_a_page_of_the_files() {
     assert_eq!(page["totalCount"], 4);
     assert!(page["nextCursor"].is_string());
 
-    let unknown = follow("id: 999999".to_owned()).next().await.expect("an answer");
+    let unknown = follow("id: 999999".to_owned())
+        .next()
+        .await
+        .expect("an answer");
     assert_eq!(code(&unknown).as_deref(), Some("NOT_FOUND"));
 }
 
@@ -740,7 +746,10 @@ async fn a_replay_of_the_same_request_answers_the_torrent_unchanged() {
     assert_eq!(result["accepted"], true);
     assert_eq!(result["clientRequestId"], " req-1 ");
     assert_eq!(result["torrent"]["id"], id);
-    assert_eq!(rig.execute(&settings(id)).await.data.into_json().unwrap(), before);
+    assert_eq!(
+        rig.execute(&settings(id)).await.data.into_json().unwrap(),
+        before
+    );
 }
 
 // The same torrent again with another client request id, or none, is a
@@ -755,7 +764,11 @@ async fn a_duplicate_is_answered_and_not_accepted() {
         .await;
     assert!(first.errors.is_empty(), "{:?}", first.errors);
     let id = first.data.into_json().unwrap()["submitTorrent"]["torrent"]["id"].clone();
-    for extra in [r#"clientRequestId: "req-2""#, "", r#"clientRequestId: "  ""#] {
+    for extra in [
+        r#"clientRequestId: "req-2""#,
+        "",
+        r#"clientRequestId: "  ""#,
+    ] {
         let again = rig.execute(&submit(&bytes, extra)).await;
         assert!(again.errors.is_empty(), "{extra}: {:?}", again.errors);
         let result = again.data.into_json().unwrap()["submitTorrent"].clone();
@@ -1061,7 +1074,9 @@ async fn the_queue_events_carry_a_torrent() {
     assert_eq!(next(id).await, ("ITEM_CREATED".into(), "STALLED".into()));
 
     let paused = rig
-        .execute(&format!("mutation {{ pauseQueueItem(id: {id}) {{ success }} }}"))
+        .execute(&format!(
+            "mutation {{ pauseQueueItem(id: {id}) {{ success }} }}"
+        ))
         .await;
     assert!(paused.errors.is_empty(), "{:?}", paused.errors);
     assert_eq!(
@@ -1396,9 +1411,15 @@ async fn torrent_updates_push_one_torrent_until_it_is_gone() {
             assert!(response.errors.is_empty(), "{query}: {:?}", response.errors);
         }
     };
-    run(format!("mutation {{ pauseQueueItem(id: {id}) {{ success }} }}")).await;
+    run(format!(
+        "mutation {{ pauseQueueItem(id: {id}) {{ success }} }}"
+    ))
+    .await;
     while push().await.expect("the updates stay open")["state"] != "PAUSED" {}
-    run(format!("mutation {{ resumeQueueItem(id: {id}) {{ success }} }}")).await;
+    run(format!(
+        "mutation {{ resumeQueueItem(id: {id}) {{ success }} }}"
+    ))
+    .await;
     while push().await.expect("the updates stay open")["state"] == "PAUSED" {}
 
     let category = |name: &str| {
@@ -1409,12 +1430,18 @@ async fn torrent_updates_push_one_torrent_until_it_is_gone() {
     run(r#"mutation { addCategory(input: { name: "tv" }) { id } }"#.to_owned()).await;
     let applied = rig.execute(&category("tv")).await;
     assert!(applied.errors.is_empty(), "{:?}", applied.errors);
-    assert_eq!(applied.data.into_json().unwrap()["setQueueItemsCategory"]["applied"], 1);
+    assert_eq!(
+        applied.data.into_json().unwrap()["setQueueItemsCategory"]["applied"],
+        1
+    );
     while push().await.expect("the updates stay open")["category"] != "tv" {}
     // The empty name clears it.
     let cleared = rig.execute(&category("")).await;
     assert!(cleared.errors.is_empty(), "{:?}", cleared.errors);
-    assert_eq!(cleared.data.into_json().unwrap()["setQueueItemsCategory"]["applied"], 1);
+    assert_eq!(
+        cleared.data.into_json().unwrap()["setQueueItemsCategory"]["applied"],
+        1
+    );
     while !push().await.expect("the updates stay open")["category"].is_null() {}
 
     run(format!("mutation {{ removeTorrent(id: {id}) }}")).await;
@@ -1793,7 +1820,8 @@ async fn a_tracker_rule_sets_the_goals_of_the_torrents_announcing_to_its_hosts()
         .unwrap();
     let source = || async move {
         let data = read(format!(
-            "{{ torrent(id: {id}) {{ trackerRule seedingPolicy {{ ratioGoal levels {{ ratioGoal }} }} }} }}"
+            "{{ torrent(id: {id}) {{ trackerRuleName trackerRule {{ id name }} \
+             seedingPolicy {{ ratioGoal levels {{ ratioGoal }} }} }} }}"
         ))
         .await;
         data["torrent"].clone()
@@ -1803,12 +1831,41 @@ async fn a_tracker_rule_sets_the_goals_of_the_torrents_announcing_to_its_hosts()
         torrent["seedingPolicy"]["levels"]["ratioGoal"],
         "TRACKER_RULE"
     );
-    assert_eq!(torrent["trackerRule"], "Example");
+    assert_eq!(torrent["trackerRuleName"], "Example");
+    assert_eq!(
+        torrent["trackerRule"],
+        serde_json::json!({ "id": rule_id, "name": "Example" })
+    );
     assert_eq!(torrent["seedingPolicy"]["ratioGoal"], 3.0);
+    // The rule itself is an admin's to read; its name is not.
+    let response = rig
+        .execute_as_key(
+            &format!("{{ torrent(id: {id}) {{ trackerRuleName trackerRule {{ id }} }} }}"),
+            CallerScope::Read,
+        )
+        .await;
+    assert!(
+        response
+            .errors
+            .iter()
+            .any(|error| error.message.contains("admin scope")),
+        "{:?}",
+        response.errors
+    );
+    let response = rig
+        .execute_as_key(
+            &format!("{{ torrent(id: {id}) {{ trackerRuleName }} }}"),
+            CallerScope::Read,
+        )
+        .await;
+    assert!(response.errors.is_empty(), "{:?}", response.errors);
+    assert_eq!(
+        response.data.into_json().unwrap()["torrent"]["trackerRuleName"],
+        "Example"
+    );
     // No schedule pause is in force, so none is left seeding through one.
     assert_eq!(
-        read("{ torrentScheduleSeeding { ruleId name torrents } }".into()).await
-            ["torrentScheduleSeeding"],
+        read("{ torrentScheduleSeeding { ruleId name torrents } }".into()).await["torrentScheduleSeeding"],
         serde_json::json!([])
     );
 
@@ -1819,6 +1876,7 @@ async fn a_tracker_rule_sets_the_goals_of_the_torrents_announcing_to_its_hosts()
     assert_eq!(left["deleteTrackerRule"], serde_json::json!([]));
     let torrent = source().await;
     assert_eq!(torrent["seedingPolicy"]["levels"]["ratioGoal"], "GLOBAL");
+    assert_eq!(torrent["trackerRuleName"], Value::Null);
     assert_eq!(torrent["trackerRule"], Value::Null);
     assert_eq!(
         read("{ trackerRules { id } }".into()).await["trackerRules"],
@@ -1968,7 +2026,10 @@ async fn a_torrents_rate_limits_are_set_and_read_back() {
             "uploadBps: 65536, downloadBps: 0",
             (Value::from(65_536), Value::from(0)),
         ),
-        ("downloadBps: 1048576", (Value::Null, Value::from(1_048_576))),
+        (
+            "downloadBps: 1048576",
+            (Value::Null, Value::from(1_048_576)),
+        ),
         (
             "uploadBps: 4096, downloadBps: null",
             (Value::from(4096), Value::Null),
@@ -2050,7 +2111,9 @@ async fn file_levels_and_picking_toggles_round_trip() {
             serde_json::json!({ "files": { "items": [{ "priority": "IGNORED" }] } }),
         ),
         (
-            format!("mutation {{ setTorrentSequential(id: {id}, sequential: true) {{ sequential }} }}"),
+            format!(
+                "mutation {{ setTorrentSequential(id: {id}, sequential: true) {{ sequential }} }}"
+            ),
             "setTorrentSequential",
             serde_json::json!({ "sequential": true }),
         ),
@@ -2313,7 +2376,7 @@ async fn the_torrent_routes_are_listed_with_their_scopes_and_reasons() {
 
     let response = rig
         .execute(
-            "{ torrentRoutes { key scopes { scope category { id name } trackerRule { id name } } \
+            "{ torrentRoutes { key scopes { scope name category { id name } trackerRule { id name } } \
              open listenAddress utp \
              mappings { mapper protocol localPort externalPort gatewayAddress error } \
              externalAddresses reason } }",
@@ -2326,9 +2389,10 @@ async fn the_torrent_routes_are_listed_with_their_scopes_and_reasons() {
         serde_json::json!([{
             "key": key.as_str(),
             "scopes": [
-                { "scope": "DEFAULT", "category": null, "trackerRule": null },
+                { "scope": "DEFAULT", "name": null, "category": null, "trackerRule": null },
                 {
                     "scope": "TRACKER_RULE",
+                    "name": "tracker.test",
                     "category": null,
                     "trackerRule": { "id": id, "name": "tracker.test" },
                 },
@@ -2347,7 +2411,7 @@ async fn the_torrent_routes_are_listed_with_their_scopes_and_reasons() {
 // and the address the internet sees.
 #[test]
 fn an_open_route_shows_where_it_listens_and_its_mappings() {
-    use weaver_server_api::torrents::types::TorrentRouteGql;
+    use weaver_server_api::torrents::types::{TorrentPortMappingStateGql, TorrentRouteGql};
     use weaver_server_core::torrents::service::TorrentRoute;
     use weaver_server_core::torrents::sessions::{
         PortMapped, PortmapProtocol, PortmapTransport, SessionView,
@@ -2381,6 +2445,14 @@ fn an_open_route_shows_where_it_listens_and_its_mappings() {
                     external_ip: Some("203.0.113.7".parse().unwrap()),
                     error: None,
                 },
+                PortMapped {
+                    transport: PortmapTransport::PcpIpv6,
+                    protocol: PortmapProtocol::Tcp,
+                    local_port: 6881,
+                    external_port: None,
+                    external_ip: None,
+                    error: None,
+                },
             ],
             external: vec!["203.0.113.7".parse().unwrap()],
             exposure: Some(exposure()),
@@ -2393,7 +2465,20 @@ fn an_open_route_shows_where_it_listens_and_its_mappings() {
     assert_eq!(route.listen_address.as_deref(), Some("127.0.0.1:6881"));
     assert!(route.utp);
     assert_eq!(route.scopes[0].of, TorrentScope::Category(3));
-    assert_eq!(route.mappings.len(), 2);
+    assert_eq!(route.scopes[0].name.as_deref(), Some("tv"));
+    assert_eq!(route.mappings.len(), 3);
+    assert_eq!(
+        route
+            .mappings
+            .iter()
+            .map(|mapping| mapping.state)
+            .collect::<Vec<_>>(),
+        [
+            TorrentPortMappingStateGql::Failed,
+            TorrentPortMappingStateGql::Mapped,
+            TorrentPortMappingStateGql::Removed,
+        ]
+    );
     assert_eq!(route.mappings[0].external_port, None);
     assert_eq!(
         route.mappings[0].error.as_deref(),
@@ -3034,9 +3119,14 @@ async fn the_torrents_list_pages_with_a_default_and_a_most() {
     };
     let every: Vec<u64> = rig.torrents.job_ids().await.iter().map(|id| id.0).collect();
     assert_eq!(every.len(), 505);
-    assert_eq!(ids(rig.execute("{ torrents { items { id } } }").await), every[..100]);
     assert_eq!(
-        ids(rig.execute("{ torrents(first: 1000) { items { id tags } } }").await),
+        ids(rig.execute("{ torrents { items { id } } }").await),
+        every[..100]
+    );
+    assert_eq!(
+        ids(rig
+            .execute("{ torrents(first: 1000) { items { id tags } } }")
+            .await),
         every[..500]
     );
     let cursor = weaver_server_api::jobs::types::encode_offset_cursor(480);
@@ -3261,9 +3351,9 @@ async fn the_updates_of_a_page_wait_for_the_load() {
     );
     let updates = |of: &str| {
         let request = Request::new(format!("subscription {{ {of} }}"))
-        .data(CallerScope::Local)
-        .data(CallerIdentity::Local([7; 32]))
-        .data(rig.torrents.clone());
+            .data(CallerScope::Local)
+            .data(CallerIdentity::Local([7; 32]))
+            .data(rig.torrents.clone());
         rig.harness.schema.execute_stream(request)
     };
     let page = format!("torrentRowUpdates(ids: {ids:?}) {{ fullUpdate torrents {{ id }} }}");
@@ -3394,9 +3484,8 @@ async fn the_torrent_batches_act_on_each_id_and_refuse_the_unknown() {
         );
     }
     let [one, two] = [ids[0], ids[1]];
-    let batch = |call: &str| {
-        format!("mutation {{ {call} {{ matched applied refused {{ id code }} }} }}")
-    };
+    let batch =
+        |call: &str| format!("mutation {{ {call} {{ matched applied refused {{ id code }} }} }}");
 
     for (mutation, field) in [
         (
@@ -3404,7 +3493,9 @@ async fn the_torrent_batches_act_on_each_id_and_refuse_the_unknown() {
             "setTorrentsForced",
         ),
         (
-            format!("setTorrentsRateLimits(ids: [{one}, {two}], uploadBps: 1000, downloadBps: 2000)"),
+            format!(
+                "setTorrentsRateLimits(ids: [{one}, {two}], uploadBps: 1000, downloadBps: 2000)"
+            ),
             "setTorrentsRateLimits",
         ),
         (
@@ -3451,7 +3542,10 @@ async fn the_torrent_batches_act_on_each_id_and_refuse_the_unknown() {
     assert_eq!(got["refused"][0]["code"], "NOT_FOUND");
 
     // Past the limit nothing is attempted.
-    let many = (1..=1001).map(|id| id.to_string()).collect::<Vec<_>>().join(", ");
+    let many = (1..=1001)
+        .map(|id| id.to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
     let response = rig
         .execute(&batch(&format!("removeTorrents(ids: [{many}])")))
         .await;
@@ -3542,7 +3636,10 @@ async fn a_queue_items_torrent_is_read_once_per_list_and_only_when_asked() {
     // One item read alone reads its own row.
     let before = reads();
     let one = rig
-        .execute(&format!("{{ queueItem(id: {}) {{ torrent {{ name }} }} }}", ids[0]))
+        .execute(&format!(
+            "{{ queueItem(id: {}) {{ torrent {{ name }} }} }}",
+            ids[0]
+        ))
         .await;
     assert!(one.errors.is_empty(), "{:?}", one.errors);
     assert_eq!(reads(), before + 1);
@@ -3551,10 +3648,18 @@ async fn a_queue_items_torrent_is_read_once_per_list_and_only_when_asked() {
         "one.mkv"
     );
 
-    for selection in ["files { items { path } }", "peerConnections { address }", "unpacking { files { items { path } } }"] {
+    for selection in [
+        "files { items { path } }",
+        "peerConnections { address }",
+        "unpacking { files { items { path } } }",
+    ] {
         let refused = rig
             .execute(&format!("{{ queueItems {{ torrent {{ {selection} }} }} }}"))
             .await;
-        assert_eq!(code(&refused).as_deref(), Some("INVALID_INPUT"), "{selection}");
+        assert_eq!(
+            code(&refused).as_deref(),
+            Some("INVALID_INPUT"),
+            "{selection}"
+        );
     }
 }

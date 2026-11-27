@@ -353,6 +353,79 @@ async fn an_unwanted_unpacked_file_is_deleted_under_the_delete_action_and_said_o
     rig.service.stop().await;
 }
 
+// A placing that moved every file whole ends short when the policy removed
+// a file it made, under UNWANTED_REMOVED, and under UNWANTED_NOT_REMOVED
+// when the removal failed; the row keeps that cause and the torrent shows
+// it. A delivery in part or a file not placed wins over either.
+#[tokio::test]
+async fn a_placing_the_policy_left_a_file_out_of_ends_on_the_removal() {
+    use crate::torrents::service::placing_end;
+    let removed = placing_end(true, None, None, Ok(vec!["small.txt".to_owned()]));
+    assert_eq!(
+        removed,
+        UnpackEnd::short(
+            true,
+            UnpackCause::UnwantedRemoved,
+            "removed for an unwanted extension: small.txt".into()
+        )
+    );
+    let not_removed = placing_end(true, None, None, Err("could not remove small.txt".into()));
+    assert_eq!(
+        not_removed,
+        UnpackEnd::short(
+            true,
+            UnpackCause::UnwantedNotRemoved,
+            "could not remove small.txt".into()
+        )
+    );
+    assert_eq!(
+        placing_end(true, None, None, Ok(Vec::new())),
+        UnpackEnd::whole()
+    );
+    assert_eq!(
+        placing_end(true, None, Some("in part".into()), Ok(vec!["a.txt".into()])).cause,
+        Some(UnpackCause::DeliveredInPart)
+    );
+    assert_eq!(
+        placing_end(true, Some("not moved".into()), None, Err("x".into())).cause,
+        Some(UnpackCause::NotPlaced)
+    );
+
+    let rig = rig(set_clock());
+    rig.service.open().await.unwrap();
+    let job_id = rig
+        .service
+        .add_opened(request(AddSource::Metainfo(metainfo(
+            "set.rar",
+            &[("set.rar", b"rar")],
+            128,
+            false,
+        ))))
+        .await
+        .unwrap();
+    for end in [&removed, &not_removed] {
+        rig.db
+            .finish_torrent_unpack(job_id, &["notes.mkv".to_owned()], &[], &[], end)
+            .unwrap();
+        assert_eq!(
+            rig.db
+                .get_torrent(job_id)
+                .unwrap()
+                .unwrap()
+                .unpack_end
+                .as_ref(),
+            Some(end)
+        );
+    }
+    rig.service.stop().await;
+    rig.db.prune_orphan_active_state(JobId(u64::MAX)).unwrap();
+    let again = service_on(&rig.db, rig.dir.path(), &rig.routes, job_env(), set_clock());
+    again.open().await.unwrap();
+    let view = again.torrent(job_id).await.unwrap();
+    assert_eq!(view.unpack_end, Some(not_removed));
+    again.stop().await;
+}
+
 // Unpacked files that cannot be placed beside the torrent's are never
 // removed for it: they stay in its unpacking directory, the torrent
 // completes and seeds on with no history row, and its unpacking line says

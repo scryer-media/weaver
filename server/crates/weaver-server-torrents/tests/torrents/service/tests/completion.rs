@@ -2486,7 +2486,9 @@ async fn a_page_of_files_is_the_window_of_the_whole_list() {
         .collect();
     let job_id = rig
         .service
-        .add_opened(request(AddSource::Metainfo(metainfo("paged", &files, 128, false))))
+        .add_opened(request(AddSource::Metainfo(metainfo(
+            "paged", &files, 128, false,
+        ))))
         .await
         .unwrap();
     let whole: Vec<u8> = bodies.concat();
@@ -2568,7 +2570,11 @@ async fn the_unpacked_files_are_paged_in_the_rows_order() {
                 .unwrap();
             let want = listed.get(offset.min(listed.len())..end).unwrap_or(&[]);
             assert_eq!(page, want, "{offset} {limit}");
-            assert_eq!(more, limit > 0 && offset + limit < every.len(), "{offset} {limit}");
+            assert_eq!(
+                more,
+                limit > 0 && offset + limit < every.len(),
+                "{offset} {limit}"
+            );
         }
     }
     rig.service.stop().await;

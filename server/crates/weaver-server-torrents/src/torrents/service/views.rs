@@ -147,8 +147,10 @@ pub struct TorrentView {
     /// The seeding terms in force, and the level each comes from.
     pub seeding_policy: Seeding,
     pub seeding_levels: SeedingLevels,
-    /// The host pattern of the tracker rule its trackers match.
+    /// The name of the tracker rule its trackers match.
     pub tracker_rule: Option<String>,
+    /// That rule's id.
+    pub tracker_rule_id: Option<u32>,
     /// The upload cap its levels resolve to, held beside its own limit.
     pub upload_cap: Option<u64>,
     /// Whether its archives are extracted: as its job was built, or as the
@@ -160,8 +162,8 @@ pub struct TorrentView {
     /// which nothing of the torrent's reads.
     pub unpack_end: Option<UnpackEnd>,
     /// Whether its download is complete and its unpacking, where one
-    /// applies, is over, whole or short: complete and not unpacking
-    /// (`Live::unpacking`).
+    /// applies, is over, whole or short: every piece it wants had where it
+    /// is (`Observed::has_wanted`) and not unpacking (`Live::unpacking`).
     pub content_ready: bool,
     pub route: Option<String>,
     pub files: Vec<TorrentFile>,
@@ -821,13 +823,14 @@ impl TorrentService {
             seeding_policy: policy,
             seeding_levels,
             tracker_rule: rule.map(|rule| rule.name.clone()),
+            tracker_rule_id: rule.map(|rule| rule.id),
             upload_cap: settings.upload_cap(record, rule),
             unpack: record
                 .unpack_in_force
                 .unwrap_or_else(|| settings.unpack(record, rule)),
             unpack_override: record.unpack,
             unpack_end: record.unpack_end.clone(),
-            content_ready: record.completed_at_ms.is_some() && !torrent.unpacking(),
+            content_ready: observed.has_wanted() && !torrent.unpacking(),
             scope: settings.scope(record.category_id, rule),
             route: torrent.route.key().map(|key| key.as_str().to_owned()),
             files: Vec::new(),

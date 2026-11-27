@@ -724,6 +724,7 @@ fn held_torrent(
             ..SeedingLevels::default()
         },
         tracker_rule: None,
+        tracker_rule_id: None,
         upload_cap: None,
         unpack: true,
         unpack_override: None,

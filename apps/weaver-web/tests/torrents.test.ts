@@ -133,7 +133,7 @@ const torrent = (overrides: Partial<TorrentData> = {}): TorrentData => ({
       uploadCap: "GLOBAL",
     },
   },
-  trackerRule: null,
+  trackerRuleName: null,
   unpack: true,
   unpackOverride: null,
   route: null,

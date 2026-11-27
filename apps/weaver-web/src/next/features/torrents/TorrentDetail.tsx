@@ -212,7 +212,7 @@ function levelText(
       return t("next.torrent.seedingFromTorrent");
     case "TRACKER_RULE":
       return t("next.torrent.seedingFromTrackerRule", {
-        name: torrent.trackerRule ?? "",
+        name: torrent.trackerRuleName ?? "",
       });
     case "CATEGORY":
       return t("next.torrent.seedingFromCategory", {
@@ -262,7 +262,14 @@ function PeersBlock({
     requestPolicy: "network-only",
   });
   const [banState, banPeer] = useMutation(BAN_TORRENT_PEER_MUTATION);
+  // The query reads the peers at mount; each later push of the torrent
+  // reads them again, once.
+  const readFor = useRef(torrent);
   useEffect(() => {
+    if (readFor.current === torrent) {
+      return;
+    }
+    readFor.current = torrent;
     reread({ requestPolicy: "network-only" });
   }, [torrent, reread]);
   const peers = data?.torrent?.peerConnections ?? NO_PEERS;

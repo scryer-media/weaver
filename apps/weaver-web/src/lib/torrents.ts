@@ -293,8 +293,8 @@ export interface TorrentData extends TorrentSummaryData {
   seedingOverride: SeedingPolicyData | null;
   /** The terms in effect. */
   seedingPolicy: SeedingTermsData;
-  /** The host pattern of the tracker rule the torrent is under, when it is. */
-  trackerRule: string | null;
+  /** The name of the tracker rule the torrent is under, when it is. */
+  trackerRuleName: string | null;
   /** Whether its archives are extracted. */
   unpack: boolean;
   /** The torrent's own unpack; null inherits. */

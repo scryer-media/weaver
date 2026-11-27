@@ -177,6 +177,11 @@ Route `reason` (`TorrentRouteReason`, on a torrent as `routeReason`):
 | `BLOCKLIST_FAILED` | The blocklist could not be loaded |
 | `SESSION_LIMIT` | Every session is in use by other routes |
 
+Route `mappings[].state` (`TorrentPortMappingState`): `MAPPED` (the gateway
+forwards the port), `FAILED` (the last request to the gateway for it failed,
+whether to map or to remove; its `error` says which), `REMOVED` (not mapped:
+removed on close, or closed by the gateway).
+
 `torrentPresence`: `available` false means the server was started without
 torrents (`WEAVER_TORRENTS`), and nothing torrent-related runs; `enabled`
 means available and turned on in settings; `jobs` means a torrent job
@@ -191,6 +196,7 @@ torrents are off and the running ones are let finish.
 read null.
 
 `contentReady`: the download is complete and its unpacking, where one
-applies, is over, whatever its result. `seedingGoalMet` and `seedingGoals`
+applies, is over, whatever its result. False while a check runs or its
+files are missing, and once it downloads again. `seedingGoalMet` and `seedingGoals`
 (`RATIO`, `SEED_TIME`, `INACTIVE_TIME`, each with `met`, `current`,
 `target`) say where the torrent stands against its seeding goals.

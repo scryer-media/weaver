@@ -19,19 +19,19 @@ use weaver_server_core::torrents::sessions::{PortMapped, PortmapProtocol, Portma
 use weaver_server_core::torrents::status::{self, Stated};
 use weaver_server_core::torrents::{
     ConnectionKind, Encryption, FetchPhase, FilePriority, NamedBy, PeerInfo, PeerSourceFlag,
-    TorrentState, TorrentTracker, TorrentVersion, TrackerStatus, UnpackCause, UnpackEnd, UnpackResult,
-    UnpackedFile, redacted_tracker_url,
+    TorrentState, TorrentTracker, TorrentVersion, TrackerStatus, UnpackCause, UnpackEnd,
+    UnpackResult, UnpackedFile, redacted_tracker_url,
 };
 
 use crate::auth::{AdminGuard, graphql_error};
-use crate::observability::with_timed_config_read;
-use weaver_server_core::settings::SharedConfig;
 use crate::jobs::types::{decode_offset_cursor, encode_offset_cursor, ms_to_datetime};
 use crate::networking::ResolvedBy;
+use crate::observability::with_timed_config_read;
 use crate::settings::types::{
     SeedTimeCountingGql, SeedingActionGql, SeedingGoalModeGql, SeedingPolicyInput,
     SeedingPolicySettings, SettingLevelGql,
 };
+use weaver_server_core::settings::SharedConfig;
 
 /// What a torrent is doing.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Enum)]
@@ -248,6 +248,8 @@ pub enum TorrentRouteScopeGql {
 pub struct TorrentRouteUseGql {
     /// What kind of scope it is.
     pub scope: TorrentRouteScopeGql,
+    /// The category's or tracker rule's name; null for the default.
+    pub name: Option<String>,
     #[graphql(skip)]
     pub of: TorrentScope,
 }
@@ -257,7 +259,10 @@ impl TorrentRouteUseGql {
     /// The category, when the scope is a category's: read from the settings
     /// in memory, only when selected.
     #[graphql(guard = "AdminGuard")]
-    async fn category(&self, ctx: &Context<'_>) -> Result<Option<crate::categories::types::Category>> {
+    async fn category(
+        &self,
+        ctx: &Context<'_>,
+    ) -> Result<Option<crate::categories::types::Category>> {
         let TorrentScope::Category(id) = self.of else {
             return Ok(None);
         };
@@ -276,7 +281,10 @@ impl TorrentRouteUseGql {
     /// The tracker rule, when the scope is a tracker rule's: read from the
     /// rules the torrent service holds in memory, only when selected.
     #[graphql(guard = "AdminGuard")]
-    async fn tracker_rule(&self, ctx: &Context<'_>) -> Result<Option<crate::settings::types::TrackerRule>> {
+    async fn tracker_rule(
+        &self,
+        ctx: &Context<'_>,
+    ) -> Result<Option<crate::settings::types::TrackerRule>> {
         let TorrentScope::TrackerRule(id) = self.of else {
             return Ok(None);
         };
@@ -285,13 +293,13 @@ impl TorrentRouteUseGql {
 }
 
 impl From<(TorrentScope, Option<String>)> for TorrentRouteUseGql {
-    fn from((of, _name): (TorrentScope, Option<String>)) -> Self {
+    fn from((of, name): (TorrentScope, Option<String>)) -> Self {
         let scope = match of {
             TorrentScope::Default => TorrentRouteScopeGql::Default,
             TorrentScope::Category(_) => TorrentRouteScopeGql::Category,
             TorrentScope::TrackerRule(_) => TorrentRouteScopeGql::TrackerRule,
         };
-        Self { scope, of }
+        Self { scope, name, of }
     }
 }
 
@@ -317,10 +325,36 @@ pub enum PortMapProtocolGql {
     Udp,
 }
 
+/// Where a port mapping stands.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Enum)]
+#[graphql(name = "TorrentPortMappingState")]
+pub enum TorrentPortMappingStateGql {
+    /// The gateway forwards the external port.
+    Mapped,
+    /// The last request to the gateway for it failed, whether to map or to
+    /// remove; `error` says which.
+    Failed,
+    /// Not mapped: removed on close, or closed by the gateway.
+    Removed,
+}
+
+impl TorrentPortMappingStateGql {
+    /// The state a gateway's last word on a mapping gives it.
+    pub fn of(external_port: Option<u16>, error: Option<&str>) -> Self {
+        match (external_port, error) {
+            (Some(_), _) => Self::Mapped,
+            (None, Some(_)) => Self::Failed,
+            (None, None) => Self::Removed,
+        }
+    }
+}
+
 /// A gateway's last word on one port mapping.
 #[derive(Clone, Debug, SimpleObject)]
 #[graphql(name = "TorrentPortMapping")]
 pub struct TorrentPortMappingGql {
+    /// Where the mapping stands.
+    pub state: TorrentPortMappingStateGql,
     /// What asked for the mapping.
     pub mapper: PortMapperGql,
     /// The protocol it forwards.
@@ -340,6 +374,7 @@ pub struct TorrentPortMappingGql {
 impl From<PortMapped> for TorrentPortMappingGql {
     fn from(mapped: PortMapped) -> Self {
         Self {
+            state: TorrentPortMappingStateGql::of(mapped.external_port, mapped.error.as_deref()),
             mapper: match mapped.transport {
                 PortmapTransport::Upnp => PortMapperGql::Upnp,
                 PortmapTransport::NatPmp => PortMapperGql::NatPmp,
@@ -927,7 +962,10 @@ pub(crate) fn page_args(
 ) -> Result<(usize, usize)> {
     let offset =
         decode_offset_cursor(after).map_err(|message| graphql_error("CURSOR_INVALID", message))?;
-    Ok((offset, first.map_or(default, |first| first as usize).min(max)))
+    Ok((
+        offset,
+        first.map_or(default, |first| first as usize).min(max),
+    ))
 }
 
 /// Which seeding goal a `TorrentSeedingGoal` measures.
@@ -1101,14 +1139,17 @@ pub struct TorrentGql {
     pub seeding_override: Option<SeedingPolicySettings>,
     /// The seeding terms in effect.
     pub seeding_policy: SeedingTermsGql,
-    /// The host pattern of the tracker rule the torrent is under, when it is.
-    pub tracker_rule: Option<String>,
+    /// The name of the tracker rule the torrent is under, when it is.
+    pub tracker_rule_name: Option<String>,
+    #[graphql(skip)]
+    pub tracker_rule_id: Option<u32>,
     /// Whether its archives are extracted.
     pub unpack: bool,
     /// The torrent's own unpack; absent inherits.
     pub unpack_override: Option<bool>,
     /// Whether its download is complete and its unpacking, where one
-    /// applies, is over, whatever its result.
+    /// applies, is over, whatever its result. False while a check runs or
+    /// its files are missing, and once it downloads again.
     pub content_ready: bool,
     /// The networking route it takes, by its key (`TorrentRoute.key`), when
     /// one is resolved.
@@ -1137,6 +1178,20 @@ impl TorrentGql {
             || terms.seed_time_goal_minutes.is_some()
             || terms.inactive_goal_minutes.is_some();
         self.seeding_left.as_deref().filter(|_| has_goal)
+    }
+
+    /// The tracker rule the torrent is under; null when no rule matches.
+    /// Read from the rules the torrent service holds in memory, only when
+    /// selected.
+    #[graphql(guard = "AdminGuard")]
+    async fn tracker_rule(
+        &self,
+        ctx: &Context<'_>,
+    ) -> Result<Option<crate::settings::types::TrackerRule>> {
+        let Some(id) = self.tracker_rule_id else {
+            return Ok(None);
+        };
+        Ok(super::service(ctx)?.tracker_rule(id).map(Into::into))
     }
 
     /// How its unpacking came out, once over; absent while it runs, and for
@@ -1284,7 +1339,8 @@ impl TorrentGql {
                 view.upload_cap,
                 view.seeding_levels,
             ),
-            tracker_rule: view.tracker_rule,
+            tracker_rule_name: view.tracker_rule,
+            tracker_rule_id: view.tracker_rule_id,
             unpack: view.unpack,
             unpack_override: view.unpack_override,
             content_ready: view.content_ready,
@@ -1546,6 +1602,51 @@ mod tests {
         assert_eq!(
             async_graphql::InputType::to_value(&state),
             async_graphql::Value::Enum(async_graphql::Name::new("FILES_MISSING"))
+        );
+    }
+
+    // Each unpack cause the row keeps reads in GraphQL as its own reason
+    // code, the two removal causes included.
+    #[test]
+    fn an_unpack_cause_reads_as_its_reason_code() {
+        let codes = UnpackCause::ALL.map(|cause| {
+            match async_graphql::InputType::to_value(&TorrentUnpackReasonGql::from(cause)) {
+                async_graphql::Value::Enum(name) => name.to_string(),
+                other => panic!("{other:?}"),
+            }
+        });
+        assert_eq!(
+            codes,
+            [
+                "REFUSED",
+                "NOTHING_DELIVERED",
+                "NOT_PLACED",
+                "DELIVERED_IN_PART",
+                "UNWANTED_REMOVED",
+                "UNWANTED_NOT_REMOVED",
+            ]
+        );
+    }
+
+    // A mapping with an external port is mapped; without one, it failed
+    // when the gateway's last word was an error, and is removed otherwise.
+    #[test]
+    fn a_port_mapping_state_follows_its_port_and_error() {
+        assert_eq!(
+            TorrentPortMappingStateGql::of(Some(51413), None),
+            TorrentPortMappingStateGql::Mapped
+        );
+        assert_eq!(
+            TorrentPortMappingStateGql::of(Some(51413), Some("renewal refused")),
+            TorrentPortMappingStateGql::Mapped
+        );
+        assert_eq!(
+            TorrentPortMappingStateGql::of(None, Some("no such entry in array")),
+            TorrentPortMappingStateGql::Failed
+        );
+        assert_eq!(
+            TorrentPortMappingStateGql::of(None, None),
+            TorrentPortMappingStateGql::Removed
         );
     }
 

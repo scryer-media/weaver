@@ -14,8 +14,8 @@ use weaver_server_core::torrents::service::{
 };
 
 use super::types::{
-    SubmitTorrentInputGql, SubmitTorrentResultGql, SubmitTorrentStatusGql, TorrentFilePriorityInputGql, TorrentGql, TorrentSourceInput,
-    TorrentTrackerInput,
+    SubmitTorrentInputGql, SubmitTorrentResultGql, SubmitTorrentStatusGql,
+    TorrentFilePriorityInputGql, TorrentGql, TorrentSourceInput, TorrentTrackerInput,
 };
 use super::{changed_torrent, read_torrent, service};
 use crate::auth::{CallerScope, ControlGuard, graphql_error, invalid_input, not_found};
@@ -27,7 +27,15 @@ use crate::jobs::types::{
 use crate::settings::types::SeedingPolicyInput;
 
 pub(super) fn action_error(error: ActionError) -> async_graphql::Error {
-    let code = match &error {
+    let (code, message) = action_refusal(&error);
+    graphql_error(code, message)
+}
+
+// The code and message a refused torrent action answers with, one torrent
+// or a batch of them: the one mapping of action refusals to codes. A
+// failure on its state is logged, and answered as any state failure is.
+fn action_refusal(error: &ActionError) -> (&'static str, String) {
+    let code = match error {
         ActionError::NotFound(_) => "NOT_FOUND",
         // No torrent mutation removes under a seeding goal's gate: one that
         // got here is refused as the queue refuses it.
@@ -35,11 +43,12 @@ pub(super) fn action_error(error: ActionError) -> async_graphql::Error {
         ActionError::Invalid(_) => "INVALID_INPUT",
         ActionError::State(message) => {
             tracing::error!(error = %message, "torrent action failed on its state");
-            return crate::observability::state_error(StateError::Database(message.clone()));
+            let error = StateError::Database(message.clone());
+            return (crate::observability::state_code(&error), error.to_string());
         }
         ActionError::Forbidden(_) => "FORBIDDEN",
     };
-    graphql_error(code, error.to_string())
+    (code, error.to_string())
 }
 
 /// A torrent source's metainfo or magnet link, an upload read within the
@@ -58,7 +67,10 @@ pub(crate) async fn torrent_source(
             let upload = upload
                 .value(ctx)
                 .map_err(|error| invalid_input(format!("invalid upload: {error}")))?;
-            match classify_upload(&upload, true).await.map_err(upload_refusal)? {
+            match classify_upload(&upload, true)
+                .await
+                .map_err(upload_refusal)?
+            {
                 (Kind::Metainfo, decoded) => {
                     AddSource::Metainfo(decoded.unwrap_or_else(|| upload.content.to_vec()))
                 }
@@ -166,7 +178,12 @@ impl TorrentsMutation {
     /// A key that only controls may name only a path under the default
     /// save folder or a category's folder.
     #[graphql(guard = "ControlGuard")]
-    async fn set_torrent_location(&self, ctx: &Context<'_>, id: u64, path: String) -> Result<TorrentGql> {
+    async fn set_torrent_location(
+        &self,
+        ctx: &Context<'_>,
+        id: u64,
+        path: String,
+    ) -> Result<TorrentGql> {
         let caller = *ctx.data::<CallerScope>()?;
         service(ctx)?
             .set_location_as(caller, JobId(id), path)
@@ -237,7 +254,12 @@ impl TorrentsMutation {
     /// Ban a peer's address from the torrent: an IP, or an IP and port
     /// whose port is ignored.
     #[graphql(guard = "ControlGuard")]
-    async fn ban_torrent_peer(&self, ctx: &Context<'_>, id: u64, address: String) -> Result<TorrentGql> {
+    async fn ban_torrent_peer(
+        &self,
+        ctx: &Context<'_>,
+        id: u64,
+        address: String,
+    ) -> Result<TorrentGql> {
         let address = address.trim();
         let ip = address
             .parse::<SocketAddr>()
@@ -434,8 +456,6 @@ impl TorrentsMutation {
     }
 }
 
-// The distinct ids a torrent batch names, in the order given, within the
-// queue batches' limit.
 // Whether an add refused as the torrent `existing` already is carries the
 // client request id that torrent was added with. One read of its row's
 // metadata, and only when the add carries an id.
@@ -464,6 +484,8 @@ fn add_error(error: AddError) -> async_graphql::Error {
     )
 }
 
+// The distinct ids a torrent batch names, in the order given, within the
+// queue batches' limit.
 fn batch_ids(ids: &[u64]) -> Result<Vec<JobId>> {
     let mut seen = std::collections::BTreeSet::new();
     let ids: Vec<JobId> = ids
@@ -502,8 +524,9 @@ async fn set_torrents(
 }
 
 // The answer a torrent batch returns, in the queue batches' shape: each id
-// it named, and why each one that did not take did not. An id the batch
-// did not reach, after one refused, is refused as not reached.
+// it named, and why each one that did not take did not, under the codes
+// one torrent's action answers with. An id the batch did not reach, after
+// one refused, is refused as not reached.
 fn torrent_batch_result(
     ids: &[JobId],
     outcome: std::collections::BTreeMap<JobId, std::result::Result<(), ActionError>>,
@@ -514,14 +537,7 @@ fn torrent_batch_result(
         .filter_map(|id| {
             let (code, message) = match outcome.get(id) {
                 Some(Ok(())) => return None,
-                Some(Err(error)) => (
-                    match error {
-                        ActionError::NotFound(_) => "NOT_FOUND",
-                        ActionError::Invalid(_) | ActionError::UnmetGoal(_) => "CONFLICT",
-                        ActionError::State(_) | ActionError::Forbidden(_) => "INTERNAL",
-                    },
-                    error.to_string(),
-                ),
+                Some(Err(error)) => action_refusal(error),
                 None => (
                     "CONFLICT",
                     "not reached: a torrent before it in the batch was refused".to_owned(),
@@ -538,5 +554,66 @@ fn torrent_batch_result(
         matched,
         applied: matched.saturating_sub(u32::try_from(refused.len()).unwrap_or(u32::MAX)),
         refused,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // A batch refuses each torrent under the code and message the action
+    // on that one torrent answers with; only an id it did not reach is
+    // refused as not reached.
+    #[test]
+    fn a_batch_refuses_each_torrent_as_one_torrent_is_refused() {
+        let errors = [
+            ActionError::NotFound(JobId(1)),
+            ActionError::UnmetGoal("ratio 0.5 of 1".into()),
+            ActionError::Invalid("no such priority".into()),
+            ActionError::State("disk I/O error".into()),
+            ActionError::Forbidden("outside the save folders".into()),
+        ];
+        let ids: Vec<JobId> = (1..=6).map(JobId).collect();
+        let outcome = ids
+            .iter()
+            .zip(errors.iter().cloned().map(Err))
+            .map(|(&id, result)| (id, result))
+            .collect();
+        let result = torrent_batch_result(&ids, outcome);
+        assert_eq!((result.matched, result.applied), (6, 0));
+        let single: Vec<(String, String)> = errors
+            .into_iter()
+            .map(|error| {
+                let error = action_error(error);
+                let code = error
+                    .extensions
+                    .as_ref()
+                    .and_then(|ext| ext.get("code"))
+                    .map(|code| code.to_string().trim_matches('"').to_owned())
+                    .unwrap();
+                (code, error.message)
+            })
+            .collect();
+        let batch: Vec<(String, String)> = result
+            .refused
+            .iter()
+            .map(|refused| (refused.code.clone(), refused.message.clone()))
+            .collect();
+        assert_eq!(batch[..5], single[..]);
+        assert_eq!(
+            single
+                .iter()
+                .map(|(code, _)| code.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "NOT_FOUND",
+                "CONFLICT",
+                "INVALID_INPUT",
+                "INTERNAL",
+                "FORBIDDEN"
+            ]
+        );
+        assert_eq!(batch[5].0, "CONFLICT");
+        assert!(batch[5].1.starts_with("not reached"));
     }
 }

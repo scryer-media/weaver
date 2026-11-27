@@ -94,6 +94,7 @@ impl TorrentView {
             seeding_policy,
             seeding_levels,
             tracker_rule,
+            tracker_rule_id,
             upload_cap,
             unpack,
             unpack_override,
@@ -185,6 +186,7 @@ impl TorrentView {
         (
             seeding_levels,
             tracker_rule,
+            tracker_rule_id,
             upload_cap,
             unpack,
             unpack_override,

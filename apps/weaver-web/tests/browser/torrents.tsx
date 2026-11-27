@@ -417,7 +417,7 @@ const torrent = (
       uploadCap: "GLOBAL",
     },
   },
-  trackerRule: null,
+  trackerRuleName: null,
   files: [
     {
       index: 0,
@@ -680,6 +680,11 @@ createRoot(document.getElementById("root")!).render(
                 running: false,
                 windingDown: false,
                 windDown: null,
+              },
+              connection: {
+                status: "connected",
+                isDisconnected: false,
+                isPolling: false,
               },
             } as NextData
           }

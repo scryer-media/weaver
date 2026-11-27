@@ -282,17 +282,32 @@ impl SystemQuery {
         range: crate::system::usage_history::UsageRange,
     ) -> Result<crate::system::usage_history::TorrentHistory> {
         use crate::system::usage_history::{
-            TorrentLiveTotals, load_torrent_history, local_today, usage_period,
+            TorrentHistoryWants, TorrentLiveTotals, load_torrent_history, local_today, usage_period,
         };
         let period = usage_period(&range)
             .map_err(|error| graphql_error("INVALID_INPUT", error.to_string()))?;
-        let live = ctx
-            .data_opt::<weaver_server_core::torrents::service::TorrentService>()
-            .map(|torrents| TorrentLiveTotals::of(&torrents.metrics().published))
-            .unwrap_or_default();
+        let fields = ctx.look_ahead();
+        let wants = TorrentHistoryWants {
+            span: ["today", "rangeStart", "rangeEnd", "total"]
+                .iter()
+                .any(|name| fields.field(name).exists()),
+            trackers: fields.field("trackers").exists(),
+        };
+        let live = match fields.field("live").exists() {
+            true => ctx
+                .data_opt::<weaver_server_core::torrents::service::TorrentService>()
+                .map(|torrents| TorrentLiveTotals::of(&torrents.metrics().published))
+                .unwrap_or_default(),
+            false => TorrentLiveTotals::default(),
+        };
+        if !wants.span && !wants.trackers {
+            return Ok(crate::system::usage_history::TorrentHistory::live_only(
+                live,
+            ));
+        }
         let db = ctx.data::<Database>()?.clone();
         spawn_blocking_with(
-            move || load_torrent_history(&db, local_today(), period, live),
+            move || load_torrent_history(&db, local_today(), period, wants, live),
             state_error,
         )
         .await

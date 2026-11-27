@@ -6828,9 +6828,9 @@ type Torrent {
 	"""
 	seedingPolicy: TorrentSeedingTerms!
 	"""
-	The host pattern of the tracker rule the torrent is under, when it is.
+	The name of the tracker rule the torrent is under, when it is.
 	"""
-	trackerRule: String
+	trackerRuleName: String
 	"""
 	Whether its archives are extracted.
 	"""
@@ -6841,7 +6841,8 @@ type Torrent {
 	unpackOverride: Boolean
 	"""
 	Whether its download is complete and its unpacking, where one
-	applies, is over, whatever its result.
+	applies, is over, whatever its result. False while a check runs or
+	its files are missing, and once it downloads again.
 	"""
 	contentReady: Boolean!
 	"""
@@ -6872,6 +6873,12 @@ type Torrent {
 	torrent with no goal.
 	"""
 	seedingGoalLeft: String
+	"""
+	The tracker rule the torrent is under; null when no rule matches.
+	Read from the rules the torrent service holds in memory, only when
+	selected.
+	"""
+	trackerRule: TrackerRule
 	"""
 	How its unpacking came out, once over; absent while it runs, and for
 	a torrent with nothing to unpack.
@@ -7330,6 +7337,10 @@ A gateway's last word on one port mapping.
 """
 type TorrentPortMapping {
 	"""
+	Where the mapping stands.
+	"""
+	state: TorrentPortMappingState!
+	"""
 	What asked for the mapping.
 	"""
 	mapper: TorrentPortMapper!
@@ -7355,6 +7366,25 @@ type TorrentPortMapping {
 	The gateway's error, when the mapping failed.
 	"""
 	error: String
+}
+
+"""
+Where a port mapping stands.
+"""
+enum TorrentPortMappingState {
+	"""
+	The gateway forwards the external port.
+	"""
+	MAPPED
+	"""
+	The last request to the gateway for it failed, whether to map or to
+	remove; `error` says which.
+	"""
+	FAILED
+	"""
+	Not mapped: removed on close, or closed by the gateway.
+	"""
+	REMOVED
 }
 
 """
@@ -7560,6 +7590,10 @@ type TorrentRouteUse {
 	What kind of scope it is.
 	"""
 	scope: TorrentRouteScope!
+	"""
+	The category's or tracker rule's name; null for the default.
+	"""
+	name: String
 	"""
 	The category, when the scope is a category's: read from the settings
 	in memory, only when selected.

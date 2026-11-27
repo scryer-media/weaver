@@ -29,10 +29,7 @@ impl TorrentsQuery {
     /// The torrents the schedule's pause leaves seeding, by the tracker rule
     /// that keeps them; empty while no such pause is in force.
     #[graphql(guard = "ReadGuard")]
-    async fn torrent_schedule_seeding(
-        &self,
-        ctx: &Context<'_>,
-    ) -> Result<Vec<ScheduleSeedingGql>> {
+    async fn torrent_schedule_seeding(&self, ctx: &Context<'_>) -> Result<Vec<ScheduleSeedingGql>> {
         Ok(service(ctx)?
             .schedule_seeding()
             .await

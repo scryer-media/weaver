@@ -642,10 +642,17 @@ fn outputs_page_is_the_window(db: &Database) {
     // No names kept yet: every page is empty.
     assert!(db.torrent_outputs_page(job_id, 0, 10).unwrap().is_empty());
     // Out of name order, with a quote and a name past the ASCII range.
-    let names: Vec<String> = ["e.mkv", "b \"quoted\".nfo", "d/é.srt", "a.txt", "c.txt", "f.bin"]
-        .iter()
-        .map(|name| (*name).to_owned())
-        .collect();
+    let names: Vec<String> = [
+        "e.mkv",
+        "b \"quoted\".nfo",
+        "d/é.srt",
+        "a.txt",
+        "c.txt",
+        "f.bin",
+    ]
+    .iter()
+    .map(|name| (*name).to_owned())
+    .collect();
     db.finish_torrent_unpack(job_id, &names, &[], &[], &UnpackEnd::whole())
         .unwrap();
     let every = db.torrent_outputs(job_id).unwrap();

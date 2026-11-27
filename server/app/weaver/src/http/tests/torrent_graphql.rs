@@ -319,7 +319,10 @@ async fn a_torrent_submitted_in_a_category_there_is_none_of_makes_it() {
         )
         .await;
         assert_eq!(submitted.get("errors"), None, "{submitted}");
-        assert_eq!(submitted["data"]["submitTorrent"]["torrent"]["category"], "films");
+        assert_eq!(
+            submitted["data"]["submitTorrent"]["torrent"]["category"],
+            "films"
+        );
     }
     let listed = graphql(&app, "{ categories { name destDir } }").await;
     assert_eq!(listed.get("errors"), None, "{listed}");
