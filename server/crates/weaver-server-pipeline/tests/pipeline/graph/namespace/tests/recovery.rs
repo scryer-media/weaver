@@ -422,7 +422,7 @@ fn failed_pending_custody_cannot_fall_back_to_an_older_derived_copy() {
         .scratch
         .as_mut()
         .unwrap()
-        .close(LoopSite::LeafWrite, 0)
+        .close(LoopSite::LeafWrite, 0, false)
         .unwrap();
     let mut read = b"prefix".to_vec();
     assert!(!job.writer.access(&job.tree, LoopSite::ReadOn).read_at(

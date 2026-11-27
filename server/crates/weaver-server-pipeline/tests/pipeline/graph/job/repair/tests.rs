@@ -368,3 +368,55 @@ fn ciphertext_past_the_cap_waits_in_the_ledger_until_a_slot_comes() {
         "deciphered again"
     );
 }
+
+// A repair's return heard under a serial no loan of the job is out under is
+// refused as stale: its read is never checked, so once nothing else is out
+// the leaves let go of what they kept for it.
+#[test]
+fn a_return_refused_as_stale_lets_the_leaves_forget_what_they_kept() {
+    use crate::pipeline::graph::engine::{Heard, Said};
+    use weaver_server_disk::operations::disk::volume::LoopSite;
+    let Archives {
+        mut job,
+        plain,
+        _directory: _kept,
+    } = archives();
+    let member = MemberId(PLAIN);
+    let set = job.tree.recovery_nodes(NodeId::ROOT)[0];
+    let keeps = |job: &GraphJob| job.writer.files[&NodeId::ROOT].leaves[&member].keeps_changes();
+    let loan = job
+        .writer
+        .lend(&mut job.tree, NodeId::ROOT, set)
+        .unwrap()
+        .expect("the set lends");
+    assert!(job.writer.repair_reads());
+    let mut again = plain[..16].to_vec();
+    again[3] ^= 0x5a;
+    job.writer
+        .write_file(
+            &mut job.tree,
+            (NodeId::ROOT, member),
+            0,
+            &again.into(),
+            LoopSite::LeafWrite,
+        )
+        .unwrap();
+    assert!(
+        keeps(&job),
+        "a write with a repair out keeps what it replaced"
+    );
+    let returned = loan.run(weaver_graph::Budget::default(), &Default::default());
+    job.run_said(
+        Said {
+            scope: 1,
+            node: set,
+            generation: u64::MAX,
+            heard: Heard::Repaired(Box::new(returned)),
+        },
+        &mut RepairSlots::default(),
+        0,
+    )
+    .unwrap();
+    assert!(!job.writer.repair_reads());
+    assert!(!keeps(&job), "refused as stale, the leaf keeps nothing");
+}

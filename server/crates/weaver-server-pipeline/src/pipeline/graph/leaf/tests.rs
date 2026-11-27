@@ -98,7 +98,7 @@ fn disjoint_stretches_answer_as_the_old_scan_did() {
         for (at, stretches) in changes(seed, 400).into_iter().enumerate() {
             leaf.revision += 1;
             for &(start, end) in &stretches {
-                leaf.change(start, end);
+                leaf.change(true, start, end);
                 before.change(leaf.revision, start, end);
             }
             let points = points(&leaf);
@@ -112,15 +112,62 @@ fn disjoint_stretches_answer_as_the_old_scan_did() {
                         continue;
                     }
                     assert_eq!(
-                        leaf.changed_since((leaf.identity, seen), start, end),
+                        leaf.changed_since((leaf.identity, seen), start, end, true),
                         before.changed_since(seen, start, end),
                         "seed {seed}, change {at}, seen {seen}, {start}..{end}"
                     );
                 }
             }
-            assert!(leaf.changed_since((leaf.identity + 1, leaf.revision), 0, 1));
+            assert!(leaf.changed_since((leaf.identity + 1, leaf.revision), 0, 1, true));
         }
     }
+}
+
+// A write over written bytes, a write of bytes already there, a close that
+// cuts and a start over, on a real file, with each told whether to keep what
+// it changes. The stretches kept after each step.
+fn written_over(record: bool) -> Vec<Vec<(u64, (u64, u64))>> {
+    use weaver_server_disk::operations::disk::volume::LoopSite;
+    let dir = tempfile::tempdir().unwrap();
+    let mut leaf = Leaf::at(dir.path(), "member.bin");
+    let mut kept = Vec::new();
+    let mut step = |leaf: &Leaf| kept.push(leaf.changed.iter().map(|(a, b)| (*a, *b)).collect());
+    leaf.write(LoopSite::LeafWrite, 0, &[1; 100], None, record)
+        .unwrap();
+    step(&leaf);
+    leaf.write(LoopSite::LeafWrite, 10, &[2; 10], None, record)
+        .unwrap();
+    step(&leaf);
+    leaf.wrote_in_place(30, 10, record);
+    step(&leaf);
+    leaf.close(LoopSite::LeafWrite, 50, record).unwrap();
+    step(&leaf);
+    leaf.truncate(record).unwrap();
+    step(&leaf);
+    kept
+}
+
+// Told no repair's read is left to check, writes that replace bytes keep
+// nothing.
+#[test]
+fn writes_keep_no_change_while_no_read_is_checked() {
+    assert!(written_over(false).iter().all(Vec::is_empty));
+}
+
+// Told a read may be checked, each replaces as it did before: what it
+// replaced, at its revision.
+#[test]
+fn writes_keep_what_they_replace_while_a_read_is_checked() {
+    assert_eq!(
+        written_over(true),
+        vec![
+            vec![],
+            vec![(10, (2, 20))],
+            vec![(10, (2, 20)), (30, (3, 40))],
+            vec![(10, (2, 20)), (30, (3, 40)), (50, (4, 100))],
+            vec![(0, (5, u64::MAX))],
+        ]
+    );
 }
 
 // The stretches stay disjoint and in order, a start over leaves one, and a
@@ -132,7 +179,7 @@ fn stretches_stay_disjoint_and_a_query_reads_only_what_it_spans() {
     for stretches in changes(4, 600) {
         leaf.revision += 1;
         for &(start, end) in &stretches {
-            leaf.change(start, end);
+            leaf.change(true, start, end);
         }
         if stretches == [(0, u64::MAX)] {
             assert_eq!(leaf.changed.len(), 1);

@@ -422,9 +422,10 @@ impl Envelopes {
             let kept = shelf.kept(state, envelope)?;
             let mends = provenance.is_verified() && kept.coverage.damaged(range);
             if from.is_some() && !writes_over() && kept.leaf.file_id(LoopSite::Capture) == from {
-                kept.leaf.wrote_in_place(offset, range.len());
+                kept.leaf.wrote_in_place(offset, range.len(), false);
             } else {
-                kept.leaf.write(LoopSite::Capture, offset, bytes, None)?;
+                kept.leaf
+                    .write(LoopSite::Capture, offset, bytes, None, false)?;
             }
             kept.coverage.write(range, provenance);
             if (provenance == Provenance::Repaired || mends) && range.start < kept.reached {
@@ -755,7 +756,7 @@ impl Shelf {
                     &envelope_name(self.node, envelope),
                 );
                 let mut leaf = Leaf::at(&self.dir, &name).through(self.to.as_ref());
-                leaf.truncate()?;
+                leaf.truncate(false)?;
                 Ok(free.insert(Kept::in_file(leaf)))
             }
         }

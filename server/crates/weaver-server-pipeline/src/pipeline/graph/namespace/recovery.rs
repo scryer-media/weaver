@@ -1985,12 +1985,13 @@ impl NamespaceWriter {
                 .is_some_and(|files| files.leaves.contains_key(member));
             if let Some(length) = length.filter(|_| has_file) {
                 self.admit_file(tree, node, *member, length, 0)?;
+                let keeps = self.keeps_changes(node, *member);
                 if let Some(leaf) = self
                     .files
                     .get_mut(&node)
                     .and_then(|files| files.leaves.get_mut(member))
                 {
-                    leaf.close(LoopSite::BindSets, length)?;
+                    leaf.close(LoopSite::BindSets, length, keeps)?;
                 }
             }
         }

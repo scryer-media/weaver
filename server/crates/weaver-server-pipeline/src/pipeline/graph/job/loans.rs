@@ -299,6 +299,11 @@ impl Loans {
         self.out.as_ref().is_some_and(|out| out.kind == kind)
     }
 
+    // Whether a repair is out on its thread.
+    pub(crate) fn repair_out(&self) -> bool {
+        self.is_out(Work::Repair)
+    }
+
     pub(crate) fn request_stop(&self) {
         if let Some(stop) = self.out.as_ref().and_then(|out| out.stop.as_ref()) {
             stop.raise();
