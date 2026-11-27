@@ -5280,13 +5280,14 @@ fn a_returned_ruling_stands_while_its_file_changes_past_what_it_read() {
             .unwrap()
             .run(weaver_graph::Budget::default(), &Default::default());
         let write = |job: &mut Job, offset: u64, bytes: &[u8]| {
-            let keeps = job.writer.repair_reads();
             job.writer
-                .files_mut(NodeId::ROOT)
-                .leaves
-                .get_mut(&member)
-                .unwrap()
-                .write(LoopSite::LeafWrite, offset, bytes, None, keeps)
+                .write_file(
+                    &mut job.tree,
+                    (NodeId::ROOT, member),
+                    offset,
+                    &bytes.to_vec().into(),
+                    LoopSite::LeafWrite,
+                )
                 .unwrap();
         };
         write(&mut job, 8, b"AND MORE");
@@ -5313,13 +5314,12 @@ fn a_returned_ruling_stands_while_its_file_changes_past_what_it_read() {
     }
 }
 
-// A member's leaf keeps what its writes replace only while a repair's read
-// may be checked: from the lend until the return is taken back. With no
-// repair out, nothing is kept; a repair out is told a byte it read moved and
-// one it did not read did not; once its return is taken back the leaf keeps
-// nothing; and a repair lent after earlier writes is not told they moved.
+// A member's file is written while a repair is out, past what it read and
+// inside it, and again once its return is taken back. A repair is told a
+// byte it read moved and one it did not read did not, and one lent after
+// earlier writes, its fix among them, is not told they moved.
 #[test]
-fn a_leaf_keeps_what_writes_replace_only_while_a_repair_s_read_may_be_checked() {
+fn a_repair_is_told_only_of_writes_to_what_it_read_since_it_was_lent() {
     let mut job = Job::new(PLENTY).with_set(Some(Fix {
         name: "payload.bin",
         read: ByteRange::new(0, 8),
@@ -5327,7 +5327,6 @@ fn a_leaf_keeps_what_writes_replace_only_while_a_repair_s_read_may_be_checked() 
     }));
     let member = job.member("payload.bin", Some(16));
     job.send(member, 0, b"original and mor", Provenance::Fresh);
-    let keeps = |job: &Job| job.writer.files[&NodeId::ROOT].leaves[&member].keeps_changes();
     let lend = |job: &mut Job| {
         let mut lent = Inline::default();
         let due = job.tree.recovery_nodes(NodeId::ROOT);
@@ -5339,34 +5338,27 @@ fn a_leaf_keeps_what_writes_replace_only_while_a_repair_s_read_may_be_checked() 
             .unwrap()
             .run(weaver_graph::Budget::default(), &Default::default())
     };
-
-    job.send(member, 4, b"INAL", Provenance::Repaired);
-    assert_eq!(job.file("payload.bin"), b"origINAL and mor");
-    assert!(!job.writer.repair_reads());
-    assert!(!keeps(&job), "a write with no repair out keeps nothing");
-
     // What the loop writes into a member a repair reads while it is out,
-    // as the writer would write it (bytes said of the member wait for the
-    // set's return).
+    // as the writer writes it (bytes said of the member wait for the set's
+    // return).
     let write = |job: &mut Job, offset: u64, bytes: &[u8]| {
-        let keeps = job.writer.repair_reads();
         job.writer
-            .files_mut(NodeId::ROOT)
-            .leaves
-            .get_mut(&member)
-            .unwrap()
-            .write(LoopSite::LeafWrite, offset, bytes, None, keeps)
+            .write_file(
+                &mut job.tree,
+                (NodeId::ROOT, member),
+                offset,
+                &bytes.to_vec().into(),
+                LoopSite::LeafWrite,
+            )
             .unwrap();
     };
 
+    job.send(member, 4, b"INAL", Provenance::Repaired);
+    assert_eq!(job.file("payload.bin"), b"origINAL and mor");
+
     let returned = lend(&mut job);
-    assert!(job.writer.repair_reads());
     write(&mut job, 13, b"MOR");
     assert_eq!(job.file("payload.bin"), b"origINAL and MOR");
-    assert!(
-        keeps(&job),
-        "a write with a repair out keeps what it replaced"
-    );
     assert!(
         !job.writer.moved_since(&job.tree, &returned),
         "a byte the repair did not read moved nothing"
@@ -5382,15 +5374,8 @@ fn a_leaf_keeps_what_writes_replace_only_while_a_repair_s_read_may_be_checked() 
             &mut job.out,
         )
         .unwrap();
-    // Its fix went down through the writer before the job let go.
+    // Its fix went down through the writer.
     assert_eq!(job.file("payload.bin"), b"orOKINAL and MOR");
-    assert!(keeps(&job));
-    job.writer.end_repair_reads_here();
-    assert!(!job.writer.repair_reads());
-    assert!(
-        !keeps(&job),
-        "the return taken back, the leaf keeps nothing"
-    );
 
     let returned = lend(&mut job);
     assert!(

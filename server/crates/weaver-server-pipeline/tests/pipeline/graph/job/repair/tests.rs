@@ -369,54 +369,116 @@ fn ciphertext_past_the_cap_waits_in_the_ledger_until_a_slot_comes() {
     );
 }
 
-// A repair's return heard under a serial no loan of the job is out under is
-// refused as stale: its read is never checked, so once nothing else is out
-// the leaves let go of what they kept for it.
-#[test]
-fn a_return_refused_as_stale_lets_the_leaves_forget_what_they_kept() {
-    use crate::pipeline::graph::engine::{Heard, Said};
-    use weaver_server_disk::operations::disk::volume::LoopSite;
-    let Archives {
-        mut job,
-        plain,
-        _directory: _kept,
-    } = archives();
-    let member = MemberId(PLAIN);
-    let set = job.tree.recovery_nodes(NodeId::ROOT)[0];
-    let keeps = |job: &GraphJob| job.writer.files[&NodeId::ROOT].leaves[&member].keeps_changes();
-    let loan = job
-        .writer
-        .lend(&mut job.tree, NodeId::ROOT, set)
-        .unwrap()
-        .expect("the set lends");
-    assert!(job.writer.repair_reads());
-    let mut again = plain[..16].to_vec();
-    again[3] ^= 0x5a;
-    job.writer
-        .write_file(
-            &mut job.tree,
-            (NodeId::ROOT, member),
-            0,
-            &again.into(),
-            LoopSite::LeafWrite,
-        )
-        .unwrap();
-    assert!(
-        keeps(&job),
-        "a write with a repair out keeps what it replaced"
+// A plain file of two articles whose second came damaged, with a PAR2
+// index and a volume of two recovery blocks over it, all in, the job's
+// repairs heard on `mail`. Its set is due a repair, which no slot sent out
+// yet. The job, the plain file's bytes, and the directory its files are in.
+fn damaged_plain(mail: &RunMail) -> (GraphJob, Vec<u8>, tempfile::TempDir) {
+    let plain = payload(2 * ARTICLE, 41);
+    let par2 = par2_set("plain", &[("plain.bin", &plain)], 2);
+    let sizes = |bytes: &[u8]| -> Vec<u32> {
+        bytes
+            .chunks(ARTICLE)
+            .map(|chunk| chunk.len() as u32)
+            .collect()
+    };
+    let files = vec![
+        file("plain.bin", &sizes(&plain)),
+        file(&par2[0].name, &sizes(&par2[0].bytes)),
+        file(&par2[1].name, &sizes(&par2[1].bytes)),
+    ];
+    let directory = tempfile::tempdir().unwrap();
+    let accountant = Arc::new(HoldsAccountant::new(HoldBudgets {
+        resident_limit: u64::MAX,
+        scratch_total: u64::MAX,
+        scratch_ceiling: u64::MAX,
+        disk_reserve: 0,
+    }));
+    let writer = NamespaceWriter::new(
+        1,
+        directory.path().to_owned(),
+        accountant,
+        CapacityReader::unknown(),
     );
-    let returned = loan.run(weaver_graph::Budget::default(), &Default::default());
-    job.run_said(
-        Said {
-            scope: 1,
-            node: set,
-            generation: u64::MAX,
-            heard: Heard::Repaired(Box::new(returned)),
-        },
-        &mut RepairSlots::default(),
+    let runs = Runs::new(
+        1,
         0,
-    )
-    .unwrap();
-    assert!(!job.writer.repair_reads());
-    assert!(!keeps(&job), "refused as stale, the leaf keeps nothing");
+        RunMail::default().sender(),
+        crate::pipeline::graph::engine::DecodePool::unbounded(),
+    );
+    let mut job = GraphJob::new(
+        &files,
+        Box::new(Hardware::default()),
+        writer,
+        runs,
+        u32::MAX,
+    );
+    job.loans = super::super::Loans::new(1, mail.sender(), job.runs.hardware());
+    let mut damaged = plain.clone();
+    damaged[ARTICLE + 5] ^= 0x5a;
+    let mut slots = RepairSlots::default();
+    for (volume, bytes) in [(1, &par2[0].bytes), (2, &par2[1].bytes), (0, &damaged)] {
+        for (ordinal, chunk) in bytes.chunks(ARTICLE).enumerate() {
+            let offset = (ordinal * ARTICLE) as u64;
+            let length = Some(bytes.len() as u64);
+            job.intake(
+                decoded(volume, ordinal as u32, offset, chunk, length),
+                &mut slots,
+                0,
+            )
+            .unwrap();
+        }
+    }
+    assert!(!job.repair_out());
+    (job, plain, directory)
+}
+
+// A repair's return is taken back after the loop wrote what it read, or
+// wrote nothing. Its check sees that write: the ruling is refused, the set
+// lent again, and the second repair mends the file. With nothing written
+// its ruling stands and mends the file at once.
+#[tokio::test]
+async fn a_repair_taken_back_is_checked_against_what_was_written_while_it_was_out() {
+    use crate::pipeline::graph::engine::Heard;
+    use weaver_server_disk::operations::disk::volume::LoopSite;
+    for moved in [false, true] {
+        let mut mail = RunMail::default();
+        let (mut job, plain, directory) = damaged_plain(&mail);
+        let set = job.tree.recovery_nodes(NodeId::ROOT)[0];
+        let mut slots = RepairSlots::default();
+        job.lend(&mut slots, 1).unwrap();
+        assert!(job.repair_out(), "moved={moved}: the set's repair is out");
+        let said = mail.recv().await.unwrap();
+        assert_eq!(said.node, set);
+        assert!(matches!(said.heard, Heard::Repaired(_)));
+        if moved {
+            // Its read is done; the loop writes a byte of it again before
+            // the return is taken back.
+            let mut again = plain[..16].to_vec();
+            again[3] ^= 0x5a;
+            job.writer
+                .write_file(
+                    &mut job.tree,
+                    (NodeId::ROOT, MemberId(0)),
+                    0,
+                    &again.into(),
+                    LoopSite::LeafWrite,
+                )
+                .unwrap();
+        }
+        let serial = said.generation;
+        job.run_said(said, &mut slots, 1).unwrap();
+        if moved {
+            assert!(job.repair_out(), "the refused ruling's set is lent again");
+            let said = mail.recv().await.unwrap();
+            assert_eq!(said.node, set);
+            assert_ne!(said.generation, serial, "under a serial of its own");
+            job.run_said(said, &mut slots, 1).unwrap();
+        }
+        assert!(!job.repair_out(), "moved={moved}: nothing left out");
+        assert!(
+            super::super::loan_tests::holds(directory.path(), &plain),
+            "moved={moved}: the file is mended"
+        );
+    }
 }

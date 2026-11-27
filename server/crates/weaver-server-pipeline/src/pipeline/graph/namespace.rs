@@ -679,13 +679,6 @@ impl NamespaceWriter {
         }
     }
 
-    // Whether a member's leaf keeps what a write changes now: a repair's
-    // read may still be checked against it.
-    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
-    pub fn repair_reads(&self) -> bool {
-        self.repair_reads
-    }
-
     // Whether the member's leaf, about to be written, keeps what the write
     // changes: while a repair's read may be checked it does, and it is
     // emptied with the rest when none is left (`end_repair_reads`). Noted
@@ -695,12 +688,6 @@ impl NamespaceWriter {
             self.changes_kept.insert((node, member));
         }
         self.repair_reads
-    }
-
-    // As the job does once a return is taken back and nothing else is out.
-    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
-    pub fn end_repair_reads_here(&mut self) {
-        self.end_repair_reads();
     }
 
     // No repair's read is left to check: the leaves that kept a change for

@@ -160,13 +160,14 @@ fn cancelled_and_stale_par3_returns_keep_damaged_carriers_repairable() {
             // A revision to the same source leaf invalidates the completed
             // worker's staged repair before acknowledgment.
             wrong[1700] ^= 0x55;
-            let keeps = job.writer.repair_reads();
             job.writer
-                .files_mut(NodeId::ROOT)
-                .leaves
-                .get_mut(&member)
-                .unwrap()
-                .write(LoopSite::LeafWrite, 1700, &wrong[1700..1701], None, keeps)
+                .write_file(
+                    &mut job.tree,
+                    (NodeId::ROOT, member),
+                    1700,
+                    &wrong[1700..1701].to_vec().into(),
+                    LoopSite::LeafWrite,
+                )
                 .unwrap();
             assert!(
                 job.file("payload.bin") == wrong,

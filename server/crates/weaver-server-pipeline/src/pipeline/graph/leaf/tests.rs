@@ -170,6 +170,144 @@ fn writes_keep_what_they_replace_while_a_read_is_checked() {
     );
 }
 
+// One seeded run of writes, writes of bytes already there, closes that cut
+// and starts over across three members' files, played twice: once keeping
+// every change, as every leaf did before, and once keeping changes only
+// while a repair is out and emptying the leaves written meanwhile as the
+// last one out returns, as the writer gates them. Repairs are lent and
+// returned through the run, at most two at once. While one is out, every
+// range it read, and ranges at every stretch's ends, answer alike in both.
+// Whenever none is out the gated leaves keep nothing. How many stretches
+// each kept, at its most and at the end, is pinned.
+#[test]
+fn changes_kept_only_while_a_repair_is_out_answer_as_changes_always_kept() {
+    use weaver_server_disk::operations::disk::volume::LoopSite;
+    const MEMBERS: u64 = 3;
+    const LENGTH: u64 = 4096;
+    // A repair out: the revision each leaf stood at when it was lent, in
+    // each run (each leaf is its own file, so its own identity), and the
+    // ranges it read of each.
+    struct Out {
+        seen: Vec<((u64, u64), (u64, u64))>,
+        reads: Vec<Vec<(u64, u64)>>,
+    }
+    let open = |dir: &Path| -> Vec<Leaf> {
+        (0..MEMBERS)
+            .map(|member| Leaf::at(dir, &format!("m{member}.bin")))
+            .collect()
+    };
+    let held = |leaves: &[Leaf]| leaves.iter().map(|leaf| leaf.changed.len()).sum::<usize>();
+    let (old_dir, new_dir) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let mut old = open(old_dir.path());
+    let mut new = open(new_dir.path());
+    let mut out: Vec<Out> = Vec::new();
+    let mut touched = BTreeSet::new();
+    let mut seeded = Seeded(0x0bad_5eed);
+    let (mut old_peak, mut new_peak, mut lent, mut compared) = (0, 0, 0, 0);
+    let forget = |new: &mut [Leaf], touched: &mut BTreeSet<usize>| {
+        for member in std::mem::take(touched) {
+            new[member].forget_changes();
+        }
+    };
+    for step in 0..1500 {
+        let pick = seeded.next(16);
+        if pick < 2 && out.len() < 2 {
+            let seen: Vec<_> = old
+                .iter()
+                .zip(&new)
+                .map(|(old, new)| (old.revision(), new.revision()))
+                .collect();
+            assert!(seen.iter().all(|(old, new)| old.1 == new.1));
+            let reads = (0..MEMBERS)
+                .map(|_| {
+                    (0..1 + seeded.next(3))
+                        .map(|_| {
+                            let start = seeded.next(LENGTH);
+                            (start, start + 1 + seeded.next(LENGTH / 4))
+                        })
+                        .collect()
+                })
+                .collect();
+            out.push(Out { seen, reads });
+            lent += 1;
+        } else if pick < 4 && !out.is_empty() {
+            out.remove(seeded.next(out.len() as u64) as usize);
+            if out.is_empty() {
+                forget(&mut new, &mut touched);
+            }
+        } else {
+            let member = seeded.next(MEMBERS) as usize;
+            let record = !out.is_empty();
+            if record {
+                touched.insert(member);
+            }
+            let offset = seeded.next(LENGTH);
+            let len = 1 + seeded.next(300);
+            let site = LoopSite::LeafWrite;
+            match seeded.next(40) {
+                0 => {
+                    old[member].truncate(true).unwrap();
+                    new[member].truncate(record).unwrap();
+                }
+                1..=4 => {
+                    old[member].close(site, offset, true).unwrap();
+                    new[member].close(site, offset, record).unwrap();
+                }
+                5..=12 => {
+                    old[member].wrote_in_place(offset, len, true);
+                    new[member].wrote_in_place(offset, len, record);
+                }
+                _ => {
+                    let bytes = vec![seeded.next(256) as u8; len as usize];
+                    old[member].write(site, offset, &bytes, None, true).unwrap();
+                    new[member]
+                        .write(site, offset, &bytes, None, record)
+                        .unwrap();
+                }
+            }
+        }
+        for repair in &out {
+            for member in 0..MEMBERS as usize {
+                let mut ranges = repair.reads[member].clone();
+                let points: Vec<u64> = points(&old[member])
+                    .into_iter()
+                    .chain(points(&new[member]))
+                    .collect();
+                for _ in 0..8 {
+                    let start = points[seeded.next(points.len() as u64) as usize];
+                    let end = points[seeded.next(points.len() as u64) as usize];
+                    if start != end {
+                        ranges.push((start.min(end), start.max(end)));
+                    }
+                }
+                for (start, end) in ranges {
+                    let (old_seen, new_seen) = repair.seen[member];
+                    assert_eq!(
+                        old[member].changed_since(old_seen, start, end, true),
+                        new[member].changed_since(new_seen, start, end, true),
+                        "step {step}, member {member}, seen {new_seen:?}, {start}..{end}"
+                    );
+                    compared += 1;
+                }
+            }
+        }
+        old_peak = old_peak.max(held(&old));
+        new_peak = new_peak.max(held(&new));
+        if out.is_empty() {
+            assert_eq!(held(&new), 0, "step {step}: kept with no repair out");
+        }
+    }
+    out.clear();
+    forget(&mut new, &mut touched);
+    assert_eq!(held(&new), 0);
+    // Repairs lent, ranges compared, and the stretches each run kept at the
+    // end and at its most: always kept, then kept only while a repair is out.
+    assert_eq!(
+        (lent, compared, held(&old), old_peak, held(&new), new_peak),
+        (147, 31_706, 30, 106, 0, 19)
+    );
+}
+
 // The stretches stay disjoint and in order, a start over leaves one, and a
 // query reads only the stretches its range spans and the one before them.
 #[test]

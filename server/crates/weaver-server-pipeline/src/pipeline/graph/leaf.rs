@@ -562,12 +562,6 @@ impl Leaf {
         self.changed.insert(start, (self.revision, end));
     }
 
-    // Whether the leaf keeps a change for a repair's read to check.
-    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
-    pub fn keeps_changes(&self) -> bool {
-        !self.changed.is_empty()
-    }
-
     // No repair's read is left to check: what the leaf kept for one goes.
     pub(crate) fn forget_changes(&mut self) {
         self.changed.clear();
