@@ -1944,6 +1944,17 @@ impl NamespaceWriter {
                     tree.with_recovery(set, |recovery, _| recovery.feed(member, evidence));
                 }
             }
+            // A member one of the object's sets gave to another of them is
+            // said again for the set that has it now.
+            let mut unfed = Vec::new();
+            tree.with_recovery(set, |recovery, _| recovery.unfed(&mut unfed));
+            for member in unfed {
+                self.early_evidence(tree, segments, node, member);
+                let evidence = &self.segments;
+                if !evidence.is_empty() {
+                    tree.with_recovery(set, |recovery, _| recovery.feed(member, evidence));
+                }
+            }
         }
         // A member a set renamed in its namespace wants that name now; the
         // tree's ledger places it, and the claims the name makes again,

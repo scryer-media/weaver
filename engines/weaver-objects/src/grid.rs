@@ -19,18 +19,25 @@
 
 use std::collections::BTreeMap;
 
-use serde::{Deserialize, Serialize};
+use serde::de::{MapAccess, SeqAccess, Visitor};
+use serde::ser::SerializeTuple;
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use weaver_graph::{ByteRange, Give, MemberId, Segment, Shelf, SliceVerdict, Take};
 
 // A run is folded eagerly inside its block, so ordered traffic needs one per
-// grid, and these bounds only bite on pathological interleavings. They bound
-// the runs a grid holds past what ordered traffic leaves: a whole member's
-// grid holding one run from its start, as every member read in order ends
-// with, counts against none of them.
+// grid, and the pending bounds only bite on pathological interleavings.
+// They bound the runs a grid holds past what ordered traffic leaves: a
+// whole member's grid holding one run from its start, as every member read
+// in order ends with, counts against none of them.
 pub(crate) const MAX_PENDING_RUNS_PER_FILE: usize = 4096;
-const MAX_DERIVED_BLOCKS_PER_FILE: usize = 16_384;
 const MAX_PENDING_RUNS_PER_JOB: usize = 16_384;
-const MAX_DERIVED_BLOCKS_PER_JOB: usize = 65_536;
+// A block closed by one run over its full extent is what every slice read
+// in order ends as, so these bound what a job's sets may describe, not an
+// interleaving: one member may hold every slice a PAR2 set may have, and
+// one object every slice a set may track, across all its sets. A closed
+// block is kept as its CRC32 and two bits.
+pub(crate) const MAX_DERIVED_BLOCKS_PER_FILE: usize = 32_768;
+const MAX_DERIVED_BLOCKS_PER_JOB: usize = 1_048_576;
 
 // The block size of the grid whose one block is the whole member.
 pub(crate) const WHOLE: u64 = u64::MAX;
@@ -147,11 +154,158 @@ const BLOCKS_PER_CHUNK: u64 = 16;
 
 type Block = BTreeMap<u64, Run>;
 
+// One chunk of a member's grid. A block closed by one run over its full
+// extent, as every slice read in order ends, is kept as a bit, its CRC32
+// and whether it was verified: its range is its place. Every other block
+// keeps its runs, keyed by their start.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct Chunk {
+    // One bit per block of the chunk, by its place in it.
+    closed: u16,
+    verified: u16,
+    // The closed blocks' CRC32s, in place order.
+    crcs: Vec<u32>,
+    open: BTreeMap<u64, Block>,
+}
+
+impl Chunk {
+    // The block's place in its chunk. `None` past the last chunk, which
+    // blocks of many places share: they stay open.
+    fn place(index: u64) -> Option<u32> {
+        (index / BLOCKS_PER_CHUNK < u64::from(u32::MAX))
+            .then_some((index % BLOCKS_PER_CHUNK) as u32)
+    }
+
+    fn is_empty(&self) -> bool {
+        self.closed == 0 && self.open.is_empty()
+    }
+
+    // Where a closed block's CRC32 lies among the chunk's.
+    fn at(&self, place: u32) -> usize {
+        (self.closed & ((1u16 << place) - 1)).count_ones() as usize
+    }
+
+    // The one run of a closed block.
+    fn closed(&self, index: u64, block_size: u64) -> Option<Run> {
+        let place = Self::place(index)?;
+        (self.closed >> place & 1 == 1).then(|| Run {
+            range: block_bounds(index, block_size),
+            crc32: self.crcs[self.at(place)],
+            verified: self.verified >> place & 1 == 1,
+        })
+    }
+
+    // The block's runs, taken out of the chunk.
+    fn take(&mut self, index: u64, block_size: u64) -> Block {
+        let Some(run) = self.closed(index, block_size) else {
+            return self.open.remove(&index).unwrap_or_default();
+        };
+        if let Some(place) = Self::place(index) {
+            self.crcs.remove(self.at(place));
+            self.closed &= !(1 << place);
+            self.verified &= !(1 << place);
+        }
+        Block::from([(run.range.start, run)])
+    }
+
+    // The block's runs, put back: nothing when it has none.
+    fn put(&mut self, index: u64, block_size: u64, block: Block) {
+        let whole = block
+            .values()
+            .next()
+            .filter(|run| block.len() == 1 && run.range == block_bounds(index, block_size));
+        match (whole, Self::place(index)) {
+            (Some(run), Some(place)) => {
+                self.crcs.insert(self.at(place), run.crc32);
+                self.closed |= 1 << place;
+                self.verified |= u16::from(run.verified) << place;
+            }
+            _ if block.is_empty() => {}
+            _ => {
+                self.open.insert(index, block);
+            }
+        }
+    }
+
+    // Every block of chunk `number`, in index order.
+    fn each(&self, number: u32, block_size: u64, mut each: impl FnMut(u64, &Block)) {
+        let first = u64::from(number) * BLOCKS_PER_CHUNK;
+        let closed = (0..BLOCKS_PER_CHUNK)
+            .map(|place| first + place)
+            .filter_map(|index| Some((index, self.closed(index, block_size)?)))
+            .map(|(index, run)| (index, Block::from([(run.range.start, run)])));
+        let mut blocks: Vec<(u64, std::borrow::Cow<'_, Block>)> = closed
+            .map(|(index, block)| (index, std::borrow::Cow::Owned(block)))
+            .chain(
+                self.open
+                    .iter()
+                    .map(|(index, block)| (*index, std::borrow::Cow::Borrowed(block))),
+            )
+            .collect();
+        blocks.sort_unstable_by_key(|(index, _)| *index);
+        for (index, block) in &blocks {
+            each(*index, block);
+        }
+    }
+}
+
+// Four values in a row. A chunk written before closed blocks were kept
+// apart is a map of its blocks, and reads as one with every block open.
+impl Serialize for Chunk {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut row = serializer.serialize_tuple(4)?;
+        row.serialize_element(&self.closed)?;
+        row.serialize_element(&self.verified)?;
+        row.serialize_element(&self.crcs)?;
+        row.serialize_element(&self.open)?;
+        row.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for Chunk {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Read;
+
+        impl<'de> Visitor<'de> for Read {
+            type Value = Chunk;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a chunk of a checksum grid")
+            }
+
+            fn visit_seq<A: SeqAccess<'de>>(self, mut row: A) -> Result<Chunk, A::Error> {
+                let short = |at| serde::de::Error::invalid_length(at, &"four values");
+                let chunk = Chunk {
+                    closed: row.next_element()?.ok_or_else(|| short(0))?,
+                    verified: row.next_element()?.ok_or_else(|| short(1))?,
+                    crcs: row.next_element()?.ok_or_else(|| short(2))?,
+                    open: row.next_element()?.ok_or_else(|| short(3))?,
+                };
+                if chunk.crcs.len() != chunk.closed.count_ones() as usize
+                    || chunk.verified & !chunk.closed != 0
+                {
+                    return Err(serde::de::Error::custom("a chunk's closed blocks disagree"));
+                }
+                Ok(chunk)
+            }
+
+            fn visit_map<A: MapAccess<'de>>(self, mut blocks: A) -> Result<Chunk, A::Error> {
+                let mut chunk = Chunk::default();
+                while let Some((index, block)) = blocks.next_entry::<u64, Block>()? {
+                    chunk.open.insert(index, block);
+                }
+                Ok(chunk)
+            }
+        }
+
+        deserializer.deserialize_any(Read)
+    }
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 struct FileGrid {
-    // Runs per block index, keyed by their start, the blocks shelved by
-    // chunk.
-    blocks: Shelf<BTreeMap<u64, Block>>,
+    // The blocks, shelved by chunk.
+    blocks: Shelf<Chunk>,
     load: Load,
     // A whole member's grid went over a budget and its runs were forgotten,
     // so a fold was thrown away: a note, kept until the member is
@@ -169,22 +323,60 @@ impl FileGrid {
         u32::try_from(index / BLOCKS_PER_CHUNK).unwrap_or(u32::MAX)
     }
 
-    fn block(&self, index: u64) -> Option<&Block> {
-        self.blocks.get(Self::chunk(index))?.get(&index)
+    // What the block's runs fold to over `range`.
+    fn fold(&self, index: u64, block_size: u64, range: ByteRange) -> Option<Folded> {
+        let chunk = self.blocks.get(Self::chunk(index))?;
+        match chunk.closed(index, block_size) {
+            Some(run) => fold_tiling(std::iter::once(&run), range),
+            None => fold_tiling(chunk.open.get(&index)?.values(), range),
+        }
+    }
+
+    // Whether the block holds a run `range` overlaps.
+    fn overlaps(&self, index: u64, block_size: u64, range: ByteRange) -> bool {
+        self.blocks.get(Self::chunk(index)).is_some_and(|chunk| {
+            match chunk.closed(index, block_size) {
+                Some(run) => run.range.intersect(range).is_some(),
+                None => chunk
+                    .open
+                    .get(&index)
+                    .is_some_and(|block| overlapping(block, range).next().is_some()),
+            }
+        })
     }
 
     // Change one block, made empty first if the grid has none; an emptied
     // block is dropped.
-    fn change<R>(&mut self, index: u64, change: impl FnOnce(&mut Block) -> R) -> R {
+    fn change<R>(
+        &mut self,
+        index: u64,
+        block_size: u64,
+        change: impl FnOnce(&mut Block) -> R,
+    ) -> R {
         self.blocks
-            .change(Self::chunk(index), BTreeMap::is_empty, |blocks| {
-                let block = blocks.entry(index).or_default();
-                let out = change(block);
-                if block.is_empty() {
-                    blocks.remove(&index);
-                }
+            .change(Self::chunk(index), Chunk::is_empty, |chunk| {
+                let mut block = chunk.take(index, block_size);
+                let out = change(&mut block);
+                chunk.put(index, block_size, block);
                 out
             })
+    }
+
+    // Every block, in index order.
+    fn each(&self, block_size: u64, mut each: impl FnMut(u64, &Block)) {
+        for (number, chunk) in self.blocks.chunks() {
+            chunk.each(number, block_size, &mut each);
+        }
+    }
+
+    // The block's runs, as they would be were none kept apart.
+    #[cfg(test)]
+    fn block(&self, index: u64, block_size: u64) -> Option<Block> {
+        let chunk = self.blocks.get(Self::chunk(index))?;
+        match chunk.closed(index, block_size) {
+            Some(run) => Some(Block::from([(run.range.start, run)])),
+            None => chunk.open.get(&index).cloned(),
+        }
     }
 
     #[cfg(test)]
@@ -214,12 +406,11 @@ impl Grid {
         self.load = Load::default();
         for (&(_, block_size), file) in &mut self.files {
             give.shelf(&mut file.blocks)?;
-            file.load = Load::default();
-            for (_, blocks) in file.blocks.chunks() {
-                for (&index, block) in blocks {
-                    file.load.add(Load::of(block, index, block_size));
-                }
-            }
+            let mut load = Load::default();
+            file.each(block_size, |index, block| {
+                load.add(Load::of(block, index, block_size));
+            });
+            file.load = load;
             self.load.add(file.load);
         }
         Ok(())
@@ -254,11 +445,8 @@ impl Grid {
         let last = (segment.range.end - 1) / block_size;
         let file = self.files.entry((member, block_size)).or_default();
         for index in first..=last {
-            let overlaps = file
-                .block(index)
-                .is_some_and(|block| overlapping(block, segment.range).next().is_some());
-            if overlaps {
-                let (before, after) = file.change(index, |block| {
+            if file.overlaps(index, block_size, segment.range) {
+                let (before, after) = file.change(index, block_size, |block| {
                     let before = Load::of(block, index, block_size);
                     remove_overlapping(block, segment.range);
                     (before, Load::of(block, index, block_size))
@@ -280,7 +468,7 @@ impl Grid {
             return;
         }
         let file = self.files.entry((member, block_size)).or_default();
-        let (before, after) = file.change(first, |block| {
+        let (before, after) = file.change(first, block_size, |block| {
             let before = Load::of(block, first, block_size);
             // A run the segment overlaps can only be one this delivery just
             // recorded, as the delivery superseded its whole range first. Two
@@ -314,7 +502,7 @@ impl Grid {
         // Over budget: the block is forgotten, so its slice is read back, and
         // later segments are recorded on it again. A whole member's grid
         // keeps a note that its fold was thrown away.
-        file.change(first, Block::clear);
+        file.change(first, block_size, Block::clear);
         file.load.sub(before);
         self.load.sub(before);
         if block_size == WHOLE {
@@ -343,8 +531,9 @@ impl Grid {
         index: u64,
         range: ByteRange,
     ) -> Option<Folded> {
-        let block = self.files.get(&(member, block_size))?.block(index)?;
-        fold_tiling(block.values(), range)
+        self.files
+            .get(&(member, block_size))?
+            .fold(index, block_size, range)
     }
 
     // A replay can retain a ruling only where the retained evidence proves
@@ -383,6 +572,14 @@ impl Grid {
             }
         }
         true
+    }
+
+    // The block sizes of the grids kept for the member, smallest first.
+    pub(crate) fn sizes(&self, member: MemberId) -> Vec<u64> {
+        self.files
+            .range((member, 0)..=(member, u64::MAX))
+            .map(|(key, _)| key.1)
+            .collect()
     }
 
     pub(crate) fn forget(&mut self, member: MemberId) {

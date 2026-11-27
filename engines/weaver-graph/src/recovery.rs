@@ -285,6 +285,12 @@ pub trait Recovery {
         self.feed(member, segments);
     }
 
+    // Covered members whose evidence the object wants said again, each
+    // once: one of its sets gave them to another, which holds nothing of
+    // what arrived before. The namespace asks after every bind and feeds
+    // each what its source still keeps.
+    fn unfed(&mut self, _out: &mut Vec<MemberId>) {}
+
     // The block sizes at whose boundaries `feed`'s checksums have to be cut
     // for this object to vouch for a block without reading it back. A
     // source that cuts its checksums there, as the article decoder can,

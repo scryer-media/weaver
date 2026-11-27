@@ -193,13 +193,13 @@ fn supersede_by_scan(grid: &mut Grid, member: MemberId, block_size: u64, segment
     let last = (segment.range.end - 1) / block_size;
     let file = grid.files.entry((member, block_size)).or_default();
     for index in first..=last {
-        let overlaps = file.block(index).is_some_and(|block| {
+        let overlaps = file.block(index, block_size).is_some_and(|block| {
             block
                 .values()
                 .any(|run| run.range.intersect(segment.range).is_some())
         });
         if overlaps {
-            let (before, after) = file.change(index, |block| {
+            let (before, after) = file.change(index, block_size, |block| {
                 let before = Load::of(block, index, block_size);
                 block.retain(|_, run| run.range.intersect(segment.range).is_none());
                 (before, Load::of(block, index, block_size))
@@ -225,7 +225,7 @@ fn offer_by_scan(grid: &mut Grid, member: MemberId, block_size: u64, segments: &
 fn state(grid: &Grid, block_size: u64, length: u64) -> (Vec<Option<Block>>, Load, Load) {
     let file = grid.files.get(&(MEMBER, block_size));
     let blocks = (0..=length / block_size.min(length))
-        .map(|index| file.and_then(|file| file.block(index)).cloned())
+        .map(|index| file.and_then(|file| file.block(index, block_size)))
         .collect();
     (
         blocks,
@@ -271,8 +271,8 @@ fn overlapping_pieces_of_one_delivery_leave_their_stretch_unproven() {
         let mut grid = Grid::default();
         grid.offer_all(MEMBER, block_size, &[piece(0, 600), piece(400, 1024)]);
         let file = &grid.files[&(MEMBER, block_size)];
-        assert!(file.block(0).is_none_or(|block| {
-            overlapping(block, ByteRange::new(400, 600))
+        assert!(file.block(0, block_size).is_none_or(|block| {
+            overlapping(&block, ByteRange::new(400, 600))
                 .next()
                 .is_none()
         }));
@@ -350,11 +350,9 @@ fn load_before(block: &Block, bounds: ByteRange) -> Load {
 fn counted(grid: &Grid, count: impl Fn(&Block, u64, u64) -> Load) -> Load {
     let mut load = Load::default();
     for (&(_, block_size), file) in &grid.files {
-        for (_, blocks) in file.blocks.chunks() {
-            for (&index, block) in blocks {
-                load.add(count(block, index, block_size));
-            }
-        }
+        file.each(block_size, |index, block| {
+            load.add(count(block, index, block_size));
+        });
     }
     load
 }
@@ -599,13 +597,19 @@ fn a_small_block_grid_past_its_run_bound_forgets_only_that_block() {
         assert!(at <= MAX_PENDING_RUNS_PER_FILE as u64, "the bound holds");
         grid.offer(MEMBER, BLOCK, &piece(at));
         counts_as_before(&grid);
-        if grid.files[&(MEMBER, BLOCK)].block(0).is_none() {
+        if grid.files[&(MEMBER, BLOCK)].block(0, BLOCK).is_none() {
             break;
         }
     }
     let file = &grid.files[&(MEMBER, BLOCK)];
-    assert!(file.block(0).is_none(), "the block over the bound goes");
-    assert!(file.block(2).is_some(), "another block keeps its runs");
+    assert!(
+        file.block(0, BLOCK).is_none(),
+        "the block over the bound goes"
+    );
+    assert!(
+        file.block(2, BLOCK).is_some(),
+        "another block keeps its runs"
+    );
     assert!(!grid.dropped(MEMBER, BLOCK));
     // Block 1 read in order, and the rest of block 2.
     for range in [block(1), ByteRange::new(half.end, block(2).end)] {
@@ -654,4 +658,160 @@ fn a_grid_from_facts_without_the_mark_is_not_dropped() {
     let grid: Grid = rmp_serde::from_slice(&bytes).expect("decodes");
     assert!(grid.files.contains_key(&(MEMBER, WHOLE)));
     assert!(!grid.dropped(MEMBER, WHOLE));
+}
+
+// A block read in order ends as one run over its extent, kept as a bit and
+// a CRC32: it folds as the run did, verified or not, and a piece said over
+// it again opens it.
+#[test]
+fn a_closed_block_folds_as_its_one_run_did() {
+    const BLOCK: u64 = 64;
+    let bytes = payload(31, 64 * 40);
+    let mut grid = Grid::default();
+    for (index, piece) in bytes.chunks(BLOCK as usize).enumerate() {
+        let start = index as u64 * BLOCK;
+        grid.offer(
+            MEMBER,
+            BLOCK,
+            &Segment {
+                range: ByteRange::new(start, start + BLOCK),
+                crc32: crc32(piece),
+                verified: !index.is_multiple_of(3),
+            },
+        );
+    }
+    let file = &grid.files[&(MEMBER, BLOCK)];
+    for (_, chunk) in file.blocks.chunks() {
+        assert!(chunk.open.is_empty(), "every block is closed");
+    }
+    assert_eq!(
+        file.load,
+        Load {
+            pending: 0,
+            derived: 40
+        }
+    );
+    for (index, piece) in bytes.chunks(BLOCK as usize).enumerate() {
+        let index = index as u64;
+        assert_eq!(
+            grid.fold(MEMBER, BLOCK, index, block_bounds(index, BLOCK)),
+            Some(Folded {
+                crc32: crc32(piece),
+                verified: !index.is_multiple_of(3),
+            })
+        );
+    }
+    let kept = round_trip(&grid);
+    assert_eq!(kept.load, grid.load);
+    assert_eq!(
+        kept.fold(MEMBER, BLOCK, 17, block_bounds(17, BLOCK)),
+        grid.fold(MEMBER, BLOCK, 17, block_bounds(17, BLOCK))
+    );
+    // Half of block 17 said again: the block is open, and unproven.
+    let half = ByteRange::new(17 * BLOCK, 17 * BLOCK + 32);
+    grid.offer(
+        MEMBER,
+        BLOCK,
+        &Segment {
+            range: half,
+            crc32: crc32(&bytes[17 * 64..17 * 64 + 32]),
+            verified: true,
+        },
+    );
+    assert_eq!(grid.fold(MEMBER, BLOCK, 17, block_bounds(17, BLOCK)), None);
+    assert_eq!(
+        grid.files[&(MEMBER, BLOCK)].load,
+        Load {
+            pending: 1,
+            derived: 39
+        }
+    );
+    assert_eq!(grid.load, counted(&grid, Load::of));
+}
+
+// A chunk written before closed blocks were kept apart is a map of its
+// blocks. It reads as one, folds as it did, and closes its blocks as they
+// next change.
+#[test]
+fn a_chunk_written_as_a_map_of_blocks_reads_as_it_was() {
+    const BLOCK: u64 = 64;
+    let run = |index: u64, verified| Run {
+        range: block_bounds(index, BLOCK),
+        crc32: index as u32 + 7,
+        verified,
+    };
+    let before: BTreeMap<u64, Block> = BTreeMap::from([
+        (0, Block::from([(0, run(0, true))])),
+        (1, Block::from([(64, run(1, false))])),
+        (
+            2,
+            Block::from([(
+                128,
+                Run {
+                    range: ByteRange::new(128, 150),
+                    crc32: 3,
+                    verified: true,
+                },
+            )]),
+        ),
+    ]);
+    let bytes = rmp_serde::to_vec(&before).expect("encodes");
+    let mut chunk: Chunk = rmp_serde::from_slice(&bytes).expect("decodes");
+    assert_eq!(chunk.open, before);
+    assert_eq!(chunk.closed, 0);
+    for index in 0..3 {
+        let block = chunk.take(index, BLOCK);
+        assert_eq!(block, before[&index]);
+        chunk.put(index, BLOCK, block);
+    }
+    assert_eq!((chunk.closed, chunk.verified), (0b011, 0b001));
+    assert_eq!(chunk.crcs, vec![7, 8]);
+    assert_eq!(chunk.open.keys().copied().collect::<Vec<_>>(), vec![2]);
+    let again: Chunk =
+        rmp_serde::from_slice(&rmp_serde::to_vec(&chunk).expect("encodes")).expect("decodes");
+    assert_eq!(again, chunk);
+    // Closed blocks that disagree with their CRC32s are refused, not read.
+    let wrong = rmp_serde::to_vec(&(0b11u16, 0u16, vec![1u32], BTreeMap::<u64, Block>::new()))
+        .expect("encodes");
+    assert!(rmp_serde::from_slice::<Chunk>(&wrong).is_err());
+}
+
+// One member may hold every slice a PAR2 set may have, and one object every
+// slice of many such sets: each finished slice still folds.
+#[test]
+fn every_finished_slice_of_many_full_sets_is_kept() {
+    const BLOCK: u64 = 4;
+    const MEMBERS: u32 = 3;
+    let mut grid = Grid::default();
+    for member in 0..MEMBERS {
+        for index in 0..MAX_DERIVED_BLOCKS_PER_FILE as u64 {
+            grid.offer(
+                MemberId(member),
+                BLOCK,
+                &Segment {
+                    range: block_bounds(index, BLOCK),
+                    crc32: index as u32,
+                    verified: true,
+                },
+            );
+        }
+    }
+    assert_eq!(
+        grid.load,
+        Load {
+            pending: 0,
+            derived: MEMBERS as usize * MAX_DERIVED_BLOCKS_PER_FILE,
+        }
+    );
+    for member in 0..MEMBERS {
+        for index in [0, 16_384, MAX_DERIVED_BLOCKS_PER_FILE as u64 - 1] {
+            assert_eq!(
+                grid.fold(MemberId(member), BLOCK, index, block_bounds(index, BLOCK)),
+                Some(Folded {
+                    crc32: index as u32,
+                    verified: true,
+                })
+            );
+        }
+    }
 }
