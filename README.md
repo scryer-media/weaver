@@ -23,7 +23,7 @@
 </p>
 
 <p align="center">
-  <a href="https://www.scryer.media/weaver/"><img src="docs/img/weaver-overview-0-12.webp" alt="Weaver web interface" width="800" /></a>
+  <a href="https://www.scryer.media/weaver/"><img src="docs/img/weaver-download-queue.png" alt="Weaver’s download queue in Light and Graphite, with active Usenet downloads and seeding torrents" width="800" /></a>
 </p>
 
 ## What is Weaver?
@@ -48,7 +48,7 @@ Weaver runs a highly efficient pipeline that not only unpacks archives while dow
 ## Advanced Networking
 Weaver has an incredibly powerful networking sub system. It enables you to compose different building blocks into highly sophisticated netflows to ensure you're maximizing your bandwidth and privacy.
 
-![advanced networking overview picture](docs/img/networking.png)
+![Weaver’s network flow highlighting a Usenet route and a private tracker route with their DNS paths](docs/img/weaver-network-flow.webp)
 
 ### Features
 - **Multiple interface support** (have two ISPs? one Weaver can max them both!)
