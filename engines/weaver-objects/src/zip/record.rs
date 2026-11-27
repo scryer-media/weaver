@@ -5,9 +5,11 @@
 // data is its member's bytes. Each member closes once its whole extent is
 // covered, and its CRC32 is folded as its bytes pass, so a checksum that
 // fails marks the member's extent damaged for the recovery beside it. A
-// member whose CRC the grid stopped folding, past its budget, closes on its
-// coverage, encrypted or not, and is asked for nothing again: its checksum
-// is judged where the member closes, against the one the directory said.
+// member whose fold the grid threw away, past its budget, closes on its
+// coverage while the fold is missing, encrypted or not, and is asked for
+// nothing again: its checksum is judged where the member closes, against
+// the one the directory said. Its bytes said again in order fold once more
+// and are judged as any member's are.
 // Data that arrived before its header placed it, in a range the object kept
 // to read the directory, is said from what was kept.
 
@@ -226,7 +228,7 @@ impl Zip {
         };
         said.coverage.write(range, provenance);
         if !retry
-            && (!encrypted || verdict == SliceVerdict::Intact || dropped)
+            && (!encrypted || verdict == SliceVerdict::Intact || (dropped && folded.is_none()))
             && !said.closed
             && said.coverage.covered(whole)
         {

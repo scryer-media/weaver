@@ -2162,3 +2162,90 @@ fn an_encrypted_member_past_its_run_bound_closes_on_coverage() {
     assert!(owner.emitted >= plain.len() as u64);
     assert_eq!(owner.unproven, 0);
 }
+
+// An encrypted member whose fold is thrown away past the job's run budget,
+// each piece of it over the budget once a damaged frame splits its runs,
+// closes on its coverage and asks for nothing again. Said again in order
+// with the budget free and a byte of its ciphertext changed, it folds once
+// more and is judged on its checksum: damaged.
+#[test]
+fn an_encrypted_member_dropped_then_said_again_in_order_is_judged_on_its_checksum() {
+    use weaver_graph::{Object, Provenance, Segment, VolumeIndex};
+    let plain = payload(94, 9_000);
+    let archive = encrypted(&plain);
+    let length = archive.len() as u64;
+    let mut owner = Owner::single(Zip::new(), archive.clone());
+    // Only what is delivered here arrives.
+    owner.pull = Pull::Moved(0);
+    // Other members' runs apart, as many as the job's pending budget holds.
+    for other in 1..=4 {
+        for at in 0..4096 {
+            owner.object.grid.offer(
+                MemberId(other),
+                crate::grid::WHOLE,
+                &Segment {
+                    range: ByteRange::at(at * 2, 1),
+                    crc32: 0,
+                    verified: true,
+                },
+            );
+        }
+    }
+    assert!(!owner.object.grid.dropped(MemberId(4), crate::grid::WHOLE));
+    offer(&mut owner, PASSWORD);
+    owner.deliver(0, ByteRange::new(0, 4096));
+    owner.deliver_as(0, ByteRange::new(4096, 8192), Provenance::Damaged, None);
+    owner.deliver(0, ByteRange::new(8192, length));
+    assert!(owner.object.grid.dropped(MemberId(0), crate::grid::WHOLE));
+    let whole = ByteRange::new(0, plain.len() as u64);
+    assert_eq!(
+        owner
+            .object
+            .grid
+            .fold(MemberId(0), crate::grid::WHOLE, 0, whole),
+        None
+    );
+    let got = owner.member("alpha.bin");
+    assert!(got.closed);
+    assert!(got.bytes == plain);
+    let again = |owner: &Owner| {
+        owner
+            .said
+            .iter()
+            .any(|emit| matches!(emit, Emit::Again { .. }))
+    };
+    assert!(!again(&owner));
+    // The budget freed, the volume said again in order with one byte of the
+    // member's ciphertext changed.
+    for other in 1..=4 {
+        owner.object.grid.forget(MemberId(other));
+    }
+    let mut changed = archive.clone();
+    changed[5000] ^= 0x5a;
+    owner.said.clear();
+    owner
+        .object
+        .unposted(VolumeIndex(0), ByteRange::new(0, length));
+    owner.deliver_as(
+        0,
+        ByteRange::new(0, length),
+        Provenance::Fresh,
+        Some(&changed),
+    );
+    assert!(owner.object.grid.dropped(MemberId(0), crate::grid::WHOLE));
+    assert!(
+        owner
+            .said
+            .iter()
+            .any(|emit| matches!(emit, Emit::Damaged { .. })),
+        "{:?}",
+        owner.said
+    );
+    // One password offered: no other candidate to retry, so the damage
+    // stands and a password is asked for, a failed check over verified
+    // bytes doubting the one in use; nothing closes on damage, as for any
+    // encrypted member.
+    assert_eq!(owner.said.len(), 2, "{:?}", owner.said);
+    assert_eq!(owner.said[0], Emit::NeedsPassword);
+    assert!(!again(&owner));
+}

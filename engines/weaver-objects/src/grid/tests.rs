@@ -482,54 +482,62 @@ fn a_restored_grid_counts_its_loads_again() {
     assert_eq!(restored.load, counted(&restored, Load::of));
 }
 
-// A whole member's grid past its run bound is dropped: it records nothing
-// more and holds no load, a restart keeps it dropped, and only forgetting
-// the member clears it.
+// A whole member's grid past its run bound is marked dropped and its runs
+// are forgotten; the mark is a note only. Its bytes said again in order are
+// recorded and fold, the mark stays through a restart, and only forgetting
+// the member clears it. Its loads are what its blocks count at every step,
+// as they were before the mark was kept.
 #[test]
-fn a_grid_past_its_run_bound_stays_dropped_until_forgotten() {
+fn a_whole_grid_past_its_run_bound_keeps_the_mark_and_records_again() {
     let block = WHOLE;
     let piece = |at: u64| Segment {
         range: ByteRange::at(at * 2, 1),
         crc32: 0,
         verified: true,
     };
+    let counts = |grid: &Grid| {
+        let blocks = counted(grid, Load::of);
+        assert_eq!(grid.load, blocks);
+        assert_eq!(
+            grid.files.get(&(MEMBER, block)).map(|file| file.load),
+            Some(blocks)
+        );
+    };
     let mut grid = Grid::default();
     for at in 0..MAX_PENDING_RUNS_PER_FILE as u64 {
         grid.offer(MEMBER, block, &piece(at));
+        counts(&grid);
     }
     assert!(!grid.dropped(MEMBER, block));
     grid.offer(MEMBER, block, &piece(MAX_PENDING_RUNS_PER_FILE as u64));
+    counts(&grid);
     assert!(grid.dropped(MEMBER, block));
-    let bytes = payload(11, 1000);
-    for segment in segments(0, &bytes, 1000, 1000, true) {
-        grid.offer(MEMBER, block, &segment);
-    }
-    let file = &grid.files[&(MEMBER, block)];
-    assert!(file.is_empty());
-    assert_eq!(file.load, Load::default());
+    assert!(grid.files[&(MEMBER, block)].is_empty());
     assert_eq!(grid.load, Load::default());
-    assert_eq!(grid.fold(MEMBER, block, 0, ByteRange::new(0, 1000)), None);
+    let bytes = payload(11, 1000);
+    let whole = ByteRange::new(0, 1000);
+    let folded = Some(Folded {
+        crc32: crc32(&bytes),
+        verified: true,
+    });
+    for segment in segments(0, &bytes, 300, 1000, true) {
+        grid.offer(MEMBER, block, &segment);
+        counts(&grid);
+    }
+    assert_eq!(grid.fold(MEMBER, block, 0, whole), folded);
+    assert!(grid.dropped(MEMBER, block));
     let mut restored = round_trip(&grid);
     assert!(restored.dropped(MEMBER, block));
-    for segment in segments(0, &bytes, 1000, 1000, true) {
-        restored.offer(MEMBER, block, &segment);
-    }
-    assert_eq!(
-        restored.fold(MEMBER, block, 0, ByteRange::new(0, 1000)),
-        None
-    );
+    assert_eq!(restored.fold(MEMBER, block, 0, whole), folded);
+    counts(&restored);
     restored.forget(MEMBER);
     assert!(!restored.dropped(MEMBER, block));
-    for segment in segments(0, &bytes, 1000, 1000, true) {
+    for segment in segments(0, &bytes, 300, 1000, true) {
         restored.offer(MEMBER, block, &segment);
+        counts(&restored);
     }
-    assert_eq!(
-        restored.fold(MEMBER, block, 0, ByteRange::new(0, 1000)),
-        Some(Folded {
-            crc32: crc32(&bytes),
-            verified: true,
-        })
-    );
+    assert_eq!(restored.fold(MEMBER, block, 0, whole), folded);
+    assert!(!restored.dropped(MEMBER, block));
 }
 
 // A grid of small blocks with one block past the member's run bound forgets

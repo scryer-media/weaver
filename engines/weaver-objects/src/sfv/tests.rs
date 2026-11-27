@@ -290,6 +290,43 @@ fn sfv_reports_a_damaged_member_and_never_repairs() {
     assert_eq!(job.store.writes, 0);
 }
 
+// A member whose grid went past its run bound, then fed again in order,
+// is judged as a member fed only in order is: whole and unread, or damaged.
+#[test]
+fn a_member_past_its_run_bound_fed_again_in_order_is_judged_as_any() {
+    let one = payload(17, 9000);
+    let mut changed = one.clone();
+    changed[4000] ^= 0x5a;
+    for bytes in [&one, &changed] {
+        let ruled = |dropped: bool| {
+            let mut job = job(&sfv_text(&[("one.bin", crc32(&one))]));
+            let member = job.member("one.bin", bytes);
+            bind(&mut job);
+            if dropped {
+                for at in 0..=4096 {
+                    job.object.feed(
+                        member,
+                        &[Segment {
+                            range: ByteRange::at(at * 2, 1),
+                            crc32: 0,
+                            verified: true,
+                        }],
+                    );
+                }
+                assert!(job.object.grid.dropped(member, WHOLE));
+            }
+            job.object.feed(member, &segments(0, bytes, 700, 700, true));
+            let mut verdicts = Vec::new();
+            job.object.verdicts(member, &mut verdicts);
+            let outcome = job
+                .object
+                .repair(&mut job.store, weaver_graph::Budget::default());
+            (verdicts, outcome, job.store.reads)
+        };
+        assert_eq!(ruled(true), ruled(false));
+    }
+}
+
 // A member past READ_CHUNK, its segments unproven, is read back in
 // several pieces whose CRC32s combine; one changed byte in its last piece
 // is found.

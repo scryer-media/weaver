@@ -153,11 +153,11 @@ struct FileGrid {
     // chunk.
     blocks: Shelf<BTreeMap<u64, Block>>,
     load: Load,
-    // A whole member's grid went over a budget and was forgotten: nothing
-    // more is recorded on it until its member is forgotten. Never set on a
-    // grid of smaller blocks, which forgets only the block over budget and
-    // goes on recording the others. Absent from facts written before it was
-    // kept, which read as not dropped.
+    // A whole member's grid went over a budget and its runs were forgotten,
+    // so a fold was thrown away: a note, kept until the member is
+    // forgotten. The grid goes on recording as any other. Never set on a
+    // grid of smaller blocks. Absent from facts written before it was kept,
+    // which read as not dropped.
     #[serde(default)]
     dropped: bool,
 }
@@ -280,9 +280,6 @@ impl Grid {
             return;
         }
         let file = self.files.entry((member, block_size)).or_default();
-        if block_size == WHOLE && file.dropped {
-            return;
-        }
         let (before, after) = file.change(first, |block| {
             let before = Load::of(block, first, block_size);
             // A run the segment overlaps can only be one this delivery just
@@ -314,9 +311,9 @@ impl Grid {
             self.load = job_load;
             return;
         }
-        // Over budget: the block is forgotten, so its slice is read back. A
-        // whole member's grid records nothing more; a grid of smaller blocks
-        // goes on recording its other blocks, and this one again.
+        // Over budget: the block is forgotten, so its slice is read back, and
+        // later segments are recorded on it again. A whole member's grid
+        // keeps a note that its fold was thrown away.
         file.change(first, Block::clear);
         file.load.sub(before);
         self.load.sub(before);
@@ -325,9 +322,9 @@ impl Grid {
         }
     }
 
-    // Whether the member's whole grid went over a budget and records
-    // nothing until the member is forgotten. Never for a grid of smaller
-    // blocks, which is never dropped whole.
+    // Whether the member's whole grid went over a budget since the member
+    // was last forgotten, so a fold of it was thrown away; it records again
+    // all the same. Never for a grid of smaller blocks.
     pub(crate) fn dropped(&self, member: MemberId, block_size: u64) -> bool {
         block_size == WHOLE
             && self
