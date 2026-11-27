@@ -308,9 +308,8 @@
     },
     {
       "name": "setQueueItemsCategory",
-      "owner": "duplicate-and-queue-policy",
-      "oracle": "unit-only",
-      "rationale": "The release flow asserts individual queue controls; the server API tests cover this batch by ids and by selection, and no release spec calls it."
+      "owner": "torrents",
+      "oracle": "api-metrics"
     },
     {
       "name": "setQueueItemsPriority",
@@ -829,21 +828,6 @@
       "oracle": "browser"
     },
     {
-      "name": "pauseTorrent",
-      "owner": "torrents",
-      "oracle": "api-metrics"
-    },
-    {
-      "name": "resumeTorrent",
-      "owner": "torrents",
-      "oracle": "api-metrics"
-    },
-    {
-      "name": "setTorrentCategory",
-      "owner": "torrents",
-      "oracle": "api-metrics"
-    },
-    {
       "name": "submit",
       "owner": "ui-torrents",
       "oracle": "browser"
@@ -1260,6 +1244,11 @@
       "name": "torrent-client-compatibility-facade",
       "owner": "torrents",
       "oracle": "api-metrics"
+    },
+    {
+      "name": "torrent-detail-file-pager",
+      "owner": "ui-torrents",
+      "oracle": "browser"
     }
   ]
 }

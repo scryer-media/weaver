@@ -367,8 +367,8 @@ func (lane *torrentLane) downloadScenario(slug string, options submitOptions, ev
 	if view.TotalBytes != fixture.TotalBytes || view.Private != fixture.Private {
 		return fmt.Errorf("total %d private %v, want %d %v", view.TotalBytes, view.Private, fixture.TotalBytes, fixture.Private)
 	}
-	if len(view.Files) != len(fixture.Files) {
-		return fmt.Errorf("%d files reported, want %d", len(view.Files), len(fixture.Files))
+	if len(view.Files.Items) != len(fixture.Files) || view.Files.TotalCount != len(fixture.Files) {
+		return fmt.Errorf("%d files reported (%d counted), want %d", len(view.Files.Items), view.Files.TotalCount, len(fixture.Files))
 	}
 	if len(view.Trackers) == 0 || view.Trackers[0].URL != fixture.Tracker {
 		return fmt.Errorf("trackers %+v, want %s", view.Trackers, fixture.Tracker)
@@ -519,7 +519,7 @@ func scenarioRatioGoal(lane *torrentLane, evidence map[string]any) error {
 		return fmt.Errorf("stopped at ratio %.3f uploaded %d of %d", stopped.Ratio, stopped.UploadedBytes, fixture.TotalBytes)
 	}
 	if stopped.SeedingLeft != nil {
-		return fmt.Errorf("seedingLeft %q after the goal", *stopped.SeedingLeft)
+		return fmt.Errorf("seedingGoalLeft %q after the goal", *stopped.SeedingLeft)
 	}
 	event, err := lane.waitAnnounce(fixture.Infohash, mark, "tracker hears the stopped announce", func(event trackerEvent) bool {
 		return event.Event == "stopped"
@@ -674,7 +674,7 @@ func scenarioUnwanted(lane *torrentLane, evidence map[string]any) error {
 	}
 	defer lane.cleanupTorrent(view.ID, evidence)
 	selected := map[string]bool{}
-	for _, file := range view.Files {
+	for _, file := range view.Files.Items {
 		selected[file.Path] = file.Selected
 	}
 	if want := map[string]bool{"readme.txt": true, "extras/run.cmd": false}; !maps.Equal(selected, want) {
@@ -908,8 +908,7 @@ func scenarioCategory(lane *torrentLane, evidence map[string]any) error {
 
 	// Taken out of the category, the torrent falls back to the global
 	// policy and moves to the default torrent route.
-	if err := lane.mutateBool("setTorrentCategory", "(id: $id, category: $category)",
-		map[string]any{"id": view.ID, "category": nil}); err != nil {
+	if err := lane.setCategory(view.ID, ""); err != nil {
 		return fmt.Errorf("clear the torrent's category: %w", err)
 	}
 	moved, err := lane.waitTorrent(view.ID, "uncategorised torrent on the default route and policy", func(view *torrentView) bool {
@@ -1446,7 +1445,7 @@ func scenarioRestart(lane *torrentLane, evidence map[string]any) error {
 			problems = append(problems, "seen "+state+" after the restart")
 		}
 	}
-	if after.CompletedAtMs == nil || view.CompletedAtMs == nil || *after.CompletedAtMs != *view.CompletedAtMs {
+	if after.CompletedAt == nil || view.CompletedAt == nil || *after.CompletedAt != *view.CompletedAt {
 		problems = append(problems, "completion time changed across the restart")
 	}
 	if after.DownloadedBytes > view.DownloadedBytes {

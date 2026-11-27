@@ -12,7 +12,7 @@ import { jobIds, testIds, torrentIds } from "./support/testids";
  * Torrents as an operator drives them in the browser: the settings panel and
  * a category's torrent section, adding a magnet and a .torrent through the
  * Add dialog, the queue row, the job's torrent blocks, the seeding override,
- * the header controls, and both removes.
+ * the header controls, the file pager, and both removes.
  *
  * The lane has generated the fixtures, handed every one of them to the
  * loopback seeder and turned torrents on before this file runs.
@@ -35,6 +35,7 @@ function fixture(slug: string): Fixture {
 
 const magnetFixture = fixture("ui-magnet");
 const fileFixture = fixture("ui-file");
+const pagedFixture = fixture("ui-paged");
 const category = "e2e-torrent-category";
 
 /**
@@ -152,6 +153,42 @@ test("the Add dialog takes a magnet and a .torrent, and the queue tags and seeds
     // Seeding shows once the download is whole: the ratio and the upload rate.
     await expect(row.getByTestId(torrentIds.queueRowSeeding)).toHaveText(/^\d+\.\d{2}\d+(\.\d)?[KMGT]B\/s↑$/);
   }
+});
+
+test("a torrent job lists its files a page at a time", async ({ cleanPage: page }) => {
+  await page.goto("/");
+  await page.getByTestId(torrentIds.addOpen).click();
+  const dialog = page.getByTestId(testIds.dialog("add"));
+  const chooser = page.waitForEvent("filechooser");
+  await dialog.getByTestId(torrentIds.addDrop).click();
+  await (await chooser).setFiles(`${fixturesRoot}/ui-paged.torrent`);
+  await dialog.getByTestId(torrentIds.addSubmit).click();
+  await expect(dialog).toBeHidden();
+  await openJob(page, pagedFixture);
+
+  // 205 files: the first page holds 200 of them, the second the last 5.
+  const files = page.getByTestId(torrentIds.file);
+  const filePaths = page.getByTestId(torrentIds.filePath);
+  await expect(files).toHaveCount(200);
+  await expect(filePaths.filter({ hasText: /pages\/file-000\.bin$/ })).toBeVisible();
+  await expect(page.getByTestId(torrentIds.filePrevious)).toBeDisabled();
+  await page.getByTestId(torrentIds.fileNext).click();
+  await expect(files).toHaveCount(5);
+  await expect(filePaths.filter({ hasText: /pages\/file-204\.bin$/ })).toBeVisible();
+  await expect(page.getByTestId(torrentIds.fileNext)).toBeDisabled();
+  await page.getByTestId(torrentIds.filePrevious).click();
+  await expect(files).toHaveCount(200);
+  await expect(filePaths.filter({ hasText: /pages\/file-000\.bin$/ })).toBeVisible();
+
+  await page.getByTestId(torrentIds.jobRemove).click();
+  const remove = page.getByTestId(testIds.dialog("torrent-remove"));
+  await remove.getByTestId(torrentIds.removeDeleteFiles).check();
+  await remove.getByTestId(testIds.confirmAccept).click();
+  // The global seed-time goal saved above is still unmet.
+  const goal = page.getByTestId(testIds.dialog("torrent-unmet-goal"));
+  await goal.getByTestId(testIds.confirmAccept).click();
+  await expect(goal).toBeHidden();
+  await expect(queueRow(page, pagedFixture.name)).toHaveCount(0);
 });
 
 test("a torrent job shows its swarm, trackers, files and policy, and takes a seeding override", async ({ cleanPage: page }) => {

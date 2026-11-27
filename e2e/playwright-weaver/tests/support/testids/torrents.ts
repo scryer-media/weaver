@@ -13,6 +13,14 @@ export const torrentIds = {
   addOpen: "add-open",
   pauseTorrents: "torrents-pause",
   resumeTorrents: "torrents-resume",
+  resumeTorrentsTimed: "torrents-resume-timed",
+
+  // A torrent's peers: the headings that sort them, and the way between pages.
+  peerHeadings: "torrent-peer-headings",
+  peerSort: (column: string) => `torrent-peer-sort-${column}`,
+  peerRange: "torrent-peer-range",
+  peerPrevious: "torrent-peer-previous",
+  peerNext: "torrent-peer-next",
 
   // The Add dialog's drop zone, link box, paused switch and submit.
   addDrop: "add-drop",
@@ -30,6 +38,9 @@ export const torrentIds = {
   queueRowProtocol: (protocol: string) => `queue-entry-protocol-${protocol}`,
   queueRowStatus: (status: string) => `queue-entry-status-${status}`,
   queueRowSeeding: "queue-entry-seeding",
+  // A seeding row's bars: the ratio goal over the finished download, and the seed-time goal.
+  queueRowSeedingBars: "queue-entry-seeding-bars",
+  queueRowSeedingGoal: "queue-entry-seeding-goal",
   queueRowPause: "queue-entry-pause",
   queueRowResume: "queue-entry-resume",
 
@@ -40,6 +51,7 @@ export const torrentIds = {
   // A torrent job's header; each button carries the action it offers.
   jobPause: "torrent-job-pause",
   jobResume: "torrent-job-resume",
+  filesMissingDialog: "torrent-files-missing",
   jobForce: "torrent-job-force",
   jobUnforce: "torrent-job-unforce",
   jobRemove: "torrent-job-remove",
@@ -53,6 +65,15 @@ export const torrentIds = {
   file: "torrent-file",
   filePath: "torrent-file-path",
   fileProgress: "torrent-file-progress",
+  // The way between pages of the files.
+  fileRange: "torrent-file-range",
+  filePrevious: "torrent-file-previous",
+  fileNext: "torrent-file-next",
+  // How its unpacking came out, a file its unpacking placed beside its own,
+  // and the button that reads more of them.
+  unpacking: "torrent-unpacking",
+  unpackedFile: "torrent-unpacked-file",
+  unpackedMore: "torrent-unpacked-more",
   // The seeding block: the override button, a term's value by the term, and
   // the level it comes from by the product's level.
   seedingOverride: "torrent-seeding-override",

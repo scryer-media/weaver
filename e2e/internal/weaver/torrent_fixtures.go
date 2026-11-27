@@ -214,7 +214,18 @@ func torrentFixtureSpecs() []torrentFixtureSpec {
 			Files: []torrentFileSpec{synthetic("topaz.bin", 2*mib)}},
 		{Slug: "ui-file", Name: "Beryl.Browser.File", Private: true, PieceLength: 64 * kib,
 			Files: []torrentFileSpec{synthetic("beryl.bin", 2*mib), synthetic("notes/beryl.txt", 12*kib)}},
+		// More files than one page of the job's file list holds.
+		{Slug: "ui-paged", Name: "Jade.Browser.Paged", PieceLength: 16 * kib, Files: pagedFiles(205)},
 	}
+}
+
+// pagedFiles is count small files, pages/file-000.bin onwards.
+func pagedFiles(count int) []torrentFileSpec {
+	files := make([]torrentFileSpec, 0, count)
+	for index := range count {
+		files = append(files, synthetic(fmt.Sprintf("pages/file-%03d.bin", index), 1*kib))
+	}
+	return files
 }
 
 func torrentFixturesRoot() string { return filepath.Join(fixturesDir(), "torrents") }
