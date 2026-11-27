@@ -1366,11 +1366,12 @@ func Recipes() []Recipe {
 
 	add(Recipe{
 		Slug: "par2-multi-grid-overlap-repair", Family: "PAR2",
-		Notes: "One payload described by independent 64 KiB and 96 KiB recovery sets, with 128 KiB of it zeroed. " +
-			"The 64 KiB set has one recovery block for its two damaged slices and cannot rebuild it; the 96 KiB set has four for its two and must.",
-		Inputs:          []string{previewPayloadPath},
+		Notes: fmt.Sprintf("One %d MiB payload described by independent 64 KiB and 96 KiB recovery sets, with %d ranges of 128 KiB zeroed. "+
+			"The 64 KiB set has %d recovery blocks for its %d damaged slices and cannot rebuild it; the 96 KiB set has %d for its %d and must.",
+			gridRepairPayloadBytes>>20, gridRepairDamagedRanges,
+			gridRepairNarrowRecovery, 2*gridRepairDamagedRanges, gridRepairWideRecovery, 2*gridRepairDamagedRanges),
 		Build:           multiPARGridOverlapRepair(),
-		ExpectedOutputs: previewClipExpectedOutput("payload.mkv"),
+		ExpectedOutputs: multiPARGridOverlapRepairExpectedOutputs,
 	})
 
 	add(Recipe{
@@ -1818,12 +1819,24 @@ func multiPARGridOverlapClean() func(context.Context, *Env) error {
 	}
 }
 
+const (
+	gridRepairPayload      = "payload.mkv"
+	gridRepairSeed         = "multi-grid-overlap-repair"
+	gridRepairPayloadBytes = 96 << 20
+	// Each damaged range is two whole 64 KiB slices starting on a 192 KiB
+	// boundary, so it also lies within exactly two 96 KiB slices.
+	gridRepairDamagedRanges  = 8
+	gridRepairDamageStride   = 60 * 3 * twoSetsPrimarySliceSize
+	gridRepairDamageLength   = 2 * twoSetsPrimarySliceSize
+	gridRepairNarrowRecovery = 4
+	gridRepairWideRecovery   = 24
+)
+
 // multiPARGridOverlapRepair damages a payload two sets describe so that only
 // the set of the wider slices holds enough recovery data to rebuild it.
 func multiPARGridOverlapRepair() func(context.Context, *Env) error {
 	return func(ctx context.Context, env *Env) error {
-		const payload = "payload.mkv"
-		if err := env.Publish(ctx, "clip-preview", payload); err != nil {
+		if err := WritePRNG(env.OutputPath(gridRepairPayload), gridRepairSeed, gridRepairPayloadBytes); err != nil {
 			return err
 		}
 		for _, set := range []struct {
@@ -1831,27 +1844,41 @@ func multiPARGridOverlapRepair() func(context.Context, *Env) error {
 			sliceSize int64
 			recovery  int
 		}{
-			{"00-grid64.par2", twoSetsPrimarySliceSize, 1},
-			{"01-grid96.par2", twoSetsSecondarySliceSize, 4},
+			{"00-grid64.par2", twoSetsPrimarySliceSize, gridRepairNarrowRecovery},
+			{"01-grid96.par2", twoSetsSecondarySliceSize, gridRepairWideRecovery},
 		} {
 			if err := env.PAR2(ctx, PAR2Spec{
 				Base:           set.index,
 				SliceSize:      set.sliceSize,
 				RecoveryBlocks: set.recovery,
 				RecoveryFiles:  1,
-				Sources:        []string{payload},
+				Sources:        []string{gridRepairPayload},
 			}); err != nil {
 				return err
 			}
 		}
-		// Two whole 64 KiB slices, which lie within two 96 KiB slices.
-		return ZeroRange(env.OutputPath(payload), twoSetsDamageOffset, twoSetsDamageLength)
+		for damaged := int64(1); damaged <= gridRepairDamagedRanges; damaged++ {
+			if err := ZeroRange(env.OutputPath(gridRepairPayload), damaged*gridRepairDamageStride, gridRepairDamageLength); err != nil {
+				return err
+			}
+		}
+		return nil
 	}
+}
+
+// multiPARGridOverlapRepairExpectedOutputs pins the delivered payload to the
+// bytes written before the damage.
+func multiPARGridOverlapRepairExpectedOutputs(_ context.Context, env *Env) (map[string]string, error) {
+	expected := env.StagePath("expected-" + gridRepairPayload)
+	if err := WritePRNG(expected, gridRepairSeed, gridRepairPayloadBytes); err != nil {
+		return nil, err
+	}
+	return map[string]string{gridRepairPayload: expected}, nil
 }
 
 const (
 	manyGridsSets           = 34
-	manyGridsPayloadBytes   = 512 * 1024
+	manyGridsPayloadBytes   = 3 << 20
 	manyGridsFirstSliceSize = 16 * 1024
 	manyGridsSliceStep      = 4 * 1024
 )
