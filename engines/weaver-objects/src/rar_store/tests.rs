@@ -2965,20 +2965,10 @@ fn damage_said(owner: &Owner) -> Vec<(VolumeIndex, ByteRange)> {
         .collect()
 }
 
-// A stored file split over two volumes, a byte of its last part posted
-// wrong with good article checksums: its first part passes its own CRC and
-// the last carries the file's, which the store states below and leaves to
-// the namespace. The namespace's failed check is heard as damage over every
-// part of the file, once.
-#[test]
-fn a_member_refuted_by_the_namespace_says_its_damage_once() {
-    let volumes = write(&items(), &split(Version::Rar5));
-    let extents = member_extents(&volumes, "alpha.bin");
-    assert!(extents.len() > 1, "{extents:?}");
-    let last = extents.last().unwrap();
-    let mut posted = volumes.clone();
-    posted[last.volume.0 as usize][last.range.start as usize + 10] ^= 0x5a;
-    let mut owner = Owner::named(store(), volumes.clone());
+// A stored file split over volumes, every byte posted as `posted` says
+// with good article checksums, its every volume delivered and closed.
+fn delivered_split(volumes: &[Vec<u8>], posted: &[Vec<u8>]) -> (Owner, MemberId) {
+    let mut owner = Owner::named(store(), volumes.to_vec());
     for (volume, bytes) in posted.iter().enumerate() {
         let whole = ByteRange::new(0, bytes.len() as u64);
         owner.deliver_as(volume, whole, Provenance::Fresh, Some(bytes));
@@ -2992,14 +2982,10 @@ fn a_member_refuted_by_the_namespace_says_its_damage_once() {
         member,
         crc32: crate::grid::crc32(&files()[0].1),
     }));
-    no_trouble(&owner);
+    (owner, member)
+}
 
-    owner.refuted(member);
-    let said: Vec<_> = extents
-        .iter()
-        .map(|extent| (extent.volume, extent.range))
-        .collect();
-    assert_eq!(damage_said(&owner), said);
+fn no_retry(owner: &Owner) {
     for emit in &owner.said {
         assert!(
             !matches!(
@@ -3009,6 +2995,76 @@ fn a_member_refuted_by_the_namespace_says_its_damage_once() {
             "unexpected {emit:?}"
         );
     }
+}
+
+// A stored file split over volumes, a byte of its last part posted wrong
+// with good article checksums: every part before the last passes its own
+// CRC, and the last carries the file's in place of its own, which the store
+// states below and leaves to the namespace. The namespace's failed check is
+// heard as damage on the last part alone, the one no part CRC vouches for,
+// once.
+#[test]
+fn a_member_refuted_by_the_namespace_blames_the_part_no_crc_vouches_for() {
+    let volumes = write(&items(), &split(Version::Rar5));
+    let extents = member_extents(&volumes, "alpha.bin");
+    assert!(extents.len() > 1, "{extents:?}");
+    let last = extents.last().unwrap();
+    let mut posted = volumes.clone();
+    posted[last.volume.0 as usize][last.range.start as usize + 10] ^= 0x5a;
+    let (mut owner, member) = delivered_split(&volumes, &posted);
+    no_trouble(&owner);
+
+    owner.refuted(member);
+    assert_eq!(damage_said(&owner), vec![(last.volume, last.range)]);
+    no_retry(&owner);
+    let before = owner.said.len();
+    owner.refuted(member);
+    assert_eq!(owner.said.len(), before, "{:?}", owner.said);
+}
+
+// The same file, a byte of its first part posted wrong: the part's own CRC
+// fails and says its damage as the part arrives. That failure accounts for
+// the whole's, so the namespace's failed check adds nothing, and no part
+// whose own CRC passed is said damaged.
+#[test]
+fn a_member_refuted_after_a_part_failed_its_own_crc_says_nothing_more() {
+    let volumes = write(&items(), &split(Version::Rar5));
+    let extents = member_extents(&volumes, "alpha.bin");
+    assert!(extents.len() > 1, "{extents:?}");
+    let first = &extents[0];
+    let mut posted = volumes.clone();
+    posted[first.volume.0 as usize][first.range.start as usize + 10] ^= 0x5a;
+    let (mut owner, member) = delivered_split(&volumes, &posted);
+    assert_eq!(damage_said(&owner), vec![(first.volume, first.range)]);
+
+    let before = owner.said.len();
+    owner.refuted(member);
+    assert_eq!(owner.said.len(), before, "{:?}", owner.said);
+    assert_eq!(damage_said(&owner), vec![(first.volume, first.range)]);
+    no_retry(&owner);
+}
+
+// The same file posted whole, restored from facts written before the store
+// kept its runs: no part's CRC has anything to vouch with, so a failed check
+// of the namespace is blamed on every part, once.
+#[test]
+fn a_member_refuted_with_no_runs_kept_blames_every_part() {
+    let volumes = write(&items(), &split(Version::Rar5));
+    let extents = member_extents(&volumes, "alpha.bin");
+    assert!(extents.len() > 1, "{extents:?}");
+    let (mut owner, member) = delivered_split(&volumes, &volumes);
+    no_trouble(&owner);
+    let entry = &mut owner.object.entries[member.0 as usize];
+    entry.plain_runs = Default::default();
+    entry.parts = Default::default();
+
+    owner.refuted(member);
+    let said: Vec<_> = extents
+        .iter()
+        .map(|extent| (extent.volume, extent.range))
+        .collect();
+    assert_eq!(damage_said(&owner), said);
+    no_retry(&owner);
     let before = owner.said.len();
     owner.refuted(member);
     assert_eq!(owner.said.len(), before, "{:?}", owner.said);

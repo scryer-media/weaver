@@ -250,25 +250,34 @@ impl RarStore {
         if let Some(candidate) = entry.trial {
             self.wrong_key = Some(candidate);
         } else if entry.judges_its_checksum() {
-            let hash_key = entry.hash_key.as_deref();
-            let (mut unvouched, mut accounted) = (Vec::new(), false);
-            for (piece, found) in entry.pieces.iter().enumerate() {
-                let verdict = match (found.crc, entry.parts.get(&piece)) {
-                    (Some(crc), Some(runs)) => {
-                        gate(runs, found.data.len(), crc, found.uses_mac, hash_key).0
-                    }
-                    _ => SliceVerdict::Unknown,
-                };
-                match verdict {
-                    SliceVerdict::Intact => {}
-                    SliceVerdict::Damaged => accounted = true,
-                    _ => unvouched.push((found.volume, found.data)),
-                }
-            }
-            for (volume, data) in unvouched.into_iter().filter(|_| !accounted) {
+            for (volume, data) in self.unvouched(id) {
                 self.say_damaged(volume, data, composed, out);
             }
         }
+    }
+
+    // The parts a failure of the whole of file `id` is blamed on: those no
+    // part's own check vouches for, the last part among them, as it carries
+    // the file's CRC in place of its own. None when a part failing its own
+    // check accounts for the failure, which that check has already said.
+    fn unvouched(&self, id: usize) -> Vec<(VolumeIndex, ByteRange)> {
+        let entry = &self.entries[id];
+        let hash_key = entry.hash_key.as_deref();
+        let mut unvouched = Vec::new();
+        for (piece, found) in entry.pieces.iter().enumerate() {
+            let verdict = match (found.crc, entry.parts.get(&piece)) {
+                (Some(crc), Some(runs)) => {
+                    gate(runs, found.data.len(), crc, found.uses_mac, hash_key).0
+                }
+                _ => SliceVerdict::Unknown,
+            };
+            match verdict {
+                SliceVerdict::Intact => {}
+                SliceVerdict::Damaged => return Vec::new(),
+                _ => unvouched.push((found.volume, found.data)),
+            }
+        }
+        unvouched
     }
 
     // The member's file failed the check of the namespace above it. A CRC32
@@ -277,8 +286,8 @@ impl RarStore {
     // with a stated CRC32 its runs do not prove is touched. Under a key on
     // trial, over verified bytes, the key is condemned as a failed whole
     // condemns it, and the next candidate reads the member again; otherwise
-    // the member's extent is damaged for the recovery beside it, once for
-    // each version of its bytes.
+    // the parts no part CRC vouches for are damaged for the recovery beside
+    // them, once for each version of their bytes.
     pub(super) fn refuted(&mut self, member: MemberId, out: &mut Vec<Emit>) {
         if self.gone {
             return;
@@ -313,10 +322,10 @@ impl RarStore {
             self.settle(None, out);
             return;
         }
-        let mut extents = Vec::new();
-        self.member_extent(member, whole, &mut extents);
-        for extent in extents {
-            self.say_damaged(extent.volume, extent.range, composed, out);
+        // Otherwise the failure is blamed where the store's own check of a
+        // whole would blame it: never on a part its own CRC proved.
+        for (volume, data) in self.unvouched(member.0 as usize) {
+            self.say_damaged(volume, data, composed, out);
         }
     }
 }

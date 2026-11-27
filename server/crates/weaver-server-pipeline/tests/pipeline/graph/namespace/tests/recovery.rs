@@ -1049,8 +1049,9 @@ fn a_zip_member_refuted_past_its_fold_is_repaired_as_one_its_fold_ruled() {
 }
 
 // A RAR store states its member's CRC32 below and leaves the check to the
-// namespace, in every order: the failed check is heard as damage over its
-// volume, and the set beside it repairs it.
+// namespace, in every order: the failed check is heard as damage on the
+// parts no part CRC vouches for, here the member's one part, which carries
+// the file's CRC in place of its own, and the set beside it repairs it.
 #[test]
 fn a_rar_member_refuted_by_the_namespace_is_repaired_in_every_order() {
     refuted_past_its_fold_is_repaired_as_one_its_fold_ruled(Store::Rar);
