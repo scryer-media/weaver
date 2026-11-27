@@ -5,6 +5,8 @@ use weaver_server_core::history::queries::HistoryQueries;
 use weaver_server_core::post_processing::settings::PostProcessingSettingsQueries;
 use weaver_server_core::proxies::ProxiesDnsPersistenceQueries;
 use weaver_server_core::proxies::ProxiesPersistenceQueries;
+use weaver_server_core::settings::persistence::SettingsPersistenceQueries;
+use weaver_server_core::settings::queries::SettingsQueries;
 use weaver_server_core::tags::TagsQueries;
 use weaver_server_core::torrents::persistence::TorrentsPersistenceInsertTorrentQueries;
 use weaver_server_core::torrents::queries::TorrentsQueries;
@@ -711,6 +713,172 @@ async fn pausing_every_torrent_is_one_hold_apart_from_the_queues() {
     // The pipeline has no pause of its own apart from the queue's.
     let response = harness.execute("mutation { pauseClass(class: NZB) }").await;
     assert!(!response.errors.is_empty());
+}
+
+// A timed pause of every torrent lifts by itself at its deadline, apart from
+// the queue's own pause, and is kept in the settings until then.
+#[tokio::test(start_paused = true)]
+async fn a_timed_pause_of_every_torrent_lifts_by_itself() {
+    use weaver_server_core::jobs::{HoldOrigin, HoldOwner};
+    let harness = TestHarness::new().await;
+    let held = || {
+        harness.handle.state().holds().held_by(
+            HoldOrigin::Manual,
+            HoldOwner::Class(weaver_server_core::torrents::CLASS),
+        )
+    };
+    let before = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let response = harness
+        .execute("mutation { pauseClass(class: TORRENT, resumeAfterSecs: 1800) }")
+        .await;
+    assert!(response.errors.is_empty(), "{:?}", response.errors);
+    assert!(held());
+    assert!(!harness.handle.is_globally_paused());
+
+    let resume_at = harness
+        .scheduled_resume
+        .class_resume_at(weaver_server_core::torrents::CLASS)
+        .await;
+    assert!(resume_at >= before + 1800);
+    assert_eq!(
+        harness
+            .db
+            .get_setting("scheduled_resume_at.class.torrent")
+            .unwrap(),
+        Some(resume_at.to_string())
+    );
+    let state = "{ globalQueueState { resumeAtEpochMs classResumes { class resumeAtEpochMs } } }";
+    let response = harness.execute(state).await;
+    assert!(response.errors.is_empty(), "{:?}", response.errors);
+    let data = response.data.into_json().unwrap();
+    assert!(data["globalQueueState"]["resumeAtEpochMs"].is_null());
+    assert_eq!(
+        data["globalQueueState"]["classResumes"],
+        serde_json::json!([{ "class": "TORRENT", "resumeAtEpochMs": resume_at * 1000 }])
+    );
+
+    // The timer sleeps on the paused clock from whenever its task first runs,
+    // so the clock steps a second at a time until the hold lifts.
+    while held() {
+        tokio::time::advance(std::time::Duration::from_secs(1)).await;
+    }
+    let response = harness.execute(state).await;
+    assert!(response.errors.is_empty(), "{:?}", response.errors);
+    assert_eq!(
+        response.data.into_json().unwrap()["globalQueueState"]["classResumes"],
+        serde_json::json!([])
+    );
+    assert_eq!(
+        harness
+            .db
+            .get_setting("scheduled_resume_at.class.torrent")
+            .unwrap(),
+        None
+    );
+}
+
+// A timed torrent pause saved before a restart is armed again on start-up;
+// one whose deadline passed while Weaver was down lifts at once.
+#[tokio::test(start_paused = true)]
+async fn a_saved_torrent_timer_is_recovered_on_start_up() {
+    use weaver_server_core::jobs::{HoldOrigin, HoldOwner};
+    let harness = TestHarness::new().await;
+    let class = weaver_server_core::torrents::CLASS;
+    let held = || {
+        harness
+            .handle
+            .state()
+            .holds()
+            .held_by(HoldOrigin::Manual, HoldOwner::Class(class))
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+
+    harness.handle.pause_class(class).await.unwrap();
+    harness
+        .db
+        .set_setting(
+            "scheduled_resume_at.class.torrent",
+            &(now + 600).to_string(),
+        )
+        .unwrap();
+    harness.scheduled_resume.recover().await.unwrap();
+    assert_eq!(
+        harness.scheduled_resume.class_resume_at(class).await,
+        now + 600
+    );
+    assert_eq!(harness.scheduled_resume.resume_at().await, 0);
+    assert!(held());
+
+    harness
+        .db
+        .set_setting("scheduled_resume_at.class.torrent", &(now - 1).to_string())
+        .unwrap();
+    harness.scheduled_resume.recover().await.unwrap();
+    assert!(!held());
+    assert_eq!(
+        harness
+            .db
+            .get_setting("scheduled_resume_at.class.torrent")
+            .unwrap(),
+        None
+    );
+}
+
+// Resuming every torrent by hand, or pausing them again without a timer,
+// ends the timed pause, so its deadline lifts nothing later.
+#[tokio::test(start_paused = true)]
+async fn a_hand_resume_or_pause_ends_the_torrent_timer() {
+    use weaver_server_core::jobs::{HoldOrigin, HoldOwner};
+    let harness = TestHarness::new().await;
+    let held = || {
+        harness.handle.state().holds().held_by(
+            HoldOrigin::Manual,
+            HoldOwner::Class(weaver_server_core::torrents::CLASS),
+        )
+    };
+    for (follow, expect_held) in [
+        ("mutation { resumeClass(class: TORRENT) }", false),
+        ("mutation { pauseClass(class: TORRENT) }", true),
+    ] {
+        let response = harness
+            .execute("mutation { pauseClass(class: TORRENT, resumeAfterSecs: 60) }")
+            .await;
+        assert!(response.errors.is_empty(), "{:?}", response.errors);
+        tokio::task::yield_now().await;
+        let response = harness.execute(follow).await;
+        assert!(response.errors.is_empty(), "{:?}", response.errors);
+        assert_eq!(
+            harness
+                .scheduled_resume
+                .class_resume_at(weaver_server_core::torrents::CLASS)
+                .await,
+            0
+        );
+        assert_eq!(
+            harness
+                .db
+                .get_setting("scheduled_resume_at.class.torrent")
+                .unwrap(),
+            None
+        );
+        tokio::time::advance(std::time::Duration::from_secs(61)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(held(), expect_held, "{follow}");
+    }
+    for secs in [0, 2_592_001] {
+        let response = harness
+            .execute(&format!(
+                "mutation {{ pauseClass(class: TORRENT, resumeAfterSecs: {secs}) }}"
+            ))
+            .await;
+        assert!(!response.errors.is_empty(), "{secs} accepted");
+    }
 }
 
 // The live metrics say what every torrent downloads and uploads, added up:

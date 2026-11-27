@@ -21,6 +21,7 @@ export const torrentIds = {
   addOpen: "add-open",
   pauseTorrents: "torrents-pause",
   resumeTorrents: "torrents-resume",
+  resumeTorrentsTimed: "torrents-resume-timed",
 
   // A torrent's peers: the headings that sort them, and the way between pages.
   peerHeadings: "torrent-peer-headings",

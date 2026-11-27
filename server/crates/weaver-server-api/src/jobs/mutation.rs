@@ -949,26 +949,35 @@ impl JobsMutation {
         Ok(true)
     }
     /// Pause every job of a class, as one hold, its jobs' own pauses and
-    /// resumes standing under it. A class with no hold of its own is
-    /// refused.
+    /// resumes standing under it. With `resumeAfterSecs`, the class resumes
+    /// on its own after that many seconds (1 to 30 days). A class with no
+    /// hold of its own is refused.
     #[graphql(guard = "ControlGuard")]
-    async fn pause_class(&self, ctx: &Context<'_>, class: ProtocolGql) -> Result<bool> {
+    async fn pause_class(
+        &self,
+        ctx: &Context<'_>,
+        class: ProtocolGql,
+        resume_after_secs: Option<u64>,
+    ) -> Result<bool> {
         let class = held_class(class)?;
-        ctx.data::<SchedulerHandle>()?
-            .pause_class(class)
-            .await
-            .map_err(|error| graphql_error("INTERNAL", error.to_string()))?;
+        let resume_at = resume_after_secs.map(resume_deadline).transpose()?;
+        let scheduled_resume = ctx.data::<ScheduledResumeCoordinator>()?;
+        map_scheduled_resume_result(match resume_at {
+            None => scheduled_resume.pause_class(class).await,
+            Some(at) => scheduled_resume.pause_class_until(class, at).await,
+        })?;
         Ok(true)
     }
 
-    /// Lift the operator's pause of every job of a class.
+    /// Lift the operator's pause of every job of a class, and its timer.
     #[graphql(guard = "ControlGuard")]
     async fn resume_class(&self, ctx: &Context<'_>, class: ProtocolGql) -> Result<bool> {
         let class = held_class(class)?;
-        ctx.data::<SchedulerHandle>()?
-            .resume_class(class)
-            .await
-            .map_err(|error| graphql_error("INTERNAL", error.to_string()))?;
+        map_scheduled_resume_result(
+            ctx.data::<ScheduledResumeCoordinator>()?
+                .resume_class(class)
+                .await,
+        )?;
         Ok(true)
     }
 
@@ -976,24 +985,12 @@ impl JobsMutation {
     /// resume on their own after that many seconds (1 to 30 days).
     #[graphql(guard = "ControlGuard")]
     async fn pause_all(&self, ctx: &Context<'_>, resume_after_secs: Option<u64>) -> Result<bool> {
+        let resume_at = resume_after_secs.map(resume_deadline).transpose()?;
         let scheduled_resume = ctx.data::<ScheduledResumeCoordinator>()?;
-        let result = match resume_after_secs {
+        map_scheduled_resume_result(match resume_at {
             None => scheduled_resume.pause_all().await,
-            Some(secs) if (1..=MAX_RESUME_AFTER_SECS).contains(&secs) => {
-                let now = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs();
-                scheduled_resume.pause_until(now + secs).await
-            }
-            Some(_) => {
-                return Err(graphql_error(
-                    "INVALID_INPUT",
-                    "resumeAfterSecs must be between 1 and 2592000",
-                ));
-            }
-        };
-        map_scheduled_resume_result(result)?;
+            Some(at) => scheduled_resume.pause_until(at).await,
+        })?;
         Ok(true)
     }
     /// Resume all download dispatch globally.
@@ -1338,6 +1335,21 @@ async fn run_batch(
 
 fn map_scheduler_result<T>(result: std::result::Result<T, SchedulerError>) -> Result<T> {
     result.map_err(scheduler_graphql_error)
+}
+
+// When a pause of `secs` lifts, in epoch seconds; 1 second to 30 days.
+fn resume_deadline(secs: u64) -> Result<u64> {
+    if !(1..=MAX_RESUME_AFTER_SECS).contains(&secs) {
+        return Err(graphql_error(
+            "INVALID_INPUT",
+            "resumeAfterSecs must be between 1 and 2592000",
+        ));
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    Ok(now + secs)
 }
 
 fn map_scheduled_resume_result<T>(

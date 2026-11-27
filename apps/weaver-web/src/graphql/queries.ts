@@ -1064,6 +1064,10 @@ export const LIVE_METRICS_QUERY = gql`
       pausedClasses
       speedLimitBytesPerSec
       resumeAtEpochMs
+      classResumes {
+        class
+        resumeAtEpochMs
+      }
       downloadBlock {
         ...DownloadBlockFields
         diskVolumes {
@@ -1422,8 +1426,8 @@ export const RESUME_ALL_MUTATION = gql`
 `;
 
 export const PAUSE_CLASS_MUTATION = gql`
-  mutation PauseClass($class: Protocol!) {
-    pauseClass(class: $class)
+  mutation PauseClass($class: Protocol!, $resumeAfterSecs: Int) {
+    pauseClass(class: $class, resumeAfterSecs: $resumeAfterSecs)
   }
 `;
 
@@ -1484,6 +1488,10 @@ export const LIVE_METRICS_SUBSCRIPTION = gql`
         pausedClasses
         speedLimitBytesPerSec
         resumeAtEpochMs
+        classResumes {
+          class
+          resumeAtEpochMs
+        }
         downloadBlock {
           ...DownloadBlockFields
           diskVolumes {

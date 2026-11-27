@@ -267,6 +267,7 @@ fn rig_around(
     let context = TorrentFacadeContext::new(
         db.clone(),
         handle.clone(),
+        weaver_server_api::ScheduledResumeCoordinator::new(db.clone(), handle.clone()),
         config.clone(),
         LoginAuthCache::default(),
         keys.clone(),
@@ -5767,4 +5768,48 @@ async fn answers_over_every_torrent_wait_for_the_load() {
         rig.post("/api/v2/torrents/stop", "hashes=all").await.status,
         StatusCode::OK
     );
+}
+
+// Stopping or starting every torrent here ends a timed pause of them set in
+// Weaver, so its deadline lifts nothing later.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn every_torrent_stopped_or_started_here_ends_a_timed_pause() {
+    use weaver_server_core::jobs::{HoldOrigin, HoldOwner};
+    let rig = rig().await;
+    let class = weaver_server_core::torrents::CLASS;
+    let coordinator = &rig.context.inner.scheduled_resume;
+    let in_an_hour = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        + 3600;
+    for (path, held) in [
+        ("/api/v2/torrents/start", false),
+        ("/api/v2/torrents/stop", true),
+        ("/api/v2/transfer/resumeSession", false),
+        ("/api/v2/transfer/pauseSession", true),
+    ] {
+        coordinator
+            .pause_class_until(class, in_an_hour)
+            .await
+            .unwrap();
+        let body = if path.contains("/torrents/") {
+            "hashes=all"
+        } else {
+            ""
+        };
+        let status = rig.post(path, body).await.status;
+        assert!(status.is_success(), "{path}: {status}");
+        assert_eq!(coordinator.class_resume_at(class).await, 0, "{path}");
+        assert_eq!(
+            rig.context
+                .inner
+                .handle
+                .state()
+                .holds()
+                .held_by(HoldOrigin::Manual, HoldOwner::Class(class)),
+            held,
+            "{path}"
+        );
+    }
 }

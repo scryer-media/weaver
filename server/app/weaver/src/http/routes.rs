@@ -172,6 +172,7 @@ pub(super) fn build_router(runtime: super::ServerRuntime) -> Router {
     let torrent_facade = super::torrent_facade::TorrentFacadeContext::new(
         db.clone(),
         handle.clone(),
+        scheduled_resume.clone(),
         config.clone(),
         auth_cache.clone(),
         api_key_cache.clone(),

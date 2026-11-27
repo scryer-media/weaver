@@ -530,6 +530,17 @@ input CategoryInput {
 	uploadCap: BpsLeafInput
 }
 
+"""
+A class pause that lifts by itself.
+"""
+type ClassResume {
+	class: Protocol!
+	"""
+	When the pause lifts, in epoch milliseconds.
+	"""
+	resumeAtEpochMs: Int!
+}
+
 type ConfiguredStorage {
 	labels: [String!]!
 	path: String!
@@ -1459,6 +1470,10 @@ type GlobalQueueState {
 	Null when no resume is scheduled.
 	"""
 	resumeAtEpochMs: Int
+	"""
+	The paused classes whose pause lifts by itself, and when.
+	"""
+	classResumes: [ClassResume!]!
 }
 
 """
@@ -2829,12 +2844,13 @@ type MutationRoot {
 	reorderQueueItem(id: Int!, kind: QueueMoveKind!, offset: Int): Boolean!
 	"""
 	Pause every job of a class, as one hold, its jobs' own pauses and
-	resumes standing under it. A class with no hold of its own is
-	refused.
+	resumes standing under it. With `resumeAfterSecs`, the class resumes
+	on its own after that many seconds (1 to 30 days). A class with no
+	hold of its own is refused.
 	"""
-	pauseClass(class: Protocol!): Boolean!
+	pauseClass(class: Protocol!, resumeAfterSecs: Int): Boolean!
 	"""
-	Lift the operator's pause of every job of a class.
+	Lift the operator's pause of every job of a class, and its timer.
 	"""
 	resumeClass(class: Protocol!): Boolean!
 	"""
@@ -7907,15 +7923,6 @@ enum WebPalette {
 	TERMINAL
 }
 
-input WebProgressColorChange {
-	palette: WebPalette!
-	stage: WebProgressStage!
-	"""
-	Null restores the palette's default for this stage.
-	"""
-	color: WebProgressColor
-}
-
 enum WebProgressColor {
 	GREY
 	TEAL
@@ -7929,6 +7936,15 @@ enum WebProgressColor {
 	AMBER
 	LIME
 	GREEN
+}
+
+input WebProgressColorChange {
+	palette: WebPalette!
+	stage: WebProgressStage!
+	"""
+	Null restores the palette's default for this stage.
+	"""
+	color: WebProgressColor
 }
 
 """

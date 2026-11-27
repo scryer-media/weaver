@@ -547,6 +547,32 @@ impl GlobalQueueState {
             secs => Some(secs.saturating_mul(1000)),
         }
     }
+
+    /// The paused classes whose pause lifts by itself, and when.
+    async fn class_resumes(&self, ctx: &async_graphql::Context<'_>) -> Vec<ClassResume> {
+        let Some(coordinator) = ctx.data_opt::<crate::ScheduledResumeCoordinator>() else {
+            return Vec::new();
+        };
+        let mut resumes = Vec::new();
+        for class in weaver_server_core::jobs::HeldClass::all() {
+            let secs = coordinator.class_resume_at(class).await;
+            if secs > 0 {
+                resumes.push(ClassResume {
+                    class: class.protocol().into(),
+                    resume_at_epoch_ms: secs.saturating_mul(1000),
+                });
+            }
+        }
+        resumes
+    }
+}
+
+/// A class pause that lifts by itself.
+#[derive(Debug, Clone, PartialEq, SimpleObject)]
+pub struct ClassResume {
+    pub class: ProtocolGql,
+    /// When the pause lifts, in epoch milliseconds.
+    pub resume_at_epoch_ms: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, SimpleObject)]
