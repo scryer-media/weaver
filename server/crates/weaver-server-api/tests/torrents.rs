@@ -400,9 +400,10 @@ async fn a_torrents_files_page_by_first_and_an_offset_cursor() {
     assert_eq!(code(&bad).as_deref(), Some("CURSOR_INVALID"));
 }
 
-// One torrent's follower reads what its query selects: with no files or
-// trackers selected the torrent is followed without them, and with them
-// selected each push is what `torrent(id)` reads for the same selection.
+// One torrent's follower reads what its query selects and never its files
+// whole: it is followed without them even when they are asked for, a
+// selected `files` is read as its page, and each push is what `torrent(id)`
+// reads for the same selection.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn torrent_updates_read_only_what_the_subscription_selects() {
     use tokio_stream::StreamExt;
@@ -433,6 +434,21 @@ async fn torrent_updates_read_only_what_the_subscription_selects() {
     let first = bare.next().await;
     assert_eq!(first.torrents.len(), 1);
     assert!(first.torrents[0].files.is_empty() && first.torrents[0].trackers.is_empty());
+    // Asked for, its files are still not read whole.
+    let mut asked = rig
+        .torrents
+        .follow(Follow::One(
+            JobId(id),
+            Shown {
+                files: true,
+                trackers: true,
+                tags: true,
+            },
+        ))
+        .unwrap();
+    let first = asked.next().await;
+    assert!(first.torrents[0].files.is_empty() && first.torrents[0].file_have.is_empty());
+    assert!(!first.torrents[0].trackers.is_empty());
 
     let push = |selection: &'static str| {
         let rig = &rig;
@@ -465,6 +481,11 @@ async fn torrent_updates_read_only_what_the_subscription_selects() {
     assert_eq!(pushed, read.data.into_json().unwrap()["torrent"]);
     assert_eq!(pushed["files"]["totalCount"], 3);
     assert_eq!(pushed["trackers"][0]["url"], "udp://b.invalid:80");
+    let paged = push("files(first: 2) { items { index } totalCount }").await;
+    assert_eq!(
+        paged["files"],
+        serde_json::json!({ "items": [{ "index": 0 }, { "index": 1 }], "totalCount": 3 })
+    );
 }
 
 // A torrent's files follower gives its page as it is, and refuses a torrent

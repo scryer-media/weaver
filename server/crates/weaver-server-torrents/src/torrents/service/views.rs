@@ -912,8 +912,10 @@ impl TorrentService {
 
     /// One page of the torrent's files in index order: at most `limit`
     /// after the first `offset`, each with the share of it in hand, and how
-    /// many files the torrent has. Only the page's files are built. None
-    /// when there is no such torrent.
+    /// many files the torrent has. Only the page's files are built and
+    /// their bytes in hand read; a torrent in a session copies its figures
+    /// for every file once, in the session's `stats`. None when there is no
+    /// such torrent.
     pub async fn torrent_files(
         &self,
         job_id: JobId,
@@ -923,24 +925,26 @@ impl TorrentService {
         self.ensure(&[job_id]).await;
         let live = self.inner.live.lock().await;
         let torrent = live.get(&job_id)?;
-        let layout = torrent.layout.as_deref();
-        let total = layout.map_or(0, |layout| layout.files().count());
+        let Some(layout) = torrent.layout.as_deref() else {
+            return Some(FilesPage {
+                files: Vec::new(),
+                total: 0,
+            });
+        };
+        let total = layout.file_count();
         if limit == 0 || offset >= total {
             return Some(FilesPage {
                 files: Vec::new(),
                 total,
             });
         }
-        let file_have = torrent.file_have_now();
-        let files = layout
-            .iter()
-            .flat_map(|layout| layout.files())
-            .enumerate()
-            .skip(offset)
-            .take(limit)
-            .map(|(index, file)| {
-                let have = file_have.get(index).copied().unwrap_or(0);
-                (
+        let page = offset..offset.saturating_add(limit).min(total);
+        let file_have = torrent.file_have_page(page.clone());
+        let files = page
+            .zip(file_have)
+            .filter_map(|(index, have)| {
+                let file = layout.file(index)?;
+                Some((
                     TorrentFile {
                         index: index as u32,
                         path: file.name.clone(),
@@ -948,7 +952,7 @@ impl TorrentService {
                         priority: torrent.levels.get(index).copied().unwrap_or_default(),
                     },
                     file_share(have, file.length),
-                )
+                ))
             })
             .collect();
         Some(FilesPage { files, total })

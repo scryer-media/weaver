@@ -2468,6 +2468,65 @@ async fn a_kept_name_with_no_file_goes_from_the_row() {
     rig.service.stop().await;
 }
 
+// A page of a torrent's files is that window of its whole list: the same
+// files, levels and share in hand as the whole read gives, before any piece
+// is had and with some had, and each page says how many files there are.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_page_of_files_is_the_window_of_the_whole_list() {
+    let rig = rig(set_clock());
+    rig.service.open().await.unwrap();
+    let bodies: Vec<Vec<u8>> = (0..5u8)
+        .map(|n| vec![n + 1; 100 + 90 * usize::from(n)])
+        .collect();
+    let names: Vec<String> = (0..5).map(|n| format!("paged/f{n}.bin")).collect();
+    let files: Vec<(&str, &[u8])> = names
+        .iter()
+        .zip(&bodies)
+        .map(|(name, body)| (name.as_str(), body.as_slice()))
+        .collect();
+    let job_id = rig
+        .service
+        .add_opened(request(AddSource::Metainfo(metainfo("paged", &files, 128, false))))
+        .await
+        .unwrap();
+    let whole: Vec<u8> = bodies.concat();
+
+    let compare = || async {
+        let view = rig.service.torrent(job_id).await.unwrap();
+        let every: Vec<_> = view
+            .files
+            .iter()
+            .map(|file| (file.clone(), view.file_progress(file)))
+            .collect();
+        assert_eq!(every.len(), 5);
+        for offset in 0..=every.len() + 1 {
+            for limit in 0..=every.len() + 1 {
+                let page = rig
+                    .service
+                    .torrent_files(job_id, offset, limit)
+                    .await
+                    .unwrap();
+                let end = (offset + limit).min(every.len());
+                let window = every.get(offset.min(every.len())..end).unwrap_or(&[]);
+                assert_eq!(page.total, every.len(), "{offset} {limit}");
+                assert_eq!(page.files, window, "{offset} {limit}");
+            }
+        }
+        every
+    };
+    let before = compare().await;
+    assert!(before.iter().all(|(_, share)| *share == 0.0));
+
+    fetch_pieces(&rig.service, job_id, &whole, Some(&[0, 3, 6]), |_| {}).await;
+    // Its session counts the pieces once it checks them.
+    let handle = handle_of(&rig.service, job_id).await;
+    rig.service.recheck(job_id).await.unwrap();
+    handle.wait_until_initialized().await.unwrap();
+    let after = compare().await;
+    assert!(after.iter().any(|(_, share)| *share > 0.0), "{after:?}");
+    rig.service.stop().await;
+}
+
 // The unpacked files are paged in SQL in the order the row keeps them: each
 // page is that window of the whole list, a page that reaches the end says
 // none follow, and a page of none reads nothing.

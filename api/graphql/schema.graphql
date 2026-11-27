@@ -6317,7 +6317,9 @@ type SubscriptionRoot {
 	One torrent as it moves: pushed as it is now, then again each time
 	what the subscription selects changes, and a last null once the
 	torrent is gone, after which the stream ends. Only the fields
-	selected are read; its files are read whole when selected.
+	selected are read. A push comes when the torrent moves: `files` is
+	read as a page of the torrent at that push, and a move of its files
+	alone brings none; `torrentFileUpdates` follows a page of them.
 	"""
 	torrentUpdates(id: Int!): Torrent
 	"""
@@ -6773,7 +6775,10 @@ type Torrent {
 	"""
 	One page of its files in file-index order: the `first` after the
 	offset cursor `after`, 200 when not given and at most 1000. Read on
-	`torrent(id)` only.
+	`torrent(id)` and `torrentUpdates(id)` only, each time from the
+	torrent as it is then. A push of `torrentUpdates` comes when the
+	torrent moves, not when its files alone do: `torrentFileUpdates`
+	follows a page of the files.
 	"""
 	files(first: Int, after: String): TorrentFilePage!
 	"""

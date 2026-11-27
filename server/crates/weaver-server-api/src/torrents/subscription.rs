@@ -4,13 +4,12 @@
 use async_graphql::{Context, Result, Subscription};
 use tokio_stream::Stream;
 use weaver_server_core::jobs::ids::JobId;
-use weaver_server_core::torrents::service::listing::Shown;
 use weaver_server_core::torrents::service::updates::{Follow, FollowError, MAX_FOLLOWED};
 
 use super::types::{
     DEFAULT_FILE_PAGE, MAX_FILE_PAGE, TorrentChangesGql, TorrentFilePageGql, TorrentGql, page_args,
 };
-use super::{refuse_detail_only, service};
+use super::{refuse_detail_only, service, shown_of};
 use crate::auth::{ReadGuard, invalid_input, not_found};
 
 #[derive(Default)]
@@ -21,19 +20,16 @@ impl TorrentsSubscription {
     /// One torrent as it moves: pushed as it is now, then again each time
     /// what the subscription selects changes, and a last null once the
     /// torrent is gone, after which the stream ends. Only the fields
-    /// selected are read; its files are read whole when selected.
+    /// selected are read. A push comes when the torrent moves: `files` is
+    /// read as a page of the torrent at that push, and a move of its files
+    /// alone brings none; `torrentFileUpdates` follows a page of them.
     #[graphql(guard = "ReadGuard")]
     async fn torrent_updates(
         &self,
         ctx: &Context<'_>,
         id: u64,
     ) -> Result<impl Stream<Item = Option<TorrentGql>>> {
-        let field = ctx.look_ahead();
-        let shown = Shown {
-            files: field.field("files").exists(),
-            trackers: field.field("trackers").exists(),
-            tags: field.field("tags").exists(),
-        };
+        let shown = shown_of(&ctx.look_ahead());
         let mut updates = service(ctx)?
             .follow(Follow::One(JobId(id), shown))
             .map_err(follow_error)?;

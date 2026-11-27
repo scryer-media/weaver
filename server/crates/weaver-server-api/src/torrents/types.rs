@@ -768,11 +768,12 @@ impl TorrentUnpackingGql {
         first: Option<u32>,
         after: Option<String>,
     ) -> Result<TorrentUnpackedFilePageGql> {
-        let offset = decode_offset_cursor(after.as_deref())
-            .map_err(|message| graphql_error("CURSOR_INVALID", message))?;
-        let limit = first
-            .map_or(DEFAULT_UNPACKED_FILE_PAGE, |first| first as usize)
-            .min(MAX_UNPACKED_FILE_PAGE);
+        let (offset, limit) = page_args(
+            first,
+            after.as_deref(),
+            DEFAULT_UNPACKED_FILE_PAGE,
+            MAX_UNPACKED_FILE_PAGE,
+        )?;
         let (files, more) = super::service(ctx)?
             .unpacked_files_page(JobId(self.id), offset, limit)
             .await
@@ -1004,10 +1005,6 @@ pub struct TorrentGql {
     /// Its trackers, each with how announcing to it went: read only when
     /// selected.
     pub trackers: Vec<TorrentTrackerGql>,
-    // Its files, when the view was read with them; otherwise the page is
-    // read from the service when asked for.
-    #[graphql(skip)]
-    pub held_files: Option<Vec<TorrentFileGql>>,
     #[graphql(skip)]
     pub unpack_end: Option<UnpackEnd>,
 }
@@ -1036,7 +1033,10 @@ impl TorrentGql {
 
     /// One page of its files in file-index order: the `first` after the
     /// offset cursor `after`, 200 when not given and at most 1000. Read on
-    /// `torrent(id)` only.
+    /// `torrent(id)` and `torrentUpdates(id)` only, each time from the
+    /// torrent as it is then. A push of `torrentUpdates` comes when the
+    /// torrent moves, not when its files alone do: `torrentFileUpdates`
+    /// follows a page of the files.
     async fn files(
         &self,
         ctx: &Context<'_>,
@@ -1044,16 +1044,6 @@ impl TorrentGql {
         after: Option<String>,
     ) -> Result<TorrentFilePageGql> {
         let (offset, limit) = page_args(first, after.as_deref(), DEFAULT_FILE_PAGE, MAX_FILE_PAGE)?;
-        if let Some(files) = &self.held_files {
-            let total = files.len();
-            let items = files.iter().skip(offset).take(limit).cloned().collect();
-            return Ok(TorrentFilePageGql {
-                items,
-                total_count: total as u64,
-                next_cursor: (limit > 0 && offset.saturating_add(limit) < total)
-                    .then(|| encode_offset_cursor(offset + limit)),
-            });
-        }
         let page = super::service(ctx)?
             .torrent_files(JobId(self.id), offset, limit)
             .await
@@ -1113,22 +1103,9 @@ impl From<TorrentView> for TorrentGql {
 
 impl TorrentGql {
     /// `view`, its save path read as one file named as the torrent is when
-    /// `one_file`: for a view read without its files. Its files are held
-    /// when the view has them.
+    /// `one_file`: for a view read without its files. Its files are not
+    /// held: `files` reads its page.
     pub(crate) fn of(view: TorrentView, one_file: bool) -> Self {
-        let held_files = (!view.files.is_empty()).then(|| {
-            view.files
-                .iter()
-                .map(|file| TorrentFileGql {
-                    index: file.index,
-                    path: file.path.clone(),
-                    length: file.length,
-                    selected: file.selected(),
-                    priority: file.priority.into(),
-                    progress: view.file_progress(file),
-                })
-                .collect()
-        });
         let (save_path, _) = view.paths_as(one_file);
         Self {
             id: view.job_id.0,
@@ -1194,7 +1171,6 @@ impl TorrentGql {
             sequential: view.sequential,
             first_last_piece_first: view.first_last_piece_first,
             trackers: view.trackers.into_iter().map(Into::into).collect(),
-            held_files,
             unpack_end: view.unpack_end,
         }
     }

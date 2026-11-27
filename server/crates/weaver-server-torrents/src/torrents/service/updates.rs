@@ -10,10 +10,10 @@
 //! few torrents (a list's page, at most `MAX_FOLLOWED`) is given their rows,
 //! which leave out the fields that move with the clock alone when they tell
 //! a change, and carry no files or trackers. One torrent's follower reads
-//! that torrent with what it shows beside its own fields (its files, its
-//! trackers, its tags), each time its row moves, and tells a change in any
-//! field it reads. One torrent's files follower reads one page of its files
-//! each time its files move, at most twice a second.
+//! that torrent with what it shows beside its own fields (its trackers, its
+//! tags), never its files, each time its row moves, and tells a change in
+//! any field it reads. One torrent's files follower reads one page of its
+//! files each time its files move, at most twice a second.
 
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
@@ -37,9 +37,9 @@ pub struct TorrentUpdates {
     revision: watch::Receiver<u64>,
     // Each torrent last given, by its print.
     last: Option<HashMap<JobId, u64>>,
-    // One torrent's follower: the revisions its row and its files had moved
-    // at when it was last read, none while it has no row.
-    seen: Option<(u64, u64)>,
+    // One torrent's follower: the revision its row had moved at when it was
+    // last read, none while it has no row.
+    seen: Option<u64>,
 }
 
 /// What moved since the last push.
@@ -59,9 +59,10 @@ pub struct TorrentChanges {
 /// Which torrents a follower follows.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Follow {
-    /// One torrent, with what `Shown` names beside its own fields, the
-    /// fields that move with the clock alone included. A file's move is
-    /// told only when its files are shown.
+    /// One torrent, with the trackers and tags `Shown` names beside its own
+    /// fields, the fields that move with the clock alone included. Its files
+    /// are never read: `TorrentService::file_updates` follows a page of
+    /// them, and `Shown::files` is not read here.
     One(JobId, Shown),
     /// The torrents of a set, at most `MAX_FOLLOWED`, as a list shows them:
     /// a list shows a page of the torrents, and follows those alone.
@@ -78,9 +79,16 @@ pub enum FollowError {
 }
 
 impl TorrentService {
-    /// Follow `job_id`'s view, whole.
+    /// Follow `job_id`'s view with its trackers and tags, without its files.
     pub fn updates(&self, job_id: JobId) -> TorrentUpdates {
-        self.updates_of(Follow::One(job_id, Shown::WHOLE))
+        self.updates_of(Follow::One(
+            job_id,
+            Shown {
+                files: false,
+                trackers: true,
+                tags: true,
+            },
+        ))
     }
 
     /// Follow one page of `job_id`'s files: at most `limit` after the first
@@ -143,24 +151,24 @@ impl TorrentUpdates {
         let snapshot = self.service.snapshot();
         match &self.follow {
             Follow::One(job_id, shown) => {
-                // A move of its files alone is read only when they are shown.
-                let moved = snapshot
-                    .row(*job_id)
-                    .map(|row| (row.moved, if shown.files { row.files_moved } else { 0 }));
+                // A move of its files alone is not read: its files are not.
+                let moved = snapshot.row(*job_id).map(|row| row.moved);
                 if self.last.is_some() && moved == self.seen {
                     return None;
                 }
                 self.seen = moved;
+                let shown = Shown {
+                    files: false,
+                    ..*shown
+                };
                 let views = self
                     .service
-                    .torrent_read(*job_id, *shown)
+                    .torrent_read(*job_id, shown)
                     .await
                     .map(|(mut view, one_file)| {
-                        // The bytes of each file move with its files: printed
-                        // only when they are shown.
-                        if !shown.files {
-                            view.file_have = Vec::new();
-                        }
+                        // The bytes of each file move with its files, which
+                        // are not read: never printed.
+                        view.file_have = Vec::new();
                         (view, one_file)
                     })
                     .into_iter()
