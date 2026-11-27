@@ -204,6 +204,31 @@ impl Par2 {
         &self.order
     }
 
+    // The set `key` was filed: a member another set binds, whose front a
+    // file of this set has, is described by this set too from now on, and
+    // what arrived of it is asked for again on this set's slices.
+    fn describes_anew(&mut self, key: [u8; 16]) {
+        if !self.catalogue.shares() {
+            return;
+        }
+        let Some(index) = self.sets.get(&key).and_then(SetState::usable) else {
+            return;
+        };
+        for described in index.files.values() {
+            let front = sets::Front::described(described.length, described.hash_16k);
+            for (_, other) in self.catalogue.fronted(front) {
+                let Some(state) = self.sets.get(&other).filter(|_| other != key) else {
+                    continue;
+                };
+                for file in state.fronted(&front) {
+                    if let Some(member) = state.members().get(file) {
+                        self.covered.unfed.insert(*member);
+                    }
+                }
+            }
+        }
+    }
+
     // A set the object did not have, filed by where its first packet was
     // found.
     fn file_set(&mut self, key: [u8; 16], state: SetState) {
@@ -219,6 +244,7 @@ impl Par2 {
         );
         self.held(key);
         self.rebound.insert(key);
+        self.describes_anew(key);
         if let Some(was) = &was
             && let Some(index) = was.usable()
         {
@@ -386,24 +412,51 @@ impl Par2 {
         (damaged > reachable).then_some(RepairOutcome::Impossible { damaged, reachable })
     }
 
+    // The slice sizes of the sets that describe the member, onto `out`:
+    // each set that binds it, and each other set describing a file of its
+    // front, which takes it if the first cannot rebuild it. Its evidence
+    // is cut and kept at these, so the set it moves to holds what the
+    // first did. A size may be named more than once.
+    fn described_sizes(&self, member: MemberId, out: &mut Vec<u64>) {
+        for key in self.covered.sets(member) {
+            let Some(state) = self.sets.get(key) else {
+                continue;
+            };
+            let Some(index) = state.index.as_ref() else {
+                continue;
+            };
+            out.push(index.slice_size);
+            if !self.catalogue.shares() {
+                continue;
+            }
+            let described = state
+                .bound(member)
+                .and_then(|file| index.file_description(&file));
+            if let Some(described) = described {
+                let front = sets::Front::described(described.length, described.hash_16k);
+                out.extend(
+                    self.catalogue
+                        .fronted(front)
+                        .filter_map(|(_, other)| self.sets.get(&other)?.index.as_ref())
+                        .map(|index| index.slice_size),
+                );
+            }
+        }
+    }
+
     // Every grid the member's evidence is folded on, each once, smallest
-    // first: the slices of each set that binds it, and the whole member. A
-    // set that binds it later is fed what came before (`unfed`), so no set's
-    // slices are kept for a member it does not bind. Listed in the object's
-    // own room, which the caller hands back when the feed is done.
+    // first: the slices of each set that describes it, and the whole
+    // member. A set that comes to describe it later is fed what came before
+    // (`unfed`), so no set's slices are kept for a member it does not
+    // describe. Listed in the object's own room, which the caller hands
+    // back when the feed is done.
     fn list_grids(&mut self, member: MemberId) -> Vec<u64> {
         let mut grids = std::mem::take(&mut self.grids);
         #[cfg(test)]
         let room = grids.capacity();
         grids.clear();
-        grids.extend(
-            self.covered
-                .sets(member)
-                .iter()
-                .filter_map(|key| self.sets.get(key)?.index.as_ref())
-                .map(|index| index.slice_size)
-                .chain([WHOLE]),
-        );
+        self.described_sizes(member, &mut grids);
+        grids.push(WHOLE);
         grids.sort_unstable();
         grids.dedup();
         #[cfg(test)]
@@ -887,6 +940,9 @@ impl Par2 {
             }
             self.rebound.insert(set);
             self.fold_set(set);
+        }
+        for set in &usable {
+            self.describes_anew(*set);
         }
         // A set that came to describe a front another set binds may take
         // what that set, standing short, gives up: only the sets describing
@@ -1416,17 +1472,20 @@ impl Recovery for Par2 {
         self.grids = grids;
     }
 
-    // A member a set newly binds, of which something was recorded and
-    // nothing on that set's slices: it was said while another set bound it.
+    fn moved(&self) -> bool {
+        !self.covered.unfed.is_empty()
+    }
+
+    // A member a set came to describe, of which something was recorded
+    // and nothing on that set's slices: it was said before the set was
+    // known to describe it.
     fn unfed(&mut self, out: &mut Vec<MemberId>) {
+        let mut sizes = Vec::new();
         for member in std::mem::take(&mut self.covered.unfed) {
             let kept = self.grid.sizes(member);
-            let lacking = self
-                .covered
-                .sets(member)
-                .iter()
-                .filter_map(|key| self.sets.get(key)?.index.as_ref())
-                .any(|index| !kept.contains(&index.slice_size));
+            sizes.clear();
+            self.described_sizes(member, &mut sizes);
+            let lacking = sizes.iter().any(|size| !kept.contains(size));
             if !kept.is_empty() && lacking {
                 out.push(member);
             }
@@ -1460,11 +1519,15 @@ impl Recovery for Par2 {
     }
 
     // A slice is proven by checksums cut at its boundaries; the whole
-    // member's CRC folds from any. Each size once, however many sets share
-    // it.
-    fn block_sizes(&self, out: &mut Vec<u64>) {
+    // member's CRC folds from any. A member is cut for the sets that
+    // describe it, and a member no set binds may be any set's. Each size
+    // once, however many sets share it.
+    fn block_sizes(&self, member: MemberId, out: &mut Vec<u64>) {
         let from = out.len();
-        out.extend(self.slice_sizes());
+        self.described_sizes(member, out);
+        if out.len() == from {
+            out.extend(self.slice_sizes());
+        }
         out[from..].sort_unstable();
         let mut kept = from;
         for at in from..out.len() {
@@ -1822,9 +1885,9 @@ fn rebind(
 struct Cover {
     // Each bound member's sets, in key order.
     by: BTreeMap<MemberId, Vec<[u8; 16]>>,
-    // Members a set came to bind since the namespace last asked. What
-    // arrived of one before was recorded for the set that bound it then,
-    // so the namespace says it again for this one.
+    // Members a set came to bind or to describe since the namespace last
+    // asked. What arrived of one before was recorded for the sets that
+    // described it then, so the namespace says it again for this one.
     unfed: BTreeSet<MemberId>,
 }
 

@@ -1190,11 +1190,12 @@ impl GraphJob {
     }
 
     // Seam for the article decoder: the block sizes the root namespace's
-    // sets fold their evidence at. An article leased now has its checksums
-    // cut at their boundaries, so a slice its bytes tile is proven as it
-    // passes rather than read back. Stable.
-    pub(crate) fn block_sizes(&self) -> Vec<u64> {
-        self.writer.block_sizes(&self.tree, NodeId::ROOT)
+    // sets fold the file's evidence at. An article of it leased now has its
+    // checksums cut at their boundaries, so a slice its bytes tile is
+    // proven as it passes rather than read back. Stable.
+    pub(crate) fn block_sizes(&self, file_index: u32) -> Vec<u64> {
+        self.writer
+            .block_sizes(&self.tree, NodeId::ROOT, MemberId(file_index))
     }
 
     // Both recovery formats report progress to the same bootstrap gate.

@@ -566,7 +566,7 @@ async fn article_copies(
         }
         raw.extend_from_slice(b".\r\n");
         let mut decoder = weaver_nntp::fused_yenc::FusedYencArticleDecoder::new();
-        decoder.set_checkpoint_plan(checkpoint_plan(pipeline, JOB));
+        decoder.set_checkpoint_plan(checkpoint_plan(pipeline, id.file_id));
         let failed = |error: String| DecodeDone::Failed {
             segment_id: id,
             raw_size: raw.len() as u64,
