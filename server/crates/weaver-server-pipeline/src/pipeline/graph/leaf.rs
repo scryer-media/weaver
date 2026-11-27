@@ -133,11 +133,12 @@ pub struct Leaf {
     // a start over (`truncate`) takes it back, and a retraction drops the
     // whole leaf.
     stamped: bool,
-    // The bytes that changed after they were written, by start and the
-    // revision that changed them, to where they end: what a write replaced,
-    // a close cut off or a start over emptied. A byte written for the first
-    // time changes nothing anyone read.
-    changed: BTreeMap<(u64, u64), u64>,
+    // The bytes that changed after they were written, by start, to the
+    // latest revision that changed them and where they end: what a write
+    // replaced, a close cut off or a start over emptied. The stretches are
+    // disjoint. A byte written for the first time changes nothing anyone
+    // read.
+    changed: BTreeMap<u64, (u64, u64)>,
     // The volume writer the file's operations go to, when the leaf does not
     // run them itself. Everything the leaf records of its file is as it
     // will be once what it submitted has returned; whoever needs the disk
@@ -485,28 +486,65 @@ impl Leaf {
     }
 
     // Whether a byte of `start..end` changed since the leaf stood at `seen`,
-    // or the leaf is another file than the one seen then.
+    // or the leaf is another file than the one seen then. The map holds, for
+    // every byte, the latest revision that changed it, so a range changed
+    // since `seen` exactly when one of the stretches it spans did.
     pub(crate) fn changed_since(&self, seen: (u64, u64), start: u64, end: u64) -> bool {
         seen.0 != self.identity
             || self
-                .changed
-                .range(..(end, 0))
-                .any(|(&(from, revision), &to)| revision > seen.1 && to > start && from < end)
+                .spanned(start, end)
+                .any(|(from, (revision, to))| revision > seen.1 && to > start && from < end)
     }
 
-    // `start..end` changed at this revision; what it changed before, within
-    // it, is answered by it.
-    fn change(&mut self, start: u64, end: u64) {
-        let within: Vec<(u64, u64)> = self
+    // The stretches of `changed` that `start..end` may reach: the one at or
+    // before its start, which may end before it, and every one starting
+    // inside it. They are disjoint, so no stretch before those reaches it.
+    fn spanned(&self, start: u64, end: u64) -> impl Iterator<Item = (u64, (u64, u64))> + '_ {
+        let from = self
             .changed
-            .range((start, 0)..(end, 0))
-            .filter(|(_, to)| **to <= end)
-            .map(|(key, _)| *key)
-            .collect();
-        for key in within {
-            self.changed.remove(&key);
+            .range(..=start)
+            .next_back()
+            .map_or(start, |(from, _)| *from);
+        self.changed
+            .range(from..end.max(from))
+            .map(|(from, stretch)| (*from, *stretch))
+    }
+
+    // `start..end` changed at this revision, which is the latest: every
+    // stretch it overlaps keeps only what lies outside it, at the revision
+    // that stretch had, and it is joined to a neighbour it abuts that
+    // changed at this revision too.
+    fn change(&mut self, mut start: u64, mut end: u64) {
+        if start >= end {
+            return;
         }
-        self.changed.insert((start, self.revision), end);
+        let overlapped: Vec<(u64, (u64, u64))> = self
+            .spanned(start, end)
+            .filter(|(_, (_, to))| *to > start)
+            .collect();
+        for (from, (revision, to)) in overlapped {
+            self.changed.remove(&from);
+            if from < start {
+                self.changed.insert(from, (revision, start));
+            }
+            if to > end {
+                self.changed.insert(end, (revision, to));
+            }
+        }
+        if let Some((&from, &(revision, to))) = self.changed.range(..start).next_back()
+            && to == start
+            && revision == self.revision
+        {
+            self.changed.remove(&from);
+            start = from;
+        }
+        if let Some(&(revision, to)) = self.changed.get(&end)
+            && revision == self.revision
+        {
+            self.changed.remove(&end);
+            end = to;
+        }
+        self.changed.insert(start, (self.revision, end));
     }
 
     pub fn path(&self) -> &Path {
@@ -1506,3 +1544,6 @@ pub mod counting {
         (READ.with(Cell::get), WRITTEN.with(Cell::get))
     }
 }
+
+#[cfg(test)]
+mod tests;
