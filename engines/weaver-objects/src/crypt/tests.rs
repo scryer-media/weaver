@@ -635,3 +635,81 @@ fn placed_agrees_with_a_byte_map_over_thousands_of_runs() {
         }
     }
 }
+
+// One seeded run of arrivals over a stream with padding: in order, out of
+// order, repeated, damaged and then repaired, un-said from inside a block,
+// with seals between them. Everything the chain hands out or keeps (the
+// plaintext pieces, what each seal gives back, the owner's padding and the
+// kept chain, both as their facts encode them) is folded into one CRC32,
+// which is the value this run gave before the chain borrowed the padding
+// and reused its scratch.
+#[test]
+fn a_seeded_run_hands_out_and_keeps_what_it_always_did() {
+    const EXPECTED: (u32, u64) = (979_244_882, 59_573);
+    let (plain, cipher) = posted(4999);
+    let (plain_len, cipher_len) = (plain.len() as u64, cipher.len() as u64);
+    let mut stream = cbc(&plain, &cipher);
+    let mut out = Out::default();
+    let mut seed = 0x6a09_e667_f3bc_c908_u64;
+    let mut next = move |bound: u64| {
+        seed = seed
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        (seed >> 33) % bound
+    };
+    let mut transcript = Vec::new();
+    let kind = |provenance: Provenance| match provenance {
+        Provenance::Fresh => 0u8,
+        Provenance::Damaged => 1,
+        Provenance::Repaired => 2,
+        Provenance::Refuted => 3,
+        Provenance::Lost => 4,
+    };
+    let mut arrivals: Vec<(ByteRange, Provenance, bool)> = Vec::new();
+    arrivals.extend(frames(1200, 97).into_iter().map(|range| (range, Provenance::Fresh, false)));
+    for _ in 0..400 {
+        let start = next(cipher_len);
+        let range = ByteRange::new(start, (start + 1 + next(200)).min(cipher_len));
+        let (provenance, corrupt) = match next(6) {
+            0 => (Provenance::Damaged, true),
+            1 => (Provenance::Damaged, false),
+            2 => (Provenance::Repaired, false),
+            _ => (Provenance::Fresh, false),
+        };
+        arrivals.push((range, provenance, corrupt));
+    }
+    arrivals.extend(
+        scrambled(cipher.len(), 61)
+            .into_iter()
+            .map(|range| (range, Provenance::Repaired, false)),
+    );
+    for (step, (range, provenance, corrupt)) in arrivals.into_iter().enumerate() {
+        let mut bytes = cipher[range.start as usize..range.end as usize].to_vec();
+        if corrupt {
+            bytes[0] ^= 0x41;
+        }
+        for piece in out.deliver(&mut stream, range.start, &bytes, provenance) {
+            transcript.extend(piece.offset.to_le_bytes());
+            transcript.extend(&piece.bytes);
+            transcript.push(kind(piece.provenance));
+        }
+        if step % 7 == 0 {
+            let start = next(cipher_len);
+            let range = ByteRange::new(start, (start + 1 + next(300)).min(cipher_len));
+            let mut into = Vec::new();
+            let bytes = out.bytes.clone();
+            transcript.push(u8::from(out.seal(&stream, range, &bytes, &mut into)));
+            transcript.extend(&into);
+        }
+        if step % 97 == 50 {
+            let from = block_floor(range.start);
+            out.coverage.erase(ByteRange::new(from.min(plain_len), plain_len));
+            out.padding.forget(plain_len, ByteRange::new(from, cipher_len));
+        }
+    }
+    transcript.extend(rmp_serde::to_vec(&out.padding).unwrap());
+    transcript.extend(rmp_serde::to_vec(&stream.chain()).unwrap());
+    transcript.extend((stream.kept() as u64).to_le_bytes());
+    let got = (crate::grid::crc32(&transcript), transcript.len() as u64);
+    assert_eq!(got, EXPECTED);
+}

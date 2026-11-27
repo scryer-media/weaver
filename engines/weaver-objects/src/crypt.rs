@@ -319,6 +319,26 @@ pub struct Chain {
     staged: Staged,
     // Whole cipher blocks, by the offset each ends at.
     checkpoints: BTreeMap<u64, Block>,
+    // Room a delivery's lists reuse. Not kept, and not copied with the chain.
+    #[serde(skip)]
+    scratch: Scratch,
+}
+
+// The lists one delivery builds: the cut filed blocks its whole blocks
+// replace, in offset order; the blocks it staged, in offset order; and the
+// blocks that decipher again, sorted. Empty between deliveries.
+#[derive(Default)]
+struct Scratch {
+    cut: Vec<u64>,
+    changed: Vec<u64>,
+    dirty: Vec<u64>,
+}
+
+// A copy of a chain starts with room of its own.
+impl Clone for Scratch {
+    fn clone(&self) -> Self {
+        Self::default()
+    }
 }
 
 impl fmt::Debug for Cbc {
@@ -494,16 +514,21 @@ fn block_at(start: u64) -> ByteRange {
 }
 
 // What has come out, as one call sees it: the owner's record and padding,
-// and on top of them what this call deciphered.
-struct Seen<'a> {
+// and on top of them what this call deciphered. The padding is the owner's
+// own, borrowed: a delivery keeps the plaintext past the payload in it as
+// it comes out, and a seal only reads it.
+struct Seen<'a, P> {
     placed: &'a dyn Placed,
     now: Coverage,
-    padding: Padding,
+    padding: P,
     plain_len: u64,
     cipher_len: u64,
 }
 
-impl Seen<'_> {
+// A delivery's view, which keeps what comes out past the payload.
+type Delivering<'a> = Seen<'a, &'a mut Padding>;
+
+impl<P: std::ops::Deref<Target = Padding>> Seen<'_, P> {
     // Whether a block of `range` may have come out: one did only where every
     // payload byte of it was placed, and a block past the payload is never
     // judged here.
@@ -574,6 +599,7 @@ impl Cbc {
             plain_len,
             staged,
             checkpoints,
+            scratch: Scratch::default(),
         };
         let key = cipher_key(key)?;
         Ok(Self { key, chain })
@@ -627,7 +653,6 @@ impl Cbc {
         let mut seen = self.chain.seen(placed, padding);
         self.chain
             .deliver(&self.key, &mut seen, arrival, plain, out);
-        *padding = seen.padding;
     }
 
     // The cipher bytes posted for `range`, from what is staged and the
@@ -673,9 +698,9 @@ impl Chain {
         self.cipher_len == cipher_len && self.plain_len == plain_len
     }
 
-    fn seen<'a>(&self, placed: &'a dyn Placed, padding: &Padding) -> Seen<'a> {
+    fn seen<'a, P>(&self, placed: &'a dyn Placed, padding: P) -> Seen<'a, P> {
         let (plain_len, cipher_len) = (self.plain_len, self.cipher_len);
-        let (now, padding) = (Coverage::new(), padding.clone());
+        let now = Coverage::new();
         Seen {
             placed,
             now,
@@ -688,7 +713,7 @@ impl Chain {
     fn deliver(
         &mut self,
         key: &MemberCipherKey,
-        seen: &mut Seen<'_>,
+        seen: &mut Delivering<'_>,
         (offset, bytes, provenance): (u64, &[u8], Provenance),
         plain: &mut dyn FnMut(ByteRange, &mut Vec<u8>) -> bool,
         out: &mut Vec<Plain>,
@@ -710,7 +735,13 @@ impl Chain {
             block_ceil(range.start),
             block_floor(range.end).max(block_ceil(range.start)),
         );
-        let mut cut = Vec::new();
+        // Lists a delivery builds and drops, in room the chain keeps between
+        // deliveries; put back below, emptied, for the next.
+        let Scratch {
+            mut cut,
+            mut changed,
+            mut dirty,
+        } = std::mem::take(&mut self.scratch);
         let open = !mid.is_empty()
             && provenance.is_verified()
             && self.staged.first_in(mid.start, mid.end).is_none()
@@ -720,10 +751,10 @@ impl Chain {
         if open {
             self.file_ciphers(key, seen, ByteRange::new(around.start, mid.start), plain);
             self.file_ciphers(key, seen, ByteRange::new(mid.end, around.end), plain);
-            let filed: Vec<u64> = (self.checkpoints.range(mid.start + BLOCK..=mid.end))
+            while let Some(at) = (self.checkpoints.range(mid.start + BLOCK..=mid.end))
+                .next()
                 .map(|(&at, _)| at)
-                .collect();
-            for at in filed {
+            {
                 if self.checkpoints.remove(&at).is_some_and(|block| block.cut) {
                     cut.push(at - BLOCK);
                 }
@@ -732,7 +763,6 @@ impl Chain {
             self.file_ciphers(key, seen, around, plain);
         }
         let arrival = (offset, bytes, provenance);
-        let mut changed = Vec::new();
         let mut overlay = None;
         if open {
             self.stage(
@@ -770,12 +800,10 @@ impl Chain {
         // A changed block re-chains the one after it, staged or out. Both
         // are in offset order, each once. The arrival's last whole block
         // re-chains the one after it the same way.
-        let mut dirty = Vec::with_capacity(changed.len() + 2);
         let last = overlay
             .filter(|_| mid.end == range.end)
             .map(|_| mid.end - BLOCK);
-        let changed = changed.into_iter().chain(last);
-        for start in changed {
+        for start in changed.iter().copied().chain(last) {
             if dirty.last() != Some(&start) && Some(start) != last {
                 dirty.push(start);
             }
@@ -802,7 +830,7 @@ impl Chain {
             (start, lead)
         });
         let mut touched = around;
-        let mut pending = dirty.into_iter().peekable();
+        let mut pending = dirty.iter().copied().peekable();
         loop {
             let next = pending.peek().copied();
             if let Some((start, lead)) = overlay
@@ -834,6 +862,14 @@ impl Chain {
             }
         }
         self.prune_checkpoints(seen, touched);
+        cut.clear();
+        changed.clear();
+        dirty.clear();
+        self.scratch = Scratch {
+            cut,
+            changed,
+            dirty,
+        };
     }
 
     // Stages the blocks of `part` of an arrival, each over what it held
@@ -842,7 +878,7 @@ impl Chain {
     // filed already. The blocks staged go onto `changed`, in offset order.
     fn stage(
         &mut self,
-        seen: &Seen<'_>,
+        seen: &Delivering<'_>,
         part: ByteRange,
         (offset, bytes, provenance): (u64, &[u8], Provenance),
         changed: &mut Vec<u64>,
@@ -886,7 +922,7 @@ impl Chain {
     fn file_ciphers(
         &mut self,
         key: &MemberCipherKey,
-        seen: &Seen<'_>,
+        seen: &Delivering<'_>,
         around: ByteRange,
         plain: &mut dyn FnMut(ByteRange, &mut Vec<u8>) -> bool,
     ) {
@@ -970,7 +1006,7 @@ impl Chain {
     fn decrypt_range(
         &mut self,
         key: &MemberCipherKey,
-        seen: &mut Seen<'_>,
+        seen: &mut Delivering<'_>,
         run: ByteRange,
         overlay: Option<Overlay<'_>>,
         out: &mut Vec<Plain>,
@@ -1120,7 +1156,7 @@ impl Chain {
     // Whether the checkpoint ending at `at` is still a seed someone needs:
     // at a deciphered run's start or end, every STRIDE bytes inside one,
     // either side of damage, and a cut block.
-    fn keep(&self, seen: &Seen<'_>, at: u64) -> bool {
+    fn keep(&self, seen: &Delivering<'_>, at: u64) -> bool {
         if self.checkpoints.get(&at).is_some_and(|block| block.cut) {
             return true;
         }
@@ -1135,7 +1171,7 @@ impl Chain {
         }
     }
 
-    fn prune_checkpoints(&mut self, seen: &Seen<'_>, around: ByteRange) {
+    fn prune_checkpoints(&mut self, seen: &Delivering<'_>, around: ByteRange) {
         let spent: Vec<u64> = self
             .checkpoints
             .range(around.start..=around.end + BLOCK)
@@ -1160,10 +1196,10 @@ impl Chain {
     // checkpoint, or `reached`, where a seal of this cipher last left off,
     // when that is nearer. Gives back where this one leaves off: the start
     // of its last block and the cipher before it, when both are known.
-    fn seal(
+    fn seal<P: std::ops::Deref<Target = Padding>>(
         &self,
         key: &MemberCipherKey,
-        seen: &Seen<'_>,
+        seen: &Seen<'_, P>,
         range: ByteRange,
         reached: Option<Reached>,
         plain: &mut dyn FnMut(ByteRange, &mut Vec<u8>) -> bool,
