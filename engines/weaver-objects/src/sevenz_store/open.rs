@@ -368,10 +368,12 @@ impl SevenZipStore {
             let lock = std::mem::replace(&mut self.folders[at], Lock::Locked);
             let opened = match (self.folder_key(index, at, &properties), lock) {
                 // Sealed at a restart: the chain it kept, keyed again, when
-                // the padding kept beside it fits the folder's stream. One
-                // that does not opens afresh, as a folder never sealed does.
+                // it and the padding kept beside it fit the folder's stream.
+                // One that does not opens afresh, as a folder never sealed
+                // does.
                 (Ok(Some(key)), Lock::Sealed(chain, padding))
-                    if padding.fits(folder.pack.len().saturating_sub(folder.plain_len)) =>
+                    if chain.fits(folder.pack.len(), folder.plain_len)
+                        && padding.fits(folder.pack.len().saturating_sub(folder.plain_len)) =>
                 {
                     Cbc::unseal(&key[..], *chain).ok().map(|cbc| (cbc, padding))
                 }
