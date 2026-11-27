@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
-use weaver_graph::{ByteRange, MemberId, Segment, SliceVerdict};
+use serde::{Deserialize, Serialize};
+use weaver_graph::{ByteRange, Durable, Facts, Give, Kind, MemberId, Segment, SliceVerdict, Take};
 
 use super::*;
 use crate::testing::{payload, segments};
@@ -192,7 +193,6 @@ fn supersede_by_scan(grid: &mut Grid, member: MemberId, block_size: u64, segment
     let last = (segment.range.end - 1) / block_size;
     let file = grid.files.entry((member, block_size)).or_default();
     for index in first..=last {
-        let bounds = block_bounds(index, block_size);
         let overlaps = file.block(index).is_some_and(|block| {
             block
                 .values()
@@ -200,9 +200,9 @@ fn supersede_by_scan(grid: &mut Grid, member: MemberId, block_size: u64, segment
         });
         if overlaps {
             let (before, after) = file.change(index, |block| {
-                let before = Load::of(block, bounds);
+                let before = Load::of(block, index, block_size);
                 block.retain(|_, run| run.range.intersect(segment.range).is_none());
-                (before, Load::of(block, bounds))
+                (before, Load::of(block, index, block_size))
             });
             file.load.sub(before);
             file.load.add(after);
@@ -236,32 +236,7 @@ fn state(grid: &Grid, block_size: u64, length: u64) -> (Vec<Option<Block>>, Load
 #[test]
 fn the_range_probe_supersedes_what_the_scan_did() {
     const LENGTH: u64 = 4096;
-    let mut seed = 0x9e37_79b9_7f4a_7c15_u64;
-    let mut next = move |bound: u64| {
-        seed = seed
-            .wrapping_mul(6_364_136_223_846_793_005)
-            .wrapping_add(1_442_695_040_888_963_407);
-        (seed >> 33) % bound
-    };
-    let mut deliveries = Vec::new();
-    for _ in 0..2000 {
-        let pieces = 1 + next(3);
-        let mut at = next(LENGTH);
-        let mut delivery = Vec::new();
-        for _ in 0..pieces {
-            let len = 1 + next(300);
-            let end = (at + len).min(LENGTH);
-            if at < end {
-                delivery.push(Segment {
-                    range: ByteRange::new(at, end),
-                    crc32: next(u64::from(u32::MAX)) as u32,
-                    verified: next(4) != 0,
-                });
-            }
-            at = end;
-        }
-        deliveries.push(delivery);
-    }
+    let deliveries = fuzzed(LENGTH, 2000);
     for block_size in [WHOLE, 64, 100] {
         let mut probed = Grid::default();
         let mut scanned = Grid::default();
@@ -312,4 +287,197 @@ fn overlapping_pieces_of_one_delivery_leave_their_stretch_unproven() {
             })
         );
     }
+}
+
+// The deliveries a fuzzed run makes over a member of `length`: out of
+// order, overlapping and said again, verified and not.
+fn fuzzed(length: u64, count: usize) -> Vec<Vec<Segment>> {
+    let mut seed = 0x9e37_79b9_7f4a_7c15_u64;
+    let mut next = move |bound: u64| {
+        seed = seed
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        (seed >> 33) % bound
+    };
+    let mut deliveries = Vec::new();
+    for _ in 0..count {
+        let pieces = 1 + next(3);
+        let mut at = next(length);
+        let mut delivery = Vec::new();
+        for _ in 0..pieces {
+            let len = 1 + next(300);
+            let end = (at + len).min(length);
+            if at < end {
+                delivery.push(Segment {
+                    range: ByteRange::new(at, end),
+                    crc32: next(u64::from(u32::MAX)) as u32,
+                    verified: next(4) != 0,
+                });
+            }
+            at = end;
+        }
+        deliveries.push(delivery);
+    }
+    deliveries
+}
+
+// The accounting before a whole member's grid read in order counted for
+// nothing: a block closed by one run over its full extent is derived,
+// anything else is pending runs.
+fn load_before(block: &Block, bounds: ByteRange) -> Load {
+    match block.values().next() {
+        Some(run) if block.len() == 1 && run.range == bounds => Load {
+            pending: 0,
+            derived: 1,
+        },
+        _ => Load {
+            pending: block.len(),
+            derived: 0,
+        },
+    }
+}
+
+// Every block of a grid, counted as `count` counts it.
+fn counted(grid: &Grid, count: impl Fn(&Block, u64, u64) -> Load) -> Load {
+    let mut load = Load::default();
+    for (&(_, block_size), file) in &grid.files {
+        for (_, blocks) in file.blocks.chunks() {
+            for (&index, block) in blocks {
+                load.add(count(block, index, block_size));
+            }
+        }
+    }
+    load
+}
+
+// A grid kept in facts and read back, as its owner keeps it.
+#[derive(Serialize, Deserialize)]
+struct Kept(Grid);
+
+impl Durable for Kept {
+    const VERSION: u16 = 1;
+
+    fn parts(&self, take: &mut Take) -> Result<(), String> {
+        self.0.parts(take)
+    }
+
+    fn restore_parts(&mut self, give: &mut Give) -> Result<(), String> {
+        self.0.restore_parts(give)
+    }
+}
+
+fn round_trip(grid: &Grid) -> Grid {
+    Facts::of(Kind::Sfv, &Kept(grid.clone()))
+        .read::<Kept>(Kind::Sfv)
+        .expect("the grid restores")
+        .0
+}
+
+// More members than the job's run budget, each read in order on its whole
+// grid: none is forgotten, none holds a load, and every one folds.
+#[test]
+fn whole_grids_read_in_order_hold_no_load() {
+    const MEMBERS: u32 = 20_000;
+    let bytes = payload(9, 1000);
+    let mut grid = Grid::default();
+    for member in 0..MEMBERS {
+        for segment in segments(0, &bytes, 300, 1000, true) {
+            grid.offer(MemberId(member), WHOLE, &segment);
+        }
+    }
+    assert_eq!(grid.load, Load::default());
+    for member in 0..MEMBERS {
+        let folded = grid.fold(MemberId(member), WHOLE, 0, ByteRange::new(0, 1000));
+        assert_eq!(
+            verdict(folded, 1000, 0, crc32(&bytes)),
+            SliceVerdict::Intact,
+            "member {member}"
+        );
+    }
+}
+
+// A whole member's grid with runs apart, or one not from its start, still
+// counts each run as pending.
+#[test]
+fn a_whole_grid_with_runs_apart_counts_them_pending() {
+    let piece = |start: u64, end: u64| Segment {
+        range: ByteRange::new(start, end),
+        crc32: 0,
+        verified: true,
+    };
+    let mut grid = Grid::default();
+    grid.offer_all(MEMBER, WHOLE, &[piece(0, 100), piece(200, 300)]);
+    let pending = |pending| Load {
+        pending,
+        derived: 0,
+    };
+    assert_eq!(grid.load, pending(2));
+    assert_eq!(grid.files[&(MEMBER, WHOLE)].load, pending(2));
+    let mut late = Grid::default();
+    late.offer(MEMBER, WHOLE, &piece(100, 200));
+    assert_eq!(late.load, pending(1));
+}
+
+// On grids of small blocks the loads are what the accounting before
+// counted, after every delivery.
+#[test]
+fn small_block_grids_count_as_before() {
+    const LENGTH: u64 = 4096;
+    let deliveries = fuzzed(LENGTH, 2000);
+    for block_size in [64, 100, 1000] {
+        let mut grid = Grid::default();
+        for (at, delivery) in deliveries.iter().enumerate() {
+            grid.offer_all(MEMBER, block_size, delivery);
+            let before = counted(&grid, |block, index, block_size| {
+                load_before(block, block_bounds(index, block_size))
+            });
+            assert_eq!(grid.load, before, "blocks of {block_size}, delivery {at}");
+            assert_eq!(
+                grid.files[&(MEMBER, block_size)].load,
+                before,
+                "blocks of {block_size}, delivery {at}"
+            );
+        }
+    }
+}
+
+// Facts written while a whole grid read in order still counted a pending
+// run come back with the loads counted again from their blocks.
+#[test]
+fn a_restored_grid_counts_its_loads_again() {
+    let bytes = payload(10, 1000);
+    let mut grid = Grid::default();
+    for member in 0..3 {
+        for segment in segments(0, &bytes, 300, 1000, true) {
+            grid.offer(MemberId(member), WHOLE, &segment);
+        }
+    }
+    for delivery in fuzzed(4096, 500) {
+        grid.offer_all(MEMBER, 64, &delivery);
+    }
+    let small = grid.files[&(MEMBER, 64)].load;
+    assert_ne!(small, Load::default());
+    // As the accounting before kept them: one pending run per whole grid.
+    let old = |pending| Load {
+        pending,
+        derived: 0,
+    };
+    for member in 0..3 {
+        grid.files
+            .get_mut(&(MemberId(member), WHOLE))
+            .expect("a grid")
+            .load = old(1);
+    }
+    grid.load = old(3);
+    grid.load.add(small);
+    let restored = round_trip(&grid);
+    for member in 0..3 {
+        assert_eq!(
+            restored.files[&(MemberId(member), WHOLE)].load,
+            Load::default()
+        );
+    }
+    assert_eq!(restored.files[&(MEMBER, 64)].load, small);
+    assert_eq!(restored.load, small);
+    assert_eq!(restored.load, counted(&restored, Load::of));
 }

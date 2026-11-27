@@ -23,7 +23,10 @@ use serde::{Deserialize, Serialize};
 use weaver_graph::{ByteRange, Give, MemberId, Segment, Shelf, SliceVerdict, Take};
 
 // A run is folded eagerly inside its block, so ordered traffic needs one per
-// grid, and these bounds only bite on pathological interleavings.
+// grid, and these bounds only bite on pathological interleavings. They bound
+// the runs a grid holds past what ordered traffic leaves: a whole member's
+// grid holding one run from its start, as every member read in order ends
+// with, counts against none of them.
 const MAX_PENDING_RUNS_PER_FILE: usize = 4096;
 const MAX_DERIVED_BLOCKS_PER_FILE: usize = 16_384;
 const MAX_PENDING_RUNS_PER_JOB: usize = 16_384;
@@ -96,7 +99,9 @@ fn fold_tiling<'a>(runs: impl Iterator<Item = &'a Run>, range: ByteRange) -> Opt
 }
 
 // What one block holds against the bounds: a block closed by one run over
-// its full extent counts as derived, anything else as pending runs.
+// its full extent counts as derived, the one block of a whole member's grid
+// holding one run from its start counts as nothing, and anything else
+// counts as pending runs.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 struct Load {
     pending: usize,
@@ -104,9 +109,12 @@ struct Load {
 }
 
 impl Load {
-    fn of(block: &BTreeMap<u64, Run>, bounds: ByteRange) -> Self {
+    fn of(block: &BTreeMap<u64, Run>, index: u64, block_size: u64) -> Self {
         match block.values().next() {
-            Some(run) if block.len() == 1 && run.range == bounds => Load {
+            Some(run) if block.len() == 1 && block_size == WHOLE && run.range.start == 0 => {
+                Load::default()
+            }
+            Some(run) if block.len() == 1 && run.range == block_bounds(index, block_size) => Load {
                 pending: 0,
                 derived: 1,
             },
@@ -193,10 +201,21 @@ impl Grid {
             .try_for_each(|file| take.shelf(&file.blocks))
     }
 
+    // The loads are counted again from the blocks given back, once per
+    // block, so loads facts were written with stand for nothing.
     pub(crate) fn restore_parts(&mut self, give: &mut Give) -> Result<(), String> {
-        self.files
-            .values_mut()
-            .try_for_each(|file| give.shelf(&mut file.blocks))
+        self.load = Load::default();
+        for (&(_, block_size), file) in &mut self.files {
+            give.shelf(&mut file.blocks)?;
+            file.load = Load::default();
+            for (_, blocks) in file.blocks.chunks() {
+                for (&index, block) in blocks {
+                    file.load.add(Load::of(block, index, block_size));
+                }
+            }
+            self.load.add(file.load);
+        }
+        Ok(())
     }
 
     // Record a segment on the member's grid of `block_size`.
@@ -228,15 +247,14 @@ impl Grid {
         let last = (segment.range.end - 1) / block_size;
         let file = self.files.entry((member, block_size)).or_default();
         for index in first..=last {
-            let bounds = block_bounds(index, block_size);
             let overlaps = file
                 .block(index)
                 .is_some_and(|block| overlapping(block, segment.range).next().is_some());
             if overlaps {
                 let (before, after) = file.change(index, |block| {
-                    let before = Load::of(block, bounds);
+                    let before = Load::of(block, index, block_size);
                     remove_overlapping(block, segment.range);
-                    (before, Load::of(block, bounds))
+                    (before, Load::of(block, index, block_size))
                 });
                 file.load.sub(before);
                 file.load.add(after);
@@ -255,9 +273,8 @@ impl Grid {
             return;
         }
         let file = self.files.entry((member, block_size)).or_default();
-        let bounds = block_bounds(first, block_size);
         let (before, after) = file.change(first, |block| {
-            let before = Load::of(block, bounds);
+            let before = Load::of(block, first, block_size);
             // A run the segment overlaps can only be one this delivery just
             // recorded, as the delivery superseded its whole range first. Two
             // pieces of one delivery that disagree on a stretch prove nothing
@@ -272,7 +289,7 @@ impl Grid {
                     },
                 );
             }
-            (before, Load::of(block, bounds))
+            (before, Load::of(block, first, block_size))
         });
         let mut file_load = file.load;
         file_load.sub(before);
