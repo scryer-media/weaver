@@ -34,8 +34,8 @@ use weaver_graph::holds::{
 };
 use weaver_graph::member::FIRST_BYTES;
 use weaver_graph::{
-    Algorithm, Builder, ByteRange, Coverage, Effect, Emit, Evidenced, Kind, Marked, MemberId,
-    NodeId, Object, ObjectId, Placement, Provenance, Segment, Tree, VolumeIndex, Why,
+    Algorithm, Builder, ByteRange, Coverage, Digest, Effect, Emit, Evidenced, Kind, Marked,
+    MemberId, NodeId, Object, ObjectId, Placement, Provenance, Segment, Tree, VolumeIndex, Why,
 };
 
 use super::checkpoint::why_name;
@@ -4054,13 +4054,23 @@ impl NamespaceWriter {
             self.verifications.insert((node, member));
             return Ok(false);
         }
-        let Some(leaf) = self
+        // A member its producer vouched for, every byte of which this file
+        // holds, folds the stated CRC32 onto what was written of it.
+        let held = self
             .files
             .get(&node)
-            .and_then(|files| files.leaves.get(&member))
+            .and_then(|files| files.recorded.get(&member))
+            .is_none_or(|recorded| recorded.is_empty());
+        let Some(leaf) = self
+            .files
+            .get_mut(&node)
+            .and_then(|files| files.leaves.get_mut(&member))
         else {
             return Ok(false);
         };
+        if record.vouched && held {
+            leaf.fold_checked(length, Digest::crc32(stated));
+        }
         match leaf.folded(length, Algorithm::Crc32) {
             Some(actual) => {
                 self.verifications.remove(&(node, member));

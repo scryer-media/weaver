@@ -841,9 +841,10 @@ async fn a_compressed_set_renamed_by_par2_while_it_extracts_delivers_every_membe
     }
 }
 
-// The engine checksums each piece it decodes as it says it, so a decoded
-// member's own check folds those runs as they land and reads nothing of its
-// file back at the close: in one volume, and across four.
+// The engine's decoder checks a member's bytes against its stated CRC32 as
+// it decodes them, so the member's own check takes that CRC32 as what its
+// file holds and reads nothing of it back at the close: in one volume, and
+// across four.
 #[tokio::test]
 async fn a_compressed_member_closes_with_no_check_read() {
     let before = member_check_bytes();

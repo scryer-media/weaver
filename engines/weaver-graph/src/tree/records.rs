@@ -245,6 +245,7 @@ impl Tree {
                 coverage: Coverage::new(),
                 closed: member.closed,
                 crc32: member.crc32,
+                vouched: false,
                 fronted: member.fronted,
                 refuted: member.refuted,
                 reached: None,

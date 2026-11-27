@@ -27,16 +27,16 @@ use unrar_rs::{
     VolumeProviderError,
 };
 use weaver_graph::{
-    Algorithm, Budget, ByteRange, Emit, Evidenced, Extraction, MemberId, Provenance, Sink,
-    VolumeIndex, Volumes, Why,
+    Budget, ByteRange, Emit, Extraction, MemberId, Provenance, Sink, VolumeIndex, Volumes, Why,
 };
 
 // A member decoded whole beside others: the bytes it came to, the furthest
-// volume its decode opened, and, if it failed, why and whether a read of its
-// volumes failed.
+// volume its decode opened, the CRC32 its decode checked them against, and,
+// if it failed, why and whether a read of its volumes failed.
 struct Decoded {
     bytes: Vec<u8>,
     last: usize,
+    checked: Option<u32>,
     ended: Option<(RarError, bool)>,
 }
 
@@ -281,7 +281,7 @@ impl Walk<'_, '_> {
             }));
         };
         let member = self.announce(&info)?;
-        self.deliver(member, decoded.bytes, keyed(archive, at))?;
+        self.deliver(member, decoded.bytes)?;
         if let Some((error, read_failed)) = decoded.ended {
             // Decoding alone, the walk would have read what failed itself.
             if read_failed {
@@ -290,7 +290,7 @@ impl Walk<'_, '_> {
             return Err(self.failed_through(decoded.last, error));
         }
         self.open = None;
-        self.checksum_of(archive, at, member)?;
+        self.checksum_of(archive, at, member, decoded.checked)?;
         self.say(Emit::MemberClosed(member))
     }
 
@@ -321,20 +321,29 @@ impl Walk<'_, '_> {
     // carrying only a BLAKE2sp hash, states nothing. Nor does an encrypted
     // RAR5 member: its header's CRC32 is keyed, and a keyed checksum is not
     // the member's own.
+    //
+    // Every decode verifies, so a member decoded without a mismatch had
+    // every byte said for it checked against the CRC32 its decoding archive
+    // read, `checked`. It is vouched for when that is the CRC32 stated: the
+    // same archive's, or, for a member decoded on an archive of its own,
+    // the walk's headers'.
     fn checksum_of(
         &mut self,
         archive: &RarArchive,
         index: usize,
         member: MemberId,
+        checked: Option<u32>,
     ) -> Result<(), Stop> {
         match archive.member_info(index).and_then(|info| info.crc32) {
-            Some(crc32) if !keyed(archive, index) => self.say(Emit::Checksum { member, crc32 }),
-            _ => Ok(()),
+            Some(_) if keyed(archive, index) => Ok(()),
+            Some(crc32) if checked == Some(crc32) => self.say(Emit::Vouched { member, crc32 }),
+            Some(crc32) => self.say(Emit::Checksum { member, crc32 }),
+            None => Ok(()),
         }
     }
 
     // A member decoded whole, said in pieces no larger than a decoder's.
-    fn deliver(&mut self, member: MemberId, bytes: Vec<u8>, keyed: bool) -> Result<(), Stop> {
+    fn deliver(&mut self, member: MemberId, bytes: Vec<u8>) -> Result<(), Stop> {
         let bytes = Bytes::from(bytes);
         let mut offset = 0;
         while offset < bytes.len() {
@@ -342,7 +351,7 @@ impl Walk<'_, '_> {
             self.say(Emit::Bytes {
                 member,
                 offset: offset as u64,
-                bytes: checked(bytes.slice(offset..end), keyed),
+                bytes: bytes.slice(offset..end).into(),
                 provenance: Provenance::Fresh,
             })?;
             offset = end;
@@ -397,7 +406,6 @@ impl Walk<'_, '_> {
         let mut out = Out {
             sink: &mut *self.sink,
             member,
-            keyed: keyed(archive, index),
             offset: 0,
             gathered: Vec::new(),
             stopped: false,
@@ -414,7 +422,8 @@ impl Walk<'_, '_> {
         match decoded {
             Ok(_) => {
                 self.open = None;
-                self.checksum_of(archive, index, member)?;
+                let checked = archive.member_info(index).and_then(|info| info.crc32);
+                self.checksum_of(archive, index, member, checked)?;
                 self.say(Emit::MemberClosed(member)).map(|()| 1)
             }
             Err(_) if out.stopped => Err(Stop::Silent),
@@ -439,7 +448,6 @@ impl Walk<'_, '_> {
         password: Option<&str>,
     ) -> Result<usize, Stop> {
         let member = self.announce(info)?;
-        let keyed = keyed(archive, index);
         let decode_limits = limits(&self.budget);
         let mut own = copy(archive, index, &decode_limits);
         let beside = Beside::default();
@@ -486,7 +494,6 @@ impl Walk<'_, '_> {
                 let mut out = Out {
                     sink: &mut **sink,
                     member,
-                    keyed,
                     offset: 0,
                     gathered: Vec::new(),
                     stopped: false,
@@ -515,7 +522,8 @@ impl Walk<'_, '_> {
             None => unreachable!("a pool runs its caller"),
         }
         self.open = None;
-        self.checksum_of(&own, 0, member)?;
+        let checked = own.member_info(0).and_then(|info| info.crc32);
+        self.checksum_of(&own, 0, member, checked)?;
         self.say(Emit::MemberClosed(member))?;
         let mut decoded = beside
             .decoded
@@ -759,9 +767,14 @@ fn decode(own: &mut RarArchive, input: &Input) -> Decoded {
         .and_then(|entry| entry.copy_to(&mut bytes))
         .err()
         .map(|error| (error, input.failed.load(Ordering::Acquire)));
+    let checked = ended
+        .is_none()
+        .then(|| own.member_info(0).and_then(|info| info.crc32))
+        .flatten();
     Decoded {
         bytes,
         last: reach.last(),
+        checked,
         ended,
     }
 }
@@ -1167,24 +1180,9 @@ fn keyed(archive: &RarArchive, index: usize) -> bool {
     archive.format() == ArchiveFormat::Rar5 && archive.member_is_encrypted(index)
 }
 
-// Decoded bytes as said to the member's file, with their CRC32 hashed here,
-// while they are in hand, unless nothing checks it. The member's check then
-// folds these runs as they land, and reads nothing of its file back when the
-// final part's header states the CRC32 at the close.
-fn checked(bytes: Bytes, keyed: bool) -> Evidenced {
-    let mut bytes = Evidenced::new(bytes);
-    if !keyed {
-        bytes.fill(Algorithm::Crc32);
-    }
-    bytes
-}
-
 struct Out<'s, 'a, 'b> {
     sink: &'s mut Sink<'a>,
     member: MemberId,
-    // Whether the member's stated checksum is keyed, so its bytes' own
-    // CRC32 is checked by nothing.
-    keyed: bool,
     offset: u64,
     gathered: Vec<u8>,
     stopped: bool,
@@ -1198,7 +1196,7 @@ impl Out<'_, '_, '_> {
         let heard = (self.sink)(Emit::Bytes {
             member: self.member,
             offset: self.offset,
-            bytes: checked(bytes, self.keyed),
+            bytes: bytes.into(),
             provenance: Provenance::Fresh,
         });
         if !heard {

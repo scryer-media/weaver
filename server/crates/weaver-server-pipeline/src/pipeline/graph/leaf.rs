@@ -904,6 +904,23 @@ impl Leaf {
         }
     }
 
+    // The fold of a member whose producer checked the `length` bytes it
+    // wrote against `digest` as it decoded them: the one run written over
+    // exactly them, which folded nothing, takes the digest, and nothing is
+    // hashed or read. A write that lands on the run after this takes the
+    // digest away again, as from any folded run it cannot fold.
+    pub fn fold_checked(&mut self, length: u64, digest: Digest) {
+        if length == 0 || self.written.len() != 1 {
+            return;
+        }
+        if let Some(run) = self.written.get_mut(&0)
+            && run.end == length
+            && run.digest.is_none()
+        {
+            run.digest = Some(digest);
+        }
+    }
+
     // The `algorithm` digest of the member's `length` bytes as the fold
     // holds them, when one folded run covers exactly them.
     pub fn folded(&self, length: u64, algorithm: Algorithm) -> Option<u64> {

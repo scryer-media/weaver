@@ -4825,6 +4825,16 @@ impl Tree {
                         .and_then(|namespace| namespace.get_mut(member))
                     {
                         record.crc32 = Some(crc32);
+                        record.vouched = false;
+                    }
+                }
+                Emit::Vouched { member, crc32 } => {
+                    if let Some(record) = self
+                        .namespace_mut(node)
+                        .and_then(|namespace| namespace.get_mut(member))
+                    {
+                        record.crc32 = Some(crc32);
+                        record.vouched = true;
                     }
                 }
                 // The producer's proof of where the member ends replaces
