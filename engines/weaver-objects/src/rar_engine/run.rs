@@ -27,7 +27,8 @@ use unrar_rs::{
     VolumeProviderError,
 };
 use weaver_graph::{
-    Budget, ByteRange, Emit, Extraction, MemberId, Provenance, Sink, VolumeIndex, Volumes, Why,
+    Algorithm, Budget, ByteRange, Emit, Evidenced, Extraction, MemberId, Provenance, Sink,
+    VolumeIndex, Volumes, Why,
 };
 
 // A member decoded whole beside others: the bytes it came to, the furthest
@@ -280,7 +281,7 @@ impl Walk<'_, '_> {
             }));
         };
         let member = self.announce(&info)?;
-        self.deliver(member, decoded.bytes)?;
+        self.deliver(member, decoded.bytes, keyed(archive, at))?;
         if let Some((error, read_failed)) = decoded.ended {
             // Decoding alone, the walk would have read what failed itself.
             if read_failed {
@@ -326,15 +327,14 @@ impl Walk<'_, '_> {
         index: usize,
         member: MemberId,
     ) -> Result<(), Stop> {
-        let keyed = archive.format() == ArchiveFormat::Rar5 && archive.member_is_encrypted(index);
         match archive.member_info(index).and_then(|info| info.crc32) {
-            Some(crc32) if !keyed => self.say(Emit::Checksum { member, crc32 }),
+            Some(crc32) if !keyed(archive, index) => self.say(Emit::Checksum { member, crc32 }),
             _ => Ok(()),
         }
     }
 
     // A member decoded whole, said in pieces no larger than a decoder's.
-    fn deliver(&mut self, member: MemberId, bytes: Vec<u8>) -> Result<(), Stop> {
+    fn deliver(&mut self, member: MemberId, bytes: Vec<u8>, keyed: bool) -> Result<(), Stop> {
         let bytes = Bytes::from(bytes);
         let mut offset = 0;
         while offset < bytes.len() {
@@ -342,7 +342,7 @@ impl Walk<'_, '_> {
             self.say(Emit::Bytes {
                 member,
                 offset: offset as u64,
-                bytes: bytes.slice(offset..end).into(),
+                bytes: checked(bytes.slice(offset..end), keyed),
                 provenance: Provenance::Fresh,
             })?;
             offset = end;
@@ -397,6 +397,7 @@ impl Walk<'_, '_> {
         let mut out = Out {
             sink: &mut *self.sink,
             member,
+            keyed: keyed(archive, index),
             offset: 0,
             gathered: Vec::new(),
             stopped: false,
@@ -438,6 +439,7 @@ impl Walk<'_, '_> {
         password: Option<&str>,
     ) -> Result<usize, Stop> {
         let member = self.announce(info)?;
+        let keyed = keyed(archive, index);
         let decode_limits = limits(&self.budget);
         let mut own = copy(archive, index, &decode_limits);
         let beside = Beside::default();
@@ -484,6 +486,7 @@ impl Walk<'_, '_> {
                 let mut out = Out {
                     sink: &mut **sink,
                     member,
+                    keyed,
                     offset: 0,
                     gathered: Vec::new(),
                     stopped: false,
@@ -1157,9 +1160,31 @@ struct Stopped;
 // `EMIT_BYTES`, the member's last aside. A write that size or larger with
 // nothing gathered goes to the sink as it is; anything smaller gathers until
 // the pieces reach it. Either way each byte is copied once.
+// Whether member `index`'s stated CRC32 is keyed, as an encrypted RAR5
+// member's is: a keyed checksum is not the member's own, so nothing checks
+// its bytes' CRC32.
+fn keyed(archive: &RarArchive, index: usize) -> bool {
+    archive.format() == ArchiveFormat::Rar5 && archive.member_is_encrypted(index)
+}
+
+// Decoded bytes as said to the member's file, with their CRC32 hashed here,
+// while they are in hand, unless nothing checks it. The member's check then
+// folds these runs as they land, and reads nothing of its file back when the
+// final part's header states the CRC32 at the close.
+fn checked(bytes: Bytes, keyed: bool) -> Evidenced {
+    let mut bytes = Evidenced::new(bytes);
+    if !keyed {
+        bytes.fill(Algorithm::Crc32);
+    }
+    bytes
+}
+
 struct Out<'s, 'a, 'b> {
     sink: &'s mut Sink<'a>,
     member: MemberId,
+    // Whether the member's stated checksum is keyed, so its bytes' own
+    // CRC32 is checked by nothing.
+    keyed: bool,
     offset: u64,
     gathered: Vec<u8>,
     stopped: bool,
@@ -1173,7 +1198,7 @@ impl Out<'_, '_, '_> {
         let heard = (self.sink)(Emit::Bytes {
             member: self.member,
             offset: self.offset,
-            bytes: bytes.into(),
+            bytes: checked(bytes, self.keyed),
             provenance: Provenance::Fresh,
         });
         if !heard {
