@@ -61,6 +61,9 @@ pub(super) struct Nodes {
     refused: BTreeSet<(NodeId, NodeId)>,
     // Each node's run progress, from its first report until the node goes.
     progress: BTreeMap<NodeId, Progress>,
+    // How many nodes have gone, so a caller tells in one read whether a
+    // step removed any. Never recorded: it is compared within one step.
+    removed: u64,
 }
 
 impl Deref for Nodes {
@@ -206,6 +209,7 @@ impl Nodes {
     // A node goes, and what it gave up with it.
     pub(super) fn remove(&mut self, node: &NodeId) -> Option<Node> {
         let removed = self.nodes.remove(node)?;
+        self.removed += 1;
         self.marks.mark(Mark::Node(*node));
         self.marks.mark(Mark::Members(*node));
         self.progress.remove(node);
@@ -237,6 +241,10 @@ impl Nodes {
         }
         self.mark_member(at.0, at.1);
         self.retired.get_mut(at)
+    }
+
+    pub(super) fn removed(&self) -> u64 {
+        self.removed
     }
 
     pub(super) fn generation(&self) -> u64 {

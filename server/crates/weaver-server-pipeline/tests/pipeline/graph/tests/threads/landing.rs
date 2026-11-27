@@ -1437,15 +1437,36 @@ async fn a_release_above_outputs_limit_parks_until_output_holds_nothing_then_goe
     assert_eq!(pipeline.hand_on_parked_for_test().await, 0);
     assert_eq!(pipeline.parked_download_results_for_test(), 1);
     no_leaf_budget_waits(&output);
+    // Output's writer has written everything the job gave it once the
+    // job's own barrier, taken before the hold opens, returns.
+    let disk = pipeline.graph_jobs[&job_id].disk().unwrap().clone();
+    let given = disk.under(&staging_dir).barrier();
+    let (said, heard) = tokio::sync::oneshot::channel();
+    given.then(move || {
+        let _ = said.send(());
+    });
     hold.open();
+    heard.await.unwrap();
+    assert!(given.returned());
+    assert_eq!(output.buffered_bytes.load(Ordering::SeqCst), 0);
+    assert_eq!(pipeline.parked_download_results_for_test(), 1);
+    // With output's writer held again, what the step hands on stays
+    // buffered: the two counters are read while neither moves.
+    let again = pipeline.volume_writers.hold(&output);
     assert_eq!(hand_on_all_parked(&mut pipeline).await, 1);
+    assert_eq!(pipeline.parked_download_results_for_test(), 0);
     assert!(output.peak_bytes() > hard);
+    let (counted, buffered) = (
+        output.unwritten_bytes(),
+        output.buffered_bytes.load(Ordering::SeqCst),
+    );
+    assert!(buffered > hard, "{buffered} {hard}");
+    assert_eq!(counted, buffered);
+    again.open();
     settle(&mut pipeline, job_id).await;
-    counts_only_buffered(&output);
     for ordinal in next..articles(&posts, 0) {
         take_through(&mut pipeline, job_id, &posts, 0, ordinal).await;
     }
-    let disk = pipeline.graph_jobs[&job_id].disk().unwrap().clone();
     settle(&mut pipeline, job_id).await;
     disk.barrier().wait_aside();
     assert!(!disk.barrier().unwritten());

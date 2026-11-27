@@ -404,6 +404,12 @@ pub enum Emit {
     // mine": a sibling holding there a volume it may carry lets it go to
     // me, where I claim it at that place. Said once per place.
     Wants(VolumeIndex),
+    // "The headers of this volume I hold moved": what they say of its
+    // members, its number, whether a volume follows or where it ends is not
+    // what it was. A member given back beside me that no object took is
+    // asked of me again, by what was parsed of it. Said once per move, never
+    // per delivery that moves nothing.
+    HeadersMoved(VolumeIndex),
     // "I know more than I did when I was offered what no object holds": a
     // member offered by clean bytes past the hole where its front stopped,
     // and taken by no object then, is offered to me again. Said once per

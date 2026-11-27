@@ -22,17 +22,37 @@ use crate::volume::{ByteRange, VolumeIndex};
 // by: its front when `at` is zero, or, when its front will not come, the
 // first clean run past the hole where it stopped. An object that knows its
 // volumes only by how they open reads `front`; one whose bytes say what
-// they are anywhere in them may read the run wherever it starts.
+// they are anywhere in them may read the run wherever it starts. `tail` is
+// the range an earlier answer asked for (`Claim::Wants`), once all of it is
+// in hand, and empty until then.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Clean<'a> {
     pub at: u64,
     pub bytes: &'a [u8],
+    pub tail: &'a [u8],
 }
+
+// The most of a member an answer may ask for (`Claim::Wants`). A wider ask
+// is no ask: nothing is fetched or kept for it.
+pub const WANTS_MOST: u64 = 40;
 
 impl<'a> Clean<'a> {
     // A front: clean bytes from the member's start.
     pub fn start(bytes: &'a [u8]) -> Self {
-        Self { at: 0, bytes }
+        Self {
+            at: 0,
+            bytes,
+            tail: &[],
+        }
+    }
+
+    // Clean bytes of the member from `at`.
+    pub fn run(at: u64, bytes: &'a [u8]) -> Self {
+        Self {
+            at,
+            bytes,
+            tail: &[],
+        }
     }
 
     // The member's front: these bytes when they start at its start, else
@@ -64,11 +84,15 @@ impl<'a> From<&'a Vec<u8>> for Clean<'a> {
 // when there are none, or not yet, while the front in hand is too short for
 // the object to judge the member by, with the places that front gives it.
 // Once no more of the front can come, those places are the answer. It
-// reads as the places wherever only the places matter.
+// reads as the places wherever only the places matter. An object that
+// places the member nowhere may say which bytes of it, past its front,
+// would let it place it: the tree fetches and keeps them, and offers the
+// member again with them (`Clean::tail`). It reads as no place.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Claim {
     Places(Vec<VolumeIndex>),
     NotYet(Vec<VolumeIndex>),
+    Wants(ByteRange),
 }
 
 impl Default for Claim {
@@ -95,6 +119,7 @@ impl std::ops::Deref for Claim {
     fn deref(&self) -> &[VolumeIndex] {
         match self {
             Self::Places(places) | Self::NotYet(places) => places,
+            Self::Wants(_) => &[],
         }
     }
 }
@@ -107,7 +132,12 @@ impl AsRef<[VolumeIndex]> for Claim {
 
 impl PartialEq<Vec<VolumeIndex>> for Claim {
     fn eq(&self, other: &Vec<VolumeIndex>) -> bool {
-        matches!(self, Self::Places(places) if places == other)
+        // An ask for bytes places nothing, as no place does.
+        match self {
+            Self::Places(places) => places == other,
+            Self::Wants(_) => other.is_empty(),
+            Self::NotYet(_) => false,
+        }
     }
 }
 
@@ -648,6 +678,19 @@ pub trait Object: Send + Sync {
         _carried: &(dyn std::any::Any + Send + Sync),
     ) -> Claim {
         Claim::default()
+    }
+
+    // `reclaim`, with the bytes an earlier answer asked for in hand
+    // (`Clean::tail`), empty when none are.
+    fn reclaim_told(
+        &self,
+        name: &str,
+        front: &[u8],
+        _tail: &[u8],
+        length: Option<u64>,
+        carried: &(dyn std::any::Any + Send + Sync),
+    ) -> Claim {
+        self.reclaim(name, front, length, carried)
     }
 
     // A member I reclaimed is now this volume of mine, with its name, front

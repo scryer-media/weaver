@@ -3395,7 +3395,12 @@ impl NamespaceWriter {
             bytes.clear();
         }
         let mut effects = Vec::new();
-        tree.read_on(node, member, range.start, &bytes, &mut effects);
+        // A read-back that removed a node is pruned as a burial is, before
+        // what it lets the objects say: the node's names went with it, and
+        // so do its files.
+        if tree.read_on(node, member, range.start, &bytes, builder, &mut effects) {
+            self.prune(tree)?;
+        }
         self.apply_each(tree, builder, segments, effects, write, out)
     }
 

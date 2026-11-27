@@ -41,18 +41,19 @@ pub trait Format: Send + Sync {
     type Name: SetName;
     // What a volume's front states of its place in its set, for a set whose
     // names say nothing of it. Serde, because it is an engine's fact.
-    type Front: Serialize + DeserializeOwned + Send + Sync;
+    type Front: Clone + Serialize + DeserializeOwned + Send + Sync;
     fn parse(name: &str) -> Option<Self::Name>;
-    // A volume's front, as far as it places the volume: `None` for a format
-    // whose volumes state nothing of their places.
-    fn front(_first_bytes: &[u8]) -> Option<Self::Front> {
+    // A volume's front, as far as it places the volume, read under the
+    // secret the engine was offered, if any: `None` for a format whose
+    // volumes state nothing of their places.
+    fn front(_first_bytes: &[u8], _secret: Option<&str>) -> Option<Self::Front> {
         None
     }
     // A volume's front, and whether the headers in it were read to their
     // end, so it says all its headers ever will: `false` where that is not
     // known.
-    fn read_front(first_bytes: &[u8]) -> Option<(Self::Front, bool)> {
-        Self::front(first_bytes).map(|front| (front, false))
+    fn read_front(first_bytes: &[u8], secret: Option<&str>) -> Option<(Self::Front, bool)> {
+        Self::front(first_bytes, secret).map(|front| (front, false))
     }
     // Whether the front states the volume's place itself, rather than only
     // linking it to the volumes beside it.
@@ -101,9 +102,16 @@ pub trait Format: Send + Sync {
         None
     }
 
-    // What the bytes of `tail` state of the volume's place, filed into its
-    // front. Whatever they say, they are all there is: nothing more is read.
-    fn told(_front: &mut Self::Front, _tail: &[u8]) {}
+    // What the bytes of `tail` state of the volume's place, read under the
+    // secret the engine was offered, if any, filed into its front. Whatever
+    // they say, they are all there is: nothing more is read.
+    fn told(_front: &mut Self::Front, _tail: &[u8], _secret: Option<&str>) {}
+
+    // Whether two fronts are of one kind of set, as far as they say: a
+    // claimant no front bound is kin of asks for no tail.
+    fn kin(_front: &Self::Front, _other: &Self::Front) -> bool {
+        false
+    }
     fn run(password: Option<String>) -> Box<dyn Extraction>;
 
     // The least a run of this format holds resident, whatever its volumes'
@@ -365,8 +373,40 @@ impl<F: Format> EngineObject<F> {
     // name is a label, which a recovery set may change later, so the front
     // outranks it. A place bound already is answered all the same: the
     // volume posted again is that volume.
-    fn placed(&self, name: &str, first_bytes: &[u8], length: Option<u64>) -> Option<VolumeIndex> {
-        self.placed_front(name, F::front(first_bytes).as_ref(), length)
+    //
+    // A claimant's place is that, with the bytes past its front it was asked for
+    // (`Claim::Wants`) read into a copy of its front first, as a bound
+    // volume's tail is (`Format::told`). Where it has none, a front of
+    // `length` whose tail would state its place, kin of the first volume
+    // bound, asks for that tail, while none was given: a tail given that
+    // said nothing is all there is.
+    fn claimed(
+        &self,
+        name: &str,
+        front: Option<&F::Front>,
+        length: Option<u64>,
+        tail: &[u8],
+    ) -> Claim {
+        let told = front.filter(|_| !tail.is_empty()).map(|front| {
+            let mut told = front.clone();
+            F::told(&mut told, tail, self.password.as_deref());
+            told
+        });
+        let front = told.as_ref().or(front);
+        if let Some(placed) = self.placed_front(name, front, length) {
+            return vec![placed].into();
+        }
+        let kin = |front: &F::Front| {
+            self.bound
+                .first()
+                .and_then(|first| self.fronts.get(first))
+                .is_some_and(|first| F::kin(first, front))
+        };
+        front
+            .zip(length)
+            .filter(|(front, _)| tail.is_empty() && kin(front))
+            .and_then(|(front, length)| F::tail(front, length))
+            .map_or_else(Claim::default, Claim::Wants)
     }
 
     // Each volume bound, but `except`, with its front and its length.
@@ -494,7 +534,7 @@ impl<F: Format> EngineObject<F> {
         let Some(front) = self.fronts.get_mut(&volume) else {
             return;
         };
-        F::told(front, &bytes);
+        F::told(front, &bytes, self.password.as_deref());
         let misplaced = F::misplaced(front, volume);
         self.file(volume);
         if misplaced {
@@ -515,7 +555,7 @@ impl<F: Format> EngineObject<F> {
         let front = match carried.and_then(|carried| carried.front.as_ref()) {
             Some(front) => Some(front),
             None => {
-                read = F::front(first_bytes);
+                read = F::front(first_bytes, self.password.as_deref());
                 read.as_ref()
             }
         };
@@ -664,7 +704,7 @@ impl<F: Format + 'static> Object for EngineObject<F> {
             return;
         }
         if delivery.offset == 0 {
-            if let Some((front, ended)) = F::read_front(delivery.bytes)
+            if let Some((front, ended)) = F::read_front(delivery.bytes, self.password.as_deref())
                 && !self.fronts.contains_key(&volume)
             {
                 self.fronts.insert(volume, front);
@@ -785,7 +825,7 @@ impl<F: Format + 'static> Object for EngineObject<F> {
         if let Some(window) = F::window(front) {
             self.windows.insert(volume.0, window);
         }
-        if let Some((front, ended)) = F::read_front(front) {
+        if let Some((front, ended)) = F::read_front(front, self.password.as_deref()) {
             self.fronts.insert(volume.0, front);
             self.read_to_end(volume.0, ended);
         }
@@ -866,19 +906,29 @@ impl<F: Format + 'static> Object for EngineObject<F> {
         length: Option<u64>,
         carried: &(dyn std::any::Any + Send + Sync),
     ) -> Claim {
+        self.reclaim_told(name, front, &[], length, carried)
+    }
+
+    fn reclaim_told(
+        &self,
+        name: &str,
+        front: &[u8],
+        tail: &[u8],
+        length: Option<u64>,
+        carried: &(dyn std::any::Any + Send + Sync),
+    ) -> Claim {
+        let parsed = F::front(front, self.password.as_deref());
         // A volume another kind of object parsed carries nothing the engine
         // reads: it is claimed by its name and front, as a new one is.
         let Some(carried) = carried.downcast_ref::<CarriedVolume<F::Front>>() else {
-            return self.placed(name, front, length).into_iter().collect();
+            return self.claimed(name, parsed.as_ref(), length, tail);
         };
-        let parsed = F::front(front);
-        self.placed_front(
+        self.claimed(
             name,
             carried.front.as_ref().or(parsed.as_ref()),
             carried.length.or(length),
+            tail,
         )
-        .into_iter()
-        .collect()
     }
 
     fn adopt(
@@ -936,8 +986,8 @@ impl<F: Format + 'static> Object for EngineObject<F> {
     // The place the volume's facts give it, held or not: whether it takes
     // it is the tree's to judge.
     fn claim(&mut self, name: &str, clean: weaver_graph::Clean<'_>, length: Option<u64>) -> Claim {
-        let first_bytes = clean.front();
-        self.placed(name, first_bytes, length).into_iter().collect()
+        let front = F::front(clean.front(), self.password.as_deref());
+        self.claimed(name, front.as_ref(), length, clean.tail)
     }
 
     fn reads_in_order(&self) -> bool {

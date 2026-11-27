@@ -30,6 +30,7 @@ const ENCRYPTED_LZ: &[u8] = include_bytes!(
 );
 const ENCRYPTED_LZ_MEMBER_LEN: u64 = 226_943;
 
+mod sealed;
 mod tails;
 
 // RAR5 store volumes, written here the way the format lays them out.
@@ -2438,7 +2439,7 @@ fn a_lone_archive_states_its_window() {
         ("rar4_solid_ppmd_plain.rar", 1 << 20),
     ] {
         let bytes = fixture(path);
-        assert!(<Rar as Format>::front(&bytes).is_none(), "{path}");
+        assert!(<Rar as Format>::front(&bytes, None).is_none(), "{path}");
         assert_eq!(<Rar as Format>::window(&bytes), Some(window), "{path}");
     }
 }

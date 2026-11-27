@@ -1236,7 +1236,7 @@ impl Namespace {
             .first_bytes
             .get(&member)
             .map_or((0, &[][..]), Front::clean);
-        Clean { at, bytes }
+        Clean::run(at, bytes)
     }
 
     // The member's front with the stamp of the write that left it so: the

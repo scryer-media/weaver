@@ -13,6 +13,7 @@ mod placement;
 mod recovery_contracts;
 mod settle;
 mod stray;
+mod wants;
 
 use std::io::Cursor;
 use std::path::PathBuf;
@@ -2981,4 +2982,42 @@ fn a_repair_inside_a_run_past_read_back_refeeds_it_in_pieces() {
             }
         }
     }
+}
+
+// A volume rar 6.24 wrote (`rar a -ma4 -m3 -ep1 -v11k`, the first of the
+// fixture set `rar4_lz_four`): its walk says its headers moved when the
+// bytes reach its file header, at most once per settle, and says nothing
+// for bytes inside that file's data, which move no header.
+#[test]
+fn a_header_move_is_said_and_a_delivery_that_moves_no_header_says_none() {
+    let volumes: Vec<(String, Vec<u8>)> = (1..=4)
+        .map(|part| {
+            let name = format!("rar4_lz_four.part0{part}.rar");
+            let bytes = fixture(&format!("extraction_profiles/{name}"));
+            (name, bytes)
+        })
+        .collect();
+    let mut owner = Owner::new(store(), volumes);
+    owner.said.clear();
+    let moved = |owner: &Owner| {
+        owner
+            .said
+            .iter()
+            .filter(|emit| matches!(emit, Emit::HeadersMoved(_)))
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+    owner.deliver(0, ByteRange::new(0, 200));
+    let heard = moved(&owner);
+    assert!(
+        !heard.is_empty()
+            && heard
+                .iter()
+                .all(|emit| *emit == Emit::HeadersMoved(VolumeIndex(0))),
+        "{:?}",
+        owner.said
+    );
+    owner.said.clear();
+    owner.deliver(0, ByteRange::new(2_000, 3_000));
+    assert_eq!(moved(&owner), Vec::new(), "{:?}", owner.said);
 }

@@ -24,12 +24,16 @@
 // RAR engine a store gives its set to places the rest of it by the same
 // headers.
 
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::io::Cursor;
 use std::sync::Arc;
 
 use unrar_rs::{ArchiveFormat, KdfCache, RarArchive, RarVolumeFacts, RarVolumeMemberFacts};
 use weaver_graph::{Claim, VolumeIndex};
+
+use crate::engine::Format;
+use crate::rar_engine::Rar;
 
 use super::{RarStore, Volume};
 use crate::beside::Beside;
@@ -216,6 +220,11 @@ fn walk(
 // a walk shows of a front before it is no RAR volume. A crafted volume whose
 // headers run past it is refused rather than carried.
 pub(super) const CARRIED: u64 = 4 * 1024 * 1024;
+
+// Whether two volumes' headers are of one kind of set (`Nameless::kin`).
+pub(crate) fn kin(facts: &RarVolumeFacts, other: &RarVolumeFacts) -> bool {
+    Nameless { facts }.kin(&Nameless { facts: other })
+}
 
 // Whether a volume's headers say it is not at `index`: they state another
 // position, or it opens on a member begun before it, so it is no set's
@@ -408,8 +417,16 @@ impl Placing {
 }
 
 impl RarStore {
-    pub(super) fn claim_volume(&self, name: &str, first_bytes: &[u8]) -> Claim {
-        self.placing_volume(name, first_bytes).claim(self)
+    // A volume's claim by its front, with the bytes past it the RAR engine
+    // asked for (`Claim::Wants`), when they came, read into a copy of its
+    // facts first: `told`. The store asks for none itself.
+    pub(super) fn claim_told(&self, name: &str, first_bytes: &[u8], tail: &[u8]) -> Claim {
+        let Some(format) = opens_rar(first_bytes) else {
+            return Claim::default();
+        };
+        let facts = told(self.front_facts(first_bytes).map(Cow::Owned), tail);
+        self.placing(name, Some(format), facts.as_deref())
+            .claim(self)
     }
 
     // A member offered by the bytes past its hole, its front never to
@@ -428,14 +445,20 @@ impl RarStore {
         self.placing(name, Some(format), self.front_facts(first_bytes).as_ref())
     }
 
-    // A transferable volume is judged by its parsed headers, or by the
-    // retained front and name while those headers say nothing. Both are
-    // the same evidence an unowned member offers, without reading it again,
-    // and are answered as it is, not yet included. A volume whose end
+    // A transferable volume is judged by its parsed headers, or by its
+    // front where that read further (`given_stated`), and by the retained
+    // front and name while those headers say nothing. Both are the same
+    // evidence an unowned member offers, and are answered as it is, not yet
+    // included. A volume whose end
     // record says its set ends with it is taken nowhere a volume held here
     // lies past: held there, that volume would go back at once, as one past
     // the last does, only to be taken again.
-    pub(super) fn reclaim_volume(&self, name: &str, front: &[u8], given: &Volume) -> Claim {
+    pub(super) fn reclaim_volume(
+        &self,
+        name: &str,
+        (front, tail): (&[u8], &[u8]),
+        given: &Volume,
+    ) -> Claim {
         let ends = given.walk.is_last();
         // A volume the set's headers put somewhere its name does not is
         // claimed there, while nothing held beside it says otherwise.
@@ -450,7 +473,10 @@ impl RarStore {
                 stated: Some(at),
                 ..Placing::default()
             },
-            None => self.reclaim_placing(name, front, given.stated()),
+            None => {
+                let stated = told(self.given_stated(given, front), tail);
+                self.reclaim_placing(name, front, stated.as_deref())
+            }
         };
         placing.placed = placing.placed.filter(|at| {
             !ends
@@ -466,10 +492,12 @@ impl RarStore {
     pub(super) fn reclaim_front(
         &self,
         name: &str,
-        front: &[u8],
+        (front, tail): (&[u8], &[u8]),
         facts: Option<&RarVolumeFacts>,
     ) -> Claim {
-        self.reclaim_placing(name, front, facts).claim(self)
+        let facts = told(facts.map(Cow::Borrowed), tail);
+        self.reclaim_placing(name, front, facts.as_deref())
+            .claim(self)
     }
 
     fn reclaim_placing(&self, name: &str, front: &[u8], facts: Option<&RarVolumeFacts>) -> Placing {
@@ -508,10 +536,13 @@ impl RarStore {
     ) -> bool {
         let read;
         let facts = match given {
-            Some(given) => given.stated(),
+            Some(given) => {
+                read = self.given_stated(given, front);
+                read.as_deref()
+            }
             None => {
-                read = self.front_facts(front);
-                read.as_ref()
+                read = self.front_facts(front).map(Cow::Owned);
+                read.as_deref()
             }
         };
         let placing = self.placing_front(name, front, facts);
@@ -640,6 +671,30 @@ impl RarStore {
             .is_some_and(|last| !states_position(last) && before(facts, last))
     }
 
+    // What a volume given back states as it is offered again: whichever
+    // reading of its headers went further, the walk it carries or its front
+    // as it stands now. The front went further when it lists more member
+    // headers than the walk's facts hold, or reached the end record the walk
+    // did not. A walk that ended read every header, so its front is not
+    // read at all.
+    fn given_stated<'a>(&self, given: &'a Volume, front: &[u8]) -> Option<Cow<'a, RarVolumeFacts>> {
+        let carried = given.stated();
+        if given.walk.ended {
+            return carried.map(Cow::Borrowed);
+        }
+        let password = self.header_password();
+        let read = front_walk(
+            front,
+            password.as_deref().map(String::as_str),
+            Arc::clone(self.keys.kdf()),
+        );
+        let held = carried.map_or(0, |facts| facts.members.len());
+        match read {
+            Some((facts, ended)) if ended || facts.members.len() > held => Some(Cow::Owned(facts)),
+            _ => carried.map(Cow::Borrowed),
+        }
+    }
+
     // What a front states, read with the store's own keys.
     pub(super) fn front_facts(&self, first_bytes: &[u8]) -> Option<RarVolumeFacts> {
         let password = self.header_password();
@@ -670,6 +725,23 @@ impl RarStore {
             beside: &self.beside,
         };
         (place(facts, &held), judged(facts, &held))
+    }
+}
+
+// The facts a claim is judged by, with the bytes past the front the RAR
+// engine asked for (`Claim::Wants`) read into a copy of them, as the RAR engine reads a
+// bound volume's tail (`Rar::told`). The facts as they are without any.
+fn told<'a>(
+    facts: Option<Cow<'a, RarVolumeFacts>>,
+    tail: &[u8],
+) -> Option<Cow<'a, RarVolumeFacts>> {
+    match tail.is_empty() {
+        true => facts,
+        false => facts.map(|facts| {
+            let mut told = facts.into_owned();
+            Rar::told(&mut told, tail, None);
+            Cow::Owned(told)
+        }),
     }
 }
 

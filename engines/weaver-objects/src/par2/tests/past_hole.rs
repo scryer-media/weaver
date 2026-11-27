@@ -31,10 +31,7 @@ fn past_hole(volume: &[u8]) -> &[u8] {
 }
 
 fn claims(job: &mut Job<Par2>, bytes: &[u8]) -> bool {
-    let clean = Clean {
-        at: HOLE as u64,
-        bytes,
-    };
+    let clean = Clean::run(HOLE as u64, bytes);
     !job.object.claim(NAME, clean, None).is_empty()
 }
 

@@ -960,8 +960,11 @@ impl RarStore {
             let kept = &self.volumes[&volume].kept;
             match step {
                 Step::Walked { moved, damaged } => {
-                    if moved {
-                        reached.entry(volume).or_insert(before);
+                    // Said once per volume per settle, however many steps
+                    // of its walk moved.
+                    if moved && let btree_map::Entry::Vacant(entry) = reached.entry(volume) {
+                        entry.insert(before);
+                        out.push(Emit::HeadersMoved(volume));
                     }
                     if let Some(range) = damaged {
                         let crc = kept.read(range).map_or(0, crc32);
@@ -1576,7 +1579,7 @@ impl Object for RarStore {
     // past its hole has no headers to give one.
     fn claim(&mut self, name: &str, clean: weaver_graph::Clean<'_>, _length: Option<u64>) -> Claim {
         match clean.at {
-            0 => self.claim_volume(name, clean.front()),
+            0 => self.claim_told(name, clean.front(), clean.tail),
             _ => self.claim_past_hole(name),
         }
     }
@@ -1642,15 +1645,26 @@ impl Object for RarStore {
         &self,
         name: &str,
         front: &[u8],
+        length: Option<u64>,
+        carried: &(dyn std::any::Any + Send + Sync),
+    ) -> Claim {
+        self.reclaim_told(name, front, &[], length, carried)
+    }
+
+    fn reclaim_told(
+        &self,
+        name: &str,
+        front: &[u8],
+        tail: &[u8],
         _length: Option<u64>,
         carried: &(dyn std::any::Any + Send + Sync),
     ) -> Claim {
         match carried.downcast_ref::<Volume>() {
-            Some(given) => self.reclaim_volume(name, front, given),
+            Some(given) => self.reclaim_volume(name, (front, tail), given),
             None => carried
                 .downcast_ref::<crate::engine::CarriedVolume<unrar_rs::RarVolumeFacts>>()
                 .map_or_else(Claim::default, |given| {
-                    self.reclaim_front(name, front, given.front.as_ref())
+                    self.reclaim_front(name, (front, tail), given.front.as_ref())
                 }),
         }
     }
