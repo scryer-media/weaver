@@ -259,7 +259,7 @@ export function RouteEditor({
                   aria-valuemin={1}
                   aria-valuemax={leg.weight + value.legs[index + 1]!.weight - 1}
                   aria-valuenow={leg.weight}
-                  className="absolute -top-[5px] -right-[5px] z-[1] h-[40px] w-[10px] cursor-ew-resize touch-none border-2 border-wv-app bg-wv-fg outline-none focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-wv-accent"
+                  className="absolute -top-[5px] -right-[5px] z-[1] h-[40px] w-[10px] cursor-ew-resize touch-none border-2 border-wv-app bg-wv-fg outline-none focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-wv-control-focus"
                   onPointerDown={(event) =>
                     event.currentTarget.setPointerCapture(event.pointerId)
                   }

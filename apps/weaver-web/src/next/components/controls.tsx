@@ -156,7 +156,7 @@ export function DangerButton({
       className={cn(
         "flex cursor-pointer items-center justify-center border font-medium whitespace-nowrap",
         solid
-          ? "!border-wv-error bg-wv-error text-wv-on-accent"
+          ? "!border-wv-error bg-wv-error text-wv-on-error"
           : "!border-wv-danger-border bg-wv-button text-wv-error-text",
         size === "compact"
           ? "h-8 px-3 text-[12.5px]"
@@ -232,7 +232,7 @@ export function Toggle({
           "flex flex-none cursor-pointer items-center border p-[2px]",
           table ? "h-[18px] w-[34px]" : "h-5 w-[38px]",
           checked
-            ? "justify-end border-wv-accent bg-[rgb(63_179_156_/_0.18)]"
+            ? "justify-end border-wv-accent bg-wv-accent/18"
             : "justify-start border-wv-control bg-wv-button",
           disabled && "cursor-default opacity-50",
         )}
@@ -240,7 +240,7 @@ export function Toggle({
         <span
           className={cn(
             table ? "size-3" : "size-[14px]",
-            checked ? "bg-wv-accent" : "bg-wv-control-focus",
+            checked ? "bg-wv-accent" : "bg-wv-control-hover-strong",
           )}
         />
       </button>

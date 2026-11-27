@@ -154,7 +154,7 @@ const EVENT_COLUMNS = {
 
 const EVENT_TONE_CLASS = {
   bad: "text-wv-error",
-  good: "text-wv-accent",
+  good: "text-wv-ok",
   note: "text-wv-info",
   plain: "text-wv-muted",
 } as const;
@@ -1264,7 +1264,7 @@ function JobDetailContent() {
                   ? "text-wv-muted"
                   : job.optionalRecoveryDownloadedBytes > 0
                     ? undefined
-                    : "text-wv-accent"
+                    : "text-wv-ok"
               }
               note={
                 job.optionalRecoveryBytes === 0

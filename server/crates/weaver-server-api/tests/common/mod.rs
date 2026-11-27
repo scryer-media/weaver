@@ -225,6 +225,7 @@ impl TestHarness {
             server_transfer_policy: Arc::clone(&server_transfer_policy),
             auth_cache: auth_cache.clone(),
             api_key_cache,
+            appearance: Default::default(),
             security: security.clone(),
             rss,
             watch_folder,

@@ -272,6 +272,12 @@ pub(super) fn build_router(runtime: super::ServerRuntime) -> Router {
         .layer(Extension(handle))
         .layer(Extension(pipeline_state))
         .layer(Extension(mcp_state))
+        .layer(Extension(
+            schema
+                .data::<weaver_server_api::settings::appearance::AppearanceStore>()
+                .cloned()
+                .unwrap_or_default(),
+        ))
         .layer(Extension(schema))
         .layer(Extension(backup))
         .layer(Extension(db))

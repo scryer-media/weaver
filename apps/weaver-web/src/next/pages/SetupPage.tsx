@@ -369,7 +369,7 @@ export function Choice({
         disabled
           ? "cursor-not-allowed !border-wv-control opacity-60"
           : checked
-            ? "cursor-pointer !border-wv-accent bg-[rgb(63_179_156_/_0.07)]"
+            ? "cursor-pointer !border-wv-accent bg-wv-accent/7"
             : "cursor-pointer !border-wv-control hover:!border-wv-control-focus",
       )}
     >

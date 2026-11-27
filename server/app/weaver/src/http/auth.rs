@@ -1892,7 +1892,7 @@ mod tests {
                 Extension(ApiKeyCache::default()),
                 Extension(cache.clone()),
                 Extension(security.clone()),
-                None,
+                (None, None),
                 Some(Extension(ConnectInfo(peer))),
                 headers.clone(),
             )
@@ -2357,7 +2357,10 @@ pub(super) async fn auth_status_handler(
     Extension(api_key_cache): Extension<ApiKeyCache>,
     Extension(auth_cache): Extension<LoginAuthCache>,
     Extension(security): Extension<RuntimeSecurityConfig>,
-    challenge: Option<Extension<super::setup_code::SetupChallenge>>,
+    (challenge, appearance): (
+        Option<Extension<super::setup_code::SetupChallenge>>,
+        Option<Extension<weaver_server_api::settings::appearance::AppearanceStore>>,
+    ),
     peer: Option<Extension<ConnectInfo<SocketAddr>>>,
     headers: HeaderMap,
 ) -> Response {
@@ -2415,6 +2418,7 @@ pub(super) async fn auth_status_handler(
         "authenticatedAccess": security.authenticated_access_mode(),
         "authenticated": login_authenticated || trusted_peer,
         "setupRequired": setup_required,
+        "appearance": appearance.map(|Extension(store)| store.current()).unwrap_or_default(),
     });
     // Only a browser about to run the first-run wizard is told how this
     // deployment is packaged. This endpoint is unauthenticated, so a

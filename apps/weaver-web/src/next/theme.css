@@ -14,84 +14,97 @@
 
 @import "tailwindcss";
 
-@theme {
+@theme static {
   /* Surfaces. */
-  --color-wv-app: #1a1b1e;
-  --color-wv-rail: #151619;
-  --color-wv-chrome: #1f2024;
-  --color-wv-list: #1c1d21;
-  --color-wv-section: #232429;
-  --color-wv-selected: #26282e;
-  --color-wv-row-hover: #22242a;
-  --color-wv-cell-hover: #1e2025;
-  --color-wv-nav-active: #23252b;
-  /* Accent-tinted grounds: the selection bar, a checked row, a state chip,
-     the current page button. Every one of them reads as "this is the good
-     outcome, and it is what you picked". */
-  --color-wv-bulk: #22302d;
-  --color-wv-bulk-line: #2f4440;
-  --color-wv-ok-bg: #1f2b29;
-  --color-wv-ok-line: #3a4b47;
-  --color-wv-ok-hover: #263533;
-  --color-wv-row-picked: #232a29;
-  --color-wv-page-current: #23302d;
-  --color-wv-nav-hover: #2a2c33;
-  --color-wv-input: #191a1d;
-  --color-wv-button: #23242a;
-  --color-wv-button-hover: #2b2d33;
-  --color-wv-segment-active: #2e3038;
-  --color-wv-menu-hover: #2a2b30;
+  --color-wv-app: light-dark(#f4f1e8, #1a1b1e);
+  --color-wv-rail: light-dark(#dedbd0, #151619);
+  --color-wv-chrome: light-dark(#eae7dc, #1f2024);
+  --color-wv-list: light-dark(#faf8f1, #1c1d21);
+  --color-wv-section: light-dark(#e5e2d7, #232429);
+  --color-wv-selected: light-dark(#dad8cb, #26282e);
+  --color-wv-row-hover: light-dark(#eae8dd, #22242a);
+  --color-wv-cell-hover: light-dark(#f0eee3, #1e2025);
+  --color-wv-nav-active: light-dark(#cecec0, #23252b);
+  /* Accent grounds for selection and fixed green grounds for success. */
+  --color-wv-bulk: light-dark(#d8e9df, #22302d);
+  --color-wv-bulk-line: color-mix(
+    in srgb,
+    var(--wv-accent) 80%,
+    var(--color-wv-app)
+  );
+  --color-wv-ok-bg: light-dark(#deede4, #1f2b29);
+  --color-wv-ok-line: light-dark(#5c826f, #548f7f);
+  --color-wv-ok-hover: light-dark(#cbe0d4, #263533);
+  --color-wv-row-picked: light-dark(#dcece2, #232a29);
+  --color-wv-page-current: light-dark(#d4e6dc, #23302d);
+  --color-wv-nav-hover: light-dark(#d4d2c6, #2a2c33);
+  --color-wv-input: light-dark(#fffdf6, #191a1d);
+  --color-wv-button: light-dark(#f2efe4, #23242a);
+  --color-wv-button-hover: light-dark(#e2dfd2, #2b2d33);
+  --color-wv-segment-active: light-dark(#d4d3c5, #2e3038);
+  --color-wv-menu-hover: light-dark(#dfded1, #2a2b30);
 
   /* Lines. */
-  --color-wv-line-strong: #2a2b30;
-  --color-wv-hairline: #26272c;
-  --color-wv-log-line: #1f2126;
-  --color-wv-axis: #2f3035;
-  --color-wv-control: #3a3b41;
-  --color-wv-control-hover: #4c4e55;
-  --color-wv-control-hover-strong: #55575f;
-  --color-wv-control-focus: #6f6d66;
-  --color-wv-track: #33343a;
-  --color-wv-danger-border: #4a3530;
-  --color-wv-danger-border-hover: #6b4640;
-  --color-wv-danger-bg: #26201f;
-  --color-wv-danger-bg-hover: #2d2320;
+  --color-wv-line-strong: light-dark(#aaa99d, #2a2b30);
+  --color-wv-hairline: light-dark(#c5c2b6, #26272c);
+  --color-wv-log-line: light-dark(#d4d1c5, #1f2126);
+  --color-wv-axis: light-dark(#838479, #2f3035);
+  --color-wv-control: light-dark(#797a6f, #808189);
+  --color-wv-control-hover: light-dark(#62655d, #898a92);
+  --color-wv-control-hover-strong: light-dark(#4c5049, #9a9ba3);
+  --color-wv-control-focus: var(--wv-accent);
+  --color-wv-track: light-dark(#b8b9ac, #33343a);
+  --color-wv-danger-border: light-dark(#a16c66, #a66a5f);
+  --color-wv-danger-border-hover: light-dark(#914b42, #bc7f71);
+  --color-wv-danger-bg: light-dark(#f8e9e4, #26201f);
+  --color-wv-danger-bg-hover: light-dark(#efd7ce, #2d2320);
   /* A control that is present but cannot act — a pagination arrow at the end. */
-  --color-wv-control-off: #2c2d33;
+  --color-wv-control-off: light-dark(#c8c6b9, #2c2d33);
 
   /* Text. */
-  --color-wv-fg: #ecebe6;
-  --color-wv-strong: #ffffff;
-  --color-wv-secondary: #d6d3cc;
-  --color-wv-tertiary: #cdcac3;
-  --color-wv-muted: #a09d96;
-  --color-wv-faint: #84817a;
-  --color-wv-eyebrow: #c4c1ba;
-  --color-wv-note: #97948d;
-  --color-wv-disabled: #75726b;
-  --color-wv-dim: #5f6068;
+  --color-wv-fg: light-dark(#22261f, #ecebe6);
+  --color-wv-strong: light-dark(#12170f, #ffffff);
+  --color-wv-secondary: light-dark(#30362e, #d6d3cc);
+  --color-wv-tertiary: light-dark(#3c4138, #cdcac3);
+  --color-wv-muted: light-dark(#484e43, #aba89f);
+  --color-wv-faint: light-dark(#50564c, #a5a299);
+  --color-wv-eyebrow: light-dark(#373d33, #c4c1ba);
+  --color-wv-note: light-dark(#4f554a, #aaa79e);
+  --color-wv-disabled: light-dark(#54594f, #a5a098);
+  --color-wv-dim: light-dark(#51594c, #a7a29b);
 
   /* Accent. Every accent use derives from the one variable below, so a build
      that wants a different brand colour changes `--wv-accent` and nothing else. */
   --color-wv-accent: var(--wv-accent);
   --color-wv-accent-hover: var(--wv-accent-hover);
-  --color-wv-on-accent: #10201c;
+  --color-wv-on-accent: light-dark(#ffffff, #10201c);
 
-  /* Semantic state. */
-  --color-wv-info: #6aa9cf;
-  --color-wv-warn: #d3a43e;
-  --color-wv-warn-hover: #e0b552;
-  --color-wv-on-warn: #241a06;
-  --color-wv-orange: #eb8f1e;
-  --color-wv-error: #e0745a;
-  --color-wv-error-text: #e89b82;
-  --color-wv-violet: #a98ad6;
-  --color-wv-green: #5fbf94;
-  --color-wv-gold: #c2ad5e;
-  --color-wv-idle: #8d8a82;
-  --color-wv-slate: #7f8692;
-  --color-wv-inert: #4e4f56;
-  --color-wv-chip-off: #3a414f;
+  /* Semantic state uses fixed colors across accent choices. */
+  --color-wv-teal: light-dark(#005e4f, #3fb39c);
+  --color-wv-progress: var(--color-wv-teal);
+  --color-wv-ok: var(--color-wv-teal);
+  --color-wv-on-ok: light-dark(#ffffff, #10201c);
+  --color-wv-info: light-dark(#195878, #72b1d4);
+  --color-wv-warn: light-dark(#754c00, #d3a43e);
+  --color-wv-warn-hover: light-dark(#684200, #e0b552);
+  --color-wv-on-warn: light-dark(#ffffff, #241a06);
+  --color-wv-orange: light-dark(#8d4200, #eb8f1e);
+  --color-wv-error: light-dark(#97302a, #ed8b74);
+  --color-wv-on-error: light-dark(#ffffff, #27120e);
+  --color-wv-error-text: light-dark(#8c332b, #e89b82);
+  --color-wv-violet: light-dark(#654987, #b89ce3);
+  --color-wv-green: light-dark(#2a5f40, #5fbf94);
+  --color-wv-gold: light-dark(#69541b, #c2ad5e);
+  --color-wv-idle: light-dark(#50574d, #a7a39a);
+  --color-wv-slate: light-dark(#4b5964, #a0a8b5);
+  --color-wv-inert: light-dark(#66695e, #85858c);
+  --color-wv-chip-off: light-dark(#7b8174, #3a414f);
+
+  --color-wv-track-dash: light-dark(#95998c, #3d3e45);
+  --color-wv-on-span: light-dark(#ffffff, #11201d);
+  --color-wv-pending: light-dark(#aaaea2, #34353b);
+  --color-wv-dns: light-dark(#195878, #5aa2ec);
+  --color-wv-dns-fill: light-dark(#dce7ee, #1b2633);
 
   /*
    * Type. Three roles, and the weight belongs to the role: titles are the
@@ -110,12 +123,270 @@
   --font-wv-mono: var(--font-wv-ui);
 
   /* The single shadow in the system. */
-  --shadow-wv-menu: 0 18px 40px -18px rgba(0, 0, 0, 0.9);
+  --shadow-wv-menu: 0 18px 40px -18px
+    light-dark(rgb(34 38 31 / 18%), rgb(0 0 0 / 90%));
 }
 
-:root {
-  --wv-accent: #3fb39c;
-  --wv-accent-hover: #52c4ad;
+:root,
+[data-palette="WEAVER"] {
+  color-scheme: light dark;
+  --wv-ground: light-dark(#f4f1e8, #1a1b1e);
+  --wv-ink: light-dark(#22261f, #ecebe6);
+  --wv-preview-rail: light-dark(#dedbd0, #151619);
+  --wv-preview-list: light-dark(#faf8f1, #1c1d21);
+  --wv-accent: light-dark(#005e4f, #3fb39c);
+  --wv-accent-hover: light-dark(#005346, #52c4ad);
+}
+
+[data-palette="WEAVER"][data-mode="LIGHT"] {
+  color-scheme: light;
+}
+[data-palette="WEAVER"][data-mode="DARK"] {
+  color-scheme: dark;
+}
+
+[data-palette="PHOSPHOR"] {
+  --wv-ground: #111b17;
+  --wv-ink: #dee8df;
+  --wv-accent: #8cd88c;
+}
+[data-palette="AMBER"] {
+  --wv-ground: #211b16;
+  --wv-ink: #efe2cd;
+  --wv-accent: #ecba71;
+  --color-wv-warn: #e8a24b;
+  --color-wv-warn-hover: #f1b268;
+}
+
+:is([data-palette="PHOSPHOR"], [data-palette="AMBER"]) {
+  color-scheme: dark;
+  --color-wv-app: var(--wv-ground);
+  --color-wv-list: color-mix(in srgb, var(--wv-ground) 98%, var(--wv-ink));
+  --color-wv-rail: color-mix(in srgb, var(--wv-ground) 80%, black);
+  --wv-preview-rail: var(--color-wv-rail);
+  --wv-preview-list: var(--color-wv-list);
+  --color-wv-chrome: color-mix(in srgb, var(--wv-ground) 96%, var(--wv-ink));
+  --color-wv-section: color-mix(in srgb, var(--wv-ground) 92%, var(--wv-ink));
+  --color-wv-input: var(--color-wv-rail);
+  --color-wv-button: var(--color-wv-section);
+  --color-wv-selected: color-mix(in srgb, var(--wv-ground) 87%, var(--wv-ink));
+  --color-wv-row-hover: var(--color-wv-section);
+  --color-wv-cell-hover: var(--color-wv-chrome);
+  --color-wv-nav-active: var(--color-wv-section);
+  --color-wv-nav-hover: var(--color-wv-selected);
+  --color-wv-button-hover: var(--color-wv-selected);
+  --color-wv-menu-hover: var(--color-wv-selected);
+  --color-wv-segment-active: var(--color-wv-selected);
+  --color-wv-line-strong: color-mix(
+    in srgb,
+    var(--wv-ground) 79%,
+    var(--wv-ink)
+  );
+  --color-wv-hairline: color-mix(in srgb, var(--wv-ground) 88%, var(--wv-ink));
+  --color-wv-log-line: var(--color-wv-hairline);
+  --color-wv-fg: var(--wv-ink);
+  --color-wv-faint: #a7a69a;
+}
+
+[data-palette="TERMINAL"] {
+  color-scheme: dark;
+  --wv-ground: #000;
+  --wv-ink: #fff;
+  --wv-terminal-green: #00ff00;
+  --wv-accent: var(--wv-terminal-green);
+  --wv-preview-rail: var(--color-wv-chrome);
+  --wv-preview-list: var(--color-wv-list);
+  --wv-meter-stripes: linear-gradient(
+    transparent 20%,
+    black 20% 40%,
+    transparent 40% 60%,
+    black 60% 80%,
+    transparent 80%
+  );
+
+  --color-wv-app: var(--wv-ground);
+  --color-wv-list: var(--wv-ground);
+  --color-wv-rail: var(--wv-ground);
+  --color-wv-input: var(--wv-ground);
+  --color-wv-chrome: #080808;
+  --color-wv-section: #0a0a0a;
+  --color-wv-button: var(--color-wv-section);
+  --color-wv-selected: #171717;
+  --color-wv-row-hover: #111;
+  --color-wv-cell-hover: var(--color-wv-chrome);
+  --color-wv-nav-active: var(--color-wv-row-hover);
+  --color-wv-nav-hover: var(--color-wv-selected);
+  --color-wv-button-hover: var(--color-wv-selected);
+  --color-wv-menu-hover: var(--color-wv-selected);
+  --color-wv-segment-active: var(--color-wv-selected);
+  --color-wv-ok-bg: var(--color-wv-chrome);
+  --color-wv-ok-hover: var(--color-wv-row-hover);
+  --color-wv-danger-bg: var(--color-wv-chrome);
+  --color-wv-danger-bg-hover: var(--color-wv-selected);
+
+  --color-wv-line-strong: #272727;
+  --color-wv-hairline: #202020;
+  --color-wv-log-line: #171717;
+  --color-wv-axis: #535353;
+  --color-wv-control: #6d6d6d;
+  --color-wv-control-hover: #767676;
+  --color-wv-control-hover-strong: #868686;
+  --color-wv-control-focus: var(--wv-terminal-green);
+  --color-wv-bulk-line: var(--color-wv-control);
+  --color-wv-ok-line: var(--color-wv-control);
+  --color-wv-danger-border: var(--color-wv-control);
+  --color-wv-danger-border-hover: var(--color-wv-control-hover);
+  --color-wv-control-off: var(--color-wv-hairline);
+  --color-wv-track: #242424;
+  --color-wv-track-dash: #393939;
+
+  --color-wv-fg: var(--wv-ink);
+  --color-wv-strong: var(--wv-ink);
+  --color-wv-secondary: #ddd;
+  --color-wv-tertiary: #c4c4c4;
+  --color-wv-muted: #b2b2b2;
+  --color-wv-faint: #9f9f9f;
+  --color-wv-eyebrow: #c4c4c4;
+  --color-wv-note: #acacac;
+  --color-wv-disabled: #959595;
+  --color-wv-dim: #959595;
+
+  --color-wv-on-accent: #000;
+  --color-wv-on-ok: #000;
+  --color-wv-on-span: #000;
+  --color-wv-green: var(--wv-terminal-green);
+  --color-wv-ok: var(--wv-terminal-green);
+  --color-wv-progress: var(--wv-terminal-green);
+  --color-wv-idle: #aaa;
+  --color-wv-slate: #a5a5a5;
+  --color-wv-inert: #808080;
+  --color-wv-chip-off: #676767;
+  --color-wv-pending: #262626;
+
+  --font-wv-title: var(--font-wv-ui);
+}
+
+[data-accent="TEAL"] {
+  --wv-accent: light-dark(#005e4f, #3fb39c);
+}
+[data-accent="BLUE"] {
+  --wv-accent: light-dark(#205689, #86b8f0);
+}
+[data-accent="GREEN"] {
+  --wv-accent: light-dark(#2e5f31, #8cd88c);
+}
+[data-accent="AMBER"] {
+  --wv-accent: light-dark(#794809, #ecba71);
+}
+[data-accent="VIOLET"] {
+  --wv-accent: light-dark(#714389, #c1a3ed);
+}
+[data-accent="ROSE"] {
+  --wv-accent: light-dark(#903952, #ed9aaf);
+}
+
+:is(
+  [data-palette="PHOSPHOR"],
+  [data-palette="AMBER"],
+  [data-palette="TERMINAL"],
+  [data-accent]:not([data-accent=""])
+) {
+  --wv-accent-hover: color-mix(
+    in srgb,
+    var(--wv-accent) 83%,
+    light-dark(black, white)
+  );
+  --color-wv-bulk: color-mix(
+    in srgb,
+    var(--wv-accent) 14%,
+    var(--color-wv-app)
+  );
+  --color-wv-row-picked: color-mix(
+    in srgb,
+    var(--wv-accent) 12%,
+    var(--color-wv-list)
+  );
+  --color-wv-page-current: var(--color-wv-bulk);
+}
+
+.wv-queue-preview {
+  display: grid;
+  grid-template-columns: 23% 1fr;
+  width: 100%;
+  height: 3rem;
+  background: var(--wv-ground);
+  color: var(--wv-ink);
+  border: 1px solid color-mix(in srgb, currentColor 35%, transparent);
+}
+.wv-preview-rail,
+.wv-preview-list {
+  display: grid;
+  align-content: center;
+  gap: 4px;
+  padding: 4px;
+}
+.wv-preview-rail {
+  background: var(--wv-preview-rail);
+}
+.wv-preview-list {
+  background: var(--wv-preview-list);
+}
+.wv-preview-rail i,
+.wv-preview-list i {
+  display: block;
+  height: 3px;
+  background: currentColor;
+  opacity: 0.6;
+}
+.wv-preview-rail i:first-child,
+.wv-preview-list i:nth-child(2) {
+  background: var(--wv-accent);
+  opacity: 1;
+}
+.wv-preview-list i {
+  width: 75%;
+}
+.wv-preview-list i:nth-child(2) {
+  width: 93%;
+}
+.wv-preview-list i:last-child {
+  width: 55%;
+}
+
+.wv-queue-preview[data-palette="TERMINAL"] .wv-preview-list i:nth-child(2) {
+  height: 5px;
+  background: var(--color-wv-progress);
+  mask-image: var(--wv-meter-stripes);
+}
+
+[data-palette="TERMINAL"] .wv-meter {
+  --wv-meter-track: none;
+}
+
+[data-palette="TERMINAL"] .wv-meter > div {
+  mask-image: var(--wv-meter-stripes);
+}
+
+[data-palette="TERMINAL"] .wv-meter::before,
+[data-palette="TERMINAL"] .wv-meter::after {
+  position: absolute;
+  z-index: 1;
+  inset-block: 0;
+  inline-size: 4px;
+  border-block: 1px solid currentColor;
+  content: "";
+  pointer-events: none;
+}
+
+[data-palette="TERMINAL"] .wv-meter::before {
+  inset-inline-start: 0;
+  border-inline-start: 1px solid currentColor;
+}
+
+[data-palette="TERMINAL"] .wv-meter::after {
+  inset-inline-end: 0;
+  color: var(--color-wv-control);
+  border-inline-end: 1px solid currentColor;
 }
 
 /* A bare `border` utility draws the interface's line colour, not the text's. */
@@ -127,6 +398,16 @@
   ::file-selector-button {
     border-color: var(--color-wv-line-strong);
   }
+
+  html :focus-visible {
+    outline: 2px solid var(--color-wv-control-focus);
+    outline-offset: 2px;
+  }
+
+  html ::selection {
+    color: var(--color-wv-on-accent);
+    background: var(--wv-accent);
+  }
 }
 
 /*
@@ -137,7 +418,6 @@ body {
   background: var(--color-wv-app);
   background-image: none;
   color: var(--color-wv-fg);
-  color-scheme: dark;
   margin: 0;
   height: 100%;
   min-height: 0;
@@ -170,7 +450,7 @@ html input[type="range"] {
 
 /* Square, unobtrusive scrollbars. */
 html * {
-  scrollbar-color: #3a3b41 transparent;
+  scrollbar-color: var(--color-wv-control) transparent;
   scrollbar-width: thin;
 }
 
@@ -180,13 +460,13 @@ html ::-webkit-scrollbar {
 }
 
 html ::-webkit-scrollbar-thumb {
-  background: #3a3b41;
+  background: var(--color-wv-control);
   border: 3px solid var(--color-wv-app);
   border-radius: 0;
 }
 
 html ::-webkit-scrollbar-thumb:hover {
-  background: #55575f;
+  background: var(--color-wv-control-hover-strong);
 }
 
 html ::-webkit-scrollbar-track {
@@ -262,6 +542,10 @@ html .wv-ping:focus-visible {
   animation: none;
   outline-color: var(--color-wv-strong);
   outline-offset: 3px;
+}
+
+html[data-palette="TERMINAL"] .wv-ping:focus-visible {
+  outline-color: var(--color-wv-control-focus);
 }
 
 @keyframes wv-ping {

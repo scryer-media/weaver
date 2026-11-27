@@ -222,7 +222,7 @@ export function StateChip({
         "flex h-[21px] flex-none items-center border px-[9px] font-wv-mono text-[10.5px] tracking-[0.08em] whitespace-nowrap uppercase",
         tone === "bad"
           ? "border-wv-danger-border bg-wv-danger-bg text-wv-error-text"
-          : "border-wv-bulk-line bg-wv-ok-bg text-wv-accent",
+          : "border-wv-ok-line bg-wv-ok-bg text-wv-ok",
       )}
     >
       {label}
@@ -621,7 +621,7 @@ export function Bar({
   return (
     <div
       ref={ref}
-      className={cn("relative", className)}
+      className={cn("wv-meter relative", className)}
       {...(label === undefined
         ? {}
         : {
@@ -633,7 +633,8 @@ export function Bar({
           })}
       style={{
         height,
-        backgroundImage: blockTrack(cell),
+        color,
+        backgroundImage: `var(--wv-meter-track, ${blockTrack(cell)})`,
         // The cells tile from the left and a track is rarely an exact multiple
         // of one, so the ground is cut to the last whole cell. Otherwise a
         // finished meter ends in a few pixels of leftover dashes and reads as

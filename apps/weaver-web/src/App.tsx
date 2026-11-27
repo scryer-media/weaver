@@ -15,6 +15,7 @@ import {
   TranslateContext,
   type TranslateContextValue,
 } from "@/lib/context/translate-context";
+import { applyAppearance, type Appearance } from "./lib/appearance";
 import { PwaProvider } from "@/lib/context/pwa-context";
 import { LoadingMark } from "@/lib/loading-mark";
 import {
@@ -231,12 +232,14 @@ function SetupGate({ children }: { children: React.ReactNode }) {
         (
           payload: AuthStatus & {
             authenticatedAccess?: boolean;
+            appearance?: Appearance;
             setup?: SetupEnvironment;
           },
         ) => {
           if (!cancelled) {
             // Before the tree mounts, so a signed-out browser goes straight to
             // the sign-in page instead of firing queries that are refused.
+            if (payload.appearance) applyAppearance(payload.appearance);
             noteAuthStatus(payload);
             setSetupRequired(Boolean(payload.setupRequired));
             setSetupEnvironment(

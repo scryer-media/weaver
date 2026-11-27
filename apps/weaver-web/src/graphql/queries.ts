@@ -1757,6 +1757,16 @@ export const SETTINGS_QUERY = gql`
   ${DOWNLOAD_BLOCK_FIELDS}
 `;
 
+export const UPDATE_WEB_APPEARANCE_MUTATION = gql`
+  mutation UpdateWebAppearance($input: WebAppearanceInput!) {
+    updateWebAppearance(input: $input) {
+      palette
+      mode
+      accent
+    }
+  }
+`;
+
 export const UPDATE_SETTINGS_MUTATION = gql`
   mutation UpdateSettings($input: GeneralSettingsInput!) {
     updateSettings(input: $input) {

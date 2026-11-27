@@ -561,7 +561,7 @@ export function ProvidersPanel() {
         searchText: `${server.host} ${server.port} ${roleLabel(t, server)} ${transportLabel(t, server)}`,
         cells: [
           <span key="host" className="flex min-w-0 items-center gap-[10px]">
-            <Square color={server.active ? WV.accent : WV.inert} />
+            <Square color={server.active ? WV.ok : WV.inert} />
             <span className="min-w-0 truncate font-wv-mono text-[12.5px]">
               {server.host}
             </span>
@@ -874,12 +874,12 @@ export function ProvidersPanel() {
           <div className="flex flex-none flex-col gap-1.5 border-t border-wv-hairline px-4 sm:px-6 py-4">
             <div
               role="status"
-              className={`flex items-center gap-3 px-[12px] py-[11px] text-wv-on-accent ${
+              className={`flex items-center gap-3 px-[12px] py-[11px] ${
                 adoptable
-                  ? "bg-wv-warn"
+                  ? "bg-wv-warn text-wv-on-warn"
                   : testResult.success
-                    ? "bg-wv-accent"
-                    : "bg-wv-error"
+                    ? "bg-wv-ok text-wv-on-ok"
+                    : "bg-wv-error text-wv-on-error"
               }`}
             >
               <Icon

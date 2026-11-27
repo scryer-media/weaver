@@ -57,6 +57,22 @@ pub(crate) struct SettingsMutation;
 #[Object]
 impl SettingsMutation {
     #[graphql(guard = "AdminGuard")]
+    async fn update_web_appearance(
+        &self,
+        ctx: &Context<'_>,
+        input: crate::settings::appearance::WebAppearanceInput,
+    ) -> Result<crate::settings::appearance::WebAppearance> {
+        let store = ctx
+            .data::<crate::settings::appearance::AppearanceStore>()?
+            .clone();
+        let db = ctx.data::<Database>()?.clone();
+        spawn_blocking_db("settings.mutation.update_web_appearance", move || {
+            store.save(&db, input)
+        })
+        .await
+    }
+
+    #[graphql(guard = "AdminGuard")]
     async fn update_archive_password_settings(
         &self,
         ctx: &Context<'_>,

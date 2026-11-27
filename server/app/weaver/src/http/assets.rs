@@ -3,11 +3,13 @@
 
 use std::sync::Arc;
 
+use async_graphql::InputType;
 use axum::extract::{ConnectInfo, Extension};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, Uri, header};
 use axum::response::{IntoResponse, Response};
 use rust_embed::Embed;
 use std::net::SocketAddr;
+use weaver_server_api::settings::appearance::{AppearanceStore, WebAppearance};
 
 use weaver_server_core::auth::LoginAuthCache;
 use weaver_server_core::runtime::environment::DeploymentEnvironment;
@@ -42,15 +44,28 @@ fn is_built_asset(path: &str, stem: &str, extension: &str) -> bool {
         .is_some_and(|hash| hash.len() == 8)
 }
 
-// Rewrite `index.html` to inject the optional base URL.
-//
-// When `base_url` is non-empty (e.g. "/weaver"):
-// 1. Replaces `<base href="/">` with `<base href="/weaver/">`
-// 2. Injects `window.__WEAVER_BASE__` so the frontend knows its prefix
-fn rewrite_index_html(raw: &[u8], base_url: &str) -> Vec<u8> {
-    let html = String::from_utf8_lossy(raw);
+// Public values used to render the web entry document before scripts run.
+struct SpaEntry<'a> {
+    base_url: &'a str,
+    appearance: WebAppearance,
+}
+
+fn rewrite_index_html(raw: &[u8], entry: &SpaEntry<'_>) -> Vec<u8> {
+    let base_url = entry.base_url;
+    let appearance = entry.appearance;
+    // Every attribute comes from a closed GraphQL enum.
+    let attributes = format!(
+        "data-palette=\"{}\" data-mode=\"{}\" data-accent=\"{}\"",
+        appearance.palette.to_value(),
+        appearance.mode.to_value(),
+        appearance
+            .accent
+            .map(|accent| accent.to_value().to_string())
+            .unwrap_or_default(),
+    );
+    let html = String::from_utf8_lossy(raw).replacen("data-appearance-root", &attributes, 1);
     let html = if base_url.is_empty() {
-        html.into_owned()
+        html
     } else {
         let html = html.replace(
             "<base href=\"/\" />",
@@ -82,6 +97,7 @@ pub(super) async fn static_handler(
     uri: Uri,
     headers: HeaderMap,
     Extension(BaseUrl(base_url)): Extension<BaseUrl>,
+    Extension(appearance): Extension<AppearanceStore>,
     Extension(super::SessionToken(session_token)): Extension<super::SessionToken>,
     Extension(auth_cache): Extension<LoginAuthCache>,
     Extension(security): Extension<RuntimeSecurityConfig>,
@@ -135,6 +151,10 @@ pub(super) async fn static_handler(
             .into_response();
     }
 
+    let entry = SpaEntry {
+        base_url: &base_url,
+        appearance: appearance.current(),
+    };
     let peer = peer.map(|Extension(ConnectInfo(peer))| peer);
     // How this deployment is packaged decides which recovery page applies.
     let deployment =
@@ -147,7 +167,7 @@ pub(super) async fn static_handler(
         // to load the wizard from any browser. The one-time startup code is
         // the admission proof for the setup write; peer address is no longer
         // an unreliable substitute for operator intent.
-        return spa_entry_response(&base_url, false, &session_token, &security);
+        return spa_entry_response(&entry, false, &session_token, &security);
     }
     if security.authenticated_access_mode()
         && auth_cache.snapshot().is_none()
@@ -157,7 +177,7 @@ pub(super) async fn static_handler(
     }
     entry_response(
         &headers,
-        &base_url,
+        &entry,
         &session_token,
         &auth_cache,
         &security,
@@ -172,7 +192,7 @@ pub(super) async fn static_handler(
 // running inside a container.
 fn entry_response(
     headers: &HeaderMap,
-    base_url: &str,
+    entry: &SpaEntry<'_>,
     session_token: &str,
     auth_cache: &LoginAuthCache,
     security: &RuntimeSecurityConfig,
@@ -182,7 +202,7 @@ fn entry_response(
     // Both interfaces render sign-in from auth status. Serving the public shell
     // grants no session; HTTP and WebSocket operations still authenticate it.
     if security.authenticated_access_mode() {
-        return spa_entry_response(base_url, false, session_token, security);
+        return spa_entry_response(entry, false, session_token, security);
     }
 
     let cached_auth = auth_cache.snapshot();
@@ -227,21 +247,24 @@ fn entry_response(
         // arriving.
     }
 
-    spa_entry_response(base_url, trusted_peer, session_token, security)
+    spa_entry_response(entry, trusted_peer, session_token, security)
 }
 
 fn spa_entry_response(
-    base_url: &str,
+    entry: &SpaEntry<'_>,
     issue_legacy_session: bool,
     session_token: &str,
     security: &RuntimeSecurityConfig,
 ) -> Response {
     if let Some(index) = FrontendAssets::get("index.html") {
         let mime = mime_guess::from_path("index.html").first_or_octet_stream();
-        let body = rewrite_index_html(&index.data, base_url);
+        let body = rewrite_index_html(&index.data, entry);
         let mut response = (
             StatusCode::OK,
-            [(header::CONTENT_TYPE, mime.as_ref().to_string())],
+            [
+                (header::CONTENT_TYPE, mime.as_ref().to_string()),
+                (header::CACHE_CONTROL, "private, no-cache".to_string()),
+            ],
             body,
         )
             .into_response();
@@ -493,6 +516,13 @@ fn html_page_response(html: impl Into<axum::body::Body>) -> Response {
 mod tests {
     use super::*;
 
+    fn default_entry() -> SpaEntry<'static> {
+        SpaEntry {
+            base_url: "",
+            appearance: WebAppearance::default(),
+        }
+    }
+
     async fn entry_page(
         path: &'static str,
         security: RuntimeSecurityConfig,
@@ -504,6 +534,7 @@ mod tests {
             Uri::from_static(path),
             HeaderMap::new(),
             Extension(BaseUrl(Arc::new(String::new()))),
+            Extension(AppearanceStore::default()),
             Extension(session_token),
             Extension(auth_cache),
             Extension(security),
@@ -523,7 +554,7 @@ mod tests {
     ) -> Response {
         super::entry_response(
             &HeaderMap::new(),
-            "",
+            &default_entry(),
             "browser-token",
             &LoginAuthCache::default(),
             security,
@@ -546,7 +577,7 @@ mod tests {
         }
         super::entry_response(
             &headers,
-            "",
+            &default_entry(),
             "browser-token",
             &LoginAuthCache::default(),
             security,
@@ -582,7 +613,7 @@ mod tests {
 
             let response = super::entry_response(
                 &HeaderMap::new(),
-                "",
+                &default_entry(),
                 "browser-token",
                 &LoginAuthCache::default(),
                 &security,
@@ -664,7 +695,7 @@ mod tests {
     async fn a_notice_page_without_a_known_peer_omits_the_address_line() {
         let response = super::entry_response(
             &HeaderMap::new(),
-            "",
+            &default_entry(),
             "browser-token",
             &LoginAuthCache::default(),
             &RuntimeSecurityConfig::default(),
@@ -684,7 +715,7 @@ mod tests {
         // must be handed `172.22.0.3`, the form a CIDR list wants.
         let response = super::entry_response(
             &HeaderMap::new(),
-            "",
+            &default_entry(),
             "browser-token",
             &LoginAuthCache::default(),
             &RuntimeSecurityConfig::default(),
@@ -748,7 +779,7 @@ mod tests {
             for peer in ["192.168.1.20:49152", "203.0.113.9:49152", "127.0.0.1:49152"] {
                 let response = super::entry_response(
                     &HeaderMap::new(),
-                    "",
+                    &default_entry(),
                     "browser-token",
                     &auth_cache,
                     &security,
@@ -784,7 +815,7 @@ mod tests {
 
         let response = super::entry_response(
             &HeaderMap::new(),
-            "",
+            &default_entry(),
             "browser-token",
             &LoginAuthCache::default(),
             &security,
@@ -893,6 +924,80 @@ mod tests {
         assert!(body.contains("Browser Access Restricted"), "{body}");
         assert!(body.contains("every browser you try"), "{body}");
         assert!(body.contains("userland-proxy"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn browser_shell_serves_saved_appearance_at_the_base_url_after_restart() {
+        use axum::{Router, body::Body, http::Request, routing::get};
+        use tower::ServiceExt;
+        use weaver_server_core::Database;
+        use weaver_server_core::settings::persistence::SettingsPersistenceQueries;
+
+        let dir = tempfile::tempdir().unwrap();
+        let database_path = dir.path().join("weaver.db");
+        let fresh = {
+            let db = Database::open(&database_path).unwrap();
+            let fresh = AppearanceStore::load(&db).unwrap();
+            db.set_setting(
+                "web.appearance.v1",
+                r#"{"palette":"AMBER","mode":"DARK","accent":"ROSE"}"#,
+            )
+            .unwrap();
+            fresh
+        };
+        let reloaded = {
+            let db = Database::open(&database_path).unwrap();
+            AppearanceStore::load(&db).unwrap()
+        };
+
+        for (appearance, palette, mode, accent) in [
+            (fresh, "WEAVER", "SYSTEM", ""),
+            (reloaded, "AMBER", "DARK", "ROSE"),
+        ] {
+            let peer: SocketAddr = "127.0.0.1:49152".parse().unwrap();
+            let token = super::super::SessionToken(Arc::new("browser-token".into()));
+            let router = Router::new().nest(
+                "/weaver",
+                Router::new()
+                    .route("/", get(static_handler))
+                    .fallback(get(static_handler))
+                    .layer(Extension(BaseUrl(Arc::new("/weaver".into()))))
+                    .layer(Extension(appearance))
+                    .layer(Extension(token))
+                    .layer(Extension(LoginAuthCache::default()))
+                    .layer(Extension(RuntimeSecurityConfig::default()))
+                    .layer(Extension(ConnectInfo(peer))),
+            );
+
+            for path in ["/weaver", "/weaver/index.html"] {
+                let request = Request::builder().uri(path).body(Body::empty()).unwrap();
+                let response = router.clone().oneshot(request).await.unwrap();
+                assert_eq!(response.status(), StatusCode::OK, "{path}");
+                let body = body_text(response).await;
+                let root = body
+                    .split_once("<html ")
+                    .and_then(|(_, html)| html.split_once('>'))
+                    .expect("browser shell should include an html element")
+                    .0;
+                assert!(
+                    root.contains(&format!(r#"data-palette="{palette}""#)),
+                    "{path}: {root}"
+                );
+                assert!(
+                    root.contains(&format!(r#"data-mode="{mode}""#)),
+                    "{path}: {root}"
+                );
+                assert!(
+                    root.contains(&format!(r#"data-accent="{accent}""#)),
+                    "{path}: {root}"
+                );
+                assert!(body.contains(r#"<base href="/weaver/" />"#), "{path}");
+                assert!(
+                    body.contains(r#"window.__WEAVER_BASE__="/weaver""#),
+                    "{path}"
+                );
+            }
+        }
     }
 
     #[test]

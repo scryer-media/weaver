@@ -663,7 +663,7 @@ export function RssPanel() {
         searchText: `${feed.name} ${rule.action} ${rule.titleRegex ?? ""} ${rule.categoryOverride ?? ""}`,
         cells: [
           <span key="feed" className="flex min-w-0 items-center gap-[10px]">
-            <Square color={rule.enabled ? WV.accent : WV.inert} />
+            <Square color={rule.enabled ? WV.ok : WV.inert} />
             <span className="min-w-0 truncate">{feed.name}</span>
           </span>,
           <Cell

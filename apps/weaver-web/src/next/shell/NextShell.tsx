@@ -27,6 +27,7 @@ import { useFlowDns } from "../features/networking/dns-choices";
 import { FlowPreview } from "../features/networking/FlowPreview";
 import type { FlowTarget } from "../features/networking/NetworkFlow";
 import { ProxyEditorFor } from "../pages/settings/panels/ProxiesPanel";
+import { RailShortcuts } from "./RailShortcuts";
 
 /**
  * The chrome every Next screen shares: a 236px rail, a 56px top bar, the
@@ -127,8 +128,16 @@ export function NextShell({
         setNavOpen(false);
       }
     };
+    const desktop = window.matchMedia("(min-width: 64rem)");
+    const onDesktop = (event: MediaQueryListEvent) => {
+      if (event.matches) setNavOpen(false);
+    };
     document.addEventListener("keydown", onKeyDown);
-    return () => document.removeEventListener("keydown", onKeyDown);
+    desktop.addEventListener("change", onDesktop);
+    return () => {
+      document.removeEventListener("keydown", onKeyDown);
+      desktop.removeEventListener("change", onDesktop);
+    };
   }, [navOpen]);
 
   // Not a component: the aside and the drawer must render the same blocks, and
@@ -156,7 +165,7 @@ export function NextShell({
       )}
       <NetworkBlock />
       <ThroughputBlock />
-      <SponsorBlock />
+      {!navOpen || onDismiss ? <RailShortcuts onNavigate={onDismiss} /> : null}
     </>
   );
 
@@ -729,24 +738,6 @@ function RailRates({
     </>
   );
 }
-
-/** The rail's last block: the sponsor link. */
-const SponsorBlock = memo(function SponsorBlock() {
-  const t = useTranslate();
-  return (
-    <div className="flex flex-none flex-col gap-[10px] border-t border-wv-line-strong px-5 py-[12px]">
-      <a
-        href="https://www.scryer.media/weaver/donate/"
-        target="_blank"
-        rel="noreferrer noopener"
-        className="flex items-center justify-center gap-[9px] text-[12.5px] text-wv-muted hover:text-wv-fg"
-      >
-        <Icon name="sponsor" size={14} className="flex-none text-wv-error" />
-        {t("nav.sponsor")}
-      </a>
-    </div>
-  );
-});
 
 /**
  * A rail block: the bordered, padded unit the rail is built from.

@@ -2982,6 +2982,7 @@ type MutationRoot {
 	"""
 	rerunPostProcessing(jobId: Int!): Boolean!
 	cancelJobPostProcessing(jobId: Int!): Boolean!
+	updateWebAppearance(input: WebAppearanceInput!): WebAppearance!
 	updateArchivePasswordSettings(passwords: [String!], passwordFile: String): ArchivePasswordSettings!
 	"""
 	Choose how hard Weaver leans on this machine.
@@ -3922,6 +3923,7 @@ type QueryRoot {
 	Load one configured NNTP server for editing.
 	"""
 	server(id: Int!): ServerDetails
+	webAppearance: WebAppearance!
 	archivePasswordSettings: ArchivePasswordSettings!
 	"""
 	Get general settings.
@@ -7857,6 +7859,43 @@ input WatchFolderSettingsInput {
 	stabilitySecs: Int
 	categoryFromSubfolders: Boolean
 	scanningPaused: Boolean
+}
+
+enum WebAccent {
+	TEAL
+	BLUE
+	GREEN
+	AMBER
+	VIOLET
+	ROSE
+}
+
+type WebAppearance {
+	palette: WebPalette!
+	mode: WebMode!
+	accent: WebAccent
+}
+
+input WebAppearanceInput {
+	palette: WebPalette
+	mode: WebMode
+	"""
+	Omit to retain the accent. Null restores the palette's own highlight.
+	"""
+	accent: WebAccent
+}
+
+enum WebMode {
+	DARK
+	LIGHT
+	SYSTEM
+}
+
+enum WebPalette {
+	WEAVER
+	PHOSPHOR
+	AMBER
+	TERMINAL
 }
 
 """

@@ -468,7 +468,7 @@ const ProvidersSection = memo(function ProvidersSection() {
               className="flex flex-wrap items-center gap-x-5 gap-y-3 border-b border-wv-hairline px-4 sm:px-6 py-3 hover:bg-wv-cell-hover"
             >
               <div className="flex min-w-0 flex-[1_1_240px] items-center gap-[9px]">
-                <Square color={degraded ? WV.warn : WV.accent} />
+                <Square color={degraded ? WV.warn : WV.ok} />
                 <span className="truncate font-wv-mono text-[12.5px] text-wv-fg">
                   {provider.host}
                 </span>
@@ -490,7 +490,7 @@ const ProvidersSection = memo(function ProvidersSection() {
               <div className="ml-auto flex flex-wrap items-center justify-end gap-x-5 gap-y-1">
                 <Bar
                   percent={providerLoadPercent(provider)}
-                  color={degraded ? WV.warn : WV.accent}
+                  color={degraded ? WV.warn : WV.ok}
                   className="w-[150px]"
                 />
                 <span className="w-[62px] text-right font-wv-mono text-[12.5px] text-wv-secondary">

@@ -522,6 +522,13 @@ pub(crate) async fn run(
     usage::prime(&usage_recorder, &usage_sources, &db).await;
 
     // Build the GraphQL schema now that the live NNTP pool exists (for server-health metrics).
+    let appearance = {
+        let db = db.clone();
+        tokio::task::spawn_blocking(move || {
+            weaver_server_api::settings::appearance::AppearanceStore::load(&db)
+        })
+        .await??
+    };
     let schema = weaver_server_api::context::build_schema_with_backup(
         weaver_server_api::SchemaContext {
             handle: handle.clone(),
@@ -530,6 +537,7 @@ pub(crate) async fn run(
             config: shared_config.clone(),
             db: db.clone(),
             server_transfer_policy: Arc::clone(&server_transfer_policy),
+            appearance,
             auth_cache: login_auth_cache.clone(),
             api_key_cache: api_key_cache.clone(),
             security: security.clone(),

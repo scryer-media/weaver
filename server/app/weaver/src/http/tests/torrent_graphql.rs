@@ -186,6 +186,7 @@ async fn endpoint(dir: &std::path::Path, db: Database, torrents: TorrentService)
         server_transfer_policy,
         auth_cache: auth_cache.clone(),
         api_key_cache: api_key_cache.clone(),
+        appearance: Default::default(),
         security: RuntimeSecurityConfig::default(),
         rss: weaver_server_api::RssService::new(handle.handle.clone(), config.clone(), db.clone()),
         watch_folder: weaver_server_core::watch_folder::WatchFolderService::new(

@@ -16,6 +16,16 @@ pub(crate) struct SettingsQuery;
 #[Object]
 impl SettingsQuery {
     #[graphql(guard = "AdminGuard")]
+    async fn web_appearance(
+        &self,
+        ctx: &Context<'_>,
+    ) -> Result<crate::settings::appearance::WebAppearance> {
+        Ok(ctx
+            .data::<crate::settings::appearance::AppearanceStore>()?
+            .current())
+    }
+
+    #[graphql(guard = "AdminGuard")]
     async fn archive_password_settings(
         &self,
         ctx: &Context<'_>,

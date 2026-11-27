@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
+use serde_json::json;
+use weaver_server_api::settings::appearance::AppearanceStore;
 use weaver_server_core::post_processing::settings::PostProcessingSettingsQueries;
 use weaver_server_core::settings::SettingsSchedulesQueries;
 use weaver_server_core::settings::queries::SettingsQueries;
@@ -194,6 +196,107 @@ async fn archive_password_settings_require_admin() {
         ] {
             assert!(!h.execute_as(query, scope).await.errors.is_empty());
         }
+    }
+}
+
+#[tokio::test]
+async fn web_appearance_requires_admin_for_reads_and_writes() {
+    let h = TestHarness::new().await;
+    let query = "{ webAppearance { palette mode accent } }";
+    let mutation = "mutation { updateWebAppearance(input: { palette: AMBER }) { palette } }";
+
+    for scope in [CallerScope::Read, CallerScope::Control] {
+        for operation in [query, mutation] {
+            let response = h.execute_as(operation, scope).await;
+            assert_eq!(response.errors.len(), 1);
+            assert_eq!(
+                response.errors[0]
+                    .extensions
+                    .as_ref()
+                    .and_then(|extensions| extensions.get("code")),
+                Some(&async_graphql::Value::String("FORBIDDEN".into()))
+            );
+        }
+    }
+
+    let response = h.execute_as(query, CallerScope::Admin).await;
+    assert_no_errors(&response);
+    assert_eq!(
+        response_data(&response)["webAppearance"]["palette"],
+        "WEAVER"
+    );
+}
+
+#[tokio::test]
+async fn web_appearance_defaults_and_persists_partial_updates_and_reset() {
+    let h = TestHarness::new().await;
+    // Existing installations have their settings but no saved appearance.
+    let defaults = json!({ "palette": "WEAVER", "mode": "SYSTEM", "accent": null });
+    assert_eq!(
+        serde_json::to_value(AppearanceStore::load(&h.db).unwrap().current()).unwrap(),
+        defaults
+    );
+
+    let query = "{ webAppearance { palette mode accent } }";
+    let response = h.execute_as(query, CallerScope::Admin).await;
+    assert_no_errors(&response);
+    assert_eq!(response_data(&response)["webAppearance"], defaults);
+
+    for (input, expected) in [
+        (
+            "palette: PHOSPHOR, mode: LIGHT, accent: VIOLET",
+            json!({ "palette": "PHOSPHOR", "mode": "LIGHT", "accent": "VIOLET" }),
+        ),
+        (
+            "mode: SYSTEM",
+            json!({ "palette": "PHOSPHOR", "mode": "SYSTEM", "accent": "VIOLET" }),
+        ),
+        (
+            "accent: null",
+            json!({ "palette": "PHOSPHOR", "mode": "SYSTEM", "accent": null }),
+        ),
+        (
+            "palette: TERMINAL",
+            json!({ "palette": "TERMINAL", "mode": "SYSTEM", "accent": null }),
+        ),
+        (
+            "palette: WEAVER, mode: SYSTEM, accent: null",
+            defaults.clone(),
+        ),
+    ] {
+        let mutation = format!(
+            "mutation {{ updateWebAppearance(input: {{ {input} }}) {{ palette mode accent }} }}"
+        );
+        let updated = h.execute_as(&mutation, CallerScope::Admin).await;
+        assert_no_errors(&updated);
+        assert_eq!(response_data(&updated)["updateWebAppearance"], expected);
+
+        let fetched = h.execute_as(query, CallerScope::Admin).await;
+        assert_no_errors(&fetched);
+        assert_eq!(response_data(&fetched)["webAppearance"], expected);
+        assert_eq!(
+            serde_json::to_value(AppearanceStore::load(&h.db).unwrap().current()).unwrap(),
+            expected
+        );
+    }
+
+    for invalid in [
+        "palette: UNKNOWN",
+        "palette: AMBER, mode: UNKNOWN",
+        "palette: AMBER, accent: UNKNOWN",
+    ] {
+        let mutation =
+            format!("mutation {{ updateWebAppearance(input: {{ {invalid} }}) {{ palette }} }}");
+        assert!(
+            !h.execute_as(&mutation, CallerScope::Admin)
+                .await
+                .errors
+                .is_empty()
+        );
+        assert_eq!(
+            serde_json::to_value(AppearanceStore::load(&h.db).unwrap().current()).unwrap(),
+            defaults
+        );
     }
 }
 
