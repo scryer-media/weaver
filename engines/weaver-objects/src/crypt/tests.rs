@@ -713,3 +713,33 @@ fn a_seeded_run_hands_out_and_keeps_what_it_always_did() {
     let got = (crate::grid::crc32(&transcript), transcript.len() as u64);
     assert_eq!(got, EXPECTED);
 }
+
+// A padding read back from facts fits its stream only when it holds no
+// byte past the plaintext beyond the payload and marks none past what it
+// holds. One hand-built too long, or marking bytes it does not hold, decodes
+// without a panic and does not fit; one a stream kept does.
+#[test]
+fn a_restored_padding_fits_only_within_its_stream() {
+    let decode = |tail: Vec<u8>, filled: u16| -> Padding {
+        let bytes = rmp_serde::to_vec(&(tail, filled, None::<()>)).unwrap();
+        rmp_serde::from_slice(&bytes).expect("decodes")
+    };
+    assert!(Padding::default().fits(0));
+    assert!(Padding::default().fits(9));
+    assert!(!decode(vec![0; 40], 0).fits(9));
+    assert!(!decode(vec![0; 10], 0).fits(9));
+    assert!(decode(vec![0; 9], 0x01ff).fits(9));
+    assert!(!decode(vec![0; 9], 0x0200).fits(9));
+    assert!(!decode(Vec::new(), 1).fits(9));
+    assert!(!decode(vec![0; 16], 0xffff).fits(15));
+
+    let (plain, cipher) = posted(4999);
+    let mut stream = cbc(&plain, &cipher);
+    let mut out = Out::default();
+    out.deliver(&mut stream, 0, &cipher, Provenance::Fresh);
+    let padding = cipher.len() as u64 - plain.len() as u64;
+    assert!(out.padding.whole(padding));
+    let kept: Padding = rmp_serde::from_slice(&rmp_serde::to_vec(&out.padding).unwrap()).unwrap();
+    assert!(kept.fits(padding));
+    assert!(!kept.fits(padding - 1));
+}

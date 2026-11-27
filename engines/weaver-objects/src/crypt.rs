@@ -255,6 +255,14 @@ impl Padding {
         self.tail_filled == (1u16 << padding.min(15)) - 1
     }
 
+    // Whether a padding read back from facts could be one kept for a
+    // stream whose plaintext past the payload is `padding` bytes long: it
+    // holds no byte past them, and marks none past what it holds.
+    pub fn fits(&self, padding: u64) -> bool {
+        let held = self.tail_plain.len();
+        held as u64 <= padding && u32::from(self.tail_filled) >> held.min(16) == 0
+    }
+
     // Keeps the plaintext past the payload's end. `offset` is where `plain`
     // starts; only the part of it at or past `unpacked_size` is kept, at its
     // true position inside the padding, so an out-of-order arrival cannot

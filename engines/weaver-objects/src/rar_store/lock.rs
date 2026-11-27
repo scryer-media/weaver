@@ -455,9 +455,11 @@ impl RarStore {
                 continue;
             };
             let entry = &mut self.entries[index];
-            // Sealed at a restart: the blocks it kept, keyed again.
+            // Sealed at a restart: the blocks it kept, keyed again, when
+            // they and the padding kept beside them fit the stream.
+            let padding = entry.out.padding.fits(cipher_len.saturating_sub(length));
             let opened = match std::mem::replace(&mut entry.lock, Lock::Locked) {
-                Lock::Sealed(chain) if chain.fits(cipher_len, length) => {
+                Lock::Sealed(chain) if padding && chain.fits(cipher_len, length) => {
                     Cbc::unseal(&key.key, *chain)
                 }
                 _ => Cbc::new(&key.key, key.iv, cipher_len, length),
