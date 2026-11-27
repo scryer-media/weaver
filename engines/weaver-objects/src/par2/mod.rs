@@ -101,7 +101,7 @@ pub struct Par2 {
     catalogue: Catalogue,
     // How many of the sets bind each member: a member any set binds is
     // covered.
-    covered: BTreeMap<MemberId, u32>,
+    covered: Covered,
     // The sets bound to any member, and those bound to any member or
     // holding any unnamed one: the only sets a binding with nothing new
     // for them can change. Each is filed or unfiled where a set's members
@@ -173,7 +173,7 @@ impl Par2 {
             memory_limit: REPAIR_MEMORY_LIMIT,
             fronts: Fronts::new(),
             catalogue: Catalogue::default(),
-            covered: BTreeMap::new(),
+            covered: Covered::default(),
             binding: BTreeSet::new(),
             holding: BTreeSet::new(),
             rebound: BTreeSet::new(),
@@ -783,13 +783,13 @@ impl Par2 {
             .filter(|(_, state)| !state.members().is_empty() || !state.unnamed().is_empty())
             .map(|(key, _)| *key)
             .collect();
-        let mut covered = BTreeMap::new();
+        let mut covered = Covered::default();
         for state in self.sets.values() {
             cover(&mut covered, state.members().values(), true);
         }
         assert_eq!(self.binding, binding);
         assert_eq!(self.holding, holding);
-        assert_eq!(self.covered, covered);
+        assert_eq!(self.covered.by, covered.by);
     }
 
     fn take(&mut self, volume: VolumeIndex, found: Vec<Found>) {
@@ -1351,19 +1351,32 @@ impl Recovery for Par2 {
     }
 
     fn covers(&self, member: MemberId) -> bool {
-        let covered = self.covered.contains_key(&member);
+        let covered = self.covered.by.contains_key(&member);
         #[cfg(test)]
-        assert_eq!(
-            covered,
-            self.sets
-                .values()
-                .any(|state| state.bound(member).is_some())
-        );
+        {
+            assert_eq!(
+                covered,
+                self.sets
+                    .values()
+                    .any(|state| state.bound(member).is_some())
+            );
+            let mut listed = Vec::new();
+            self.covered_members(&mut listed);
+            assert_eq!(covered, listed.contains(&member));
+        }
         covered
     }
 
     fn covers_some(&self) -> bool {
-        !self.covered.is_empty()
+        !self.covered.by.is_empty()
+    }
+
+    fn covered_members(&self, out: &mut Vec<MemberId>) {
+        out.extend(self.covered.by.keys().copied());
+    }
+
+    fn coverage_version(&self) -> u64 {
+        self.covered.changes
     }
 
     fn feed(&mut self, member: MemberId, segments: &[Segment]) {
@@ -1766,7 +1779,7 @@ impl Par2 {
 // moved, and its members are counted as covered in place of those it had.
 fn rebind(
     sets: &mut BTreeMap<[u8; 16], SetState>,
-    covered: &mut BTreeMap<MemberId, u32>,
+    covered: &mut Covered,
     key: [u8; 16],
     given: Bindings,
     unnamed: &[(MemberId, Length)],
@@ -1782,19 +1795,39 @@ fn rebind(
     }
 }
 
+// How many of the sets bind each member, and how many times the members
+// bound changed: a member that comes to be bound or stops being bound
+// changes what the set covers.
+#[derive(Debug, Default)]
+struct Covered {
+    by: BTreeMap<MemberId, u32>,
+    changes: u64,
+}
+
+impl Covered {
+    // Every set gives up its members at once.
+    fn clear(&mut self) {
+        if !self.by.is_empty() {
+            self.by.clear();
+            self.changes += 1;
+        }
+    }
+}
+
 // Count members as bound by one more set, or one fewer.
-fn cover<'a>(
-    covered: &mut BTreeMap<MemberId, u32>,
-    members: impl Iterator<Item = &'a MemberId>,
-    bound: bool,
-) {
+fn cover<'a>(covered: &mut Covered, members: impl Iterator<Item = &'a MemberId>, bound: bool) {
     for member in members {
         if bound {
-            *covered.entry(*member).or_default() += 1;
-        } else if let Some(count) = covered.get_mut(member) {
+            let count = covered.by.entry(*member).or_default();
+            if *count == 0 {
+                covered.changes += 1;
+            }
+            *count += 1;
+        } else if let Some(count) = covered.by.get_mut(member) {
             *count -= 1;
             if *count == 0 {
-                covered.remove(member);
+                covered.by.remove(member);
+                covered.changes += 1;
             }
         }
     }

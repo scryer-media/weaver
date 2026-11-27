@@ -50,6 +50,10 @@ pub struct RarRecord {
     // member the record sits in.
     name: String,
     member: Option<MemberId>,
+    // Raised each time `member` changes: with whether the record could not
+    // read itself, what `coverage_version` says. Not kept across a restart.
+    #[serde(skip)]
+    member_changes: u64,
     // Whether the volume is closed: nothing more arrives for it.
     closed: bool,
     // What the last ruling found.
@@ -346,6 +350,7 @@ impl Recovery for RarRecord {
             .or_else(|| namespace.find_by_name(&self.name).map(|member| member.id));
         if found != self.member {
             self.member = found;
+            self.member_changes += 1;
             self.said = None;
             self.protected = None;
             self.units = None;
@@ -354,11 +359,31 @@ impl Recovery for RarRecord {
 
     // The volume it sits in, unless it could not read itself there.
     fn covers(&self, member: MemberId) -> bool {
-        self.member == Some(member) && self.said != Some(Said::Unread)
+        let covered = self.member == Some(member) && self.said != Some(Said::Unread);
+        #[cfg(test)]
+        {
+            let mut listed = Vec::new();
+            self.covered_members(&mut listed);
+            assert_eq!(covered, listed.contains(&member));
+        }
+        covered
     }
 
     fn covers_some(&self) -> bool {
         self.member.is_some() && self.said != Some(Said::Unread)
+    }
+
+    fn covered_members(&self, out: &mut Vec<MemberId>) {
+        if self.said != Some(Said::Unread) {
+            out.extend(self.member);
+        }
+    }
+
+    // `member` and whether the record could not read itself are all
+    // `covers` reads: each change of `member` raises its count, and an
+    // unread record adds one.
+    fn coverage_version(&self) -> u64 {
+        self.member_changes * 2 + u64::from(self.said == Some(Said::Unread))
     }
 
     // The articles' checksums are of the bytes as posted, and the record's

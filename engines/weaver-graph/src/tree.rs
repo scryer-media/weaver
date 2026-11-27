@@ -568,6 +568,14 @@ enum Down {
     Forget { keep_repairs: bool },
 }
 
+// What a set listed in the index covers: where it is homed, the version of
+// its coverage it was read at, and the members it said.
+struct Covering {
+    home: NodeId,
+    version: u64,
+    members: Vec<MemberId>,
+}
+
 pub struct Tree {
     nodes: Nodes,
     // What an object parsed of a member it gave back, parked beside the
@@ -583,6 +591,17 @@ pub struct Tree {
     // home goes; never recorded, so a rebuild lists every set again.
     sets: BTreeSet<(NodeId, NodeId)>,
     homed: BTreeMap<NodeId, NodeId>,
+    // Every member a set homed in a namespace covers, by that namespace,
+    // with how many of its sets cover it: whether a set beside an ask covers
+    // the ask's member, in one lookup. Each listed set's last reading of
+    // what it covers is kept beside, under the version it read at, with the
+    // node generation the readings were brought up to. Kept only by
+    // `rehome` and `bring_coverage_up`; never recorded, so a rebuild lists
+    // every set again.
+    covered: BTreeMap<(NodeId, MemberId), u32>,
+    coverage: BTreeMap<NodeId, Covering>,
+    coverage_at: u64,
+    coverage_changed: Vec<NodeId>,
     next_node: u32,
     // How deep a namespace may sit: an object that would open one deeper is
     // never built, and its member is refused as the container it is.
@@ -697,6 +716,10 @@ impl Tree {
             names: NameLedger::new(),
             sets: BTreeSet::new(),
             homed: BTreeMap::new(),
+            covered: BTreeMap::new(),
+            coverage: BTreeMap::new(),
+            coverage_at: 0,
+            coverage_changed: Vec::new(),
             next_node: 1,
             nesting: u32::MAX,
             emits: Vec::new(),
@@ -886,13 +909,98 @@ impl Tree {
         if let Some(home) = self.homed.remove(&node) {
             self.sets.remove(&(home, node));
         }
+        let left = self.unlist_coverage(node);
         if let Some(home) = self
             .home(node)
             .filter(|_| self.is_live(node) && self.recovers(node))
         {
             self.homed.insert(node, home);
             self.sets.insert((home, node));
+            self.list_coverage(node, home, left);
         }
+    }
+
+    // Bring what each listed set covers up to what it says now: only a set
+    // whose own row was marked since the last time was told anything, and
+    // only one whose coverage version moved is read again. A set out on
+    // loan keeps what it covered as it left.
+    fn bring_coverage_up(&mut self) {
+        let at = self.nodes.generation();
+        if at == self.coverage_at {
+            return;
+        }
+        let mut changed = std::mem::take(&mut self.coverage_changed);
+        changed.clear();
+        changed.extend(
+            self.nodes
+                .changed_since(self.coverage_at)
+                .filter_map(|mark| match mark {
+                    Mark::Node(node) => Some(node),
+                    Mark::Members(_) => None,
+                })
+                .filter(|node| self.coverage.contains_key(node)),
+        );
+        self.coverage_at = at;
+        for node in changed.drain(..) {
+            let Some(version) = self
+                .recovery(node)
+                .map(|recovery| recovery.coverage_version())
+            else {
+                continue;
+            };
+            let Some(home) = self
+                .coverage
+                .get(&node)
+                .filter(|found| found.version != version)
+                .map(|found| found.home)
+            else {
+                continue;
+            };
+            let left = self.unlist_coverage(node);
+            self.list_coverage(node, home, left);
+        }
+        self.coverage_changed = changed;
+    }
+
+    // The set's members go from the index, and what it covered is handed
+    // back.
+    fn unlist_coverage(&mut self, node: NodeId) -> Option<Covering> {
+        let left = self.coverage.remove(&node)?;
+        for member in &left.members {
+            let key = (left.home, *member);
+            if let Some(count) = self.covered.get_mut(&key) {
+                *count -= 1;
+                if *count == 0 {
+                    self.covered.remove(&key);
+                }
+            }
+        }
+        Some(left)
+    }
+
+    // The set's members go into the index under `home`: what it says it
+    // covers, or, out on loan, what it covered as it left.
+    fn list_coverage(&mut self, node: NodeId, home: NodeId, left: Option<Covering>) {
+        let covering = match self.recovery(node) {
+            Some(recovery) => {
+                let mut members = left.map(|left| left.members).unwrap_or_default();
+                members.clear();
+                recovery.covered_members(&mut members);
+                Covering {
+                    home,
+                    version: recovery.coverage_version(),
+                    members,
+                }
+            }
+            None => match left {
+                Some(left) => Covering { home, ..left },
+                None => return,
+            },
+        };
+        for member in &covering.members {
+            *self.covered.entry((home, *member)).or_default() += 1;
+        }
+        self.coverage.insert(node, covering);
     }
 
     // Where a set stands among the sets of its home: its own before those
@@ -5615,6 +5723,7 @@ impl Tree {
     // which of the parent's volumes hold that range. Repeat until the root,
     // whose volumes are the source's.
     pub fn lift(&mut self, node: NodeId, seek: Seek, root: &mut dyn SeekUp) -> Pull {
+        self.bring_coverage_up();
         let mut asks = vec![(node, seek)];
         let mut pulled = Pull::Moved(0);
         while let Some((at, ask)) = asks.pop() {
@@ -5632,18 +5741,19 @@ impl Tree {
                 pulled = pulled.fold(ask.unseekable());
                 continue;
             };
-            // A window's set that covers the member it sits in rules on that
-            // member only once all of it is in, its own recovery bytes with
-            // it: deferring them would hold back the ruling that asks for
-            // them, so the deferral parks nothing.
-            if ask.when == When::Deferred
-                && self.window(at).is_some()
-                && self
-                    .recovery(at)
-                    .is_some_and(|recovery| recovery.covers(member))
-            {
-                continue;
-            }
+            // A set beside the asker that covers the member, the asker's own
+            // among them, rules on that member only once all of it is in:
+            // deferring its bytes would hold back the ruling, so the
+            // deferral is wanted now. Bytes parked before the set learned
+            // what it covers are raised by the next round's ask.
+            let ask =
+                match ask.when == When::Deferred && self.covered.contains_key(&(parent, member)) {
+                    true => Seek {
+                        when: When::Now,
+                        ..ask
+                    },
+                    false => ask,
+                };
             // A seek past the end of a window asks for nothing that is the
             // node's.
             let Some(range) = self
@@ -6705,6 +6815,7 @@ mod tests {
 
     mod again;
     mod candidates;
+    mod covering;
     mod handed;
     mod held_arrival;
     mod kin;

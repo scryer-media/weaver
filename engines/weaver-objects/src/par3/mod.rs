@@ -417,6 +417,8 @@ pub struct Par3 {
     bound: BTreeMap<String, MemberId>,
     // The members `bound` names, each once.
     covered: BTreeSet<MemberId>,
+    // Raised each time `covered` changes: what `coverage_version` says.
+    covered_changes: u64,
     // Members that may be a free described file. Those complete are what a
     // repair reads back to identify.
     unnamed: BTreeMap<MemberId, Unnamed>,
@@ -475,6 +477,7 @@ impl Par3 {
             volumes: Vec::new(),
             bound: BTreeMap::new(),
             covered: BTreeSet::new(),
+            covered_changes: 0,
             unnamed: BTreeMap::new(),
             described: BTreeMap::new(),
             identified: BTreeMap::new(),
@@ -495,7 +498,11 @@ impl Par3 {
     // The described paths and the members they are bound to, with the
     // members they name.
     fn set_bound(&mut self, bound: BTreeMap<String, MemberId>) {
-        self.covered = bound.values().copied().collect();
+        let covered: BTreeSet<MemberId> = bound.values().copied().collect();
+        if covered != self.covered {
+            self.covered = covered;
+            self.covered_changes += 1;
+        }
         self.bound = bound;
     }
 
@@ -1205,11 +1212,26 @@ impl Recovery for Par3 {
     }
 
     fn covers(&self, member: MemberId) -> bool {
-        self.covered.contains(&member)
+        let covered = self.covered.contains(&member);
+        #[cfg(test)]
+        {
+            let mut listed = Vec::new();
+            self.covered_members(&mut listed);
+            assert_eq!(covered, listed.contains(&member));
+        }
+        covered
     }
 
     fn covers_some(&self) -> bool {
         !self.covered.is_empty()
+    }
+
+    fn covered_members(&self, out: &mut Vec<MemberId>) {
+        out.extend(self.covered.iter().copied());
+    }
+
+    fn coverage_version(&self) -> u64 {
+        self.covered_changes
     }
 
     fn feed(&mut self, member: MemberId, segments: &[Segment]) {

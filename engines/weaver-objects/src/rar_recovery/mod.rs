@@ -170,6 +170,10 @@ pub struct RarRecovery {
     stem: Option<String>,
     // The set's data volumes in the namespace, by their index in the set.
     bound: BTreeMap<u32, MemberId>,
+    // Raised each time `bound` changes: with whether the set is refuted,
+    // what `coverage_version` says. Not kept across a restart.
+    #[serde(skip)]
+    bound_changes: u64,
     // Their names, which the restore stages them under.
     names: BTreeMap<MemberId, String>,
     // A data volume's name, to name the ones no member carries after.
@@ -262,6 +266,7 @@ impl RarRecovery {
             revs: Vec::new(),
             stem: None,
             bound: BTreeMap::new(),
+            bound_changes: 0,
             names: BTreeMap::new(),
             reference: None,
             whole: BTreeSet::new(),
@@ -1109,7 +1114,10 @@ impl Recovery for RarRecovery {
             .keys()
             .filter(|member| self.refused.contains(member))
             .count() as u64;
-        self.bound = bound;
+        if bound != self.bound {
+            self.bound = bound;
+            self.bound_changes += 1;
+        }
         self.names = names;
         self.whole = whole;
     }
@@ -1137,11 +1145,34 @@ impl Recovery for RarRecovery {
     }
 
     fn covers(&self, member: MemberId) -> bool {
-        !self.refuted() && self.bound.values().any(|bound| *bound == member)
+        let covered = !self.refuted() && self.bound.values().any(|bound| *bound == member);
+        #[cfg(test)]
+        {
+            let mut listed = Vec::new();
+            self.covered_members(&mut listed);
+            assert_eq!(covered, listed.contains(&member));
+        }
+        covered
     }
 
     fn covers_some(&self) -> bool {
         !self.refuted() && !self.bound.is_empty()
+    }
+
+    fn covered_members(&self, out: &mut Vec<MemberId>) {
+        if self.refuted() {
+            return;
+        }
+        let mut listed: Vec<MemberId> = self.bound.values().copied().collect();
+        listed.sort_unstable();
+        listed.dedup();
+        out.extend(listed);
+    }
+
+    // `bound` and whether the set is refuted are all `covers` reads: each
+    // change of `bound` raises its count, and refuted adds one.
+    fn coverage_version(&self) -> u64 {
+        self.bound_changes * 2 + u64::from(self.refuted())
     }
 
     // A set that binds no data volume has yet to learn what it describes:

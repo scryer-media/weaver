@@ -1397,6 +1397,36 @@ fn a_set_that_covers_no_data_volume_rules_on_nothing_whenever_its_footers_arrive
     assert_eq!(early.object.outcome(), Some(RepairOutcome::Unread));
 }
 
+// A set its ruling refutes lists no member, under a coverage version it has
+// not said before, so an index of what it covers drops what it listed.
+#[test]
+fn a_refuted_set_lists_nothing_under_a_new_coverage_version() {
+    // Bound by its table under no name, over volumes of the size it gives
+    // that are another set's.
+    let mut job = job();
+    rev(&mut job, "a8f3c1d2", &rev5(3, 1, 3, &[300, 300, 300]))
+        .expect("the first volume of the set");
+    for at in 1..=3 {
+        volume(&mut job, &format!("beacon.part0{at}.rar"), &payload(7, 300));
+    }
+    bind(&mut job);
+    let listed = |object: &RarRecovery| {
+        let mut out = Vec::new();
+        object.covered_members(&mut out);
+        out
+    };
+    let before = (listed(&job.object), job.object.coverage_version());
+    assert!(!before.0.is_empty(), "the set lists what it is bound over");
+    let outcome = job
+        .object
+        .repair(&mut job.store, weaver_graph::Budget::default());
+    assert_eq!(outcome, RepairOutcome::Unread);
+    assert!(job.object.refuted());
+    let after = (listed(&job.object), job.object.coverage_version());
+    assert_eq!(after.0, []);
+    assert_ne!(after.1, before.1);
+}
+
 // A RAR3 footer counts the volumes of a set that covers one: one data volume
 // in, a footer naming three, and the two absent ones are missing.
 #[test]

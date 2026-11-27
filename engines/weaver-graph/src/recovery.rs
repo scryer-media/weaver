@@ -242,6 +242,17 @@ pub trait Recovery {
     // its ruling vouches for no file.
     fn covers_some(&self) -> bool;
 
+    // The members `covers` holds for, each once, read off what `covers`
+    // reads. An object that covers nothing lists none.
+    fn covered_members(&self, _out: &mut Vec<MemberId>) {}
+
+    // A value that changes whenever `covers` may answer otherwise for some
+    // member: two reads that give the same value saw `covered_members` list
+    // the same members. An object that covers nothing keeps 0.
+    fn coverage_version(&self) -> u64 {
+        0
+    }
+
     // Whether the object has yet to learn what some set of it describes:
     // its own volumes may still say, once something asks for them. The
     // owner asks it to rule once the namespace holds every other member,
