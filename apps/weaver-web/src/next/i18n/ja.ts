@@ -240,6 +240,7 @@ export const nextJa: LocaleDictionary = {
   "next.addNzb.title": "追加",
   "next.addNzb.submitOne": "ダウンロードを追加",
   "next.addNzb.submitMany": "{{count}} 件のダウンロードを追加",
+  "next.addNzb.unsupportedFile": "対応していないファイル拡張子です。",
   "next.addNzb.dropZone":
     "NZB またはトレントファイルをここにドロップするか、クリックして選択",
   "next.addNzb.dropZoneNzb":
@@ -829,6 +830,7 @@ export const nextJa: LocaleDictionary = {
   "next.shell.docs": "ドキュメント",
   "next.shell.social": "コミュニティ",
   "next.appearance.title": "外観",
+  "next.appearance.instanceWide": "インスタンス全体",
   "next.appearance.help":
     "この Weaver インスタンスに接続するすべてのブラウザーに適用されます。",
   "next.appearance.weaver": "Weaver",

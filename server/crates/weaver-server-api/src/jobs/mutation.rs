@@ -19,7 +19,9 @@ use crate::history::types::{
     history_item_from_row,
 };
 use crate::jobs::batch::{QueueBatchOp, batch_result};
-use crate::jobs::staging::{StagedUploadManager, normalize_uploaded_nzb_reader};
+use crate::jobs::staging::{
+    StagedUploadManager, classify_upload, normalize_uploaded_nzb_reader, upload_refusal,
+};
 use crate::jobs::types::{
     CancelJobResult, DuplicateDecisionInfo, DuplicateModeGql, PRIORITY_ATTRIBUTE_KEY,
     PersistedQueueEvent, ProtocolGql, QueueBatchResult, QueueBatchTarget, QueueCommandResult,
@@ -159,9 +161,12 @@ impl JobsMutation {
                     .map_err(|e| graphql_error("INVALID_INPUT", format!("invalid upload: {e}")))?;
                 let filename =
                     (!upload.filename.trim().is_empty()).then_some(upload.filename.clone());
-                let kind = classify(&upload.content);
+                let (kind, decoded) = classify_upload(&upload, true)
+                    .await
+                    .map_err(upload_refusal)?;
                 if goes_to_class(ctx, &kind)? {
-                    let mut submission = Submission::of(kind, upload.content.to_vec());
+                    let bytes = decoded.unwrap_or_else(|| upload.content.to_vec());
+                    let mut submission = Submission::of(kind, bytes);
                     submission.category = category;
                     submission.paused = input.paused;
                     submission.unpack = input.unpack;
@@ -213,7 +218,10 @@ impl JobsMutation {
         // A torrent is not staged: it is added whole, through `submit`. While
         // torrents take no new ones it is refused here, for every client, so
         // its row says so before anything is submitted.
-        let kind = classify(&upload.content);
+        let kind = match classify_upload(&upload, false).await {
+            Ok((kind, _)) => kind,
+            Err(error) => return Ok(rejected_stage_upload_result(filename, error.to_string())),
+        };
         let refusal = match ctx
             .data::<SchedulerHandle>()?
             .state()

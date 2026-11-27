@@ -272,6 +272,41 @@ async fn a_magnet_or_an_infohash_goes_to_the_torrent_client() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn compressed_torrent_and_magnet_files_stage_and_submit() {
+    use std::io::Write;
+
+    let rig = rig().await;
+    let magnet = b"magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567";
+    for (filename, content) in [
+        ("example.torrent.gz", metainfo("linux.iso")),
+        ("example.magnet.gz", magnet.to_vec()),
+    ] {
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        encoder.write_all(&content).unwrap();
+        let compressed = encoder.finish().unwrap();
+        let staged = rig
+            .run(
+                STAGE,
+                json!({ "input": { "nzbUpload": null } }),
+                Some((filename, &compressed)),
+            )
+            .await;
+        assert_no_errors(&staged);
+        let data = response_data(&staged);
+        assert_eq!(data["stageNzbUpload"]["kind"], "TORRENT", "{filename}");
+        assert_eq!(data["stageNzbUpload"]["error"], Value::Null, "{filename}");
+        assert_eq!(data["stageNzbUpload"]["stagedUploadId"], Value::Null);
+
+        let submitted = rig.submit_file(filename, &compressed, true).await;
+        assert_no_errors(&submitted);
+        let data = response_data(&submitted);
+        assert_eq!(data["submit"]["accepted"], true, "{filename}");
+        let id = JobId(data["submit"]["jobId"].as_u64().unwrap());
+        assert!(rig.torrents.torrent(id).await.is_some(), "{filename}");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_upload_is_read_for_what_it_holds_not_its_name() {
     let rig = rig().await;
 

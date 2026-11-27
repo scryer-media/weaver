@@ -237,6 +237,7 @@ export const nextEs: LocaleDictionary = {
   "next.addNzb.title": "Añadir",
   "next.addNzb.submitOne": "Añadir descarga",
   "next.addNzb.submitMany": "Añadir {{count}} descargas",
+  "next.addNzb.unsupportedFile": "Extensión de archivo no admitida.",
   "next.addNzb.dropZone":
     "Suelta archivos NZB o torrent aquí o haz clic para elegir",
   "next.addNzb.dropZoneNzb": "Suelta archivos NZB aquí o haz clic para elegir",
@@ -837,6 +838,7 @@ export const nextEs: LocaleDictionary = {
   "next.shell.docs": "Guías",
   "next.shell.social": "Comunidad",
   "next.appearance.title": "Apariencia",
+  "next.appearance.instanceWide": "Toda la instancia",
   "next.appearance.help":
     "Se aplica a todos los navegadores conectados a esta instancia de Weaver.",
   "next.appearance.weaver": "Weaver",

@@ -309,6 +309,65 @@
   --color-wv-page-current: var(--color-wv-bulk);
 }
 
+.wv-rail-shortcuts {
+  --wv-rail-panel: color-mix(
+    in srgb,
+    var(--color-wv-chrome) 55%,
+    var(--color-wv-rail)
+  );
+  --wv-rail-frame: color-mix(
+    in srgb,
+    var(--color-wv-control) 42%,
+    var(--wv-rail-panel)
+  );
+  --wv-rail-selection: color-mix(
+    in srgb,
+    var(--wv-accent) 8%,
+    var(--wv-rail-panel)
+  );
+}
+
+.wv-rail-shortcuts,
+.wv-rail-swatch {
+  --wv-rail-accent: color-mix(
+    in srgb,
+    var(--wv-accent) var(--wv-rail-accent-weight, 80%),
+    var(--wv-rail-panel)
+  );
+}
+
+[data-palette="TERMINAL"] .wv-rail-shortcuts {
+  --wv-rail-accent-weight: 68%;
+}
+
+.wv-rail-sponsor {
+  --wv-sponsor-ink: light-dark(#83344f, #dba0aa);
+  color: var(--wv-sponsor-ink);
+  border-color: color-mix(
+    in srgb,
+    var(--wv-sponsor-ink) 42%,
+    var(--wv-rail-panel)
+  );
+  background-color: color-mix(
+    in srgb,
+    var(--wv-sponsor-ink) 7%,
+    var(--wv-rail-panel)
+  );
+}
+
+.wv-rail-sponsor:hover {
+  border-color: color-mix(
+    in srgb,
+    var(--wv-sponsor-ink) 62%,
+    var(--wv-rail-panel)
+  );
+  background-color: color-mix(
+    in srgb,
+    var(--wv-sponsor-ink) 13%,
+    var(--wv-rail-panel)
+  );
+}
+
 .wv-queue-preview {
   display: grid;
   grid-template-columns: 23% 1fr;
@@ -357,6 +416,27 @@
   height: 5px;
   background: var(--color-wv-progress);
   mask-image: var(--wv-meter-stripes);
+}
+
+.wv-queue-preview-compact {
+  grid-template-columns: 1fr;
+  width: 1.625rem;
+  height: 1rem;
+  flex: none;
+}
+
+.wv-queue-preview-compact .wv-preview-rail,
+.wv-queue-preview-compact .wv-preview-list i:last-child {
+  display: none;
+}
+
+.wv-queue-preview-compact .wv-preview-list {
+  gap: 2px;
+  padding: 2px;
+}
+
+.wv-queue-preview-compact .wv-preview-list i {
+  height: 2px;
 }
 
 [data-palette="TERMINAL"] .wv-meter {

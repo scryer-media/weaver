@@ -32,6 +32,7 @@ import "@/next/theme.css";
 
 const query = new URLSearchParams(location.search);
 const screen = query.get("screen") ?? "tag";
+const torrentsOn = screen !== "addOff";
 const dictionary = { ...en, ...nextEn } as Record<string, string>;
 const t = (key: string, values?: Record<string, unknown>) =>
   Object.entries(values ?? {}).reduce(
@@ -176,7 +177,7 @@ window.fetch = async (input, init) => {
       : operations.variables,
   });
   if (name === "StageNzbUpload") {
-    if (/^d\d/.test(content))
+    if (/^(?:d\d|magnet:)/i.test(content.trim()))
       return answer({
         data: { stageNzbUpload: { kind: "TORRENT", accepted: false } },
       });
@@ -676,10 +677,10 @@ createRoot(document.getElementById("root")!).render(
         <NextDataContext.Provider
           value={
             {
-              torrents: "on",
+              torrents: torrentsOn ? "on" : "off",
               torrentPresence: {
                 available: true,
-                enabled: true,
+                enabled: torrentsOn,
                 jobs: false,
                 running: false,
                 windingDown: false,

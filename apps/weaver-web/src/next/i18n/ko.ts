@@ -231,6 +231,7 @@ export const nextKo: LocaleDictionary = {
   "next.addNzb.title": "추가",
   "next.addNzb.submitOne": "다운로드 추가",
   "next.addNzb.submitMany": "다운로드 {{count}}개 추가",
+  "next.addNzb.unsupportedFile": "지원하지 않는 파일 확장자입니다.",
   "next.addNzb.dropZone": "NZB 또는 토렌트 파일을 여기에 놓거나 클릭하여 선택",
   "next.addNzb.dropZoneNzb": "NZB 파일을 여기에 놓거나 클릭하여 선택",
   "next.addNzb.status.queued": "대기 중",
@@ -809,6 +810,7 @@ export const nextKo: LocaleDictionary = {
   "next.shell.docs": "문서",
   "next.shell.social": "커뮤니티",
   "next.appearance.title": "화면 설정",
+  "next.appearance.instanceWide": "인스턴스 전체",
   "next.appearance.help":
     "이 Weaver 인스턴스에 연결된 모든 브라우저에 적용됩니다.",
   "next.appearance.weaver": "Weaver",

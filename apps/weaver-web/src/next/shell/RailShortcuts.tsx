@@ -15,6 +15,9 @@ import { useTranslate } from "@/lib/context/translate-context";
 import { cn } from "@/lib/utils";
 import { AppearancePicker } from "../components/AppearancePicker";
 import { Icon } from "../components/icons";
+// These logos are reused verbatim from Scryer's public/social assets.
+import discordLogo from "./social/discord.svg";
+import redditLogo from "./social/reddit.svg";
 
 const APPEARANCE_ACCESS_QUERY = gql`
   query RailAppearanceAccess {
@@ -23,18 +26,21 @@ const APPEARANCE_ACCESS_QUERY = gql`
 `;
 
 const SHORTCUT =
-  "flex h-8 min-w-0 cursor-pointer items-center justify-center gap-1.5 border border-wv-control bg-wv-button px-2 text-[12px] text-wv-secondary hover:border-wv-control-hover hover:bg-wv-button-hover hover:text-wv-fg aria-expanded:border-wv-accent";
-const PANEL = "border border-wv-control bg-wv-chrome shadow-wv-menu";
+  "flex h-8 min-w-0 cursor-pointer items-center justify-center gap-1.5 border border-[color:var(--wv-rail-frame)] bg-[var(--wv-rail-panel)] px-2 text-[12px] text-wv-secondary hover:border-wv-control/70 hover:bg-wv-chrome hover:text-wv-fg aria-expanded:border-[color:var(--wv-rail-accent)] aria-expanded:bg-[var(--wv-rail-selection)]";
+const PANEL =
+  "border border-[color:var(--wv-rail-frame)] bg-[var(--wv-rail-panel)] shadow-wv-menu";
 const SOCIAL_LINKS = [
   {
     name: "Reddit",
     testId: "shell-rail-reddit",
     href: "https://www.reddit.com/r/scryer_media/",
+    logo: redditLogo,
   },
   {
     name: "Discord",
     testId: "shell-rail-discord",
     href: "https://discord.gg/SQmtZTanqm",
+    logo: discordLogo,
   },
 ];
 
@@ -48,6 +54,7 @@ function RailAppearanceOptions() {
     <AppearancePicker
       editable={!error && data?.callerScope === "ADMIN"}
       idPrefix="rail-appearance"
+      compact
     />
   );
 }
@@ -141,7 +148,7 @@ export const RailShortcuts = memo(function RailShortcuts({
   return (
     <div
       data-testid="shell-rail-shortcuts"
-      className="relative grid flex-none grid-cols-2 gap-1.5 border-t border-wv-line-strong p-2.5"
+      className="wv-rail-shortcuts relative grid flex-none grid-cols-2 gap-1.5 border-t border-wv-line-strong p-2.5"
       onBlur={(event) => {
         if (!event.currentTarget.contains(event.relatedTarget)) setOpen(null);
       }}
@@ -151,10 +158,10 @@ export const RailShortcuts = memo(function RailShortcuts({
         target="_blank"
         rel="noopener noreferrer"
         data-testid="shell-rail-sponsor"
-        className={SHORTCUT}
+        className={cn(SHORTCUT, "wv-rail-sponsor")}
         onClick={followLink}
       >
-        <Icon name="sponsor" size={14} className="shrink-0 text-wv-error" />
+        <Icon name="sponsor" size={14} className="shrink-0" />
         <span className="truncate">{t("nav.sponsor")}</span>
       </a>
       <button
@@ -216,7 +223,7 @@ export const RailShortcuts = memo(function RailShortcuts({
               className={cn(PANEL, "p-1")}
               onKeyDown={navigateMenu}
             >
-              {SOCIAL_LINKS.map(({ href, name, testId }, index) => (
+              {SOCIAL_LINKS.map(({ href, logo, name, testId }, index) => (
                 <a
                   key={name}
                   ref={index === 0 ? firstSocialLink : undefined}
@@ -226,11 +233,21 @@ export const RailShortcuts = memo(function RailShortcuts({
                   role="menuitem"
                   tabIndex={-1}
                   data-testid={testId}
-                  className="flex items-center justify-between gap-2 px-2 py-1.5 text-[12px] text-wv-secondary hover:bg-wv-menu-hover hover:text-wv-fg"
+                  className="flex items-center gap-2 px-2 py-1.5 text-[12px] text-wv-secondary hover:bg-wv-menu-hover hover:text-wv-fg"
                   onClick={followLink}
                 >
-                  {name}
-                  <Icon name="external" size={13} className="shrink-0" />
+                  <img
+                    src={logo}
+                    alt=""
+                    aria-hidden="true"
+                    className="size-4 shrink-0 object-contain"
+                  />
+                  <span>{name}</span>
+                  <Icon
+                    name="external"
+                    size={13}
+                    className="ml-auto shrink-0"
+                  />
                 </a>
               ))}
             </div>
@@ -247,15 +264,20 @@ export const RailShortcuts = memo(function RailShortcuts({
           data-testid="shell-rail-theme-popover"
           className={cn(
             PANEL,
-            "absolute bottom-full left-2.5 z-30 max-h-[min(27rem,calc(100dvh-6rem))] w-[min(28rem,calc(100vw-1.25rem))] overflow-y-auto p-3 outline-none",
+            "absolute inset-x-2.5 bottom-full z-30 max-h-[calc(100dvh-6rem)] overflow-y-auto overscroll-contain p-1.5 outline-none",
           )}
         >
-          <h2 id={`${themeId}-title`} className="mb-1 text-sm font-semibold">
-            {t("next.appearance.title")}
-          </h2>
-          <p className="mb-3 text-xs text-wv-muted">
-            {t("next.appearance.help")}
-          </p>
+          <div className="mb-1.5 flex flex-wrap items-baseline justify-between gap-x-2 border-b border-wv-hairline px-1.5 pt-0.5 pb-1.5">
+            <h2
+              id={`${themeId}-title`}
+              className="text-xs font-semibold text-wv-fg"
+            >
+              {t("next.appearance.title")}
+            </h2>
+            <span className="text-[10.5px] text-wv-muted">
+              {t("next.appearance.instanceWide")}
+            </span>
+          </div>
           <RailAppearanceOptions />
         </div>
       ) : null}

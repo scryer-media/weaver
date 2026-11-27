@@ -28,6 +28,23 @@ import { testIds, torrentIds } from "@/next/testids";
 import { useTorrentAddsOffered } from "@/next/data/use-torrents-shown";
 
 const NO_CATEGORY_VALUE = "__none__";
+const OFFERED_COMPRESSION_EXTENSIONS = [".gz", ".xz", ".zst"];
+
+function uploadExtensions(extension: string): string[] {
+  return [
+    extension,
+    ...OFFERED_COMPRESSION_EXTENSIONS.map(
+      (compression) => extension + compression,
+    ),
+  ];
+}
+
+const NZB_FILE_EXTENSIONS = uploadExtensions(".nzb");
+const ADD_FILE_EXTENSIONS = [
+  ...NZB_FILE_EXTENSIONS,
+  ...uploadExtensions(".torrent"),
+  ...uploadExtensions(".magnet"),
+];
 
 /** Staged, but the duplicate policy turned its submission away; only a forced submit takes it. */
 function isBlocked(entry: UploadNzbEntry): boolean {
@@ -48,8 +65,8 @@ function entryTone(entry: UploadNzbEntry): string {
 /**
  * "Add": one drop zone and one text box for NZBs and torrents alike.
  *
- * The daemon reads each file and the text for what they are, so nothing here
- * tells an NZB from a torrent. Files picked or dropped are added to the list
+ * The daemon reads the contents of supported files and pasted links to
+ * classify them. Files picked or dropped are added to the list
  * rather than replacing it, so a second trip through the file browser keeps
  * the first.
  */
@@ -64,15 +81,17 @@ export function AddNzbDialog({
   initialFiles?: readonly File[] | null;
 }) {
   const t = useTranslate();
+  // While torrents are off the dialog takes NZB files only, even with torrent jobs left.
+  const torrentsOn = useTorrentAddsOffered();
+  const fileExtensions = torrentsOn ? ADD_FILE_EXTENSIONS : NZB_FILE_EXTENSIONS;
   const upload = useUploadNzb({
     open,
     resetOnOpen: true,
     onSubmitted: onClose,
+    fileExtensions,
   });
   const { addFiles, fileInputRef } = upload;
   const blocked = upload.entries.filter(isBlocked);
-  // While torrents are off the dialog speaks of NZBs only, even with torrent jobs left.
-  const torrentsOn = useTorrentAddsOffered();
   // Unpack is a torrent's choice: the row stands once a file read as a torrent is in the list, or
   // the link is a magnet or an infohash.
   const torrent =
@@ -185,6 +204,7 @@ export function AddNzbDialog({
           <input
             ref={fileInputRef}
             type="file"
+            accept={fileExtensions.join(",")}
             multiple
             className="hidden"
             onChange={(event) => {

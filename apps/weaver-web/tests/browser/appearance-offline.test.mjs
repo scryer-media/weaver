@@ -27,9 +27,13 @@ function appearanceAttributes({ palette, mode, accent }) {
   return `data-palette="${palette}" data-mode="${mode}" data-accent="${accent ?? ""}"`;
 }
 
-async function choose(page, testId) {
+async function choose(page, testId, key) {
   const choice = page.getByTestId(testId);
-  await choice.click();
+  if (key) {
+    await choice.and(page.locator(":enabled")).press(key);
+  } else {
+    await choice.click();
+  }
   await choice.and(page.locator('[aria-pressed="true"]')).waitFor();
   await page
     .getByRole("group", { name: "Appearance", exact: true })
@@ -237,6 +241,7 @@ async function assertExternalLink(link, href) {
 test("the rail shortcuts change appearance in place, share it with Settings, and work in the drawer", async () => {
   const context = await browser.newContext({
     viewport: { width: 1400, height: 900 },
+    colorScheme: "dark",
   });
   try {
     const page = await context.newPage();
@@ -291,8 +296,36 @@ test("the rail shortcuts change appearance in place, share it with Settings, and
     await socialMenu.waitFor({ state: "hidden" });
 
     const downloadsUrl = page.url();
-    await theme.click();
-    await themePanel.waitFor();
+    await theme.press("Enter");
+    await themePanel.and(page.locator(":focus")).waitFor();
+    const compactWidth = (await themePanel.boundingBox()).width;
+    const compactPreviews = themePanel
+      .getByTestId(/^rail-appearance-palette-/)
+      .locator("[data-palette]");
+    const previewColors = await compactPreviews.evaluateAll((previews) =>
+      previews.map((preview) => getComputedStyle(preview).backgroundColor),
+    );
+    assert.equal(previewColors.length, 4);
+    assert.equal(new Set(previewColors).size, 4);
+    const compactPreviewHeight = (await compactPreviews.first().boundingBox())
+      .height;
+    const blue = themePanel
+      .getByRole("button", { name: "Blue", exact: true })
+      .and(themePanel.getByTestId("rail-appearance-accent-BLUE"));
+    await blue.and(page.locator(":enabled")).waitFor();
+    await page.keyboard.press("Tab");
+    await themePanel
+      .getByTestId("rail-appearance-palette-WEAVER")
+      .and(page.locator(":focus-visible"))
+      .waitFor();
+    await choose(page, "rail-appearance-accent-BLUE", "Space");
+    assert.equal(await blue.getAttribute("aria-pressed"), "true");
+    assert.match(
+      await themePanel
+        .getByTestId("rail-appearance-selected-accent")
+        .innerText(),
+      /\bBlue\b/,
+    );
     await choose(page, "rail-appearance-palette-TERMINAL");
     assert.equal(page.url(), downloadsUrl);
     assert.equal(await downloads.isVisible(), true);
@@ -307,6 +340,23 @@ test("the rail shortcuts change appearance in place, share it with Settings, and
     const settingsTerminal = page.getByTestId("appearance-palette-TERMINAL");
     await settingsTerminal.waitFor();
     assert.equal(await settingsTerminal.getAttribute("aria-pressed"), "true");
+    assert.equal(
+      await page
+        .getByTestId("appearance-accent-BLUE")
+        .getAttribute("aria-pressed"),
+      "true",
+    );
+    const settingsPicker = page.getByRole("group", {
+      name: "Appearance",
+      exact: true,
+    });
+    assert.ok(compactWidth < (await settingsPicker.boundingBox()).width);
+    const settingsPreview = settingsPicker
+      .getByTestId("appearance-palette-WEAVER")
+      .locator("[data-palette]");
+    assert.ok(
+      compactPreviewHeight < (await settingsPreview.boundingBox()).height,
+    );
     await choose(page, "appearance-palette-AMBER");
     await page.getByTestId("nav-downloads").filter({ visible: true }).click();
     await downloads.waitFor();
@@ -318,7 +368,7 @@ test("the rail shortcuts change appearance in place, share it with Settings, and
     await page.keyboard.press("Escape");
     await themePanel.waitFor({ state: "hidden" });
 
-    await page.setViewportSize({ width: 390, height: 844 });
+    await page.setViewportSize({ width: 320, height: 700 });
     await shortcuts.waitFor({ state: "hidden" });
     const openNav = page.getByTestId("shell-open-navigation");
     await openNav.click();
@@ -330,6 +380,18 @@ test("the rail shortcuts change appearance in place, share it with Settings, and
     const system = themePanel.getByTestId("rail-appearance-mode-SYSTEM");
     await system.waitFor();
     assert.equal(await system.getAttribute("aria-pressed"), "true");
+    const fitsNarrowViewport = await themePanel.evaluate((panel) => {
+      const { top, right, bottom, left } = panel.getBoundingClientRect();
+      return (
+        top >= 0 &&
+        left >= 0 &&
+        right <= window.innerWidth &&
+        bottom <= window.innerHeight &&
+        panel.scrollWidth <= panel.clientWidth &&
+        panel.scrollHeight <= panel.clientHeight
+      );
+    });
+    assert.equal(fitsNarrowViewport, true);
     assert.equal(page.url(), drawerDownloadsUrl);
     await page.keyboard.press("Escape");
     await themePanel.waitFor({ state: "hidden" });
@@ -342,6 +404,7 @@ test("the rail shortcuts change appearance in place, share it with Settings, and
     await shortcuts.waitFor({ state: "hidden" });
     assert.equal(await openNav.getAttribute("aria-expanded"), "false");
     assert.deepEqual(mutations, [
+      { accent: "BLUE" },
       { palette: "TERMINAL" },
       { palette: "AMBER" },
       { palette: "WEAVER" },

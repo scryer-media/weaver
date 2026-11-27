@@ -33,6 +33,7 @@ pub mod persistence;
 pub mod proxies;
 pub mod support;
 pub use weaver_server_torrents::{speed_test, torrents};
+pub use weaver_torrent::core::torrent_metainfo::MAX_TORRENT_FILE_BYTES;
 pub mod update_check;
 // Transitional, removed in 0.9.1. See the module docs.
 pub mod upgrade_compat;

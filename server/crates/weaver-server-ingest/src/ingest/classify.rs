@@ -9,9 +9,9 @@
 pub use weaver_server_jobs::jobs::model::Kind;
 use weaver_server_jobs::jobs::model::Protocol;
 
-// The longest a magnet, infohash or URL given as text can be. Anything longer
-// is a document.
-const TEXT_LIMIT: usize = 64 * 1024;
+/// The longest a magnet, infohash or URL given as text can be. Anything longer
+/// is a document.
+pub const SUBMISSION_TEXT_LIMIT_BYTES: usize = 64 * 1024;
 
 /// The class of job a link's declared media type says it fetches, before
 /// its bytes are read: a torrent file's type is a metainfo's class. `None`
@@ -31,7 +31,7 @@ pub fn classify(bytes: &[u8]) -> Kind {
     if bytes.first() == Some(&b'd') && bytes.get(1).is_some_and(u8::is_ascii_digit) {
         return Kind::Metainfo;
     }
-    if bytes.len() > TEXT_LIMIT {
+    if bytes.len() > SUBMISSION_TEXT_LIMIT_BYTES {
         return Kind::Nzb;
     }
     let Some(text) = std::str::from_utf8(bytes)
@@ -136,7 +136,10 @@ mod tests {
             assert_eq!(classify(input), Kind::Nzb, "{input:?}");
         }
         // Too long to be text, whatever it starts with.
-        let long = format!("https://example.invalid/{}", "a".repeat(TEXT_LIMIT));
+        let long = format!(
+            "https://example.invalid/{}",
+            "a".repeat(SUBMISSION_TEXT_LIMIT_BYTES),
+        );
         assert_eq!(classify(long.as_bytes()), Kind::Nzb);
     }
 
