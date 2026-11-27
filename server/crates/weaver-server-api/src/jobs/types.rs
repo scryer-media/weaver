@@ -2084,7 +2084,7 @@ fn normalize_progress_percent(progress_ratio: f64) -> f64 {
     (progress_ratio * 100.0).clamp(0.0, 100.0)
 }
 
-fn ms_to_datetime(ms: i64) -> DateTime<Utc> {
+pub(crate) fn ms_to_datetime(ms: i64) -> DateTime<Utc> {
     DateTime::from_timestamp_millis(ms).unwrap_or(DateTime::<Utc>::UNIX_EPOCH)
 }
 

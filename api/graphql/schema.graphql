@@ -71,9 +71,10 @@ A torrent to analyze without adding it: a .torrent file, uploaded or
 as base64, or a magnet link. Exactly one source is required.
 """
 input AnalyzeTorrentInput {
-	torrentUpload: Upload
-	torrentBase64: String
-	magnet: String
+	"""
+	The torrent to analyze.
+	"""
+	source: TorrentSourceInput!
 }
 
 type ApiKey {
@@ -3074,62 +3075,80 @@ type MutationRoot {
 	"""
 	setLogFilter(directives: String!): LogFilter!
 	startApplicationUpgrade(input: StartApplicationUpgradeInput!): ApplicationUpgradeStartPayload!
+	"""
+	Add a torrent from its metainfo or a magnet link, and return it.
+	An uploaded metainfo file is bounded as `submit` bounds one.
+	"""
 	submitTorrent(input: SubmitTorrentInput!): Torrent!
-	removeTorrent(id: Int!, deleteFiles: Boolean! = false): Boolean!
-	pauseTorrent(id: Int!): Boolean!
-	resumeTorrent(id: Int!): Boolean!
-	setTorrentForced(id: Int!, forced: Boolean!): Boolean!
+	"""
+	Remove the torrent, and its files when `deleteFiles`; return its id.
+	Never refused for a seeding goal still to meet.
+	"""
+	removeTorrent(id: Int!, deleteFiles: Boolean! = false): Int!
+	"""
+	Run the torrent outside the queue's limits, or under them again.
+	"""
+	setTorrentForced(id: Int!, forced: Boolean!): Torrent!
 	"""
 	Move the torrent's directory under `path`; it goes on from there.
 	A key that only controls may name only a path under the default
 	save folder or a category's folder.
 	"""
-	setTorrentLocation(id: Int!, path: String!): Boolean!
+	setTorrentLocation(id: Int!, path: String!): Torrent!
 	"""
 	Set each named file's level; the others keep theirs.
 	"""
-	setTorrentFilePriorities(id: Int!, priorities: [TorrentFilePriorityInput!]!): Boolean!
+	setTorrentFilePriorities(id: Int!, priorities: [TorrentFilePriorityInput!]!): Torrent!
 	"""
 	Check every piece of the torrent again, trusting nothing saved.
 	"""
-	recheckTorrent(id: Int!): Boolean!
-	setTorrentSequential(id: Int!, sequential: Boolean!): Boolean!
-	setTorrentFirstLastPieceFirst(id: Int!, firstLastPieceFirst: Boolean!): Boolean!
-	setTorrentCategory(id: Int!, category: String): Boolean!
+	recheckTorrent(id: Int!): Torrent!
+	"""
+	Fetch the torrent's pieces in order, or not.
+	"""
+	setTorrentSequential(id: Int!, sequential: Boolean!): Torrent!
+	"""
+	Fetch each file's first and last pieces first, or not.
+	"""
+	setTorrentFirstLastPieceFirst(id: Int!, firstLastPieceFirst: Boolean!): Torrent!
 	"""
 	Ban a peer's address from the torrent: an IP, or an IP and port
 	whose port is ignored.
 	"""
-	banTorrentPeer(id: Int!, address: String!): Boolean!
+	banTorrentPeer(id: Int!, address: String!): Torrent!
 	"""
-	The torrent's own upload and download limits in bytes per second,
-	in force on its peers at once; null is unlimited and 0 closes that
-	direction. A limit left out is kept.
+	Set both of the torrent's own limits in bytes per second, in force on
+	its peers at once. As `setBandwidth`: null or left out is no limit, 0
+	lets nothing through, and a value past the largest stored one is
+	refused.
 	"""
-	setTorrentRateLimits(id: Int!, upload: Int, download: Int): Boolean!
+	setTorrentRateLimits(id: Int!, uploadBps: Int, downloadBps: Int): Torrent!
 	"""
 	Add `urls` as one tier after the torrent's last; the ones it lists
 	already are left out.
 	"""
-	addTorrentTrackers(id: Int!, urls: [String!]!): Boolean!
+	addTorrentTrackers(id: Int!, urls: [String!]!): Torrent!
 	"""
 	List `trackers` in place of the torrent's own.
 	"""
-	replaceTorrentTrackers(id: Int!, trackers: [TorrentTrackerInput!]!): Boolean!
-	removeTorrentTrackers(id: Int!, urls: [String!]!): Boolean!
+	replaceTorrentTrackers(id: Int!, trackers: [TorrentTrackerInput!]!): Torrent!
+	"""
+	Take `urls` out of the torrent's tracker list.
+	"""
+	removeTorrentTrackers(id: Int!, urls: [String!]!): Torrent!
 	"""
 	Announce now, to every tracker or to `tracker` alone.
 	"""
-	reannounceTorrent(id: Int!, tracker: String): Boolean!
+	reannounceTorrent(id: Int!, tracker: String): Torrent!
 	"""
 	Look the torrent up on the DHT now.
 	"""
-	dhtAnnounceTorrent(id: Int!): Boolean!
+	dhtAnnounceTorrent(id: Int!): Torrent!
 	"""
 	The torrent's own seeding policy; null returns it to its category's
 	and the global one.
 	"""
-	setTorrentSeeding(id: Int!, seeding: SeedingPolicyInput): Boolean!
+	setTorrentSeeding(id: Int!, seeding: SeedingPolicyInput): Torrent!
 }
 
 type NamedId {
@@ -3387,47 +3406,6 @@ type PathTestResult {
 }
 
 """
-The transport a peer connection runs over.
-"""
-enum PeerConnection {
-	TCP
-	UTP
-}
-
-"""
-What of a peer connection is encrypted.
-"""
-enum PeerEncryption {
-	NONE
-	"""
-	The handshake only.
-	"""
-	HEADER_ONLY
-	"""
-	All of it.
-	"""
-	RC4
-}
-
-"""
-A source that named a peer.
-"""
-enum PeerSource {
-	TRACKER
-	DHT
-	PEX
-	LSD
-	"""
-	The torrent's own list.
-	"""
-	RESUME_DATA
-	"""
-	The peer connected to us.
-	"""
-	INCOMING
-}
-
-"""
 A transport peers are reached and taken on.
 """
 enum PeerTransport {
@@ -3458,20 +3436,6 @@ type PlatformNetworking {
 	bridgeNetworkSuspected: Boolean!
 	maxWireguardInstances: Int!
 	notes: [String!]!
-}
-
-enum PortMapProtocol {
-	TCP
-	UDP
-}
-
-enum PortMapper {
-	UPNP
-	NAT_PMP
-	"""
-	PCP from a global IPv6 address.
-	"""
-	PCP_IPV_6
 }
 
 type PostProcessingSettingsGql {
@@ -4069,20 +4033,16 @@ type QueryRoot {
 	Filesystem capacity for the configured storage directories (data / intermediate / complete).
 	"""
 	diskUsage: [DiskUsage!]!
+	"""
+	One torrent by its job id; null when there is none. Its files, peer
+	connections and unpacked files are read here only.
+	"""
 	torrent(id: Int!): Torrent
-	"""
-	The torrent's live peer connections, by address.
-	"""
-	torrentPeers(id: Int!): [TorrentPeer!]!
-	"""
-	The torrent's trackers, each with how announcing to it went.
-	"""
-	torrentTrackers(id: Int!): [TorrentTracker!]!
 	"""
 	The torrents the schedule's pause leaves seeding, by the tracker rule
 	that keeps them; empty while no such pause is in force.
 	"""
-	scheduleSeeding: [ScheduleSeeding!]!
+	torrentScheduleSeeding: [TorrentScheduleSeeding!]!
 	"""
 	Every torrent route, by the scopes that run on it, with whether
 	peers can reach its session.
@@ -4090,16 +4050,13 @@ type QueryRoot {
 	torrentRoutes: [TorrentRoute!]!
 	"""
 	Every torrent, or a category's, in the order they were added: the
-	`first` after the offset cursor `after`, as `queueItems` pages.
-	`first` is 100 when not given, and at most 500.
+	`first` after the offset cursor `after`, 100 when not given and at
+	most 500, with the `after` of the next page, null on the last. One
+	torrent past the page is read to know whether there is a next;
+	nothing is counted. A torrent's files, peer connections and unpacked
+	files are read on `torrent(id)`, and asking for them here is refused.
 	"""
-	torrents(category: String, first: Int, after: String): [Torrent!]!
-	"""
-	`torrents` as a page: the same torrents, order, limits and cursor,
-	with the `after` of the next page, null on the last. One torrent past
-	the page is read to know whether there is a next; nothing is counted.
-	"""
-	torrentPage(category: String, first: Int, after: String): TorrentPage!
+	torrents(category: String, first: Int, after: String): TorrentPage!
 	"""
 	Every tag made, in tag order, with how many jobs carry it.
 	"""
@@ -4922,18 +4879,6 @@ input SchedulePruneFilesInput {
 }
 
 """
-The torrents the schedule's pause leaves seeding under one tracker rule.
-"""
-type ScheduleSeeding {
-	ruleId: Int!
-	"""
-	The rule's name.
-	"""
-	name: String!
-	torrents: Int!
-}
-
-"""
 One target of a `speed_limit` rule and the rates it sets, in bytes per
 second. Null is no limit; 0 lets nothing through.
 """
@@ -5611,19 +5556,6 @@ enum SeedingGoalMode {
 }
 
 """
-The level each of a torrent's seeding terms comes from.
-"""
-type SeedingLevels {
-	ratioGoal: SettingLevel!
-	seedTimeGoalMinutes: SettingLevel!
-	inactiveGoalMinutes: SettingLevel!
-	mode: SettingLevel!
-	action: SettingLevel!
-	seedTimeCounting: SettingLevel!
-	uploadCap: SettingLevel!
-}
-
-"""
 Seeding terms at one level; a term left out inherits.
 """
 input SeedingPolicyInput {
@@ -5645,23 +5577,6 @@ type SeedingPolicySettings {
 	mode: GoalModeLeaf!
 	action: SeedingActionLeaf!
 	seedTimeCounting: SeedTimeCountingLeaf!
-}
-
-"""
-The seeding terms a torrent is held to, each resolved over its levels.
-"""
-type SeedingTerms {
-	ratioGoal: Float
-	seedTimeGoalMinutes: Int
-	inactiveGoalMinutes: Int
-	mode: SeedingGoalMode!
-	action: SeedingAction!
-	seedTimeCounting: SeedTimeCounting!
-	"""
-	The upload cap in bytes per second; absent is none.
-	"""
-	uploadCap: Int
-	levels: SeedingLevels!
 }
 
 type SemanticCandidateSnapshotInfo {
@@ -6295,14 +6210,28 @@ type SubmitStagedNzbsResult {
 }
 
 """
-A torrent to add: its metainfo file, base64, or a magnet link.
+A torrent to add.
 """
 input SubmitTorrentInput {
-	metainfoBase64: String
-	magnet: String
+	"""
+	Where it comes from.
+	"""
+	source: TorrentSourceInput!
+	"""
+	Its category's name; absent is none.
+	"""
 	category: String
+	"""
+	Whether it is added paused.
+	"""
 	paused: Boolean! = false
+	"""
+	Whether it runs outside the queue's limits.
+	"""
 	forced: Boolean! = false
+	"""
+	Its own seeding terms; absent inherits.
+	"""
 	seeding: SeedingPolicyInput
 	"""
 	Whether its archives are extracted; absent inherits.
@@ -6312,6 +6241,16 @@ input SubmitTorrentInput {
 	The tags its job is added with.
 	"""
 	tags: [String!]! = []
+	"""
+	Its own upload limit in bytes per second; absent is no limit and 0
+	lets nothing through.
+	"""
+	uploadLimitBps: Int
+	"""
+	Its own download limit in bytes per second; absent is no limit and 0
+	lets nothing through.
+	"""
+	downloadLimitBps: Int
 }
 
 type SubscriptionRoot {
@@ -6375,20 +6314,35 @@ type SubscriptionRoot {
 	"""
 	systemMetricsUpdates: SystemMetricsSnapshot!
 	"""
-	The torrents as they move: the one `id` names, whole, or the ones
-	`ids` names (at most 500), as a list shows them. Give one of the two.
-	The first push is the torrents as they are, with `fullUpdate`; each
-	later one comes when one of them changes and carries only the
+	One torrent as it moves: pushed as it is now, then again each time
+	what the subscription selects changes, and a last null once the
+	torrent is gone, after which the stream ends. Only the fields
+	selected are read; its files are read whole when selected.
+	"""
+	torrentUpdates(id: Int!): Torrent
+	"""
+	The torrents `ids` names (at most 500) as they move, as a list shows
+	them. The first push is the torrents as they are, with `fullUpdate`;
+	each later one comes when one of them changes and carries only the
 	torrents that changed or came and the ids of the ones gone.
 
-	`ids` reads each torrent's row as the service last published it: no
-	files and no trackers, and a change in the fields that move with the
-	clock alone is told with the next other change. Those torrents are
-	followed only once the stored torrents are all read at start: asked
-	before, it is an error with code `TORRENTS_LOADING`. `id` reads its
-	torrent whole, files and trackers with it, each time it moves.
+	Each torrent's row is read as the service last published it: no
+	files, and a change in the fields that move with the clock alone is
+	told with the next other change. A torrent's files, peer connections
+	and unpacked files are read on `torrent(id)`, and asking for them
+	here is refused. The torrents are followed only once the stored
+	torrents are all read at start: asked before, it is an error with
+	code `TORRENTS_LOADING`.
 	"""
-	torrentUpdates(id: Int, ids: [Int!]): TorrentChanges!
+	torrentRowUpdates(ids: [Int!]!): TorrentChanges!
+	"""
+	One page of a torrent's files as they move: the `first` after the
+	offset cursor `after`, 200 when not given and at most 1000. Sent at
+	once, then each time the page changes, at most twice a second. A
+	torrent that does not exist is an error with code `NOT_FOUND`; once
+	the torrent is gone, the stream ends.
+	"""
+	torrentFileUpdates(id: Int!, first: Int, after: String): TorrentFilePage!
 }
 
 """
@@ -6561,71 +6515,134 @@ enum TimelineStage {
 	FINAL_MOVE
 }
 
+"""
+A torrent.
+"""
 type Torrent {
+	"""
+	Its job's id.
+	"""
 	id: Int!
+	"""
+	Its name.
+	"""
 	name: String!
 	"""
-	Its v1 hash; empty when it has none.
+	Its v1 hash, hex; null when it has none.
 	"""
-	infohash: String!
+	infohashV1: String
+	"""
+	Its v2 hash, hex; null when it has none.
+	"""
 	infohashV2: String
 	"""
 	Which hashes verify its pieces, once its metainfo is in hand.
 	"""
 	version: TorrentVersion
+	"""
+	What it is doing.
+	"""
 	state: TorrentState!
 	"""
 	Why the torrent is in its state, when the server states the reason
 	itself.
 	"""
-	stated: TorrentStatedReason
+	stateReason: TorrentStateReason
 	"""
 	Why the torrent is in its state, in free words (an error, an
 	unpacking refusal), when that is the reason. While its route holds
 	it, the cause behind `routeReason`, when one is known.
 	"""
-	detail: String
+	stateDetail: String
 	"""
 	Why its route holds it, while its state comes from that hold.
 	"""
 	routeReason: TorrentRouteReason
+	"""
+	Its category's name, when it has one.
+	"""
 	category: String
 	"""
 	Its job's tags, in tag order.
 	"""
 	tags: [String!]!
+	"""
+	Whether it is private: it uses its trackers only.
+	"""
 	private: Boolean!
+	"""
+	Whether it runs outside the queue's limits.
+	"""
 	forced: Boolean!
+	"""
+	The share of its wanted bytes in hand, from 0 to 1.
+	"""
 	progress: Float!
+	"""
+	The bytes it wants.
+	"""
 	totalBytes: Int!
+	"""
+	The wanted bytes in hand, verified.
+	"""
 	haveBytes: Int!
+	"""
+	Bytes uploaded since it was added.
+	"""
 	uploadedBytes: Int!
+	"""
+	Bytes downloaded since it was added.
+	"""
 	downloadedBytes: Int!
+	"""
+	Its share ratio: uploaded over downloaded.
+	"""
 	ratio: Float!
+	"""
+	Its download rate in bytes per second.
+	"""
 	downloadBps: Int!
+	"""
+	Its upload rate in bytes per second.
+	"""
 	uploadBps: Int!
 	"""
 	The torrent's own upload limit in bytes per second; null is
 	unlimited and 0 closed.
 	"""
-	uploadLimit: Int
+	uploadLimitBps: Int
 	"""
 	The torrent's own download limit in bytes per second; null is
 	unlimited and 0 closed.
 	"""
-	downloadLimit: Int
+	downloadLimitBps: Int
+	"""
+	Seconds until it is complete, when that can be told.
+	"""
 	etaSeconds: Int
-	peers: Int!
-	seeds: Int!
-	leechers: Int!
+	"""
+	The peers it is connected to.
+	"""
+	connectedPeers: Int!
+	"""
+	The seeds among its connected peers.
+	"""
+	connectedSeeds: Int!
+	"""
+	The leechers among its connected peers.
+	"""
+	connectedLeechers: Int!
 	"""
 	The most peers a torrent connects to.
 	"""
 	maxPeers: Int!
 	"""
-	The swarm's seeds and leechers as its trackers last counted them.
+	The swarm's seeds as its trackers last counted them.
 	"""
 	swarmSeeds: Int
+	"""
+	The swarm's leechers as its trackers last counted them.
+	"""
 	swarmLeechers: Int
 	"""
 	Seconds until the next tracker announce.
@@ -6643,7 +6660,13 @@ type Torrent {
 	Seconds of the current unbroken seeding run.
 	"""
 	consecutiveSeedingSeconds: Int!
+	"""
+	Its average download rate in bytes per second while running.
+	"""
 	downloadAvgBps: Int!
+	"""
+	Its average upload rate in bytes per second while running.
+	"""
 	uploadAvgBps: Int!
 	"""
 	Bytes received and thrown away this run: pieces that failed their
@@ -6654,27 +6677,47 @@ type Torrent {
 	"""
 	The last time a complete copy was in reach.
 	"""
-	lastSeenCompleteMs: Int
+	lastSeenCompleteAt: DateTime
+	"""
+	How many pieces it has, once its metainfo is in hand.
+	"""
 	pieceCount: Int
+	"""
+	Its piece size in bytes, once its metainfo is in hand.
+	"""
 	pieceSize: Int
 	"""
 	The pieces in hand, verified.
 	"""
 	piecesHave: Int
+	"""
+	The program its metainfo says made it.
+	"""
 	createdBy: String
-	createdAtMs: Int
+	"""
+	When its metainfo says it was made.
+	"""
+	metainfoCreatedAt: DateTime
+	"""
+	Its metainfo's comment.
+	"""
 	comment: String
-	addedAtMs: Int!
-	completedAtMs: Int
+	"""
+	When it was added.
+	"""
+	addedAt: DateTime!
+	"""
+	When it completed.
+	"""
+	completedAt: DateTime
+	"""
+	The folder its files are written in.
+	"""
 	storageDir: String
 	"""
 	The folder that holds the torrent's output.
 	"""
 	savePath: String
-	"""
-	The seeding goal still to meet; absent once it is met.
-	"""
-	seedingLeft: String
 	"""
 	The torrent's own seeding terms; absent when it inherits every one.
 	"""
@@ -6682,7 +6725,7 @@ type Torrent {
 	"""
 	The seeding terms in effect.
 	"""
-	seedingPolicy: SeedingTerms!
+	seedingPolicy: TorrentSeedingTerms!
 	"""
 	The host pattern of the tracker rule the torrent is under, when it is.
 	"""
@@ -6695,13 +6738,15 @@ type Torrent {
 	The torrent's own unpack; absent inherits.
 	"""
 	unpackOverride: Boolean
+	"""
+	The networking route it takes, by its key, when one is resolved.
+	"""
 	route: String
 	"""
 	The networking route the torrent takes, by its consumer key:
 	`torrent:default`, `torrent:category:<id>` or `torrent:tracker:<id>`.
 	"""
 	routeConsumer: String!
-	files: [TorrentFile!]!
 	"""
 	Whether its pieces are fetched in order.
 	"""
@@ -6710,10 +6755,14 @@ type Torrent {
 	Whether each file's first and last pieces are fetched first.
 	"""
 	firstLastPieceFirst: Boolean!
+	"""
+	Its trackers, each with how announcing to it went: read only when
+	selected.
+	"""
 	trackers: [TorrentTracker!]!
 	"""
-	The seeding goal still to meet, as `seedingLeft` gives it; absent
-	once it is met and for a torrent with no goal.
+	The seeding goal still to meet; absent once it is met and for a
+	torrent with no goal.
 	"""
 	seedingGoalLeft: String
 	"""
@@ -6721,10 +6770,21 @@ type Torrent {
 	a torrent with nothing to unpack.
 	"""
 	unpacking: TorrentUnpacking
+	"""
+	One page of its files in file-index order: the `first` after the
+	offset cursor `after`, 200 when not given and at most 1000. Read on
+	`torrent(id)` only.
+	"""
+	files(first: Int, after: String): TorrentFilePage!
+	"""
+	Its live peer connections, by address; empty while it is in no
+	session. Read on `torrent(id)` only.
+	"""
+	peerConnections: [TorrentPeer!]!
 }
 
 """
-What a `torrentUpdates` push carries.
+What a `torrentRowUpdates` push carries.
 """
 type TorrentChanges {
 	"""
@@ -6793,23 +6853,50 @@ type TorrentExposure {
 	"""
 	address: String
 	"""
-	The port announced; 0 when none is.
+	The port announced; null when none is.
 	"""
-	announcedPort: Int!
+	announcedPort: Int
+	"""
+	Whether peers can connect in.
+	"""
 	inbound: Boolean!
+	"""
+	Whether UDP trackers are announced to.
+	"""
 	udpTrackers: Boolean!
+	"""
+	Whether the DHT runs.
+	"""
 	dht: Boolean!
+	"""
+	Whether uTP runs.
+	"""
 	utp: Boolean!
 }
 
+"""
+One file of a torrent.
+"""
 type TorrentFile {
+	"""
+	Its index in the torrent.
+	"""
 	index: Int!
+	"""
+	Its path inside the torrent.
+	"""
 	path: String!
+	"""
+	Its length in bytes.
+	"""
 	length: Int!
 	"""
 	Whether the file is fetched at all: its level is above ignored.
 	"""
 	selected: Boolean!
+	"""
+	Its level.
+	"""
 	priority: TorrentFilePriority!
 	"""
 	The share of the file in hand, from 0 to 1.
@@ -6818,13 +6905,43 @@ type TorrentFile {
 }
 
 """
+One page of a torrent's files, in file-index order.
+"""
+type TorrentFilePage {
+	"""
+	The page's files.
+	"""
+	items: [TorrentFile!]!
+	"""
+	How many files the torrent has.
+	"""
+	totalCount: Int!
+	"""
+	The `after` that asks for the next page; null on the last page.
+	"""
+	nextCursor: String
+}
+
+"""
 How eagerly a torrent file is fetched: qBittorrent's four levels. An
 ignored file is not fetched; padding is always ignored.
 """
 enum TorrentFilePriority {
+	"""
+	Not fetched.
+	"""
 	IGNORED
+	"""
+	Fetched at the normal level.
+	"""
 	NORMAL
+	"""
+	Fetched before normal files.
+	"""
 	HIGH
+	"""
+	Fetched before every other file.
+	"""
 	MAXIMUM
 }
 
@@ -6832,7 +6949,13 @@ enum TorrentFilePriority {
 A file's level, by its index in the torrent.
 """
 input TorrentFilePriorityInput {
+	"""
+	The file's index in the torrent.
+	"""
 	index: Int!
+	"""
+	The level to give it.
+	"""
 	priority: TorrentFilePriority!
 }
 
@@ -6862,9 +6985,12 @@ type TorrentHistory {
 }
 
 """
-One page of `torrentPage`.
+One page of `torrents`.
 """
 type TorrentPage {
+	"""
+	The page's torrents.
+	"""
 	items: [Torrent!]!
 	"""
 	The `after` that asks for the next page; null on the last page.
@@ -6880,34 +7006,90 @@ type TorrentPeer {
 	The peer's address and port.
 	"""
 	address: String!
+	"""
+	The client the peer says it is.
+	"""
 	client: String!
 	"""
 	The peer id, hex.
 	"""
 	peerId: String!
-	connection: PeerConnection!
+	"""
+	The transport it runs over.
+	"""
+	connection: TorrentPeerConnection!
 	"""
 	We made the connection.
 	"""
 	outgoing: Boolean!
-	encryption: PeerEncryption!
+	"""
+	What of it is encrypted.
+	"""
+	encryption: TorrentPeerEncryption!
+	"""
+	What it shows of the peer and of us.
+	"""
 	flags: TorrentPeerFlags!
 	"""
 	Every source that named the peer.
 	"""
-	sources: [PeerSource!]!
+	sources: [TorrentPeerSource!]!
 	"""
 	How many of the torrent's pieces the peer has.
 	"""
 	pieces: Int!
+	"""
+	The share of the torrent the peer has, from 0 to 1.
+	"""
 	progress: Float!
+	"""
+	The rate it sends to us in bytes per second.
+	"""
 	downloadBps: Int!
+	"""
+	The rate we send to it in bytes per second.
+	"""
 	uploadBps: Int!
 	"""
-	Bytes over this connection.
+	Bytes received over this connection.
 	"""
 	downloadedBytes: Int!
+	"""
+	Bytes sent over this connection.
+	"""
 	uploadedBytes: Int!
+}
+
+"""
+The transport a peer connection runs over.
+"""
+enum TorrentPeerConnection {
+	"""
+	TCP.
+	"""
+	TCP
+	"""
+	uTP.
+	"""
+	UTP
+}
+
+"""
+What of a peer connection is encrypted.
+"""
+enum TorrentPeerEncryption {
+	"""
+	Nothing.
+	"""
+	NONE
+	"""
+	The handshake only.
+	"""
+	HEADER_ONLY
+	"""
+	All of it.
+	"""
+	RC4
 }
 
 """
@@ -6930,12 +7112,60 @@ type TorrentPeerFlags {
 	The peer chokes us.
 	"""
 	remoteChoked: Boolean!
+	"""
+	The peer has sent nothing asked of it for a while.
+	"""
 	snubbed: Boolean!
+	"""
+	The peer is unchoked by the optimistic turn.
+	"""
 	optimisticUnchoke: Boolean!
+	"""
+	The peer has every piece.
+	"""
 	seed: Boolean!
+	"""
+	The peer only uploads.
+	"""
 	uploadOnly: Boolean!
+	"""
+	The peer sent a piece that failed its check and is watched.
+	"""
 	onParole: Boolean!
+	"""
+	The connection was made through a hole punch.
+	"""
 	holepunched: Boolean!
+}
+
+"""
+A source that named a peer.
+"""
+enum TorrentPeerSource {
+	"""
+	A tracker.
+	"""
+	TRACKER
+	"""
+	The DHT.
+	"""
+	DHT
+	"""
+	Peer exchange.
+	"""
+	PEX
+	"""
+	Local discovery.
+	"""
+	LSD
+	"""
+	The torrent's own list.
+	"""
+	RESUME_DATA
+	"""
+	The peer connected to us.
+	"""
+	INCOMING
 }
 
 type TorrentPeers {
@@ -6954,11 +7184,52 @@ type TorrentPeers {
 }
 
 """
+The protocol a port mapping forwards.
+"""
+enum TorrentPortMapProtocol {
+	"""
+	TCP.
+	"""
+	TCP
+	"""
+	UDP.
+	"""
+	UDP
+}
+
+"""
+What asked a gateway for a port mapping.
+"""
+enum TorrentPortMapper {
+	"""
+	UPnP.
+	"""
+	UPNP
+	"""
+	NAT-PMP.
+	"""
+	NAT_PMP
+	"""
+	PCP from a global IPv6 address.
+	"""
+	PCP_IPV_6
+}
+
+"""
 A gateway's last word on one port mapping.
 """
 type TorrentPortMapping {
-	mapper: PortMapper!
-	protocol: PortMapProtocol!
+	"""
+	What asked for the mapping.
+	"""
+	mapper: TorrentPortMapper!
+	"""
+	The protocol it forwards.
+	"""
+	protocol: TorrentPortMapProtocol!
+	"""
+	The port it forwards to.
+	"""
 	localPort: Int!
 	"""
 	The port the gateway forwards; none once the mapping failed or was
@@ -6970,6 +7241,9 @@ type TorrentPortMapping {
 	inside a tunnel may tell the tunnel's own private address: not shown.
 	"""
 	gatewayAddress: String
+	"""
+	The gateway's error, when the mapping failed.
+	"""
 	error: String
 }
 
@@ -7020,7 +7294,13 @@ type TorrentRates {
 A torrent route and whether peers can reach its session.
 """
 type TorrentRoute {
+	"""
+	The route's key.
+	"""
 	key: String!
+	"""
+	The scopes that run on it.
+	"""
 	scopes: [TorrentRouteUse!]!
 	"""
 	Whether its session is open.
@@ -7030,7 +7310,13 @@ type TorrentRoute {
 	The address its session listens on, TCP's, and uTP's when `utp`.
 	"""
 	listenAddress: String
+	"""
+	Whether its session runs uTP.
+	"""
 	utp: Boolean!
+	"""
+	Its session's port mappings.
+	"""
 	mappings: [TorrentPortMapping!]!
 	"""
 	Its address as the internet sees it.
@@ -7059,24 +7345,81 @@ type TorrentRoute {
 Why a torrent route's session is unavailable.
 """
 enum TorrentRouteReason {
+	"""
+	Nothing has asked its session to open.
+	"""
 	NOT_ASKED_TO_OPEN
+	"""
+	Its leg is down.
+	"""
 	LEG_DOWN
+	"""
+	Its leg is not configured.
+	"""
 	LEG_MISSING
+	"""
+	Its leg was taken away.
+	"""
 	LEG_REVOKED
+	"""
+	Its egress quota is spent.
+	"""
 	QUOTA_SILENCED
+	"""
+	Torrents are turned off.
+	"""
 	TORRENTS_DISABLED
+	"""
+	Its route's legs cannot carry it.
+	"""
 	TORRENT_ROUTE_LEGS
+	"""
+	Its route falls back to the host address, which it may not.
+	"""
 	TORRENT_ROUTE_DIRECT_FALLBACK
+	"""
+	Its route's rungs cannot carry it.
+	"""
 	TORRENT_ROUTE_RUNGS
+	"""
+	Its leg failed to open.
+	"""
 	LEG_OPEN_FAILED
+	"""
+	Its session's state directory could not be made.
+	"""
 	STATE_DIRECTORY_FAILED
+	"""
+	Its listen port is not free.
+	"""
 	LISTEN_PORT_UNAVAILABLE
+	"""
+	Its listen port could not be bound.
+	"""
 	LISTEN_PORT_BIND_FAILED
+	"""
+	Its session's saved state could not be read.
+	"""
 	SESSION_STATE_UNREADABLE
+	"""
+	Its session could not be built.
+	"""
 	SESSION_BUILD_FAILED
+	"""
+	uTP could not start on it.
+	"""
 	UTP_UNAVAILABLE
+	"""
+	Its blocklist could not be loaded.
+	"""
 	BLOCKLIST_FAILED
+	"""
+	The most sessions are open.
+	"""
 	SESSION_LIMIT
+	"""
+	Its session is opening.
+	"""
 	OPENING
 }
 
@@ -7084,8 +7427,17 @@ enum TorrentRouteReason {
 What runs on a torrent route.
 """
 enum TorrentRouteScope {
+	"""
+	The route torrents take when nothing else names one.
+	"""
 	DEFAULT
+	"""
+	A category's route.
+	"""
 	CATEGORY
+	"""
+	A tracker rule's route.
+	"""
 	TRACKER_RULE
 }
 
@@ -7094,9 +7446,109 @@ A scope that runs on a torrent route: the default, or a category or
 tracker rule by its id and name.
 """
 type TorrentRouteUse {
+	"""
+	What kind of scope it is.
+	"""
 	scope: TorrentRouteScope!
+	"""
+	The category's or tracker rule's id; absent for the default.
+	"""
 	id: Int
+	"""
+	The category's or tracker rule's name; absent for the default.
+	"""
 	name: String
+}
+
+"""
+The torrents the schedule's pause leaves seeding under one tracker rule.
+"""
+type TorrentScheduleSeeding {
+	"""
+	The tracker rule's id.
+	"""
+	ruleId: Int!
+	"""
+	The rule's name.
+	"""
+	name: String!
+	"""
+	How many torrents the rule keeps seeding.
+	"""
+	torrents: Int!
+}
+
+"""
+The level each of a torrent's seeding terms comes from.
+"""
+type TorrentSeedingLevels {
+	"""
+	The level the ratio goal comes from.
+	"""
+	ratioGoal: SettingLevel!
+	"""
+	The level the seeding time goal comes from.
+	"""
+	seedTimeGoalMinutes: SettingLevel!
+	"""
+	The level the inactive time goal comes from.
+	"""
+	inactiveGoalMinutes: SettingLevel!
+	"""
+	The level the goal mode comes from.
+	"""
+	mode: SettingLevel!
+	"""
+	The level the action at the goal comes from.
+	"""
+	action: SettingLevel!
+	"""
+	The level the way seeding time is counted comes from.
+	"""
+	seedTimeCounting: SettingLevel!
+	"""
+	The level the upload cap comes from.
+	"""
+	uploadCap: SettingLevel!
+}
+
+"""
+The seeding terms a torrent is held to, each resolved over its levels.
+"""
+type TorrentSeedingTerms {
+	"""
+	The share ratio to reach; absent is none.
+	"""
+	ratioGoal: Float
+	"""
+	The minutes to seed; absent is none.
+	"""
+	seedTimeGoalMinutes: Int
+	"""
+	The minutes without upload after which the goal is met; absent is
+	none.
+	"""
+	inactiveGoalMinutes: Int
+	"""
+	Whether any goal or every goal must be met.
+	"""
+	mode: SeedingGoalMode!
+	"""
+	What is done once the goal is met.
+	"""
+	action: SeedingAction!
+	"""
+	How seeding time is counted.
+	"""
+	seedTimeCounting: SeedTimeCounting!
+	"""
+	The upload cap in bytes per second; absent is none.
+	"""
+	uploadCap: Int
+	"""
+	The level each term comes from.
+	"""
+	levels: TorrentSeedingLevels!
 }
 
 type TorrentSettings {
@@ -7216,25 +7668,83 @@ input TorrentSettingsInput {
 	whenDisabled: TorrentDisableMode
 }
 
+"""
+Where a torrent comes from: exactly one of its metainfo, base64 or as
+an upload, or a magnet link.
+"""
+input TorrentSourceInput @oneOf {
+	"""
+	Its metainfo file, base64.
+	"""
+	metainfoBase64: String
+	"""
+	Its metainfo file, uploaded.
+	"""
+	metainfoUpload: Upload
+	"""
+	A magnet link.
+	"""
+	magnet: String
+}
+
+"""
+What a torrent is doing.
+"""
 enum TorrentState {
+	"""
+	Waiting in the queue.
+	"""
 	QUEUED
+	"""
+	Fetching its metadata.
+	"""
 	FETCHING_METADATA
+	"""
+	Checking the pieces on disk.
+	"""
 	CHECKING_FILES
+	"""
+	Downloading.
+	"""
 	DOWNLOADING
+	"""
+	Downloading, with nothing arriving.
+	"""
 	STALLED
+	"""
+	Complete and seeding.
+	"""
 	SEEDING
+	"""
+	Paused.
+	"""
 	PAUSED
+	"""
+	Stopped, its seeding over.
+	"""
 	STOPPED
+	"""
+	Moving its files.
+	"""
 	MOVING
+	"""
+	Waiting for the certificate its SSL torrent needs.
+	"""
 	NEEDS_CERTIFICATE
+	"""
+	Checking its saved resume data.
+	"""
 	CHECKING_RESUME_DATA
+	"""
+	Held: its files are missing from disk.
+	"""
 	FILES_MISSING
 }
 
 """
 Why a torrent is in its state, as the server states it.
 """
-enum TorrentStatedReason {
+enum TorrentStateReason {
 	"""
 	Kept from starting for room on its disk, as a usenet job waits.
 	"""
@@ -7286,35 +7796,62 @@ type TorrentTestRequest {
 	maxDurationSeconds: Int!
 }
 
+"""
+One tracker of a torrent, with how announcing to it went.
+"""
 type TorrentTracker {
+	"""
+	Its tier: trackers of a lower tier are tried first.
+	"""
 	tier: Int!
-	source: TrackerSource!
-	status: TrackerStatus!
+	"""
+	Who named it.
+	"""
+	source: TorrentTrackerSource!
+	"""
+	How announcing to it went.
+	"""
+	status: TorrentTrackerStatus!
 	"""
 	An announce to it is in flight.
 	"""
 	updating: Boolean!
+	"""
+	What it said in its last answer, when it said anything.
+	"""
 	message: String
+	"""
+	The seeds it last counted.
+	"""
 	seeders: Int
+	"""
+	The leechers it last counted.
+	"""
 	leechers: Int
 	"""
 	The completed downloads it last counted.
 	"""
-	downloaded: Int
+	completedDownloads: Int
 	"""
 	The peers its last answer named.
 	"""
-	peers: Int
+	announcedPeers: Int
 	"""
 	Announces to it that failed in a row.
 	"""
 	fails: Int!
-	lastAnnounceMs: Int
-	nextAnnounceMs: Int
+	"""
+	When it was last announced to.
+	"""
+	lastAnnounceAt: DateTime
+	"""
+	When it is next announced to.
+	"""
+	nextAnnounceAt: DateTime
 	"""
 	The earliest the tracker takes the next announce.
 	"""
-	minAnnounceMs: Int
+	minAnnounceAt: DateTime
 	"""
 	Who resolves its host; none for an address.
 	"""
@@ -7330,8 +7867,58 @@ type TorrentTracker {
 A tracker in a torrent's list, by tier.
 """
 input TorrentTrackerInput {
+	"""
+	Its tier: trackers of a lower tier are tried first.
+	"""
 	tier: Int!
+	"""
+	Its announce URL.
+	"""
 	url: String!
+}
+
+"""
+Who named a tracker.
+"""
+enum TorrentTrackerSource {
+	"""
+	The torrent's metainfo or magnet link.
+	"""
+	TORRENT
+	"""
+	The operator.
+	"""
+	OPERATOR
+}
+
+"""
+How announcing to a tracker went.
+"""
+enum TorrentTrackerStatus {
+	"""
+	Not announced to yet.
+	"""
+	NOT_CONTACTED
+	"""
+	Its last announce was answered.
+	"""
+	WORKING
+	"""
+	Its last announce failed.
+	"""
+	NOT_WORKING
+	"""
+	It answered its last announce with an error.
+	"""
+	TRACKER_ERROR
+	"""
+	It could not be reached.
+	"""
+	UNREACHABLE
+	"""
+	It is not announced to.
+	"""
+	DISABLED
 }
 
 """
@@ -7361,8 +7948,28 @@ A file a torrent's unpacking placed beside the torrent's own: no piece
 of the torrent, so it has no index, level or progress of its own.
 """
 type TorrentUnpackedFile {
+	"""
+	Its path beside the torrent's files.
+	"""
 	path: String!
+	"""
+	Its length in bytes.
+	"""
 	length: Int!
+}
+
+"""
+One page of the files a torrent's unpacking placed.
+"""
+type TorrentUnpackedFilePage {
+	"""
+	The page's files.
+	"""
+	items: [TorrentUnpackedFile!]!
+	"""
+	The `after` that asks for the next page; null on the last page.
+	"""
+	nextCursor: String
 }
 
 """
@@ -7370,25 +7977,38 @@ A torrent's unpacking, once over. It is the unpacking's own: the
 torrent's state, history and counters never read it.
 """
 type TorrentUnpacking {
+	"""
+	How it came out.
+	"""
 	result: TorrentUnpackResult!
 	"""
 	Why it is short of whole.
 	"""
 	reason: String
 	"""
-	The files it placed beside the torrent's own, which the torrent's
-	file list shows after them: read from the torrent's row and disk
-	only when asked for.
+	One page of the files it placed beside the torrent's own, in the
+	order it placed them: the `first` after the offset cursor `after`,
+	100 when not given and at most 1000. Read on `torrent(id)` only; a
+	file no longer on disk is left out of its page.
 	"""
-	files: [TorrentUnpackedFile!]!
+	files(first: Int, after: String): TorrentUnpackedFilePage!
 }
 
 """
 Which hashes verify a torrent's pieces.
 """
 enum TorrentVersion {
+	"""
+	SHA-1 piece hashes.
+	"""
 	V1
+	"""
+	SHA-256 merkle trees.
+	"""
 	V2
+	"""
+	Both.
+	"""
 	HYBRID
 }
 
@@ -7609,23 +8229,6 @@ input TrackerRuleInput {
 	True clears the rule's archive passwords; false keeps them.
 	"""
 	clearArchivePasswords: Boolean! = false
-}
-
-"""
-Who named a tracker.
-"""
-enum TrackerSource {
-	TORRENT
-	OPERATOR
-}
-
-enum TrackerStatus {
-	NOT_CONTACTED
-	WORKING
-	NOT_WORKING
-	TRACKER_ERROR
-	UNREACHABLE
-	DISABLED
 }
 
 """

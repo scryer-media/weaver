@@ -281,7 +281,7 @@ async fn a_server_running_torrents_takes_a_metainfo_and_lists_it() {
     let submitted = graphql(
         &app,
         &format!(
-            r#"mutation {{ submitTorrent(input: {{ metainfoBase64: "{}" }}) {{ id name totalBytes }} }}"#,
+            r#"mutation {{ submitTorrent(input: {{ source: {{ metainfoBase64: "{}" }} }}) {{ id name totalBytes }} }}"#,
             metainfo("one.mkv", 3000)
         ),
     )
@@ -292,10 +292,10 @@ async fn a_server_running_torrents_takes_a_metainfo_and_lists_it() {
     assert_eq!(torrent["totalBytes"], 3000);
     let id = torrent["id"].as_u64().unwrap();
 
-    let listed = graphql(&app, "{ torrents { id name } }").await;
+    let listed = graphql(&app, "{ torrents { items { id name } } }").await;
     assert_eq!(listed.get("errors"), None, "{listed}");
-    assert_eq!(listed["data"]["torrents"][0]["id"], id);
-    assert_eq!(listed["data"]["torrents"][0]["name"], "one.mkv");
+    assert_eq!(listed["data"]["torrents"]["items"][0]["id"], id);
+    assert_eq!(listed["data"]["torrents"]["items"][0]["name"], "one.mkv");
     torrents.stop().await;
 }
 
@@ -313,7 +313,7 @@ async fn a_torrent_submitted_in_a_category_there_is_none_of_makes_it() {
         let submitted = graphql(
             &app,
             &format!(
-                r#"mutation {{ submitTorrent(input: {{ metainfoBase64: "{}", category: "{category}" }}) {{ name category }} }}"#,
+                r#"mutation {{ submitTorrent(input: {{ source: {{ metainfoBase64: "{}" }}, category: "{category}" }}) {{ name category }} }}"#,
                 metainfo(name, 3000)
             ),
         )
@@ -363,7 +363,7 @@ async fn empty_seeding_terms_inherit_the_global_policy() {
     let submitted = graphql(
         &app,
         &format!(
-            r#"mutation {{ submitTorrent(input: {{ metainfoBase64: "{}", seeding: {{}} }}) {{ id {seeding} }} }}"#,
+            r#"mutation {{ submitTorrent(input: {{ source: {{ metainfoBase64: "{}" }}, seeding: {{}} }}) {{ id {seeding} }} }}"#,
             metainfo("one.mkv", 3000)
         ),
     )
@@ -383,7 +383,7 @@ async fn empty_seeding_terms_inherit_the_global_policy() {
         async move {
             let set = graphql(
                 &app,
-                &format!("mutation {{ setTorrentSeeding(id: {id}, seeding: {terms}) }}"),
+                &format!("mutation {{ setTorrentSeeding(id: {id}, seeding: {terms}) {{ id }} }}"),
             )
             .await;
             assert_eq!(set.get("errors"), None, "{set}");

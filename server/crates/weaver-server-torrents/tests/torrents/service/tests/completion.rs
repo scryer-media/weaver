@@ -2468,6 +2468,53 @@ async fn a_kept_name_with_no_file_goes_from_the_row() {
     rig.service.stop().await;
 }
 
+// The unpacked files are paged in SQL in the order the row keeps them: each
+// page is that window of the whole list, a page that reaches the end says
+// none follow, and a page of none reads nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_unpacked_files_are_paged_in_the_rows_order() {
+    let rig = rig(set_clock());
+    rig.service.open().await.unwrap();
+    let save = rig.dir.path().join("flat");
+    std::fs::create_dir_all(&save).unwrap();
+    let (job_id, whole) = added_flat(&rig, "first", &save).await;
+    let kept: Vec<String> = ["e.txt", "b.txt", "d.txt", "a.txt", "c.txt"]
+        .iter()
+        .map(|name| (*name).to_owned())
+        .collect();
+    for name in &kept {
+        std::fs::write(save.join(name), name.as_bytes()).unwrap();
+    }
+    rig.db
+        .finish_torrent_unpack(job_id, &kept, &[], &[], &UnpackEnd::whole())
+        .unwrap();
+    fetched_and_completed(&rig, job_id, &whole).await;
+    let every = rig.db.torrent_outputs(job_id).unwrap();
+    assert_eq!(every.len(), 6, "{every:?}");
+    let listed = rig.service.unpacked_files(job_id).await.unwrap();
+
+    for offset in 0..=every.len() + 1 {
+        for limit in 0..=every.len() + 1 {
+            let end = (offset + limit).min(every.len());
+            let window = every.get(offset.min(every.len())..end).unwrap_or(&[]);
+            assert_eq!(
+                rig.db.torrent_outputs_page(job_id, offset, limit).unwrap(),
+                window,
+                "{offset} {limit}"
+            );
+            let (page, more) = rig
+                .service
+                .unpacked_files_page(job_id, offset, limit)
+                .await
+                .unwrap();
+            let want = listed.get(offset.min(listed.len())..end).unwrap_or(&[]);
+            assert_eq!(page, want, "{offset} {limit}");
+            assert_eq!(more, limit > 0 && offset + limit < every.len(), "{offset} {limit}");
+        }
+    }
+    rig.service.stop().await;
+}
+
 // A torrent of `first.rar` and `first.mkv` laid flat in a folder, complete,
 // with `small.txt` unpacked beside them and on its row; and another folder
 // that holds someone else's file at each of `theirs`, each holding its own

@@ -3,14 +3,14 @@
 # Variables: {"first": 25, "after": null, "category": null}
 # first at most 500. Next page: "after" = nextCursor; null on the last page.
 query TorrentsPage($first: Int = 25, $after: String, $category: String) {
-  torrentPage(first: $first, after: $after, category: $category) {
+  torrents(first: $first, after: $after, category: $category) {
     nextCursor
     items {
       id
       name
       state
-      stated
-      detail
+      stateReason
+      stateDetail
       routeReason
       private
       progress
@@ -18,8 +18,8 @@ query TorrentsPage($first: Int = 25, $after: String, $category: String) {
       haveBytes
       downloadBps
       uploadBps
-      peers
-      seeds
+      connectedPeers
+      connectedSeeds
       swarmSeeds
       swarmLeechers
       ratio
