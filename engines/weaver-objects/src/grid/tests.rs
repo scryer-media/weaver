@@ -276,3 +276,40 @@ fn the_range_probe_supersedes_what_the_scan_did() {
         }
     }
 }
+
+// Two pieces of one delivery that overlap disagree, or may, on the bytes
+// they share: neither is recorded, so no run covers the stretch and a fold
+// that needs it is unproven, on a grid of blocks and on the whole member's.
+#[test]
+fn overlapping_pieces_of_one_delivery_leave_their_stretch_unproven() {
+    let bytes = payload(5, 1024);
+    let piece = |start: usize, end: usize| Segment {
+        range: ByteRange::new(start as u64, end as u64),
+        crc32: crc32(&bytes[start..end]),
+        verified: true,
+    };
+    for block_size in [1024, WHOLE] {
+        let mut grid = Grid::default();
+        grid.offer_all(MEMBER, block_size, &[piece(0, 600), piece(400, 1024)]);
+        let file = &grid.files[&(MEMBER, block_size)];
+        assert!(
+            file.block(0)
+                .is_none_or(|block| overlapping(block, ByteRange::new(400, 600))
+                    .next()
+                    .is_none())
+        );
+        assert_eq!(grid.fold(MEMBER, block_size, 0, ByteRange::new(0, 1024)), None);
+        assert_eq!(grid.fold(MEMBER, block_size, 0, ByteRange::new(0, 600)), None);
+        assert_eq!(file.load, Load::default());
+        assert_eq!(grid.load, Load::default());
+        // The same bytes delivered again, apart, are proven.
+        grid.offer_all(MEMBER, block_size, &[piece(0, 400), piece(400, 1024)]);
+        assert_eq!(
+            grid.fold(MEMBER, block_size, 0, ByteRange::new(0, 1024)),
+            Some(Folded {
+                crc32: crc32(&bytes),
+                verified: true,
+            })
+        );
+    }
+}

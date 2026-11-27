@@ -235,13 +235,7 @@ impl Grid {
             if overlaps {
                 let (before, after) = file.change(index, |block| {
                     let before = Load::of(block, bounds);
-                    loop {
-                        let next = overlapping(block, segment.range).next();
-                        let Some(start) = next.map(|run| run.range.start) else {
-                            break;
-                        };
-                        block.remove(&start);
-                    }
+                    remove_overlapping(block, segment.range);
                     (before, Load::of(block, bounds))
                 });
                 file.load.sub(before);
@@ -264,14 +258,20 @@ impl Grid {
         let bounds = block_bounds(first, block_size);
         let (before, after) = file.change(first, |block| {
             let before = Load::of(block, bounds);
-            insert_merged(
-                block,
-                Run {
-                    range: segment.range,
-                    crc32: segment.crc32,
-                    verified: segment.verified,
-                },
-            );
+            // A run the segment overlaps can only be one this delivery just
+            // recorded, as the delivery superseded its whole range first. Two
+            // pieces of one delivery that disagree on a stretch prove nothing
+            // of it: both go, and the stretch is unproven.
+            if remove_overlapping(block, segment.range) == 0 {
+                insert_merged(
+                    block,
+                    Run {
+                        range: segment.range,
+                        crc32: segment.crc32,
+                        verified: segment.verified,
+                    },
+                );
+            }
             (before, Load::of(block, bounds))
         });
         let mut file_load = file.load;
@@ -389,10 +389,10 @@ fn block_bounds(index: u64, block_size: u64) -> ByteRange {
 }
 
 // The runs of `block` that `range` overlaps, in offset order. A block's runs
-// are disjoint: a delivery's segments are in order and none overlaps
-// another, and each is superseded before any is recorded. So no run before
-// the one at or before the range's start reaches it, and a probe reads only
-// the runs the range spans.
+// are disjoint, as the grid keeps them: a segment supersedes what it
+// overlaps before it is recorded, and one that overlaps a run recorded
+// since is not recorded. So no run before the one at or before the range's
+// start reaches it, and a probe reads only the runs the range spans.
 fn overlapping(block: &Block, range: ByteRange) -> impl Iterator<Item = &Run> {
     let from = block
         .range(..=range.start)
@@ -402,6 +402,19 @@ fn overlapping(block: &Block, range: ByteRange) -> impl Iterator<Item = &Run> {
         .range(from..range.end.max(from))
         .map(|(_, run)| run)
         .filter(move |run| run.range.intersect(range).is_some())
+}
+
+// Remove the runs of `block` that `range` overlaps, and say how many went.
+fn remove_overlapping(block: &mut Block, range: ByteRange) -> usize {
+    let mut removed = 0;
+    loop {
+        let next = overlapping(block, range).next();
+        let Some(start) = next.map(|run| run.range.start) else {
+            return removed;
+        };
+        block.remove(&start);
+        removed += 1;
+    }
 }
 
 // Insert a run into its block, folding it with a neighbour it abuts and
