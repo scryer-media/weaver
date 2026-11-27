@@ -420,7 +420,11 @@ test("the limits dialog edits each egress's quota behind a picker and saves ever
     true,
   );
   await disclose.click();
-  assert.equal(await disclose.getAttribute("aria-expanded"), "true");
+  // The button goes once the quotas are open.
+  assert.equal(
+    await disclose.evaluate((element) => element.closest("[inert]") !== null),
+    true,
+  );
   const pick = async (name) => {
     await picker.click();
     await page.getByRole("menuitemradio", { name, exact: true }).click();
@@ -440,8 +444,7 @@ test("the limits dialog edits each egress's quota behind a picker and saves ever
   await cap("Upload hard cap").click();
   await pick("LTE standby");
   assert.equal(await allowance("Download cap").inputValue(), "30");
-  // A cap switched on with nothing typed is refused, and its egress is shown, with the quotas shut or not.
-  await disclose.click();
+  // A cap switched on with nothing typed is refused, and its egress is shown.
   await dialog.getByRole("button", { name: "Apply", exact: true }).click();
   await dialog
     .getByText("Set an allowance before switching the quota on.", {
@@ -449,7 +452,6 @@ test("the limits dialog edits each egress's quota behind a picker and saves ever
     })
     .waitFor();
   assert.equal((await sent(page)).length, 0);
-  assert.equal(await disclose.getAttribute("aria-expanded"), "true");
   assert.equal(await allowance("Download cap").inputValue(), "1");
   await allowance("Upload hard cap").fill("50");
   if (shot("limits")) await dialog.screenshot({ path: shot("limits") });

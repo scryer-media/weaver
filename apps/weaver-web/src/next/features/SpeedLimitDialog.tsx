@@ -46,7 +46,8 @@ import { FieldRows, Fold } from "@/next/pages/settings/framework";
  * Below the speeds an "Adjust bandwidth quotas" button slides open each
  * egress's quota, one egress at a time behind a picker, with the same fields
  * and `setEgressQuota` as the egress editor. It starts shut each time the
- * dialog opens. Every egress edited since then is saved on Apply.
+ * dialog opens, and the button goes once they are open. Every egress edited
+ * since then is saved on Apply.
  */
 export function useSpeedLimitDialog() {
   const t = useTranslate();
@@ -89,7 +90,7 @@ export function useSpeedLimitDialog() {
     Record<number, EgressQuotaDraft>
   >({});
   const [savingQuotas, setSavingQuotas] = useState(false);
-  // The quotas sit shut behind their header; a refused quota opens them.
+  // The quotas stay shut until asked for; nothing can be edited, or refused, before.
   const [quotaOpen, setQuotaOpen] = useState(false);
   const quotaEgress =
     egresses.find((egress) => egress.id === quotaEgressId) ?? egresses[0];
@@ -124,7 +125,6 @@ export function useSpeedLimitDialog() {
     );
     if (invalid) {
       setQuotaEgressId(invalid.id);
-      setQuotaOpen(true);
       setError(egressQuotaProblem(t, quotaEdits[invalid.id]!));
       return;
     }
@@ -236,14 +236,17 @@ export function useSpeedLimitDialog() {
       ) : null}
       {quotaEgress ? (
         <>
-          <div className="flex justify-center border-b border-wv-hairline px-4 py-[14px] sm:px-6">
-            <SecondaryButton
-              expanded={quotaOpen}
-              onClick={() => setQuotaOpen((was) => !was)}
-            >
-              {t("next.speedLimit.adjustQuotas")}
-            </SecondaryButton>
-          </div>
+          {/* The button slides away as the quotas slide open in its place. */}
+          <Fold open={!quotaOpen}>
+            <div className="flex justify-center border-b border-wv-hairline px-4 py-[14px] sm:px-6">
+              <SecondaryButton
+                expanded={quotaOpen}
+                onClick={() => setQuotaOpen(true)}
+              >
+                {t("next.speedLimit.adjustQuotas")}
+              </SecondaryButton>
+            </div>
+          </Fold>
           <Fold open={quotaOpen}>
             <FieldRows
               fields={[
