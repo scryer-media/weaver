@@ -285,12 +285,26 @@ pub trait Recovery {
         self.feed(member, segments);
     }
 
-    // The block sizes at whose boundaries `feed`'s checksums have to be cut
-    // for this object to vouch for a block without reading it back. A
+    // Covered members whose evidence the object wants said again, each
+    // once: a set of it came to describe them after some of their bytes
+    // arrived, and holds nothing of those. The namespace asks after a
+    // bind, after it feeds the object and before it rules it, and feeds
+    // each what its source still keeps.
+    fn unfed(&mut self, _out: &mut Vec<MemberId>) {}
+
+    // Whether `unfed` may name a member.
+    fn moved(&self) -> bool {
+        false
+    }
+
+    // The block sizes at whose boundaries `feed`'s checksums of the member
+    // have to be cut for this object to vouch for a block of it without
+    // reading it back: those of what describes the member, not of all the
+    // object holds. A
     // source that cuts its checksums there, as the article decoder can,
     // gives the object its proof as the bytes pass. An object that folds
     // checksums of any alignment, or takes none, names none.
-    fn block_sizes(&self, _out: &mut Vec<u64>) {}
+    fn block_sizes(&self, _member: MemberId, _out: &mut Vec<u64>) {}
 
     // The parent's other answer to a seek: this range of a covered member
     // will never come. The object learns that and nothing else, no bytes

@@ -630,12 +630,21 @@ pub struct RestartedDone {
 // The job served as `run` serves it, and the pipeline drained and taken down
 // once, the first time a repair of the job is out on a thread. Whether the
 // restored job lent a repair again.
+//
+// The first repair stands on its thread until the shutdown has started, so
+// it comes back stopped however fast its thread is: one let run could end
+// before the drain stopped it, and would leave nothing to lend again.
 pub async fn run_restarted_while_repairing(scenario: &Scenario) -> (RestartedDone, bool) {
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, complete_dir) =
         new_direct_pipeline_with_backlog(&temp_dir, backlog_base_bytes(), 1).await;
     scenario.prepare(&mut pipeline);
     insert_active_job(&mut pipeline, JOB, scenario.spec()).await;
+    let hold = pipeline
+        .graph_jobs
+        .get_mut(&JOB)
+        .expect("the job is a graph job")
+        .hold_next_repair();
     let mut sent = pipeline.event_tx.subscribe();
     let mut events = Vec::new();
     let mut in_memory = BTreeSet::new();
@@ -673,6 +682,13 @@ pub async fn run_restarted_while_repairing(scenario: &Scenario) -> (RestartedDon
             // A repair out writes the job's files: the drain waits for it to
             // its end rather than for a bound.
             assert!(pipeline.graph_drain_waits_for_loans());
+            // The shutdown the drain starts, started before the repair is
+            // let go: the repair finds it as it begins.
+            pipeline
+                .shared_state
+                .shutdown_started()
+                .store(true, std::sync::atomic::Ordering::Release);
+            hold.let_go();
             pipeline.drain().await;
             assert!(
                 !pipeline.graph_jobs[&JOB].awaits_mail(),

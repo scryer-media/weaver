@@ -234,6 +234,53 @@ fn a_check_stated_after_proven_bytes_landed_finds_their_fold() {
     assert!(job.writer.pending_verifications().is_empty());
 }
 
+// A member its producer checked as it decoded it takes the stated CRC32 as
+// its fold, once: a later write that takes that digest away leaves the
+// member to a check that reads its file, not to the stamp again.
+#[test]
+fn a_checked_member_is_stamped_once_and_checked_after_its_digest_goes() {
+    let mut job = Job::new(PLENTY);
+    let bytes = b"payload".to_vec();
+    let member = job.member("payload.bin", Some(bytes.len() as u64));
+    job.send(member, 0, &bytes, Provenance::Fresh);
+    job.close(member);
+    let record = job
+        .tree
+        .namespace_mut(NodeId::ROOT)
+        .unwrap()
+        .get_mut(member)
+        .unwrap();
+    record.crc32 = Some(crc32(&bytes));
+    record.checked = true;
+    let folded = |job: &mut Job| {
+        job.writer.files_mut(NodeId::ROOT).leaves[&member]
+            .folded(bytes.len() as u64, weaver_graph::Algorithm::Crc32)
+    };
+    assert!(
+        !job.writer
+            .fails_its_checksum(&job.tree, NodeId::ROOT, member)
+            .unwrap()
+    );
+    assert_eq!(folded(&mut job), Some(u64::from(crc32(&bytes))));
+    assert!(job.writer.pending_verifications().is_empty());
+    // A write that folds nothing lands on the stamped run: its digest goes.
+    job.writer
+        .files_mut(NodeId::ROOT)
+        .leaves
+        .get_mut(&member)
+        .unwrap()
+        .write(LoopSite::LeafWrite, 0, &bytes[..1], None, false)
+        .unwrap();
+    assert_eq!(folded(&mut job), None);
+    assert!(
+        !job.writer
+            .fails_its_checksum(&job.tree, NodeId::ROOT, member)
+            .unwrap()
+    );
+    assert_eq!(folded(&mut job), None);
+    assert_eq!(job.writer.pending_verifications(), vec![(0, member.0)]);
+}
+
 // A member whose file an object took over after its namespace ended: no
 // check of it can be lent, so its obligation keeps the job at work no
 // longer.
@@ -450,7 +497,7 @@ fn a_rewrite_discards_an_old_answer_before_installing_a_fold() {
         .leaves
         .get_mut(&member)
         .unwrap()
-        .write(LoopSite::LeafWrite, 9, &[0x42], None)
+        .write(LoopSite::LeafWrite, 9, &[0x42], None, false)
         .unwrap();
     apply(&mut job, verified).unwrap();
     assert!(job.writer.verifications_waiting());
@@ -522,7 +569,7 @@ fn a_stale_read_error_cannot_fail_replacement_backing() {
     let verified = check.run(&Default::default());
     let mut replacement = Leaf::at(job.dir.path(), "payload.bin");
     replacement
-        .write(LoopSite::LeafWrite, 0, &bytes, None)
+        .write(LoopSite::LeafWrite, 0, &bytes, None, false)
         .unwrap();
     job.writer
         .files_mut(NodeId::ROOT)

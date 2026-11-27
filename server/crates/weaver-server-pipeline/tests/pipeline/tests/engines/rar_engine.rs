@@ -14,6 +14,7 @@ use crate::jobs::model::JobStatus;
 use crate::pipeline::tests::direct_store::obfuscate_volumes;
 use crate::pipeline::tests::direct_store::scenarios::{HeaderCheck, header_encrypted_store_set};
 use crate::pipeline::tests::rar5_fixture_bytes;
+use weaver_server_pipeline::pipeline::tests::engines::restart_fixtures::member_check_bytes;
 
 const MIXED: &str = "rar5_multifile_lz.rar";
 
@@ -838,4 +839,28 @@ async fn a_compressed_set_renamed_by_par2_while_it_extracts_delivers_every_membe
             );
         }
     }
+}
+
+// The engine's decoder checks a member's bytes against its stated CRC32 as
+// it decodes them, so the member's own check takes that CRC32 as what its
+// file holds and reads nothing of it back at the close: in one volume, and
+// across four.
+#[tokio::test]
+async fn a_compressed_member_closes_with_no_check_read() {
+    let before = member_check_bytes();
+    let graph = run(&mixed()).await;
+    assert_mixed_members(&graph);
+    assert_engine_ran(&graph);
+    let read = member_check_bytes() - before;
+    assert_eq!(read, 0, "bytes a member check read back");
+}
+
+#[tokio::test]
+async fn a_compressed_member_spanning_four_volumes_closes_with_no_check_read() {
+    let before = member_check_bytes();
+    let graph = run(&Scenario::new(posts(super::rar::lz_four()))).await;
+    assert!(graph.completed(), "{:?} {:?}", graph.status, graph.failure);
+    assert_engine_ran(&graph);
+    let read = member_check_bytes() - before;
+    assert_eq!(read, 0, "bytes a member check read back");
 }

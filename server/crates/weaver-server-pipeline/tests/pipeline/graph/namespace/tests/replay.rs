@@ -443,7 +443,7 @@ fn same_path_backing_changes_invalidate_replay_even_without_tree_edits() {
         .leaves
         .get_mut(&MemberId(0))
         .unwrap()
-        .write(LoopSite::LeafWrite, 11, &[0x29], None)
+        .write(LoopSite::LeafWrite, 11, &[0x29], None, false)
         .unwrap();
     expected[11] = 0x29;
     assert_eq!(job.tree.generation(), before);

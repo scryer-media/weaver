@@ -1658,12 +1658,12 @@ pub async fn run_unprompted(scenario: &Scenario) -> (Vec<Option<RepairOutcome>>,
 fn handed_out(
     pipeline: &mut Pipeline,
     scenario: &Scenario,
-) -> Option<(Vec<DownloadWork>, Option<weaver_yenc::CheckpointPlan>)> {
+) -> Option<(Vec<DownloadWork>, Option<crate::pipeline::CheckpointPlans>)> {
     if scenario.leased {
         let lease = pipeline.lease_for_server_for_test(0)?;
         let mut works = lease.works;
         works.reverse();
-        return Some((works, Some(lease.checkpoint_plan)));
+        return Some((works, Some(lease.checkpoint_plans)));
     }
     // The scheduler hands a restored job nothing while its recovery reads
     // back what arrived of its volumes; the queue popped by hand
@@ -1799,7 +1799,7 @@ async fn serve_from(
     scenario: &Scenario,
     (file, ordinal): (u32, u32),
     exclude: weaver_nntp::ServerSet,
-    leased: Option<&weaver_yenc::CheckpointPlan>,
+    leased: Option<&crate::pipeline::CheckpointPlans>,
 ) {
     let server = (0..).find(|server| !exclude.contains(*server)).unwrap();
     let segment_id = SegmentId {
@@ -1858,7 +1858,7 @@ pub(in crate::pipeline::tests) fn article_decoded(
     scenario: &Scenario,
     (file, ordinal): (u32, u32),
     server: usize,
-    leased: Option<&weaver_yenc::CheckpointPlan>,
+    leased: Option<&crate::pipeline::CheckpointPlans>,
 ) -> DecodeResult {
     let segment_id = SegmentId {
         file_id: NzbFileId {
@@ -1945,9 +1945,10 @@ pub(in crate::pipeline::tests) fn article_decoded(
     // The decoder checksums the bytes it decoded, cut at the block
     // boundaries of the plan the article was leased under: its lease's, or
     // what the job knows now when it was handed out alone.
-    let checkpoint_plan = leased
-        .cloned()
-        .unwrap_or_else(|| checkpoint_plan(pipeline, job));
+    let checkpoint_plan = leased.map_or_else(
+        || checkpoint_plan(pipeline, segment_id.file_id),
+        |plans| plans.of(file).clone(),
+    );
     let mut checksums = weaver_yenc::SegmentedCrc32::new(offset as u64, checkpoint_plan.clone());
     checksums.update(&body);
     let (_, segments) = checksums.finish_article();

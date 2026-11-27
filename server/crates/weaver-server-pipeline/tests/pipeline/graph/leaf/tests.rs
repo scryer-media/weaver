@@ -8,8 +8,9 @@ use weaver_server_disk::operations::disk::volume::LoopSite;
 fn moving_a_missing_owned_file_keeps_the_old_name_and_intent() {
     let dir = tempfile::tempdir().unwrap();
     let mut leaf = Leaf::at(dir.path(), "source.bin");
-    leaf.write(LoopSite::LeafWrite, 0, b"source", None).unwrap();
-    leaf.close(LoopSite::LeafWrite, 6).unwrap();
+    leaf.write(LoopSite::LeafWrite, 0, b"source", None, false)
+        .unwrap();
+    leaf.close(LoopSite::LeafWrite, 6, false).unwrap();
     std::fs::remove_file(leaf.path()).unwrap();
     leaf.intend("destination.bin");
 
@@ -53,7 +54,7 @@ fn truncation_propagates_inspection_errors() {
     let dir = tempfile::tempdir().unwrap();
     std::os::unix::fs::symlink("loop", dir.path().join("loop")).unwrap();
     let mut leaf = Leaf::at(dir.path(), "loop");
-    assert!(leaf.truncate().is_err());
+    assert!(leaf.truncate(false).is_err());
 }
 
 // A name the file system will not take is told apart from a full disk
@@ -64,7 +65,7 @@ fn a_refused_name_is_told_apart_from_other_write_errors() {
     let name = format!("{}.mkv", "a".repeat(300));
     let mut leaf = Leaf::at(dir.path(), &name);
     let error = leaf
-        .write(LoopSite::LeafWrite, 0, b"lantern", None)
+        .write(LoopSite::LeafWrite, 0, b"lantern", None, false)
         .unwrap_err();
     assert!(error.names_unusable(), "{error}");
     assert!(!leaf.on_disk());
@@ -73,7 +74,7 @@ fn a_refused_name_is_told_apart_from_other_write_errors() {
     let mut full = Leaf::at(dir.path(), "full.bin");
     counting::fill_after(Some(0));
     let error = full
-        .write(LoopSite::LeafWrite, 0, b"lantern", None)
+        .write(LoopSite::LeafWrite, 0, b"lantern", None, false)
         .unwrap_err();
     counting::fill_after(None);
     assert!(!error.names_unusable(), "{error}");
@@ -88,7 +89,7 @@ fn a_write_does_not_preallocate_the_declared_unwritten_tail() {
     let dir = tempfile::tempdir().unwrap();
     let sized = weaver_server_disk::pipeline::graph::sparse::sizes_files_in(dir.path());
     let mut leaf = Leaf::at(dir.path(), "payload.bin");
-    leaf.write(LoopSite::LeafWrite, 0, b"a", Some(1 << 30))
+    leaf.write(LoopSite::LeafWrite, 0, b"a", Some(1 << 30), false)
         .unwrap();
     let length = leaf.len(LoopSite::LeafWrite).unwrap();
     assert_eq!(length, if sized { 1 << 30 } else { 1 });
@@ -98,8 +99,9 @@ fn a_write_does_not_preallocate_the_declared_unwritten_tail() {
         let taken = std::fs::metadata(leaf.path()).unwrap().blocks() * 512;
         assert!(taken < 1 << 30, "{taken} bytes taken for one written");
     }
-    leaf.write(LoopSite::LeafWrite, 1, b"b", None).unwrap();
-    leaf.close(LoopSite::LeafWrite, 2).unwrap();
+    leaf.write(LoopSite::LeafWrite, 1, b"b", None, false)
+        .unwrap();
+    leaf.close(LoopSite::LeafWrite, 2, false).unwrap();
     assert_eq!(std::fs::read(leaf.path()).unwrap(), b"ab");
 }
 
@@ -127,8 +129,15 @@ fn file_crc(leaf: &Leaf, length: u64) -> u64 {
 
 fn folding(leaf: &mut Leaf, offset: u64, bytes: Vec<u8>) {
     let bytes = Evidenced::from(bytes);
-    leaf.write_folding(LoopSite::LeafWrite, offset, &bytes, Algorithm::Crc32, None)
-        .unwrap();
+    leaf.write_folding(
+        LoopSite::LeafWrite,
+        offset,
+        &bytes,
+        Algorithm::Crc32,
+        None,
+        false,
+    )
+    .unwrap();
 }
 
 // A write over bytes already written, a close that cuts the file short
@@ -147,7 +156,7 @@ fn the_fold_answers_for_the_file_through_rewrites_cuts_and_restores() {
     folding(&mut leaf, 100, bytes(50, 4));
     let crc = Algorithm::Crc32;
     assert_eq!(leaf.folded(8192, crc), Some(file_crc(&leaf, 8192)));
-    leaf.close(LoopSite::LeafWrite, 7000).unwrap();
+    leaf.close(LoopSite::LeafWrite, 7000, false).unwrap();
     assert_eq!(leaf.folded(7000, crc), Some(file_crc(&leaf, 7000)));
 
     // A restore folds what is vouched for, run by run, reading nothing.
@@ -236,7 +245,7 @@ fn a_read_back_does_not_wait_for_a_later_write_of_other_bytes() {
     folding(&mut leaf, 0, bytes(4096, 1));
     folding(&mut leaf, 4096, bytes(4096, 2));
     other
-        .write(LoopSite::LeafWrite, 0, &bytes(4096, 7), None)
+        .write(LoopSite::LeafWrite, 0, &bytes(4096, 7), None, false)
         .unwrap();
     through.writers.settle();
     let hold = through.writers.hold(&through.volume);
@@ -250,9 +259,9 @@ fn a_read_back_does_not_wait_for_a_later_write_of_other_bytes() {
     // Another file's work goes on meanwhile, its close and a read below
     // the length it closed at included.
     other
-        .write(LoopSite::LeafWrite, 4096, &bytes(4096, 8), None)
+        .write(LoopSite::LeafWrite, 4096, &bytes(4096, 8), None, false)
         .unwrap();
-    other.close(LoopSite::LeafWrite, 8192).unwrap();
+    other.close(LoopSite::LeafWrite, 8192, false).unwrap();
     let mut read = Vec::new();
     other.read(LoopSite::LeafWrite, 0, 4096, &mut read).unwrap();
     assert_eq!(read, bytes(4096, 7));
@@ -287,19 +296,19 @@ fn handed_over(handed: impl FnOnce(&Path, &Arc<Submitter>) -> Leaf) -> (Vec<u8>,
     let mut other = Leaf::at(dir.path(), "other.bin").through(Some(&through.to));
     let hold = through.writers.hold(&through.volume);
     other
-        .write(LoopSite::LeafWrite, 0, &bytes(16, 1), None)
+        .write(LoopSite::LeafWrite, 0, &bytes(16, 1), None, false)
         .unwrap();
     hold.wait_held();
     let mut first = Leaf::at(dir.path(), "bundle.tar").through(Some(&through.to));
-    first.truncate().unwrap();
+    first.truncate(false).unwrap();
     first
-        .write(LoopSite::LeafWrite, 0, &all[..512], None)
+        .write(LoopSite::LeafWrite, 0, &all[..512], None, false)
         .unwrap();
     let mut second = handed(dir.path(), &through.to);
     second
-        .write(LoopSite::LeafWrite, 512, &all[512..], Some(length))
+        .write(LoopSite::LeafWrite, 512, &all[512..], Some(length), false)
         .unwrap();
-    second.close(LoopSite::LeafWrite, length).unwrap();
+    second.close(LoopSite::LeafWrite, length, false).unwrap();
     first.release_handle();
     hold.open();
     through.writers.settle();
@@ -330,13 +339,13 @@ fn a_read_of_bytes_still_out_waits_for_their_write() {
     let dir = tempfile::tempdir().unwrap();
     let through = through();
     let mut leaf = Leaf::at(dir.path(), "lantern.bin").through(Some(&through.to));
-    leaf.write(LoopSite::LeafWrite, 0, &bytes(4096, 1), None)
+    leaf.write(LoopSite::LeafWrite, 0, &bytes(4096, 1), None, false)
         .unwrap();
-    leaf.write(LoopSite::LeafWrite, 4096, &bytes(4096, 2), None)
+    leaf.write(LoopSite::LeafWrite, 4096, &bytes(4096, 2), None, false)
         .unwrap();
     through.writers.settle();
     let hold = through.writers.hold(&through.volume);
-    leaf.write(LoopSite::LeafWrite, 1000, &bytes(100, 3), None)
+    leaf.write(LoopSite::LeafWrite, 1000, &bytes(100, 3), None, false)
         .unwrap();
     let barrier = through.to.barrier();
     hold.wait_held();
@@ -356,8 +365,8 @@ fn a_read_of_bytes_still_out_waits_for_their_write() {
     assert_eq!(through.read_waits(), 1);
     through.writers.settle();
     let hold = through.writers.hold(&through.volume);
-    leaf.truncate().unwrap();
-    leaf.write(LoopSite::LeafWrite, 0, &bytes(10, 4), None)
+    leaf.truncate(false).unwrap();
+    leaf.write(LoopSite::LeafWrite, 0, &bytes(10, 4), None, false)
         .unwrap();
     let barrier = through.to.barrier();
     hold.wait_held();
@@ -433,7 +442,7 @@ fn a_fold_across_four_gib_keeps_its_digest() {
     assert_eq!(&now[4046..4146], &bytes(100, 6)[..]);
     assert_eq!(run(&leaf).2, Some(crc.hash(&now).value));
 
-    leaf.close(LoopSite::LeafWrite, LINE + 10).unwrap();
+    leaf.close(LoopSite::LeafWrite, LINE + 10, false).unwrap();
     assert_eq!(leaf.len(LoopSite::LeafWrite).unwrap(), LINE + 10);
     let kept = held(&leaf, LINE - 4096, LINE + 10);
     let (start, end, digest) = run(&leaf);

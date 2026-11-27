@@ -2544,11 +2544,13 @@ fn delivery_releases_partial_and_retired_files_without_changing_their_bytes() {
     let member = job.member("partial.bin", Some(10));
     job.send(member, 0, b"front", Provenance::Fresh);
     let mut retired = Leaf::at(job.dir.path(), "retired.bin");
-    retired.write(LoopSite::LeafWrite, 0, b"old", None).unwrap();
+    retired
+        .write(LoopSite::LeafWrite, 0, b"old", None, false)
+        .unwrap();
     job.writer.discard(retired).unwrap();
     let mut scratch = Leaf::at(job.dir.path(), ".weaver-chunks/scratch");
     scratch
-        .write(LoopSite::LeafWrite, 0, b"held", None)
+        .write(LoopSite::LeafWrite, 0, b"held", None, false)
         .unwrap();
     job.writer.files_mut(NodeId::ROOT).scratch = Some(scratch);
     assert_eq!(job.writer.open_files().len(), 3);
@@ -3099,7 +3101,7 @@ fn give_back_does_not_retain_a_truncated_leaf_tail() {
         .leaves
         .get_mut(&member)
         .unwrap();
-    leaf.close(LoopSite::LeafWrite, 12).unwrap();
+    leaf.close(LoopSite::LeafWrite, 12, false).unwrap();
     std::fs::OpenOptions::new()
         .write(true)
         .open(leaf.path())
@@ -3153,7 +3155,7 @@ fn give_back_reports_a_missing_recorded_leaf_without_discarding_the_source_recor
         .leaves
         .get_mut(&member)
         .unwrap();
-    leaf.close(LoopSite::LeafWrite, 12).unwrap();
+    leaf.close(LoopSite::LeafWrite, 12, false).unwrap();
     std::fs::remove_file(leaf.path()).unwrap();
 
     assert!(
@@ -5279,11 +5281,13 @@ fn a_returned_ruling_stands_while_its_file_changes_past_what_it_read() {
             .run(weaver_graph::Budget::default(), &Default::default());
         let write = |job: &mut Job, offset: u64, bytes: &[u8]| {
             job.writer
-                .files_mut(NodeId::ROOT)
-                .leaves
-                .get_mut(&member)
-                .unwrap()
-                .write(LoopSite::LeafWrite, offset, bytes, None)
+                .write_file(
+                    &mut job.tree,
+                    (NodeId::ROOT, member),
+                    offset,
+                    &bytes.to_vec().into(),
+                    LoopSite::LeafWrite,
+                )
                 .unwrap();
         };
         write(&mut job, 8, b"AND MORE");
@@ -5308,6 +5312,81 @@ fn a_returned_ruling_stands_while_its_file_changes_past_what_it_read() {
             "rewritten={rewritten}: a byte the repair read changed takes its ruling back"
         );
     }
+}
+
+// A member's file is written while a repair is out, past what it read and
+// inside it, and again once its return is taken back. A repair is told a
+// byte it read moved and one it did not read did not, and one lent after
+// earlier writes, its fix among them, is not told they moved.
+#[test]
+fn a_repair_is_told_only_of_writes_to_what_it_read_since_it_was_lent() {
+    let mut job = Job::new(PLENTY).with_set(Some(Fix {
+        name: "payload.bin",
+        read: ByteRange::new(0, 8),
+        fix: (2, b"OK"),
+    }));
+    let member = job.member("payload.bin", Some(16));
+    job.send(member, 0, b"original and mor", Provenance::Fresh);
+    let lend = |job: &mut Job| {
+        let mut lent = Inline::default();
+        let due = job.tree.recovery_nodes(NodeId::ROOT);
+        job.writer
+            .repair(&mut job.tree, NodeId::ROOT, &due, &mut lent)
+            .unwrap();
+        lent.0
+            .pop()
+            .unwrap()
+            .run(weaver_graph::Budget::default(), &Default::default())
+    };
+    // What the loop writes into a member a repair reads while it is out,
+    // as the writer writes it (bytes said of the member wait for the set's
+    // return).
+    let write = |job: &mut Job, offset: u64, bytes: &[u8]| {
+        job.writer
+            .write_file(
+                &mut job.tree,
+                (NodeId::ROOT, member),
+                offset,
+                &bytes.to_vec().into(),
+                LoopSite::LeafWrite,
+            )
+            .unwrap();
+    };
+
+    job.send(member, 4, b"INAL", Provenance::Repaired);
+    assert_eq!(job.file("payload.bin"), b"origINAL and mor");
+
+    let returned = lend(&mut job);
+    write(&mut job, 13, b"MOR");
+    assert_eq!(job.file("payload.bin"), b"origINAL and MOR");
+    assert!(
+        !job.writer.moved_since(&job.tree, &returned),
+        "a byte the repair did not read moved nothing"
+    );
+    let mut build = job.build();
+    job.writer
+        .returned(
+            &mut job.tree,
+            &mut build,
+            &Source,
+            &weaver_objects::Objects::default(),
+            returned,
+            &mut job.out,
+        )
+        .unwrap();
+    // Its fix went down through the writer.
+    assert_eq!(job.file("payload.bin"), b"orOKINAL and MOR");
+
+    let returned = lend(&mut job);
+    assert!(
+        !job.writer.moved_since(&job.tree, &returned),
+        "writes before the lend are not moves"
+    );
+    write(&mut job, 6, b"!");
+    assert!(
+        job.writer.moved_since(&job.tree, &returned),
+        "a byte the repair read moved"
+    );
 }
 
 #[test]

@@ -1158,6 +1158,10 @@ impl Object for RarStore {
         self.say_gaps(out);
     }
 
+    fn member_refuted(&mut self, member: MemberId, out: &mut Vec<Emit>) {
+        self.refuted(member, out);
+    }
+
     fn volume_lost(&mut self, volume: VolumeIndex, range: ByteRange, out: &mut Vec<Emit>) {
         let Some(found) = self.volumes.get(&volume) else {
             return;

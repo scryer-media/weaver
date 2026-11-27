@@ -57,7 +57,7 @@ fn lease_works_to_new_lane(
         completion_critical: false,
         effective_exclude_servers: weaver_nntp::ServerSet::EMPTY,
         dial_exclude_servers: weaver_nntp::ServerSet::EMPTY,
-        checkpoint_plan: weaver_yenc::CheckpointPlan::None,
+        checkpoint_plans: Default::default(),
         pressure_clear: true,
         repeated: None,
         works,

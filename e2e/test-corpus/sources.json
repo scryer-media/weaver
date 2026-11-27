@@ -7082,6 +7082,1434 @@
       }
     },
     {
+      "path": "testdata/par2-many-grids-clean/00-grid.par2",
+      "size": 1056,
+      "blake3": "7585dc2f0233821bca39713da6be83774c202fbce625a213c8647383296606f8",
+      "format": "par2",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes@go1.27.3",
+          "par2cmdline-turbo-1.4.0"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par2-many-grids-clean/00-grid.vol0+1.par2",
+      "size": 17508,
+      "blake3": "24a5f50b187fd45c4b9394c46e7850e6459fefab3c8ffa65625aba9348065bd8",
+      "format": "par2",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes@go1.27.3",
+          "par2cmdline-turbo-1.4.0"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par2-many-grids-clean/01-grid.par2",
+      "size": 936,
+      "blake3": "f4903b8e09e262e575e91c3ff216902ceef061f479bfc73f0bdc714f44763957",
+      "format": "par2",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes@go1.27.3",
+          "par2cmdline-turbo-1.4.0"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par2-many-grids-clean/01-grid.vol0+1.par2",
+      "size": 21484,
+      "blake3": "f9e30229a1a69866cf5ee1315b4095c8215fc0e823777daefff322cecc03b8a4",
+      "format": "par2",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes@go1.27.3",
+          "par2cmdline-turbo-1.4.0"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par2-many-grids-clean/02-grid.par2",
+      "size": 856,
+      "blake3": "c9bb363049f8ee7338ced16f3c3d9f7885168c4e166d3156a2a440437073c190",
+      "format": "par2",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes@go1.27.3",
+          "par2cmdline-turbo-1.4.0"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par2-many-grids-clean/02-grid.vol0+1.par2",
+      "size": 25500,
+      "blake3": "06f8318a76ed1595eec24e9ac16772a0044e5c06544d947eae8db77ed57bfcda",
+      "format": "par2",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes@go1.27.3",
+          "par2cmdline-turbo-1.4.0"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par2-many-grids-clean/03-grid.par2",
+      "size": 796,
+      "blake3": "510d8d4e22e94d46e4ef8e8170ad3d741868a83402052da07256996ad1dbb25e",
+      "format": "par2",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes@go1.27.3",
+          "par2cmdline-turbo-1.4.0"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par2-many-grids-clean/03-grid.vol0+1.par2",
+      "size": 29536,
+      "blake3": "589c20e4eac9d8360fc5a6afa0b3b03609d29856315f06ca48f1fb870eae8021",
+      "format": "par2",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes@go1.27.3",
+          "par2cmdline-turbo-1.4.0"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par2-many-grids-clean/04-grid.par2",
+      "size": 736,
+      "blake3": "84df6b5c2bb4cc6e17db03259dc295f2f15a797187b083bf94fc56a42623c427",
+      "format": "par2",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes@go1.27.3",
+          "par2cmdline-turbo-1.4.0"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par2-many-grids-clean/04-grid.vol0+1.par2",
+      "size": 33572,
+      "blake3": "33da2157c58b5fac03ca2fac9a9bfef1468d8d2ff64e958b4af8ac0b683dd30c",
+      "format": "par2",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes@go1.27.3",
+          "par2cmdline-turbo-1.4.0"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par2-many-grids-clean/05-grid.par2",
+      "size": 716,
+      "blake3": "530a96ecbb83cb97918659dfbbc0063a25fa2c9970c364336a77e8309c83e342",
+      "format": "par2",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes@go1.27.3",
+          "par2cmdline-turbo-1.4.0"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par2-many-grids-clean/05-grid.vol0+1.par2",
+      "size": 37648,
+      "blake3": "75e997fdf4257653d66eabdfb6c1fed8a180eae701001b280b5913aa77ac36e1",
+      "format": "par2",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes@go1.27.3",
+          "par2cmdline-turbo-1.4.0"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par2-many-grids-clean/06-grid.par2",
+      "size": 676,
+      "blake3": "02573b578b58e6654822ccbd6974b7f8995913cf2bdb3d7919f197acc0687750",
+      "format": "par2",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes@go1.27.3",
+          "par2cmdline-turbo-1.4.0"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par2-many-grids-clean/06-grid.vol0+1.par2",
+      "size": 41704,
+      "blake3": "0dacf21a9dde697dad6989f6740c8f6a826f504ca12addb30defd82a82368d3d",
+      "format": "par2",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes@go1.27.3",
+          "par2cmdline-turbo-1.4.0"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par2-many-grids-clean/07-grid.par2",
+      "size": 656,
+      "blake3": "10ffa4765d4584a1d55a8bb68e7e0006a3ad400f8757961a8745ebd44c5358bc",
+      "format": "par2",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes@go1.27.3",
+          "par2cmdline-turbo-1.4.0"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par2-many-grids-clean/07-grid.vol0+1.par2",
+      "size": 45780,
+      "blake3": "5aea2d6d12132dff2626f748cfe961e372bda0f597558745d9b112b885e8ffa9",
+      "format": "par2",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes@go1.27.3",
+          "par2cmdline-turbo-1.4.0"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par2-many-grids-clean/08-grid.par2",
+      "size": 636,
+      "blake3": "d11f86c0a80341eb387edcc288bb29be445d2df7fb0d1d485e5edf072a3cfbb4",
+      "format": "par2",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes@go1.27.3",
+          "par2cmdline-turbo-1.4.0"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par2-many-grids-clean/08-grid.vol0+1.par2",
+      "size": 49856,
+      "blake3": "a89f0f15147d5a75b49937aa6e2f1bd8b6d249582641591573b536be8e39d500",
+      "format": "par2",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes@go1.27.3",
+          "par2cmdline-turbo-1.4.0"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par2-many-grids-clean/09-grid.par2",
+      "size": 616,
+      "blake3": "d295140ef3715fcfdf03c3435cb1770dad0b97b8e9a30dcbd51850d0363ef156",
+      "format": "par2",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes@go1.27.3",
+          "par2cmdline-turbo-1.4.0"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par2-many-grids-clean/09-grid.vol0+1.par2",
+      "size": 53932,
+      "blake3": "31d142cbca12b2e38c0d1664ed6e24bef35f1d1158514b8683e5b6e8cc516471",
+      "format": "par2",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes@go1.27.3",
+          "par2cmdline-turbo-1.4.0"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par2-many-grids-clean/10-grid.par2",
+      "size": 616,
+      "blake3": "26489b7a52983aeaa2163c81445e97f51ebfab8a157eb26c4a588f97dbde7263",
+      "format": "par2",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes@go1.27.3",
+          "par2cmdline-turbo-1.4.0"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par2-many-grids-clean/10-grid.vol0+1.par2",
+      "size": 58028,
+      "blake3": "2ce14b56575d7c05aec1c17926dfb6a88a4d8a788c99f496c5e6f71fdcd0537b",
+      "format": "par2",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes@go1.27.3",
+          "par2cmdline-turbo-1.4.0"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par2-many-grids-clean/11-grid.par2",
+      "size": 596,
+      "blake3": "cd0f4f0803452a45bb05ba62e40707d9a092a0c47630449fe520559f28a77b79",
+      "format": "par2",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes@go1.27.3",
+          "par2cmdline-turbo-1.4.0"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par2-many-grids-clean/11-grid.vol0+1.par2",
+      "size": 62104,
+      "blake3": "4ae7f9526661a9413923dca17b3760725eb917155361d60ceda8564305434073",
+      "format": "par2",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes@go1.27.3",
+          "par2cmdline-turbo-1.4.0"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par2-many-grids-clean/12-grid.par2",
+      "size": 576,
+      "blake3": "87ecc287e8624ea12cd56d72b8bc6479a02f0223b1bb6979efe5c9b450f642cf",
+      "format": "par2",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes@go1.27.3",
+          "par2cmdline-turbo-1.4.0"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par2-many-grids-clean/12-grid.vol0+1.par2",
+      "size": 66180,
+      "blake3": "d35129c42304ce306ad1416120c549b5ee0aa645b9500b6692db5ff98bfdffcf",
+      "format": "par2",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes@go1.27.3",
+          "par2cmdline-turbo-1.4.0"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par2-many-grids-clean/13-grid.par2",
+      "size": 576,
+      "blake3": "9870d8b27a51eea497e772b5d4815b000ef8f54b28368174748cf39c47013ee9",
+      "format": "par2",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes@go1.27.3",
+          "par2cmdline-turbo-1.4.0"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par2-many-grids-clean/13-grid.vol0+1.par2",
+      "size": 70276,
+      "blake3": "5db865d1738d31ada1b64f5cedf0689908b37b637d32b7aee8ac07f37ba12491",
+      "format": "par2",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes@go1.27.3",
+          "par2cmdline-turbo-1.4.0"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par2-many-grids-clean/14-grid.par2",
+      "size": 576,
+      "blake3": "08c3661c501a78bc658407cef288559003a495e1d576e61ee7b12ab80bfb3c5c",
+      "format": "par2",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes@go1.27.3",
+          "par2cmdline-turbo-1.4.0"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par2-many-grids-clean/14-grid.vol0+1.par2",
+      "size": 74372,
+      "blake3": "fc68510db6c6d8699ac086019e6d726f1161561bceb904e2fd5cfac686082d3a",
+      "format": "par2",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes@go1.27.3",
+          "par2cmdline-turbo-1.4.0"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par2-many-grids-clean/15-grid.par2",
+      "size": 556,
+      "blake3": "583f2d719049a9c97f870c36aed1053c11b04cf8f3cf04f476ee660b312f12d9",
+      "format": "par2",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes@go1.27.3",
+          "par2cmdline-turbo-1.4.0"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par2-many-grids-clean/15-grid.vol0+1.par2",
+      "size": 78448,
+      "blake3": "ae24b326e613bf98a7f63aebb4c783eafd8636ac089556f6dee6b50193a5ddaa",
+      "format": "par2",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes@go1.27.3",
+          "par2cmdline-turbo-1.4.0"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par2-many-grids-clean/16-grid.par2",
+      "size": 556,
+      "blake3": "ba30804ca2b00db1c17d51213a713541442637eed9b935cf12e9e6af5b0e8452",
+      "format": "par2",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes@go1.27.3",
+          "par2cmdline-turbo-1.4.0"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par2-many-grids-clean/16-grid.vol0+1.par2",
+      "size": 82544,
+      "blake3": "1f9d1237effba7d1c198c612f446229ccf2fa2b8c895db82c5c76d3be6f73605",
+      "format": "par2",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes@go1.27.3",
+          "par2cmdline-turbo-1.4.0"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par2-many-grids-clean/17-grid.par2",
+      "size": 556,
+      "blake3": "5eb2269cab18963a6722330f9c4780a66ffcafa6413525238b3b320754ab7c24",
+      "format": "par2",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes@go1.27.3",
+          "par2cmdline-turbo-1.4.0"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par2-many-grids-clean/17-grid.vol0+1.par2",
+      "size": 86640,
+      "blake3": "ee5378fecb4c2a8d92cad25f7bc679d2c976a90a759afc7f86c5299792fac772",
+      "format": "par2",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes@go1.27.3",
+          "par2cmdline-turbo-1.4.0"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par2-many-grids-clean/18-grid.par2",
+      "size": 536,
+      "blake3": "cc7813a8de7ad343326c95c6efb56582ff58f6c0228ba135d7c2d9ccb8d2f79d",
+      "format": "par2",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes@go1.27.3",
+          "par2cmdline-turbo-1.4.0"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par2-many-grids-clean/18-grid.vol0+1.par2",
+      "size": 90716,
+      "blake3": "b353ad8d71f7c264b7da3896d0440325b2566f983f84a0de977b8d5cebdb98a9",
+      "format": "par2",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes@go1.27.3",
+          "par2cmdline-turbo-1.4.0"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par2-many-grids-clean/19-grid.par2",
+      "size": 536,
+      "blake3": "c2a0130cec598fa7410bafa0fe0aa424b6f8f9736219c0cecda4db4769682ca7",
+      "format": "par2",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes@go1.27.3",
+          "par2cmdline-turbo-1.4.0"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par2-many-grids-clean/19-grid.vol0+1.par2",
+      "size": 94812,
+      "blake3": "d03689d691646d542a3a02898dc01e55d0b538b24a0ede71bcae9f1231794384",
+      "format": "par2",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes@go1.27.3",
+          "par2cmdline-turbo-1.4.0"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par2-many-grids-clean/20-grid.par2",
+      "size": 536,
+      "blake3": "a6c92c1e352445a168f1d783aa49ebce0c82a1f8617c8d5c375bbd087f270f4d",
+      "format": "par2",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes@go1.27.3",
+          "par2cmdline-turbo-1.4.0"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par2-many-grids-clean/20-grid.vol0+1.par2",
+      "size": 98908,
+      "blake3": "3dc4dc703c0f1b33e7b13b6278812641a7b33c91c8d8844923f62c9d4a04e98e",
+      "format": "par2",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes@go1.27.3",
+          "par2cmdline-turbo-1.4.0"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par2-many-grids-clean/21-grid.par2",
+      "size": 536,
+      "blake3": "7d2f1dabf178e4673a3d2f3887c27ff7fbe8c410080ce928e0c4448d464b98ba",
+      "format": "par2",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes@go1.27.3",
+          "par2cmdline-turbo-1.4.0"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par2-many-grids-clean/21-grid.vol0+1.par2",
+      "size": 103004,
+      "blake3": "4b5de6472007e3a204325119690dfc65216782b0799e46fcbc73b6c609d5fe7b",
+      "format": "par2",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes@go1.27.3",
+          "par2cmdline-turbo-1.4.0"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par2-many-grids-clean/22-grid.par2",
+      "size": 516,
+      "blake3": "bb10cf37345489a627fd666455e1a2f54c72242302619b88ccfd28cae295bdf8",
+      "format": "par2",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes@go1.27.3",
+          "par2cmdline-turbo-1.4.0"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par2-many-grids-clean/22-grid.vol0+1.par2",
+      "size": 107080,
+      "blake3": "ac49e91bfb4c9b1463dea5c37613150ad8c04d8fecd77bce7cdfdd2d102e47e7",
+      "format": "par2",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes@go1.27.3",
+          "par2cmdline-turbo-1.4.0"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par2-many-grids-clean/23-grid.par2",
+      "size": 516,
+      "blake3": "78bc201d7b3bc390c542b66887b0449026a3ba6fc84fec9492bfd8745d7cc255",
+      "format": "par2",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes@go1.27.3",
+          "par2cmdline-turbo-1.4.0"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par2-many-grids-clean/23-grid.vol0+1.par2",
+      "size": 111176,
+      "blake3": "584e19aab67ccd9e9aacc52734ea6ca72cea22fbbbd733808861987a753be93a",
+      "format": "par2",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes@go1.27.3",
+          "par2cmdline-turbo-1.4.0"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par2-many-grids-clean/24-grid.par2",
+      "size": 516,
+      "blake3": "dcac3276b9fabc09326fc635b08c45cf1c2d90c0121fedd6b10b49cb9b3c4bc6",
+      "format": "par2",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes@go1.27.3",
+          "par2cmdline-turbo-1.4.0"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par2-many-grids-clean/24-grid.vol0+1.par2",
+      "size": 115272,
+      "blake3": "1d62ff7e36a8f2202e08a9c060f3baa63dd492fb053f14dc6f5e5433e231fbbd",
+      "format": "par2",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes@go1.27.3",
+          "par2cmdline-turbo-1.4.0"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par2-many-grids-clean/25-grid.par2",
+      "size": 516,
+      "blake3": "2904b454d00f7aaf43ef80f98624a08e99ee6d6d9b31502bbd79707e6f6027cc",
+      "format": "par2",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes@go1.27.3",
+          "par2cmdline-turbo-1.4.0"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par2-many-grids-clean/25-grid.vol0+1.par2",
+      "size": 119368,
+      "blake3": "ba7a61ebbb0fe48d2c1fc6aae6a117f24464298c7bd3451657a9d38d28d3a304",
+      "format": "par2",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes@go1.27.3",
+          "par2cmdline-turbo-1.4.0"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par2-many-grids-clean/26-grid.par2",
+      "size": 516,
+      "blake3": "f0b3773b6bdee47274d614501bdb3a94e3537e18699ee4f41faad6f973160cd7",
+      "format": "par2",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes@go1.27.3",
+          "par2cmdline-turbo-1.4.0"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par2-many-grids-clean/26-grid.vol0+1.par2",
+      "size": 123464,
+      "blake3": "3f6935c4a82035565dd2e46947e88b0e811bf86f518758c1aba032dc0aa3c5c2",
+      "format": "par2",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes@go1.27.3",
+          "par2cmdline-turbo-1.4.0"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par2-many-grids-clean/27-grid.par2",
+      "size": 516,
+      "blake3": "1cb5e309775d5d73901b6316aaead6965b0583369e0b778961f77483cf652064",
+      "format": "par2",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes@go1.27.3",
+          "par2cmdline-turbo-1.4.0"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par2-many-grids-clean/27-grid.vol0+1.par2",
+      "size": 127560,
+      "blake3": "4118ee5ce7b3f0662b5853ea2edba127b2ed0747a645b759f68d45237e41507f",
+      "format": "par2",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes@go1.27.3",
+          "par2cmdline-turbo-1.4.0"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par2-many-grids-clean/28-grid.par2",
+      "size": 496,
+      "blake3": "bcd0821223d8e37524b2544160156ac3935229fae6ca4dfe1a95e2d1682f2674",
+      "format": "par2",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes@go1.27.3",
+          "par2cmdline-turbo-1.4.0"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par2-many-grids-clean/28-grid.vol0+1.par2",
+      "size": 131636,
+      "blake3": "b3b0906b222ddc7ea2d2d7dedec39086e2f3fb12044c1e4a319bbb82b2a6bd9c",
+      "format": "par2",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes@go1.27.3",
+          "par2cmdline-turbo-1.4.0"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par2-many-grids-clean/29-grid.par2",
+      "size": 496,
+      "blake3": "05ef36558148f668d34ed00d844c099d29396f5d6917f73c514507c5d34af958",
+      "format": "par2",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes@go1.27.3",
+          "par2cmdline-turbo-1.4.0"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par2-many-grids-clean/29-grid.vol0+1.par2",
+      "size": 135732,
+      "blake3": "80579af4704a0c284faec0d21f2d1fe005686197e289cb1f362879422dd7d00c",
+      "format": "par2",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes@go1.27.3",
+          "par2cmdline-turbo-1.4.0"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par2-many-grids-clean/30-grid.par2",
+      "size": 496,
+      "blake3": "8b1ee804c1c058a0359f96c5400f38c494196603f2c9ca5defd1fc6bdab6ddc0",
+      "format": "par2",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes@go1.27.3",
+          "par2cmdline-turbo-1.4.0"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par2-many-grids-clean/30-grid.vol0+1.par2",
+      "size": 139828,
+      "blake3": "1656da8d61565eb3905940c3a254ae5047115fad1a56a5c4d98583cdae0583c5",
+      "format": "par2",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes@go1.27.3",
+          "par2cmdline-turbo-1.4.0"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par2-many-grids-clean/31-grid.par2",
+      "size": 496,
+      "blake3": "4b713eedf14a097b7a6197b96560518c87322a60661bee0a4fc4633cefa504e4",
+      "format": "par2",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes@go1.27.3",
+          "par2cmdline-turbo-1.4.0"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par2-many-grids-clean/31-grid.vol0+1.par2",
+      "size": 143924,
+      "blake3": "ce8951ce7da84135984b5a51ffd5f813d2565ba75e7d997839a5f71ed474e788",
+      "format": "par2",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes@go1.27.3",
+          "par2cmdline-turbo-1.4.0"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par2-many-grids-clean/32-grid.par2",
+      "size": 496,
+      "blake3": "2f28db3e2b05bd1a62f32dd2da69a9226f19e1c20a619933e47b01572aaab8bc",
+      "format": "par2",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes@go1.27.3",
+          "par2cmdline-turbo-1.4.0"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par2-many-grids-clean/32-grid.vol0+1.par2",
+      "size": 148020,
+      "blake3": "f3ff55667fd656698188ebcfde12987c6d500432e1f30b344b272a477d7b6754",
+      "format": "par2",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes@go1.27.3",
+          "par2cmdline-turbo-1.4.0"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par2-many-grids-clean/33-grid.par2",
+      "size": 496,
+      "blake3": "fc3037dcb321ca00ba70d8060b94662fdd9e9dde15b3c1402241fe216ac9010b",
+      "format": "par2",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes@go1.27.3",
+          "par2cmdline-turbo-1.4.0"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par2-many-grids-clean/33-grid.vol0+1.par2",
+      "size": 152116,
+      "blake3": "997658f04e42dbe2e8ade56b10aa61e529cc2e0bb8aa85b06c94c606b31ff4cf",
+      "format": "par2",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes@go1.27.3",
+          "par2cmdline-turbo-1.4.0"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par2-many-grids-clean/lattice-00.bin",
+      "size": 524288,
+      "blake3": "ad453e68147034771fa83371a1492677c44113e3a4e2f94e7718255644022bd3",
+      "format": "bin",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes@go1.27.3",
+          "par2cmdline-turbo-1.4.0"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par2-many-grids-clean/lattice-01.bin",
+      "size": 524288,
+      "blake3": "a70e808eb2e1475d112fd52c171b7543a820ce93655c7d76f7f0603a919959cd",
+      "format": "bin",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes@go1.27.3",
+          "par2cmdline-turbo-1.4.0"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par2-many-grids-clean/lattice-02.bin",
+      "size": 524288,
+      "blake3": "bcdd4ba3b0929023e66d864ae4a53e53e15f8110c178e6521c682a2f476d52c5",
+      "format": "bin",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes@go1.27.3",
+          "par2cmdline-turbo-1.4.0"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par2-many-grids-clean/lattice-03.bin",
+      "size": 524288,
+      "blake3": "ba29089ac362ad694964aa5e2889343a3ea6f6bfcedf8de3f907142f77f8fdc3",
+      "format": "bin",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes@go1.27.3",
+          "par2cmdline-turbo-1.4.0"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par2-many-grids-clean/lattice-04.bin",
+      "size": 524288,
+      "blake3": "86a0e01a5ab4aa1e0b2a31c9a537e7e4c5ab96d6bda8ed7a09cde39f0375edab",
+      "format": "bin",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes@go1.27.3",
+          "par2cmdline-turbo-1.4.0"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par2-many-grids-clean/lattice-05.bin",
+      "size": 524288,
+      "blake3": "a5fdc62481a8580a701c4f39d2ed26ec1a5423c2b1999d60a5c9bc95aa5e59ef",
+      "format": "bin",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes@go1.27.3",
+          "par2cmdline-turbo-1.4.0"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par2-many-grids-clean/lattice-06.bin",
+      "size": 524288,
+      "blake3": "df16f29f933d7ff3d7c3451d47518b9e7b2db3f1a3e566a86bbe0659a9e0c20d",
+      "format": "bin",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes@go1.27.3",
+          "par2cmdline-turbo-1.4.0"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par2-many-grids-clean/lattice-07.bin",
+      "size": 524288,
+      "blake3": "26f88893958284e608787f57554ff83d18c9c8e310b2dfcbe501bad322bcab07",
+      "format": "bin",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes@go1.27.3",
+          "par2cmdline-turbo-1.4.0"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par2-many-grids-clean/lattice-08.bin",
+      "size": 524288,
+      "blake3": "eae65bac0404006d6bea8bda2fd41756c150d818a510746d654ec5ad23ce4bde",
+      "format": "bin",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes@go1.27.3",
+          "par2cmdline-turbo-1.4.0"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par2-many-grids-clean/lattice-09.bin",
+      "size": 524288,
+      "blake3": "39a39e705b1e8ed8efc0d4286a4ff35f351de88eb154997e7f19b866e582eb45",
+      "format": "bin",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes@go1.27.3",
+          "par2cmdline-turbo-1.4.0"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par2-many-grids-clean/lattice-10.bin",
+      "size": 524288,
+      "blake3": "7506209452a7a7c3a7fa8884bdb304d76c2c021f9a12f389b25990d85ed5d985",
+      "format": "bin",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes@go1.27.3",
+          "par2cmdline-turbo-1.4.0"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par2-many-grids-clean/lattice-11.bin",
+      "size": 524288,
+      "blake3": "0318c64b36c355be5c32466deb59e896fe2bd0cbaf58ea499701f174674d5c3f",
+      "format": "bin",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes@go1.27.3",
+          "par2cmdline-turbo-1.4.0"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par2-many-grids-clean/lattice-12.bin",
+      "size": 524288,
+      "blake3": "7e4bbd422660903ef08f1cb5dfa3a83409184d97cb6484e6ba030d2ee0e40bb3",
+      "format": "bin",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes@go1.27.3",
+          "par2cmdline-turbo-1.4.0"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par2-many-grids-clean/lattice-13.bin",
+      "size": 524288,
+      "blake3": "aeccbd4a581e5a663e46f8dfeccc17e21da1fa28022fef82d735a4ad18cba631",
+      "format": "bin",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes@go1.27.3",
+          "par2cmdline-turbo-1.4.0"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par2-many-grids-clean/lattice-14.bin",
+      "size": 524288,
+      "blake3": "48e073ce60a8d38089a61ebc7a21f51579b7c2a40f870ad95a1a975a450a7d4e",
+      "format": "bin",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes@go1.27.3",
+          "par2cmdline-turbo-1.4.0"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par2-many-grids-clean/lattice-15.bin",
+      "size": 524288,
+      "blake3": "b167ebe7391ec403c2e55c284f398f892a542da8d7116e9b94c13f504df9aa0d",
+      "format": "bin",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes@go1.27.3",
+          "par2cmdline-turbo-1.4.0"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par2-many-grids-clean/lattice-16.bin",
+      "size": 524288,
+      "blake3": "8719120a861ad91ba8c864b274d55ad3d344dd168efd72724c3ec48c3128f128",
+      "format": "bin",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes@go1.27.3",
+          "par2cmdline-turbo-1.4.0"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par2-many-grids-clean/lattice-17.bin",
+      "size": 524288,
+      "blake3": "830e90c7f7031b6e24868c3c15e129a3be7f9128f4d8bf64b9d038c8ccdf391c",
+      "format": "bin",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes@go1.27.3",
+          "par2cmdline-turbo-1.4.0"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par2-many-grids-clean/lattice-18.bin",
+      "size": 524288,
+      "blake3": "f9c71b7e623ebe7eef9dd1bd034729d22e35c1ac611656c1ed744522804bf8df",
+      "format": "bin",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes@go1.27.3",
+          "par2cmdline-turbo-1.4.0"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par2-many-grids-clean/lattice-19.bin",
+      "size": 524288,
+      "blake3": "d55dcbe80bdc9c2ad32c9620f5aeb587da71a78043eb11f60fa466ff26f18718",
+      "format": "bin",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes@go1.27.3",
+          "par2cmdline-turbo-1.4.0"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par2-many-grids-clean/lattice-20.bin",
+      "size": 524288,
+      "blake3": "ff1538c5ffd8bd44044debe47955585a229a71f092028643fc31863cfc9498b9",
+      "format": "bin",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes@go1.27.3",
+          "par2cmdline-turbo-1.4.0"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par2-many-grids-clean/lattice-21.bin",
+      "size": 524288,
+      "blake3": "788eb2d25173f85d0805ddad55e1bd0b2edef0d319b5218bd4ea2ec00bd673ee",
+      "format": "bin",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes@go1.27.3",
+          "par2cmdline-turbo-1.4.0"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par2-many-grids-clean/lattice-22.bin",
+      "size": 524288,
+      "blake3": "a175de1273377768bd555a6bc74088ed0478dee6991ccf49442b5e9fe4be8e35",
+      "format": "bin",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes@go1.27.3",
+          "par2cmdline-turbo-1.4.0"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par2-many-grids-clean/lattice-23.bin",
+      "size": 524288,
+      "blake3": "06a60245efa560b33f891fdb7601e4f34316de0f9de61fb3b8497b694d3904fc",
+      "format": "bin",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes@go1.27.3",
+          "par2cmdline-turbo-1.4.0"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par2-many-grids-clean/lattice-24.bin",
+      "size": 524288,
+      "blake3": "4a9ea80299f11ccb459ae4ce6812b1c279dd7099cfaa7b7a6c36f3fb520c69f8",
+      "format": "bin",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes@go1.27.3",
+          "par2cmdline-turbo-1.4.0"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par2-many-grids-clean/lattice-25.bin",
+      "size": 524288,
+      "blake3": "41c68dcfb1611d21d91a19128eb3db8de96b44deb10f5bbd614aad8c6e9c234c",
+      "format": "bin",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes@go1.27.3",
+          "par2cmdline-turbo-1.4.0"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par2-many-grids-clean/lattice-26.bin",
+      "size": 524288,
+      "blake3": "27c0a4b267acc64390caf7342bda6ecf83b3faa0569cb8d91f5d9eba5a06942f",
+      "format": "bin",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes@go1.27.3",
+          "par2cmdline-turbo-1.4.0"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par2-many-grids-clean/lattice-27.bin",
+      "size": 524288,
+      "blake3": "d6dcda419c6f9214e979066ce3d82e250126821a5db12e76bbc82ecdeea7f643",
+      "format": "bin",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes@go1.27.3",
+          "par2cmdline-turbo-1.4.0"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par2-many-grids-clean/lattice-28.bin",
+      "size": 524288,
+      "blake3": "b84d28bc1d745e2e245ed74e3943f47c2bfeaa296f94a644fad75e89baa6a864",
+      "format": "bin",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes@go1.27.3",
+          "par2cmdline-turbo-1.4.0"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par2-many-grids-clean/lattice-29.bin",
+      "size": 524288,
+      "blake3": "86c8ff49691be66fb36013c54cbf06eb1b4064905eb23b9574010c355c04b7f2",
+      "format": "bin",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes@go1.27.3",
+          "par2cmdline-turbo-1.4.0"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par2-many-grids-clean/lattice-30.bin",
+      "size": 524288,
+      "blake3": "81222b627a460b5d43114b832d291555f1af652c37cace75d65975554cb2008d",
+      "format": "bin",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes@go1.27.3",
+          "par2cmdline-turbo-1.4.0"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par2-many-grids-clean/lattice-31.bin",
+      "size": 524288,
+      "blake3": "5c98b67ac97854ec50e4a55157af583b545d52f898e0baf11edc6a661f1dee80",
+      "format": "bin",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes@go1.27.3",
+          "par2cmdline-turbo-1.4.0"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par2-many-grids-clean/lattice-32.bin",
+      "size": 524288,
+      "blake3": "e47ed7232ab917330fbc044c7860de716adc4312128aeed9672d1a6be1b20ae0",
+      "format": "bin",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes@go1.27.3",
+          "par2cmdline-turbo-1.4.0"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par2-many-grids-clean/lattice-33.bin",
+      "size": 524288,
+      "blake3": "bbd40da72b5f024b1a72029935463aac2af429ac124ee08621dae5c40e8e2b0b",
+      "format": "bin",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes@go1.27.3",
+          "par2cmdline-turbo-1.4.0"
+        ]
+      }
+    },
+    {
       "path": "testdata/par2-multi-grid-overlap-clean/00-grid64.par2",
       "size": 2012,
       "blake3": "d9f6ac501d5c861837c15298bb0ad80eb1d8e99147db140c1375e23e35d276cf",
@@ -7164,6 +8592,96 @@
         "toolchains": [
           "ffmpeg-7.1-ubuntu2404",
           "go-fixture-bytes",
+          "par2cmdline-turbo-1.4.0"
+        ],
+        "inputs": [
+          "testdata/mixed-archive/sample-preview.mkv"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par2-multi-grid-overlap-repair/00-grid64.par2",
+      "size": 2012,
+      "blake3": "01fc34224c4e7193aad9effac5a33749e73a8a91f384cf0187d69ff7bba61890",
+      "format": "par2",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "ffmpeg-7.1-ubuntu2404",
+          "go-fixture-bytes@go1.27.3",
+          "par2cmdline-turbo-1.4.0"
+        ],
+        "inputs": [
+          "testdata/mixed-archive/sample-preview.mkv"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par2-multi-grid-overlap-repair/00-grid64.vol0+1.par2",
+      "size": 67616,
+      "blake3": "20b78e11cb36a22d3227d755f35ddc16e0dfd28b5b499104b1505f2b76fdeec1",
+      "format": "par2",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "ffmpeg-7.1-ubuntu2404",
+          "go-fixture-bytes@go1.27.3",
+          "par2cmdline-turbo-1.4.0"
+        ],
+        "inputs": [
+          "testdata/mixed-archive/sample-preview.mkv"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par2-multi-grid-overlap-repair/01-grid96.par2",
+      "size": 1492,
+      "blake3": "58717022a1602f9b426da458790cd3e1ed5559ab08cd2b3838de56953ce650e4",
+      "format": "par2",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "ffmpeg-7.1-ubuntu2404",
+          "go-fixture-bytes@go1.27.3",
+          "par2cmdline-turbo-1.4.0"
+        ],
+        "inputs": [
+          "testdata/mixed-archive/sample-preview.mkv"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par2-multi-grid-overlap-repair/01-grid96.vol0+4.par2",
+      "size": 397748,
+      "blake3": "dd9e43ad89e14857587ee10b149be0c99e782392824d059f1cf7aeb62d19bac8",
+      "format": "par2",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "ffmpeg-7.1-ubuntu2404",
+          "go-fixture-bytes@go1.27.3",
+          "par2cmdline-turbo-1.4.0"
+        ],
+        "inputs": [
+          "testdata/mixed-archive/sample-preview.mkv"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par2-multi-grid-overlap-repair/payload.mkv",
+      "size": 5242880,
+      "blake3": "3059cbf467b1f5e17f312c5e04268d977448ef71c154538130660e349aa06338",
+      "format": "mkv",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "ffmpeg-7.1-ubuntu2404",
+          "go-fixture-bytes@go1.27.3",
           "par2cmdline-turbo-1.4.0"
         ],
         "inputs": [

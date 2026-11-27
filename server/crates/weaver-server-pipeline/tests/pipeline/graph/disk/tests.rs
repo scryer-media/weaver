@@ -243,9 +243,10 @@ fn a_read_waits_for_the_writes_of_its_range() {
     let hold = through.hold();
     let to = through.writers.test_submitter(&through.volume, 1);
     let mut leaf = Leaf::at(dir.path(), "a.bin").through(Some(&to));
-    leaf.write(LoopSite::LeafWrite, 0, b"lantern", None)
+    leaf.write(LoopSite::LeafWrite, 0, b"lantern", None, false)
         .unwrap();
-    leaf.write(LoopSite::LeafWrite, 7, b"light", None).unwrap();
+    leaf.write(LoopSite::LeafWrite, 7, b"light", None, false)
+        .unwrap();
     assert!(leaf.settled().is_some_and(|barrier| !barrier.passed()));
     hold.wait_held();
     assert!(!leaf.path().exists(), "nothing is on disk yet");
@@ -272,7 +273,7 @@ fn the_loop_reads_an_open_file_through_one_handle_until_it_closes() {
     let to = through.writers.test_submitter(&through.volume, 1);
     let reads = || through.volume.writer.loop_reads.load(Ordering::Relaxed);
     let mut leaf = Leaf::at(dir.path(), "a.bin").through(Some(&to));
-    leaf.write(LoopSite::LeafWrite, 0, b"lanternlight", None)
+    leaf.write(LoopSite::LeafWrite, 0, b"lanternlight", None, false)
         .unwrap();
     assert!(!leaf.holds_reader(), "nothing was read yet");
 
@@ -283,7 +284,7 @@ fn the_loop_reads_an_open_file_through_one_handle_until_it_closes() {
     assert_eq!(read, b"lanternlight");
     assert_eq!(reads(), 2);
 
-    leaf.close(LoopSite::LeafWrite, 12).unwrap();
+    leaf.close(LoopSite::LeafWrite, 12, false).unwrap();
     assert!(!leaf.holds_reader(), "the handle goes before the close");
     read.clear();
     leaf.read(LoopSite::LeafWrite, 0, 12, &mut read).unwrap();
@@ -291,7 +292,8 @@ fn the_loop_reads_an_open_file_through_one_handle_until_it_closes() {
     assert!(!leaf.holds_reader(), "a closed file is not held");
     assert_eq!(reads(), 3);
 
-    leaf.write(LoopSite::LeafWrite, 12, b"!", None).unwrap();
+    leaf.write(LoopSite::LeafWrite, 12, b"!", None, false)
+        .unwrap();
     read.clear();
     leaf.read(LoopSite::LeafWrite, 12, 1, &mut read).unwrap();
     assert_eq!(read, b"!");
@@ -312,9 +314,10 @@ fn the_length_of_a_file_whose_write_failed_is_an_error() {
     let hold = through.hold();
     let to = through.writers.test_submitter(&through.volume, 1);
     let mut leaf = Leaf::at(dir.path(), "a.bin").through(Some(&to));
-    leaf.write(LoopSite::LeafWrite, 0, b"lantern", None)
+    leaf.write(LoopSite::LeafWrite, 0, b"lantern", None, false)
         .unwrap();
-    leaf.write(LoopSite::LeafWrite, 7, b"light", None).unwrap();
+    leaf.write(LoopSite::LeafWrite, 7, b"light", None, false)
+        .unwrap();
     hold.wait_held();
     // The first write goes down; the second fails.
     hold.release(1);
@@ -336,9 +339,10 @@ fn a_move_follows_the_last_write_of_its_file() {
     let hold = through.hold();
     let to = through.writers.test_submitter(&through.volume, 1);
     let mut leaf = Leaf::at(dir.path(), "from.bin").through(Some(&to));
-    leaf.write(LoopSite::LeafWrite, 0, b"lantern", None)
+    leaf.write(LoopSite::LeafWrite, 0, b"lantern", None, false)
         .unwrap();
-    leaf.write(LoopSite::LeafWrite, 7, b"light", None).unwrap();
+    leaf.write(LoopSite::LeafWrite, 7, b"light", None, false)
+        .unwrap();
     leaf.intend("to.bin");
     leaf.move_on().unwrap();
     let moved = to.barrier();
@@ -799,7 +803,7 @@ fn a_released_file_is_released_again_only_after_another_operation() {
     let hold = through.hold();
     let to = through.writers.test_submitter(&through.volume, 1);
     let mut leaf = Leaf::at(dir.path(), "a.bin").through(Some(&to));
-    leaf.write(LoopSite::LeafWrite, 0, b"lantern", None)
+    leaf.write(LoopSite::LeafWrite, 0, b"lantern", None, false)
         .unwrap();
     leaf.release_handle();
     let released = to.barrier();
@@ -815,7 +819,8 @@ fn a_released_file_is_released_again_only_after_another_operation() {
         "nothing was queued behind the release"
     );
 
-    leaf.write(LoopSite::LeafWrite, 7, b"light", None).unwrap();
+    leaf.write(LoopSite::LeafWrite, 7, b"light", None, false)
+        .unwrap();
     leaf.release_handle();
     let again = to.barrier();
     assert!(
@@ -843,13 +848,14 @@ fn a_fold_never_waits_for_the_file_s_operations() {
     let hold = through.hold();
     let to = through.writers.test_submitter(&through.volume, 1);
     let mut leaf = Leaf::at(dir.path(), "a.bin").through(Some(&to));
-    leaf.write(LoopSite::LeafWrite, 0, b"lantern", None)
+    leaf.write(LoopSite::LeafWrite, 0, b"lantern", None, false)
         .unwrap();
     leaf.release_handle();
     hold.wait_held();
     hold.release(1);
     let written = to.barrier();
-    leaf.write(LoopSite::LeafWrite, 7, b"light", None).unwrap();
+    leaf.write(LoopSite::LeafWrite, 7, b"light", None, false)
+        .unwrap();
     let digest = Algorithm::Crc32.hash(b"lantern");
 
     leaf.fold_read(7, digest);

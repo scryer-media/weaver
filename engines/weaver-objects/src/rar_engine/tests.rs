@@ -334,7 +334,7 @@ fn said(emits: &[Emit]) -> Vec<Said> {
                 out.push(Said::Damaged(volume.0, range.start, range.end))
             }
             // Said beside the walk; `checksums` reads them.
-            Emit::Checksum { .. } => {}
+            Emit::Checksum { .. } | Emit::Checked { .. } => {}
             // Text for the log, which changes nothing.
             Emit::Failed(_) => {}
             other => panic!("an engine run does not say {other:?}"),
@@ -859,12 +859,13 @@ fn a_sink_that_says_stop_hears_nothing_more() {
     assert!(matches!(said[1], Said::Bytes(0, _)));
 }
 
-// Each member's checksum as the run said it, in the order it was said.
+// Each member's checksum as the run said it, in the order it was said. A
+// run's decodes all verify, so it says every one checked.
 fn checksums(emits: &[Emit]) -> Vec<(u32, u32)> {
     emits
         .iter()
         .filter_map(|emit| match emit {
-            Emit::Checksum { member, crc32 } => Some((member.0, *crc32)),
+            Emit::Checked { member, crc32 } => Some((member.0, *crc32)),
             _ => None,
         })
         .collect()
@@ -932,8 +933,13 @@ fn a_split_compressed_member_states_its_own_checksum_once_decoded() {
     assert_eq!(bytes.len() as u64, SPLIT_LZ_MEMBER_LEN);
     assert_eq!(crc32(&bytes), SPLIT_LZ_MEMBER_CRC);
     assert_eq!(checksums(&emits), vec![(0, crc32(&bytes))]);
+    // The decoder checked them: the run hashes none of them itself.
+    assert!(emits.iter().all(|emit| match emit {
+        Emit::Bytes { bytes, .. } => bytes.evidence().is_empty(),
+        _ => true,
+    }));
     let at = |wanted: fn(&Emit) -> bool| emits.iter().rposition(wanted).unwrap();
-    let stated = at(|emit| matches!(emit, Emit::Checksum { .. }));
+    let stated = at(|emit| matches!(emit, Emit::Checked { .. }));
     assert!(at(|emit| matches!(emit, Emit::Bytes { .. })) < stated);
     assert_eq!(stated + 1, at(|emit| matches!(emit, Emit::MemberClosed(_))));
 }

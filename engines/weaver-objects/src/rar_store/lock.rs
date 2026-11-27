@@ -21,7 +21,7 @@ use weaver_graph::{ByteRange, Emit, VolumeIndex, Why};
 use zeroize::Zeroizing;
 
 use super::{Candidate, Condemned, Lock, RarStore};
-use crate::crypt::Cbc;
+use crate::crypt::{Cbc, Padding};
 use crate::grid::crc32;
 use crate::kept::Kept;
 use crate::keys::{self, Keys, Tuple};
@@ -455,13 +455,22 @@ impl RarStore {
                 continue;
             };
             let entry = &mut self.entries[index];
-            // Sealed at a restart: the blocks it kept, keyed again.
-            let opened = match std::mem::replace(&mut entry.lock, Lock::Locked) {
-                Lock::Sealed(chain) if chain.fits(cipher_len, length) => {
-                    Cbc::unseal(&key.key, *chain)
+            // Sealed at a restart: the blocks it kept, keyed again, when
+            // they and the padding kept beside them fit the stream. A kept
+            // padding belongs to the chain kept beside it: a chain not used
+            // takes its padding with it, and a padding that does not fit
+            // goes whatever the lock, so a fresh cipher starts with none.
+            let fits = entry.out.padding.fits(cipher_len.saturating_sub(length));
+            let (opened, forget) = match std::mem::replace(&mut entry.lock, Lock::Locked) {
+                Lock::Sealed(chain) if fits && chain.fits(cipher_len, length) => {
+                    (Cbc::unseal(&key.key, *chain), false)
                 }
-                _ => Cbc::new(&key.key, key.iv, cipher_len, length),
+                Lock::Sealed(_) => (Cbc::new(&key.key, key.iv, cipher_len, length), true),
+                _ => (Cbc::new(&key.key, key.iv, cipher_len, length), !fits),
             };
+            if forget {
+                Arc::make_mut(&mut entry.out).padding = Padding::default();
+            }
             let Ok(cbc) = opened else {
                 return self.give_up(Emit::NeedsEngine(Why::Unsupported), out);
             };

@@ -412,14 +412,14 @@ impl NamespaceWriter {
             .map(|record| record.output_name.as_str())
     }
 
-    // The block sizes the namespace's sets fold their evidence at. Bytes its
-    // source cuts at their boundaries prove a slice as they pass, rather
-    // than be read back.
-    pub(crate) fn block_sizes(&self, tree: &Tree, node: NodeId) -> Vec<u64> {
+    // The block sizes the namespace's sets fold the member's evidence at.
+    // Bytes its source cuts at their boundaries prove a slice as they
+    // pass, rather than be read back.
+    pub(crate) fn block_sizes(&self, tree: &Tree, node: NodeId, member: MemberId) -> Vec<u64> {
         let mut sizes = Vec::new();
         for set in tree.recovery_nodes(node) {
             if let Some(recovery) = tree.recovery(set) {
-                recovery.block_sizes(&mut sizes);
+                recovery.block_sizes(member, &mut sizes);
             }
         }
         sizes
@@ -441,6 +441,9 @@ impl NamespaceWriter {
     ) -> Result<(), WriteError> {
         self.announce_absent(tree, builder, segments, (node, reading), out)?;
         let due = self.due(tree, node, reading(node));
+        for &set in &due {
+            self.feed_moved(tree, segments, node, set);
+        }
         self.repair(tree, node, &due, lender)
     }
 
@@ -1738,7 +1741,7 @@ impl NamespaceWriter {
             let mut sizes = Vec::new();
             for set in &covering {
                 if let Some(recovery) = tree.recovery(*set) {
-                    recovery.block_sizes(&mut sizes);
+                    recovery.block_sizes(member, &mut sizes);
                 }
             }
             let cuts = block_cuts(range, &mut sizes);
@@ -1780,7 +1783,7 @@ impl NamespaceWriter {
         // each set read, cut wherever the read back cut them, which a set's
         // fold cannot tell from a change. Only bytes the namespace did not
         // hold, a repair's among them, take a ruling back.
-        for set in covering {
+        for &set in &covering {
             if self
                 .acknowledging
                 .as_ref()
@@ -1788,6 +1791,30 @@ impl NamespaceWriter {
             {
                 tree.feed_proven(set, member, &self.segments);
             } else {
+                tree.feed(set, member, &self.segments);
+            }
+        }
+        for set in covering {
+            self.feed_moved(tree, segments, arrival.node, set);
+        }
+    }
+
+    // A member a set came to describe after some of its bytes arrived is
+    // said again for that set, as far as the source still keeps its
+    // checksums. A set learns what it describes as its own volumes arrive,
+    // so the namespace asks after a bind, after it feeds the set and before
+    // it rules it: the set reads back only what the source no longer
+    // vouches for.
+    // A set with nothing to ask for is only read, so its row is not marked.
+    fn feed_moved(&mut self, tree: &mut Tree, segments: &dyn Segments, node: NodeId, set: NodeId) {
+        if !tree.recovery(set).is_some_and(|recovery| recovery.moved()) {
+            return;
+        }
+        let mut unfed = Vec::new();
+        tree.with_recovery(set, |recovery, _| recovery.unfed(&mut unfed));
+        for member in unfed {
+            self.early_evidence(tree, segments, node, member);
+            if !self.segments.is_empty() {
                 tree.feed(set, member, &self.segments);
             }
         }
@@ -1944,6 +1971,7 @@ impl NamespaceWriter {
                     tree.with_recovery(set, |recovery, _| recovery.feed(member, evidence));
                 }
             }
+            self.feed_moved(tree, segments, node, set);
         }
         // A member a set renamed in its namespace wants that name now; the
         // tree's ledger places it, and the claims the name makes again,
@@ -1985,12 +2013,13 @@ impl NamespaceWriter {
                 .is_some_and(|files| files.leaves.contains_key(member));
             if let Some(length) = length.filter(|_| has_file) {
                 self.admit_file(tree, node, *member, length, 0)?;
+                let keeps = self.keeps_changes(node, *member);
                 if let Some(leaf) = self
                     .files
                     .get_mut(&node)
                     .and_then(|files| files.leaves.get_mut(member))
                 {
-                    leaf.close(LoopSite::BindSets, length)?;
+                    leaf.close(LoopSite::BindSets, length, keeps)?;
                 }
             }
         }

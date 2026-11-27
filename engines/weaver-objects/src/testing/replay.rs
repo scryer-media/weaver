@@ -263,6 +263,16 @@ pub(crate) fn restores_alike(
     (facts, live, restored)
 }
 
+// Paddings no stream could have kept, as facts could carry them: a tail
+// longer than any padding, and one marked past the bytes it holds.
+pub(crate) fn misfit_paddings() -> [crate::crypt::Padding; 2] {
+    let padding = |tail: Vec<u8>, filled: u16| -> crate::crypt::Padding {
+        let bytes = rmp_serde::to_vec(&(tail, filled, None::<()>)).expect("encodes");
+        rmp_serde::from_slice(&bytes).expect("decodes")
+    };
+    [padding(vec![0; 16], u16::MAX), padding(vec![0; 2], 1 << 2)]
+}
+
 // Whether `needle` appears anywhere in `blob`.
 pub(crate) fn contains(blob: &[u8], needle: &[u8]) -> bool {
     !needle.is_empty() && blob.windows(needle.len()).any(|window| window == needle)
