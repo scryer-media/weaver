@@ -116,13 +116,19 @@ impl TorrentService {
                     outcome.extend(self.resume_many(&ids).await);
                 }
                 QueueAction::Cancel(origin) => {
+                    // A cancel the caller asked for is never refused for a
+                    // seeding goal still to meet; one Weaver decides on is.
+                    // The cancels of one kind that follow go with it.
+                    let asked = origin.is_user();
                     let mut removals = vec![(job_id, deletes_files(origin))];
                     while let Some((job_id, QueueAction::Cancel(origin))) =
-                        actions.next_if(|(_, action)| matches!(action, QueueAction::Cancel(_)))
+                        actions.next_if(|(_, action)| {
+                            matches!(action, QueueAction::Cancel(origin) if origin.is_user() == asked)
+                        })
                     {
                         removals.push((job_id, deletes_files(origin)));
                     }
-                    outcome.extend(self.remove_many(&removals, false).await);
+                    outcome.extend(self.remove_many(&removals, asked).await);
                 }
                 QueueAction::Update(update) => {
                     let mut updates = vec![(job_id, update)];

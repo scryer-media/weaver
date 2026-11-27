@@ -91,21 +91,34 @@ async fn a_private_torrent_short_of_its_goal_is_removed_when_asked_and_kept_from
         })
         .await
         .unwrap();
-    // The queue's own cancel still keeps it while its goal is unmet.
+    use crate::jobs::handle::{CancellationOrigin, QueueAction};
+    // A cancel Weaver decides on keeps it while its goal is unmet, alone
+    // and in a batch.
+    for origin in [
+        CancellationOrigin::SemanticBad,
+        CancellationOrigin::SemanticSuperseded,
+    ] {
+        let unmet = ActionError::UnmetGoal("ratio 0.00 of 1.00".into());
+        assert_eq!(
+            rig.service.act(job_id, QueueAction::Cancel(origin)).await,
+            Err(unmet.clone())
+        );
+        let cancelled = rig
+            .service
+            .act_many(vec![(job_id, QueueAction::Cancel(origin))])
+            .await;
+        assert_eq!(cancelled.get(&job_id), Some(&Err(unmet)));
+        assert!(rig.db.get_torrent(job_id).unwrap().is_some());
+    }
+    // A cancel the caller asked for is never refused for it.
     let cancelled = rig
         .service
         .act_many(vec![(
             job_id,
-            crate::jobs::handle::QueueAction::Cancel(crate::jobs::handle::CancellationOrigin::User),
+            QueueAction::Cancel(CancellationOrigin::UserKeepingFiles),
         )])
         .await;
-    assert_eq!(
-        cancelled.get(&job_id),
-        Some(&Err(ActionError::UnmetGoal("ratio 0.00 of 1.00".into())))
-    );
-    assert!(rig.db.get_torrent(job_id).unwrap().is_some());
-    // The operator's remove is never refused for it.
-    rig.service.remove(job_id, false).await.unwrap();
+    assert_eq!(cancelled.get(&job_id), Some(&Ok(())));
     assert_eq!(rig.db.get_torrent(job_id).unwrap(), None);
     let history = rig.db.get_job_history(job_id.0).unwrap().unwrap();
     assert_eq!(history.status, "cancelled");

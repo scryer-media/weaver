@@ -37,8 +37,9 @@ pub(super) fn action_error(error: ActionError) -> async_graphql::Error {
 fn action_refusal(error: &ActionError) -> (&'static str, String) {
     let code = match error {
         ActionError::NotFound(_) => "NOT_FOUND",
-        // No torrent mutation removes under a seeding goal's gate: one that
-        // got here is refused as the queue refuses it.
+        // No removal a caller asks for is held by a seeding goal's gate;
+        // only a cancel Weaver decides on is. One that got here is refused
+        // as the queue refuses it.
         ActionError::UnmetGoal(_) => "CONFLICT",
         ActionError::Invalid(_) => "INVALID_INPUT",
         ActionError::State(message) => {
