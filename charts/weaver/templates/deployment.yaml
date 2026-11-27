@@ -110,6 +110,11 @@ spec:
                   name: {{ . }}
                   key: {{ $.Values.database.key }}
             {{- end }}
+            {{- if .Values.torrents.enabled }}
+            # Weaver listens on the port the pod and the Service expose.
+            - name: WEAVER_TORRENT_PORT
+              value: {{ .Values.torrents.port | quote }}
+            {{- end }}
             {{- range $name, $value := .Values.env }}
             - name: {{ $name }}
               value: {{ $value | quote }}

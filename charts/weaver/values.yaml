@@ -100,7 +100,8 @@ torrents:
   # <fullname>-torrent. Torrents are available without it; turn them on in
   # Weaver's settings.
   enabled: false
-  # Must equal the listen port saved in Weaver's torrent settings.
+  # Weaver's torrent listen port. While enabled, the chart sets
+  # WEAVER_TORRENT_PORT to it, which pins the port in Weaver's settings.
   port: 6881
   service:
     # LoadBalancer or NodePort.
