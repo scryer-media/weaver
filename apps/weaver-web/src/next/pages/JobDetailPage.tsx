@@ -451,7 +451,7 @@ function JobDetailContent() {
   // Posts, articles, providers, PAR2 recovery and NZB duplicate identity
   // belong to a usenet job only; every other kind of job leaves them out.
   const usenet = job !== null && (job.protocol ?? "NZB") === "NZB";
-  const { torrent, refresh: refreshTorrent } = useTorrent(jobId, isTorrent);
+  const { torrent } = useTorrent(jobId, isTorrent);
   // Asked for once the job is known to be usenet: nothing else has one.
   const [{ data: duplicateData }, refetchDuplicate] = useQuery<{
     duplicateSnapshot: DuplicateSnapshot | null;
@@ -908,7 +908,6 @@ function JobDetailContent() {
                           ? resumeJob({ id: job.id })
                           : pauseJob({ id: job.id }),
                     ).then(async () => {
-                      refreshTorrent();
                       if (
                         wasMissing &&
                         (await stillFilesMissing(client, job.id))
@@ -936,7 +935,7 @@ function JobDetailContent() {
                           : "next.torrent.unforced",
                       ),
                       () => setTorrentForced({ id: job.id, forced }),
-                    ).then(refreshTorrent);
+                    );
                   }}
                 >
                   {torrent?.forced
@@ -1306,11 +1305,7 @@ function JobDetailContent() {
         </MetricStrip>
 
         {torrent ? (
-          <TorrentDetail
-            torrent={torrent}
-            onChanged={refreshTorrent}
-            onReport={setReport}
-          />
+          <TorrentDetail torrent={torrent} onReport={setReport} />
         ) : null}
 
         {/* The stage waterfall and its wait for the first stage are the
@@ -1858,7 +1853,7 @@ function JobDetailContent() {
           setConfirm(null);
           void run(t("next.torrent.rechecking"), () =>
             recheckTorrent({ id: job.id }),
-          ).then(refreshTorrent);
+          );
         }}
         other={{
           label: t("next.torrent.move"),
@@ -1880,7 +1875,7 @@ function JobDetailContent() {
           setConfirm(null);
           void run(t("next.torrent.rechecking"), () =>
             recheckTorrent({ id: job.id }),
-          ).then(refreshTorrent);
+          );
         }}
       />
       <RecordEditor
@@ -1954,7 +1949,7 @@ function JobDetailContent() {
               kind === "move"
                 ? setTorrentLocation({ id: job.id, path: value.trim() })
                 : setTorrentCategory(job.id, value),
-          ).then(refreshTorrent);
+          );
         }}
       />
       <TorrentRemoveDialog

@@ -73,6 +73,7 @@ import {
   type PeerSort,
   type PeerSortKey,
 } from "@/next/features/torrents/peers";
+import { rereadOnChange } from "@/next/features/torrents/reread";
 import { countLabel } from "@/next/i18n/labels";
 import { testIds, torrentIds } from "@/next/testids";
 import {
@@ -109,27 +110,26 @@ const PEER_COLUMNS = {
 };
 
 /**
- * A torrent job's torrent, followed while the page shows it. Following it
- * again reads it at once, as a change that pushes nothing still shows.
+ * A torrent job's torrent, followed while the page shows it and the tab is
+ * visible: sent at once and again each time it moves, a change made from
+ * this screen included. Shown again, the tab reads it afresh.
  */
 export function useTorrent(id: number, active: boolean) {
   const { connection } = useNextData("connection");
+  const visible = usePageVisible();
   // Each push is the whole torrent as it now is, and null once it is gone.
-  const [{ data }, follow] = useSubscription<
+  const [{ data }] = useSubscription<
     { torrentUpdates: TorrentData | null },
     TorrentData | null
   >(
     {
       query: TORRENT_UPDATES_SUBSCRIPTION,
       variables: { id },
-      pause: !active || connection.isDisconnected,
+      pause: !active || !visible || connection.isDisconnected,
     },
     (_held, pushed) => pushed.torrentUpdates,
   );
-  return {
-    torrent: active ? (data ?? null) : null,
-    refresh: () => follow(),
-  };
+  return { torrent: active ? (data ?? null) : null };
 }
 
 const ACTION_KEYS = {
@@ -621,11 +621,9 @@ function TrackerSource({
 
 function TrackersBlock({
   torrent,
-  onChanged,
   onReport,
 }: {
   torrent: TorrentData;
-  onChanged: () => void;
   onReport: (message: string) => void;
 }) {
   const t = useTranslate();
@@ -649,6 +647,7 @@ function TrackersBlock({
     reannounceState.fetching ||
     dhtState.fetching;
 
+  // The torrent pushes the change; nothing is read again here.
   const settle = (
     result: { error?: TorrentActionError },
     report: (message: string) => void,
@@ -657,7 +656,6 @@ function TrackersBlock({
       report(torrentErrorText(result.error));
       return false;
     }
-    onChanged();
     return true;
   };
 
@@ -945,11 +943,9 @@ function useTorrentFilePage(
  */
 function FilesBlock({
   torrent,
-  onChanged,
   onReport,
 }: {
   torrent: TorrentData;
-  onChanged: () => void;
   onReport: (message: string) => void;
 }) {
   const t = useTranslate();
@@ -974,12 +970,12 @@ function FilesBlock({
   const pickedIndexes = [...picked].filter((index) => index < total);
   const allPicked = total > 0 && pickedIndexes.length === total;
 
+  // The torrent and its files push the change; nothing is read again here.
   const settle = (result: { error?: TorrentActionError }) => {
     if (result.error) {
       onReport(torrentErrorText(result.error));
       return false;
     }
-    onChanged();
     return true;
   };
 
@@ -1296,8 +1292,15 @@ function useUnpackedFiles(
     pause: result === null,
     requestPolicy: "network-only",
   });
+  // The read that starts with the query covers the first result; only a
+  // change from one result to another is read again.
+  const readFor = useRef(result);
   useEffect(() => {
-    if (result !== null) reread({ requestPolicy: "network-only" });
+    const before = readFor.current;
+    readFor.current = result;
+    if (rereadOnChange(before, result)) {
+      reread({ requestPolicy: "network-only" });
+    }
   }, [result, reread]);
   const first = data?.torrent?.unpacking?.files ?? null;
   const [later, setLater] = useState<{
@@ -1349,11 +1352,9 @@ function useUnpackedFiles(
 /** A torrent job's own blocks on the job's screen: its transfer, its limits, its information, how it seeds, its trackers, its peers and its files. */
 export function TorrentDetail({
   torrent,
-  onChanged,
   onReport,
 }: {
   torrent: TorrentData;
-  onChanged: () => void;
   onReport: (message: string) => void;
 }) {
   const t = useTranslate();
@@ -1372,7 +1373,6 @@ export function TorrentDetail({
         return;
       }
       setEditing(null);
-      onChanged();
     });
   };
 
@@ -1434,15 +1434,11 @@ export function TorrentDetail({
         </div>
       </DetailBlock>
 
-      <TrackersBlock
-        torrent={torrent}
-        onChanged={onChanged}
-        onReport={onReport}
-      />
+      <TrackersBlock torrent={torrent} onReport={onReport} />
 
       <PeersBlock torrent={torrent} onReport={onReport} />
 
-      <FilesBlock torrent={torrent} onChanged={onChanged} onReport={onReport} />
+      <FilesBlock torrent={torrent} onReport={onReport} />
 
       <RecordEditor
         open={editing !== null}

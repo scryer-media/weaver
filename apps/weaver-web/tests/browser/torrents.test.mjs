@@ -670,10 +670,8 @@ test("the override dialog starts from the override, and Use inherited clears onl
   await dialog
     .getByRole("button", { name: "Use inherited", exact: true })
     .click();
-  await page
-    .locator("#status")
-    .filter({ hasText: /^changed 1$/ })
-    .waitFor();
+  // The dialog closes once the change is accepted; the torrent pushes it.
+  await dialog.waitFor({ state: "detached" });
   assert.deepEqual(
     (await sent(page))
       .filter((entry) => entry.name === "SetTorrentSeeding")

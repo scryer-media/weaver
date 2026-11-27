@@ -446,9 +446,6 @@ function Seeding() {
         <div key={entry.id} aria-label={entry.seedingPolicy.levels.ratioGoal}>
           <TorrentDetail
             torrent={entry}
-            onChanged={() => {
-              status.textContent = `changed ${entry.id}`;
-            }}
             onReport={(message) => {
               status.textContent = message;
             }}
@@ -472,9 +469,9 @@ const file = (
   progress: 0,
 });
 
-/** One torrent's detail as the job page shows it: read from its subscription, and read again on each change. */
+/** One torrent's detail as the job page shows it: read from its subscription, which pushes each change. */
 function Files() {
-  const [{ data }, follow] = useSubscription<{
+  const [{ data }] = useSubscription<{
     torrentUpdates: TorrentChangesData<TorrentData>;
   }>({
     query: TORRENT_UPDATES_SUBSCRIPTION,
@@ -484,7 +481,6 @@ function Files() {
   return live ? (
     <TorrentDetail
       torrent={live}
-      onChanged={() => follow()}
       onReport={(message) => {
         status.textContent = message;
       }}
@@ -633,7 +629,6 @@ function Fixture() {
     return (
       <TorrentDetail
         torrent={named}
-        onChanged={() => {}}
         onReport={(message) => {
           status.textContent = message;
         }}
