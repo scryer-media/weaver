@@ -780,7 +780,6 @@ export const nextZh: LocaleDictionary = {
   "next.shell.docs": "文档",
   "next.shell.social": "社区",
   "next.appearance.title": "外观",
-  "next.appearance.help": "应用于连接到此 Weaver 实例的所有浏览器。",
   "next.appearance.weaver": "Weaver",
   "next.appearance.terminal": "终端",
   "next.appearance.phosphor": "荧光绿",

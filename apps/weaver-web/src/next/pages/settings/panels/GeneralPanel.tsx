@@ -479,9 +479,8 @@ export function GeneralPanel() {
     {
       id: "appearance",
       label: t("next.appearance.title"),
-      help: t("next.appearance.help"),
-      keywords: "appearance palette theme mode accent",
-      stacked: true,
+      keywords: "appearance palette theme mode accent progress colours",
+      wide: true,
       control: {
         kind: "custom",
         control: <AppearancePicker editable={Boolean(settings)} />,

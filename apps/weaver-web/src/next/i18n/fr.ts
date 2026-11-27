@@ -842,8 +842,6 @@ export const nextFr: LocaleDictionary = {
   "next.shell.docs": "Docs",
   "next.shell.social": "Communauté",
   "next.appearance.title": "Apparence",
-  "next.appearance.help":
-    "S’applique à tous les navigateurs connectés à cette instance de Weaver.",
   "next.appearance.weaver": "Weaver",
   "next.appearance.terminal": "Terminal",
   "next.appearance.phosphor": "Phosphore",

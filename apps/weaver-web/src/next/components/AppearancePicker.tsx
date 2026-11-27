@@ -180,13 +180,18 @@ export function AppearancePicker({
         compact ? "space-y-2" : "flex flex-wrap items-start gap-x-10 gap-y-5",
       )}
     >
-      {/* In Settings the progress colours sit beside these, below once the
-          width cannot hold both. */}
+      {/* In Settings the progress colours sit beside the heading and these,
+          below once the width cannot hold both. */}
       <div
         className={
           compact ? "contents" : "min-w-0 max-w-2xl flex-[1_1_34rem] space-y-3"
         }
       >
+        {!compact && (
+          <div className="text-[13.5px] font-medium tracking-[-0.005em] text-wv-fg">
+            {t("next.appearance.title")}
+          </div>
+        )}
         <div
           className={compact ? "grid" : "grid grid-cols-2 gap-2 sm:grid-cols-4"}
         >
@@ -354,10 +359,7 @@ function ProgressColors({
       aria-label={t("next.appearance.progress")}
       className="min-w-0 flex-[1_1_31rem] space-y-1.5"
     >
-      <div className="flex flex-wrap items-baseline justify-between gap-2">
-        <span className="text-xs text-wv-muted">
-          {t("next.appearance.progress")}
-        </span>
+      <div className="flex justify-end">
         <button
           type="button"
           disabled={picked.size === 0}

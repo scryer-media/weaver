@@ -830,8 +830,6 @@ export const nextJa: LocaleDictionary = {
   "next.shell.docs": "ドキュメント",
   "next.shell.social": "コミュニティ",
   "next.appearance.title": "外観",
-  "next.appearance.help":
-    "この Weaver インスタンスに接続するすべてのブラウザーに適用されます。",
   "next.appearance.weaver": "Weaver",
   "next.appearance.terminal": "ターミナル",
   "next.appearance.phosphor": "蛍光グリーン",
