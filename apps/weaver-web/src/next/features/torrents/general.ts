@@ -7,6 +7,7 @@ import {
   statedReasonText,
   type TorrentData,
 } from "../../../lib/torrents.ts";
+import { normalizeGraphqlTimestamp } from "../../../lib/job-types.ts";
 import {
   EM_DASH,
   formatDate,
@@ -28,6 +29,9 @@ const seconds = (value: number | null) =>
   value === null ? EM_DASH : formatDuration(value);
 const text = (value: string | null) =>
   value === null || value === "" ? EM_DASH : value;
+/** A `DateTime` as the views show a date. */
+const date = (value: string | null) =>
+  formatDate(normalizeGraphqlTimestamp(value));
 
 /** Why the torrent is in its state: its route's reason while the route holds it, else the reason the server states, else the server's free words. */
 export function transferNote(
@@ -36,8 +40,9 @@ export function transferNote(
 ): string | undefined {
   if (torrent.routeReason !== null)
     return routeReasonText(t, torrent.routeReason);
-  if (torrent.stated !== null) return statedReasonText(t, torrent.stated);
-  return torrent.detail ?? undefined;
+  if (torrent.stateReason !== null)
+    return statedReasonText(t, torrent.stateReason);
+  return torrent.stateDetail ?? undefined;
 }
 
 /** The Transfer section, in qBittorrent's order. */
@@ -79,7 +84,7 @@ export function transferFields(
       key: "connections",
       label: t("next.torrent.connections"),
       value: t("next.torrent.connectionsValue", {
-        count: torrent.peers,
+        count: torrent.connectedPeers,
         max: torrent.maxPeers,
       }),
     },
@@ -96,7 +101,7 @@ export function transferFields(
     {
       key: "seeds",
       label: t("next.torrent.seeds"),
-      value: total(torrent.seeds, torrent.swarmSeeds),
+      value: total(torrent.connectedSeeds, torrent.swarmSeeds),
     },
     {
       key: "downloadSpeed",
@@ -111,7 +116,7 @@ export function transferFields(
     {
       key: "peers",
       label: t("next.torrent.peers"),
-      value: total(torrent.leechers, torrent.swarmLeechers),
+      value: total(torrent.connectedLeechers, torrent.swarmLeechers),
     },
     {
       key: "wasted",
@@ -131,7 +136,7 @@ export function transferFields(
     {
       key: "lastSeenComplete",
       label: t("next.torrent.lastSeenComplete"),
-      value: formatDate(torrent.lastSeenCompleteMs),
+      value: date(torrent.lastSeenCompleteAt),
     },
   ];
 }
@@ -173,17 +178,17 @@ function allInformationFields(
     {
       key: "addedOn",
       label: t("next.torrent.addedOn"),
-      value: formatDate(torrent.addedAtMs),
+      value: date(torrent.addedAt),
     },
     {
       key: "completedOn",
       label: t("next.torrent.completedOn"),
-      value: formatDate(torrent.completedAtMs),
+      value: date(torrent.completedAt),
     },
     {
       key: "createdOn",
       label: t("next.torrent.createdOn"),
-      value: formatDate(torrent.createdAtMs),
+      value: date(torrent.metainfoCreatedAt),
     },
     {
       key: "private",
@@ -203,7 +208,7 @@ function allInformationFields(
     {
       key: "infoHashV1",
       label: t("next.torrent.infoHashV1"),
-      value: text(torrent.infohash),
+      value: text(torrent.infohashV1),
       wide: true,
     },
     {

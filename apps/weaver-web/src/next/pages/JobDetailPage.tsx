@@ -22,7 +22,7 @@ import {
   REPROCESS_JOB_MUTATION,
   RERUN_POST_PROCESSING_MUTATION,
   RESUME_JOB_MUTATION,
-  SET_TORRENT_CATEGORY_MUTATION,
+  SET_QUEUE_ITEMS_CATEGORY_MUTATION,
   SET_TORRENT_FORCED_MUTATION,
   SET_TORRENT_LOCATION_MUTATION,
 } from "@/graphql/queries";
@@ -39,7 +39,9 @@ import {
   readDownloadErrorMessage,
   saveResponseAsDownload,
 } from "@/lib/download";
+import { refusalMessage } from "@/lib/refusal";
 import {
+  normalizeGraphqlTimestamp,
   normalizeJobData,
   type GraphqlJobData,
   type JobData,
@@ -393,7 +395,28 @@ function JobDetailContent() {
   const [, setTorrentForced] = useMutation(SET_TORRENT_FORCED_MUTATION);
   const [, recheckTorrent] = useMutation(RECHECK_TORRENT_MUTATION);
   const [, setTorrentLocation] = useMutation(SET_TORRENT_LOCATION_MUTATION);
-  const [, setTorrentCategory] = useMutation(SET_TORRENT_CATEGORY_MUTATION);
+  const [, setJobsCategory] = useMutation<{
+    setQueueItemsCategory: {
+      refused: { id: number; code: string; message: string }[];
+    };
+  }>(SET_QUEUE_ITEMS_CATEGORY_MUTATION);
+  // A torrent's category is its job's: the empty string takes it out of its
+  // own, and a refusal of the one job is the failure, by its code.
+  const setTorrentCategory = async (id: number, category: string) => {
+    const result = await setJobsCategory({ target: { ids: [id] }, category });
+    const refused = result.data?.setQueueItemsCategory.refused[0];
+    if (result.error || !refused) return result;
+    return {
+      error: {
+        message: refusalMessage(t, {
+          message: refused.message,
+          graphQLErrors: [
+            { message: refused.message, extensions: { code: refused.code } },
+          ],
+        }),
+      },
+    };
+  };
   const [removingTorrent, setRemovingTorrent] = useState(false);
   // The draft of the torrent's location or category while its editor is open.
   const [torrentEdit, setTorrentEdit] = useState<{
@@ -647,7 +670,10 @@ function JobDetailContent() {
         ? // A torrent finishes when its last piece checks out and then seeds
           // for days: its own completion date, with no pipeline after it.
           t("next.job.finished", {
-            time: formatDate(torrent?.completedAtMs ?? job.completedAt),
+            time: formatDate(
+              normalizeGraphqlTimestamp(torrent?.completedAt) ??
+                job.completedAt,
+            ),
           })
         : done
           ? [
@@ -1927,10 +1953,7 @@ function JobDetailContent() {
             () =>
               kind === "move"
                 ? setTorrentLocation({ id: job.id, path: value.trim() })
-                : setTorrentCategory({
-                    id: job.id,
-                    category: value === "" ? null : value,
-                  }),
+                : setTorrentCategory(job.id, value),
           ).then(refreshTorrent);
         }}
       />
