@@ -1798,6 +1798,7 @@ const TORRENT_SETTINGS_FIELDS = `
     torrent {
       enabled
       basePort
+      basePortPinned
       announcePort
       upnp
       encryption

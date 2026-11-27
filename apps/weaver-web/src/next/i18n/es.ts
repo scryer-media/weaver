@@ -2520,6 +2520,8 @@ export const nextEs: LocaleDictionary = {
   "next.torrents.finishAllForced":
     "Un torrent forzado, o uno sin límite de compartición, comparte hasta «Detener ya».",
   "next.torrents.basePort": "Puerto base",
+  "next.torrents.basePortPinnedHelp":
+    "Fijado por {{variable}} en el entorno de weaver; cámbialo en tu despliegue.",
   "next.torrents.announcePort": "Puerto anunciado",
   "next.torrents.upnp": "UPnP",
   "next.torrents.sslEnabled": "Torrents SSL",
