@@ -131,9 +131,9 @@ torrents:
 This opens the port on the pod (TCP and UDP) and adds the Service
 `weaver-torrent`. To turn torrents off, set `env.WEAVER_TORRENTS: "0"`.
 
-Then, in Weaver's Settings, turn torrents on and set the **listen port** to
-`torrents.port`. Weaver picks a random listen port on first start, and no
-environment variable sets it.
+Weaver listens on `torrents.port`: the chart sets `WEAVER_TORRENT_PORT` to
+it, and the port cannot be changed in Settings while it is set. Then, in
+Weaver's Settings, turn torrents on.
 
 With `NodePort`, set `nodePort` and set Weaver's **announce port** to it, so
 trackers hand out the port peers can reach.
@@ -256,7 +256,7 @@ delete it. `persistence.downloads.retain: false` removes it with the release.
 | `extraVolumes`                             | `[]`                          | Passed through                                |
 | `extraVolumeMounts`                        | `[]`                          | Passed through                                |
 | `torrents.enabled`                         | `false`                       | Expose the torrent listen port                |
-| `torrents.port`                            | `6881`                        | Must equal Weaver's listen port               |
+| `torrents.port`                            | `6881`                        | Weaver's torrent listen port                  |
 | `torrents.service.type`                    | `LoadBalancer`                | `LoadBalancer` or `NodePort`                  |
 | `torrents.service.nodePort`                | `null`                        | For `NodePort`                                |
 | `torrents.service.annotations`             | `{}`                          |                                               |
