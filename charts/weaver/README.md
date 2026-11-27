@@ -118,6 +118,8 @@ To serve under a path, set `basePath: /weaver`. The chart passes it to
 
 ## Torrents
 
+Torrents are available without any chart setting. To expose the listen port:
+
 ```yaml
 torrents:
   enabled: true
@@ -126,8 +128,8 @@ torrents:
     type: LoadBalancer   # or NodePort
 ```
 
-This sets `WEAVER_TORRENTS=1`, opens the port on the pod (TCP and UDP) and
-adds the Service `weaver-torrent`.
+This opens the port on the pod (TCP and UDP) and adds the Service
+`weaver-torrent`. To turn torrents off, set `env.WEAVER_TORRENTS: "0"`.
 
 Then, in Weaver's Settings, turn torrents on and set the **listen port** to
 `torrents.port`. Weaver picks a random listen port on first start, and no
@@ -253,7 +255,7 @@ delete it. `persistence.downloads.retain: false` removes it with the release.
 | `persistence.downloads.nfs.path`           | `""`                          | For `nfs`                                     |
 | `extraVolumes`                             | `[]`                          | Passed through                                |
 | `extraVolumeMounts`                        | `[]`                          | Passed through                                |
-| `torrents.enabled`                         | `false`                       | Make torrents available                       |
+| `torrents.enabled`                         | `false`                       | Expose the torrent listen port                |
 | `torrents.port`                            | `6881`                        | Must equal Weaver's listen port               |
 | `torrents.service.type`                    | `LoadBalancer`                | `LoadBalancer` or `NodePort`                  |
 | `torrents.service.nodePort`                | `null`                        | For `NodePort`                                |

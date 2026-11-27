@@ -47,6 +47,6 @@ Delete it yourself to remove the downloads.
 
 {{- if .Values.torrents.enabled }}
 
-Torrents are available. Turn them on in Settings, and set the listen port there
-to {{ .Values.torrents.port }}, the port of {{ include "weaver.fullname" . }}-torrent.
+The torrent listen port {{ .Values.torrents.port }} is exposed by {{ include "weaver.fullname" . }}-torrent.
+Turn torrents on in Settings, and set the listen port there to {{ .Values.torrents.port }}.
 {{- end }}

@@ -1421,7 +1421,7 @@ async fn the_ssl_listener_keeps_its_port() {
     assert_eq!(h.db.load_config().unwrap().torrent.ssl_port, None);
 }
 
-// A request on a server started without `WEAVER_TORRENTS`.
+// A request on a server started with `WEAVER_TORRENTS` turned off.
 fn without_torrents(query: &str) -> async_graphql::Request {
     local_request(query).data(weaver_server_core::torrents::TorrentAvailability::UNAVAILABLE)
 }
@@ -1452,8 +1452,14 @@ async fn a_server_without_torrents_refuses_turning_them_on_and_names_the_variabl
         error_code(&refused).as_deref(),
         Some("TORRENTS_UNAVAILABLE")
     );
+    assert_eq!(
+        refused.errors[0].message,
+        weaver_server_core::torrents::TORRENTS_UNAVAILABLE
+    );
     assert!(
-        refused.errors[0].message.contains("WEAVER_TORRENTS"),
+        refused.errors[0]
+            .message
+            .contains("started with WEAVER_TORRENTS turned off; remove it or set it to 1"),
         "{}",
         refused.errors[0].message
     );

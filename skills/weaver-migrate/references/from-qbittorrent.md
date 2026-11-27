@@ -2,9 +2,10 @@
 
 ## Before anything
 
-Torrents in Weaver take two switches: the host environment variable
-`WEAVER_TORRENTS=1`, and torrents turned on in Weaver's settings. Without
-the first, Weaver has no qBittorrent API at all. Both are the operator's.
+Torrents in Weaver are available unless the host environment variable
+`WEAVER_TORRENTS` turns them off (any value but `1` or `true`), and run once
+turned on in Weaver's settings. Turned off by the variable, Weaver has no
+qBittorrent API at all. Both are the operator's.
 
 ## What carries over
 

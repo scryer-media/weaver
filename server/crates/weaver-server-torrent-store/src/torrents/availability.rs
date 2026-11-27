@@ -3,27 +3,27 @@
 
 //! Whether this run of the server has torrents at all.
 //!
-//! Torrents take two opt-ins. The first is the environment variable
-//! [`TORRENTS_ENV`], read once at start by the app and handed down as a
+//! Torrents are available unless the environment variable [`TORRENTS_ENV`]
+//! turns them off. It is read once at start by the app and handed down as a
 //! [`TorrentAvailability`]; nothing below the app reads the environment for
-//! it. The second is the saved `enabled` setting, which only counts while
-//! the first is given.
+//! it. Available, they still run only once the saved `enabled` setting turns
+//! them on: until then no session opens.
 //!
 //! Unavailable, the torrent client is never built: no session, listener,
 //! DHT, tracker or peer traffic, no port mapping and no load of the stored
-//! torrents. Their rows, settings and files stay as they are, so giving the
-//! variable later brings everything back as saved.
+//! torrents. Their rows, settings and files stay as they are, so removing
+//! the variable later brings everything back as saved.
 
-/// The environment variable that makes torrents available.
+/// The environment variable that turns torrents off for a run.
 pub const TORRENTS_ENV: &str = "WEAVER_TORRENTS";
 
 /// The refusal of turning torrents on while they are unavailable.
-pub const TORRENTS_UNAVAILABLE: &str = "torrents are not available on this server: set the environment variable WEAVER_TORRENTS=1 and restart Weaver, then turn them on";
+pub const TORRENTS_UNAVAILABLE: &str = "torrents are not available on this server: the server was started with WEAVER_TORRENTS turned off; remove it or set it to 1 and restart Weaver, then turn them on";
 
 /// The refusal of a torrent handed to a server that has none: by an upload,
 /// a watch folder, a feed or the API. It names the variable, since no switch
 /// the operator can see turns them on.
-pub const TORRENT_ADD_UNAVAILABLE: &str = "torrents are not available on this server: set the environment variable WEAVER_TORRENTS=1 and restart Weaver";
+pub const TORRENT_ADD_UNAVAILABLE: &str = "torrents are not available on this server: the server was started with WEAVER_TORRENTS turned off; remove it or set it to 1 and restart Weaver";
 
 /// Whether this run of the server has torrents at all.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -37,10 +37,10 @@ impl TorrentAvailability {
         Self(available)
     }
 
-    /// As the value of [`TORRENTS_ENV`] says: available for `1` or `true`,
-    /// unavailable unset or for anything else.
+    /// As the value of [`TORRENTS_ENV`] says: available unset or for `1`
+    /// or `true`, unavailable for anything else.
     pub fn of_env_value(value: Option<&str>) -> Self {
-        Self(matches!(value, Some("1" | "true")))
+        Self(matches!(value, None | Some("1" | "true")))
     }
 
     pub const fn available(self) -> bool {

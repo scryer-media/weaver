@@ -182,8 +182,8 @@ forwards the port), `FAILED` (the last request to the gateway for it failed,
 whether to map or to remove; its `error` says which), `REMOVED` (not mapped:
 removed on close, or closed by the gateway).
 
-`torrentPresence`: `available` false means the server was started without
-torrents (`WEAVER_TORRENTS`), and nothing torrent-related runs; `enabled`
+`torrentPresence`: `available` false means the server was started with
+`WEAVER_TORRENTS` turned off, and nothing torrent-related runs; `enabled`
 means available and turned on in settings; `jobs` means a torrent job
 exists; `running` means one is not paused or stopped; `windingDown` means
 torrents are off and the running ones are let finish.

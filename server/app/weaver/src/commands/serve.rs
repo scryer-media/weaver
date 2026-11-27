@@ -219,9 +219,9 @@ pub(crate) async fn run(
         handle.note_server_probe_latency(server_id, latency);
     }
 
-    // Whether this run has torrents at all: the first of their two opt-ins,
-    // read here once and handed down. Nothing below reads the environment
-    // for it.
+    // Whether this run has torrents at all: yes unless the variable turns
+    // them off, read here once and handed down. Nothing below reads the
+    // environment for it.
     let torrent_availability = weaver_server_core::torrents::TorrentAvailability::of_env_value(
         std::env::var(weaver_server_core::torrents::TORRENTS_ENV)
             .ok()
@@ -377,7 +377,7 @@ pub(crate) async fn run(
     if !torrent_availability.available() {
         info!(
             variable = weaver_server_core::torrents::TORRENTS_ENV,
-            "torrents are not available in this run; set the variable to 1 to make them available"
+            "torrents are turned off in this run; remove the variable or set it to 1 to make them available"
         );
     }
     let torrents = torrent_availability

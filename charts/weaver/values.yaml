@@ -94,9 +94,11 @@ persistence:
 extraVolumes: []
 extraVolumeMounts: []
 
+# To turn torrents off, set env: { WEAVER_TORRENTS: "0" }.
 torrents:
-  # Makes torrents available (WEAVER_TORRENTS=1). Turn them on in Weaver's
-  # settings afterwards.
+  # Exposes the torrent listen port: TCP and UDP on the pod, and the Service
+  # <fullname>-torrent. Torrents are available without it; turn them on in
+  # Weaver's settings.
   enabled: false
   # Must equal the listen port saved in Weaver's torrent settings.
   port: 6881

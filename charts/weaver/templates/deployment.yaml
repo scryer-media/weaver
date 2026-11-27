@@ -87,10 +87,6 @@ spec:
             # The chart, not Weaver, replaces the image.
             - name: WEAVER_DISABLE_SELF_UPGRADE
               value: "1"
-            {{- if .Values.torrents.enabled }}
-            - name: WEAVER_TORRENTS
-              value: "1"
-            {{- end }}
             {{- with .Values.encryptionKey.existingSecret }}
             - name: WEAVER_ENCRYPTION_KEY
               valueFrom:

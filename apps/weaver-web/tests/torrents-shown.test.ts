@@ -149,7 +149,8 @@ test("torrent-only things show only once torrents are known to be on", () => {
   );
 });
 
-// A server started without WEAVER_TORRENTS: the third state, apart from off.
+// A server started with WEAVER_TORRENTS turned off: the third state, apart
+// from off.
 const unavailable = (enabled: boolean, jobs: boolean): TorrentPresence => ({
   ...presence(enabled, jobs),
   available: false,

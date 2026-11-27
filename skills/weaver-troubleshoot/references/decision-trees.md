@@ -172,8 +172,8 @@ decides.
      (.detail // "")[0:120]] | @tsv' tnet.json
    ```
 
-   - `available` false → the server runs without torrents
-     (`WEAVER_TORRENTS`). Report; the operator decides.
+   - `available` false → the server was started with `WEAVER_TORRENTS`
+     turned off. Report; the operator decides.
    - `enabled` false → torrents are off in settings.
    - A route `open` false → its `reason` (`codes.md`) is the cause.
 2. The torrent:
