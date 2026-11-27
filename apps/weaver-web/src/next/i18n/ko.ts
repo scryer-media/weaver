@@ -810,7 +810,6 @@ export const nextKo: LocaleDictionary = {
   "next.shell.docs": "문서",
   "next.shell.social": "커뮤니티",
   "next.appearance.title": "화면 설정",
-  "next.appearance.instanceWide": "인스턴스 전체",
   "next.appearance.help":
     "이 Weaver 인스턴스에 연결된 모든 브라우저에 적용됩니다.",
   "next.appearance.weaver": "Weaver",

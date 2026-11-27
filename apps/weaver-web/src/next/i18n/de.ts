@@ -856,7 +856,6 @@ export const nextDe: LocaleDictionary = {
   "next.shell.docs": "Doku",
   "next.shell.social": "Community",
   "next.appearance.title": "Darstellung",
-  "next.appearance.instanceWide": "Instanzweit",
   "next.appearance.help":
     "Gilt für alle Browser, die mit dieser Weaver-Instanz verbunden sind.",
   "next.appearance.weaver": "Weaver",

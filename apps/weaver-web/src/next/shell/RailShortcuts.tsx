@@ -267,17 +267,12 @@ export const RailShortcuts = memo(function RailShortcuts({
             "absolute inset-x-2.5 bottom-full z-30 max-h-[calc(100dvh-6rem)] overflow-y-auto overscroll-contain p-1.5 outline-none",
           )}
         >
-          <div className="mb-1.5 flex flex-wrap items-baseline justify-between gap-x-2 border-b border-wv-hairline px-1.5 pt-0.5 pb-1.5">
-            <h2
-              id={`${themeId}-title`}
-              className="text-xs font-semibold text-wv-fg"
-            >
-              {t("next.appearance.title")}
-            </h2>
-            <span className="text-[10.5px] text-wv-muted">
-              {t("next.appearance.instanceWide")}
-            </span>
-          </div>
+          <h2
+            id={`${themeId}-title`}
+            className="mb-1.5 border-b border-wv-hairline px-1.5 pt-0.5 pb-1.5 text-xs font-semibold text-wv-fg"
+          >
+            {t("next.appearance.title")}
+          </h2>
           <RailAppearanceOptions />
         </div>
       ) : null}
