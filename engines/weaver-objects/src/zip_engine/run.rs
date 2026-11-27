@@ -187,12 +187,11 @@ impl Walk<'_, '_> {
         })?;
         self.open = Some(member);
         let encrypted = file.encrypted();
-        if shape == Shape::File && !encrypted {
-            self.say(Emit::Checksum {
-                member,
-                crc32: file.crc32(),
-            })?;
-        }
+        // The zip library checks a plain member's bytes against the CRC32
+        // its directory states as they are read, and fails the read that
+        // reaches their end on a mismatch: a member read whole is said
+        // checked, before its close, and its own check hashes nothing.
+        let checked = (shape == Shape::File && !encrypted).then(|| file.crc32());
         let out = Out {
             sink: &mut *self.sink,
             member,
@@ -208,6 +207,9 @@ impl Walk<'_, '_> {
         }
         copied.map_err(|error| Some((error.to_string(), verdict::zip_read(&error, encrypted))))?;
         self.open = None;
+        if let Some(crc32) = checked {
+            self.say(Emit::Checked { member, crc32 })?;
+        }
         self.say(Emit::MemberClosed(member))?;
         Ok(())
     }
