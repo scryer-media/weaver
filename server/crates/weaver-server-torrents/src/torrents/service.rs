@@ -390,12 +390,18 @@ impl TorrentService {
     ) -> Result<Self, String> {
         let routes = NetworkRoutes::new(Arc::clone(proxies), ROUTE_TIMEOUT);
         let sessions = Sessions::new(Arc::new(routes), SessionEnv::of(config), db.clone());
+        // An e2e run may move the wall clock on by an offset; otherwise the
+        // system clock.
+        let clock: Arc<dyn Clock> = match weaver_server_base::e2e_clock::torrent_clock() {
+            Some(offset) => Arc::new(offset),
+            None => Arc::new(SystemClock),
+        };
         let service = Self::new(
             db,
             sessions,
             TorrentSettings::of(config),
             JobEnv::of_pipeline(pipeline, writers, buffers),
-            Arc::new(SystemClock),
+            clock,
         );
         service.wire_to(queue);
         service.park_crashed(crashed);

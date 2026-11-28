@@ -210,6 +210,37 @@ async fn the_clock_alone_moves_only_one_torrents_follower() {
     seeded.rig.service.stop().await;
 }
 
+// A wall clock moved on far past the tick's span, as an e2e offset moves
+// it, credits the whole jump to the seeding time, and a seed-time goal the
+// jump passes reads as met.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_clock_jump_while_seeding_counts_toward_the_seed_time_goal() {
+    let seeded = seeded().await;
+    seeded
+        .rig
+        .service
+        .set_policy_override(
+            seeded.job_id,
+            Some(SeedingPolicy {
+                seed_time_counting: Default::default(),
+                ratio_goal: Leaf::Off,
+                seed_time_goal_minutes: Leaf::Set(60),
+                inactive_goal_minutes: Leaf::Off,
+                mode: Leaf::Set(SeedingGoalMode::Any),
+                action: Leaf::Set(SeedingAction::Stop),
+            }),
+        )
+        .await
+        .unwrap();
+    let before = seeded.view().await;
+    assert!(!before.seeding_goal_met, "{:?}", before.seeding_goals);
+    seeded.advance(60 * 60 * 1000);
+    let after = seeded.view().await;
+    assert_eq!(after.seeding_seconds, before.seeding_seconds + 60 * 60);
+    assert!(after.seeding_goal_met, "{:?}", after.seeding_goals);
+    seeded.rig.service.stop().await;
+}
+
 // A follower hears a tracker's answer as it lands, with nothing in the queue
 // to say so: the rig has no queue, and the answer moves the torrent's row.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
