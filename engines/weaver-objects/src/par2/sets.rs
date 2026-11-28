@@ -56,6 +56,10 @@ pub(super) struct SetState {
     // The described files by the hash of their front, folded with `whole`:
     // what a member's front digest finds its file by.
     fronts: BTreeMap<Front, Vec<FileId>>,
+    // The described files by their name in ASCII lower case, each with its
+    // length, in file order, folded with `whole`: what a member's posted
+    // name finds its file by, in either case.
+    names: BTreeMap<Box<str>, Vec<(FileId, u64)>>,
     // Recovery packets by exponent: the first copy found is the one kept.
     pub(super) recovery: BTreeMap<u32, Location>,
     // Which member each described file is bound to: by its front, its
@@ -81,6 +85,7 @@ impl SetState {
             whole: BTreeMap::new(),
             alike: BTreeMap::new(),
             fronts: BTreeMap::new(),
+            names: BTreeMap::new(),
             recovery: BTreeMap::new(),
             members: BTreeMap::new(),
             unnamed: Vec::new(),
@@ -110,6 +115,7 @@ impl SetState {
         self.whole = whole_of(self.index.as_ref());
         self.alike = alike_of(self.index.as_ref());
         self.fronts = fronts_of(self.index.as_ref());
+        self.names = names_of(self.index.as_ref());
         self.index_changed();
     }
 
@@ -142,6 +148,7 @@ impl SetState {
             whole: whole_of(index.as_ref()),
             alike: alike_of(index.as_ref()),
             fronts: fronts_of(index.as_ref()),
+            names: names_of(index.as_ref()),
             index,
             packets,
             hashes,
@@ -185,6 +192,30 @@ impl SetState {
     // The described files whose front is `front`, in file order.
     pub(super) fn fronted(&self, front: &Front) -> &[FileId] {
         self.fronts.get(front).map_or(&[], Vec::as_slice)
+    }
+
+    // The described files whose name is `name` in ASCII lower case, each
+    // with its length, in file order.
+    pub(super) fn named(&self, name: &str) -> &[(FileId, u64)] {
+        self.names
+            .get(name.to_ascii_lowercase().as_str())
+            .map_or(&[], Vec::as_slice)
+    }
+
+    // A set over `index` as though its packets had built it.
+    #[cfg(test)]
+    pub(super) fn indexed(index: Par2FileSet) -> Self {
+        let index = Some(index);
+        let mut state = Self {
+            whole: whole_of(index.as_ref()),
+            alike: alike_of(index.as_ref()),
+            fronts: fronts_of(index.as_ref()),
+            names: names_of(index.as_ref()),
+            index,
+            ..Self::new((VolumeIndex(0), 0))
+        };
+        state.index_changed();
+        state
     }
 
     pub(super) fn members(&self) -> &BTreeMap<FileId, MemberId> {
@@ -537,6 +568,22 @@ fn fronts_of(index: Option<&Par2FileSet>) -> BTreeMap<Front, Vec<FileId>> {
     fronts
 }
 
+// ASCII lower case is the equivalence `eq_ignore_ascii_case` tests, so one
+// bucket holds every description a posted name matches in either case.
+fn names_of(index: Option<&Par2FileSet>) -> BTreeMap<Box<str>, Vec<(FileId, u64)>> {
+    let mut names: BTreeMap<Box<str>, Vec<(FileId, u64)>> = BTreeMap::new();
+    for description in index.into_iter().flat_map(|index| index.files.values()) {
+        names
+            .entry(description.filename.to_ascii_lowercase().into_boxed_str())
+            .or_default()
+            .push((description.file_id, description.length));
+    }
+    for files in names.values_mut() {
+        files.sort();
+    }
+    names
+}
+
 // Admit declared geometry before anything is built on it.
 fn validate_par2_geometry(set: &Par2FileSet, output_limit: u64) -> par2_rs::Result<()> {
     if set.slice_size == 0 {
@@ -578,5 +625,96 @@ fn validate_par2_geometry(set: &Par2FileSet, output_limit: u64) -> par2_rs::Resu
 fn par2_resource_error(reason: &str) -> par2_rs::Par2Error {
     par2_rs::Par2Error::ResourceLimitExceeded {
         reason: format!("WEAVER_RESOURCE_LIMIT[par2_metadata]: {reason}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use par2_rs::{Packet, parse_packet};
+    use weaver_graph::{Object, ObjectId, Recovery};
+
+    use super::super::Par2;
+    use super::super::facts::par2;
+    use super::{SetState, names_of};
+    use crate::testing::{Job, par2_set, payload};
+
+    const OWN: ObjectId = ObjectId(7);
+
+    // Every metadata packet of a recovery file, its main packet first and
+    // its descriptions after it, one by one.
+    fn metadata(bytes: &[u8]) -> Vec<Packet> {
+        let mut packets = Vec::new();
+        let mut at = 0;
+        while at < bytes.len() {
+            let (packet, length) = parse_packet(&bytes[at..], at as u64).expect("a packet");
+            at += length;
+            if !matches!(packet, Packet::RecoverySlice(_) | Packet::Unknown { .. }) {
+                packets.push(packet);
+            }
+        }
+        packets.sort_by_key(|packet| match packet {
+            Packet::Main(_) => 0,
+            Packet::FileDescription(_) => 1,
+            _ => 2,
+        });
+        packets
+    }
+
+    // The name index is built where the index is, from it alone: a later
+    // description adds its name, and an index that no longer builds
+    // leaves none.
+    #[test]
+    fn the_name_index_follows_the_index() {
+        let (a, b) = (payload(1, 2048), payload(2, 1024));
+        let files = par2_set("set", &[("Alpha.bin", &a), ("beta.BIN", &b)], 512, 1, 1);
+        let packets = metadata(&files[0].1);
+        let mut state = SetState::new((weaver_graph::VolumeIndex(0), 0));
+        let mut named = Vec::new();
+        for (at, packet) in packets.into_iter().enumerate() {
+            assert!(state.take_metadata([at as u8; 16], packet));
+            state.rebuild(u64::MAX);
+            assert_eq!(state.names, names_of(state.index.as_ref()), "packet {at}");
+            named.push(state.names.len());
+        }
+        assert_eq!(named.first(), Some(&0), "{named:?}");
+        assert!(named.contains(&1), "{named:?}");
+        assert_eq!(named.last(), Some(&2), "{named:?}");
+        assert!(state.usable().is_some());
+        let lengths = |name: &str| {
+            state
+                .named(name)
+                .iter()
+                .map(|(_, length)| *length)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(lengths("ALPHA.BIN"), vec![2048]);
+        assert_eq!(lengths("beta.bin"), vec![1024]);
+
+        // A slice larger than the output budget: the index no longer builds.
+        state.rebuild(1);
+        assert!(state.index.is_none());
+        assert!(state.names.is_empty());
+        assert!(state.named("alpha.bin").is_empty());
+    }
+
+    // A checkpoint carries no name index: the restored set builds it again
+    // from its packets, alike.
+    #[test]
+    fn a_restored_set_builds_the_same_name_index() {
+        let (a, b) = (payload(3, 2048), payload(4, 1024));
+        let mut job = Job::new(Par2::new(OWN), OWN);
+        for (name, bytes) in par2_set("set", &[("Alpha.bin", &a), ("beta.BIN", &b)], 512, 1, 1) {
+            job.volume(&name, &bytes, 700, false);
+        }
+        let member = job.member("ALPHA.BIN", &a);
+        job.object.bind(&mut job.namespace, &mut Vec::new());
+        assert!(job.object.covers(member));
+        let restored = par2(&job.object.facts()).expect("restores");
+        assert_eq!(restored.facts(), job.object.facts());
+        assert_eq!(restored.sets.len(), job.object.sets.len());
+        for (key, state) in &job.object.sets {
+            assert_eq!(state.names.len(), 2);
+            assert_eq!(restored.sets[key].names, state.names);
+        }
     }
 }

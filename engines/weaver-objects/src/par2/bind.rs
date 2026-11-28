@@ -23,7 +23,9 @@ use std::cell::Cell;
 use std::cell::OnceCell;
 use std::collections::{BTreeMap, BTreeSet};
 
-use par2_rs::{FileDescription, FileId, Par2FileSet};
+#[cfg(test)]
+use par2_rs::FileDescription;
+use par2_rs::{FileId, Par2FileSet};
 use weaver_graph::{Member, MemberId, Namespace, ObjectId};
 
 use super::catalogue::Catalogue;
@@ -358,18 +360,7 @@ fn match_member(state: &SetState, candidate: &Candidate<'_>) -> Option<(FileId, 
         }
         ContentMatch::Inconclusive => {}
     }
-    let mut matches = described(index, |description| description.filename == candidate.name);
-    if matches.is_empty() {
-        // Posted subjects can change case without changing file identity.
-        // Only a unique folded match is usable; length must not resolve a
-        // collision between distinct case-sensitive recovery names.
-        matches = described(index, |description| {
-            description.filename.eq_ignore_ascii_case(candidate.name)
-        });
-        if matches.len() > 1 {
-            return None;
-        }
-    }
+    let mut matches = named(state, index, candidate.name)?;
     // Two names, two descriptions: the posted name of a swapped pair answers
     // to the partner's description. Length breaks that tie whenever the pair
     // differ in it. Only a tie is broken this way: a lone name match keeps
@@ -422,6 +413,45 @@ fn by_content(state: &SetState, index: &Par2FileSet, candidate: &Candidate<'_>) 
     }
 }
 
+// The files the set describes under `name`, each with its length, in file
+// order: those named exactly, or else those named so in another ASCII case.
+// None when more than one is named so in another case.
+fn named(state: &SetState, index: &Par2FileSet, name: &str) -> Option<Vec<(FileId, u64)>> {
+    let folded = state.named(name);
+    let exact: Vec<(FileId, u64)> = folded
+        .iter()
+        .copied()
+        .filter(|(file, _)| {
+            index
+                .file_description(file)
+                .is_some_and(|description| description.filename == name)
+        })
+        .collect();
+    if !exact.is_empty() {
+        return Some(exact);
+    }
+    // Posted subjects can change case without changing file identity.
+    // Only a unique folded match is usable; length must not resolve a
+    // collision between distinct case-sensitive recovery names.
+    (folded.len() <= 1).then(|| folded.to_vec())
+}
+
+// What `named` answered before the name index: every description scanned.
+#[cfg(test)]
+fn named_by_scan(index: &Par2FileSet, name: &str) -> Option<Vec<(FileId, u64)>> {
+    let mut matches = described(index, |description| description.filename == name);
+    if matches.is_empty() {
+        matches = described(index, |description| {
+            description.filename.eq_ignore_ascii_case(name)
+        });
+        if matches.len() > 1 {
+            return None;
+        }
+    }
+    Some(matches)
+}
+
+#[cfg(test)]
 fn described(index: &Par2FileSet, test: impl Fn(&FileDescription) -> bool) -> Vec<(FileId, u64)> {
     let mut found: Vec<_> = index
         .files
@@ -445,9 +475,14 @@ fn is_split_fragment_of(candidate_name: &str, described_name: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::{BTreeMap, BTreeSet, HashMap};
+
+    use par2_rs::{FileDescription, FileId, Par2FileSet, RecoverySetId};
     use weaver_graph::{MemberId, ObjectId, Provenance, Recovery};
 
     use super::super::Par2;
+    use super::super::sets::SetState;
+    use super::{named, named_by_scan};
     use crate::testing::{Job, par2_set, payload};
 
     const OWN: ObjectId = ObjectId(7);
@@ -514,5 +549,148 @@ mod tests {
         job.arrive(member, 0, &a, Provenance::Repaired);
         assert_eq!(bind(&mut job), (3, Some("a.bin".to_owned())));
         assert_eq!(bind(&mut job), (3, Some("a.bin".to_owned())));
+    }
+
+    // An index describing `files`, each its id byte, name and length.
+    fn index(files: &[(u8, &str, u64)]) -> Par2FileSet {
+        let files: HashMap<FileId, FileDescription> = files
+            .iter()
+            .map(|&(id, name, length)| {
+                let file_id = FileId::from_bytes([id; 16]);
+                let description = FileDescription {
+                    file_id,
+                    hash_full: [id; 16],
+                    hash_16k: [id; 16],
+                    length,
+                    par2_name: name.to_owned(),
+                    filename: name.to_owned(),
+                };
+                (file_id, description)
+            })
+            .collect();
+        Par2FileSet {
+            recovery_set_id: RecoverySetId::from_bytes([9; 16]),
+            slice_size: 512,
+            recovery_file_ids: files.keys().copied().collect(),
+            non_recovery_file_ids: Vec::new(),
+            files,
+            slice_checksums: HashMap::new(),
+            recovery_slices: BTreeMap::new(),
+            creator: None,
+            unicode_names: Default::default(),
+        }
+    }
+
+    // What `named` found, each file by its id byte; none for a refusal.
+    type Found = Option<Vec<(u8, u64)>>;
+
+    fn ids(found: Option<Vec<(FileId, u64)>>) -> Found {
+        found.map(|found| {
+            found
+                .into_iter()
+                .map(|(file, length)| (file.as_bytes()[0], length))
+                .collect()
+        })
+    }
+
+    // The name index answers every posted name as scanning every
+    // description did: the same files, in the same order, and the same
+    // refusals.
+    #[test]
+    fn the_name_index_answers_as_the_scan_did() {
+        let index = index(&[
+            (1, "movie.mkv", 100),
+            (2, "dup.bin", 60),
+            (3, "dup.bin", 50),
+            (4, "same.bin", 70),
+            (5, "same.bin", 70),
+            (6, "Case.TXT", 10),
+            (7, "Fold.nfo", 5),
+            (8, "fold.NFO", 6),
+            (9, "Exact.srt", 3),
+            (10, "exact.SRT", 4),
+            (11, "\u{c9}t\u{e9}.bin", 8),
+        ]);
+        let state = SetState::indexed(index.clone());
+        assert!(state.usable().is_some());
+        let cases: [(&str, Found); 9] = [
+            // Exact, unique.
+            ("movie.mkv", Some(vec![(1, 100)])),
+            // Exact, two descriptions of one name, lengths apart.
+            ("dup.bin", Some(vec![(2, 60), (3, 50)])),
+            // Exact, two descriptions of one name and length.
+            ("same.bin", Some(vec![(4, 70), (5, 70)])),
+            // Another case, unique.
+            ("case.txt", Some(vec![(6, 10)])),
+            // Two descriptions apart only in case, posted in a third.
+            ("FOLD.Nfo", None),
+            // Exact beside another apart only in case: exact wins.
+            ("Exact.srt", Some(vec![(9, 3)])),
+            // Folding is ASCII only: 'É' is not 'é'.
+            ("\u{e9}t\u{e9}.bin", Some(vec![])),
+            // ASCII letters of a non-ASCII name still fold.
+            ("\u{c9}T\u{e9}.BIN", Some(vec![(11, 8)])),
+            // Nothing of the name.
+            ("nothing.here", Some(vec![])),
+        ];
+        for (name, expected) in cases {
+            let scanned = named_by_scan(&index, name);
+            assert_eq!(ids(scanned.clone()), expected, "scan, {name}");
+            assert_eq!(named(&state, &index, name), scanned, "index, {name}");
+        }
+    }
+
+    // Seeded names over a small alphabet in random case, so exact, folded,
+    // colliding and missing names all occur: the index answers each as the
+    // scan did.
+    #[test]
+    fn the_name_index_answers_seeded_names_as_the_scan_did() {
+        let mut state = 0x2545_f491_4f6c_dd1d_u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        // One to three of 'a', 'b' and 'é', each in either case.
+        fn name(next: &mut dyn FnMut() -> u64) -> String {
+            let length = 1 + next() % 3;
+            (0..length)
+                .map(|_| {
+                    let [lower, upper] =
+                        [['a', 'A'], ['b', 'B'], ['\u{e9}', '\u{c9}']][(next() % 3) as usize];
+                    if next().is_multiple_of(2) {
+                        lower
+                    } else {
+                        upper
+                    }
+                })
+                .collect()
+        }
+        let described: Vec<(u8, String, u64)> = (1..=60u8)
+            .map(|id| (id, name(&mut next), next() % 4))
+            .collect();
+        let files: Vec<(u8, &str, u64)> = described
+            .iter()
+            .map(|(id, name, length)| (*id, name.as_str(), *length))
+            .collect();
+        let index = index(&files);
+        let set = SetState::indexed(index.clone());
+        let mut outcomes = BTreeSet::new();
+        for _ in 0..400 {
+            let posted = name(&mut next);
+            let scanned = named_by_scan(&index, &posted);
+            outcomes.insert(scanned.as_ref().map(Vec::len));
+            assert_eq!(named(&set, &index, &posted), scanned, "{posted}");
+        }
+        assert!(outcomes.contains(&None), "{outcomes:?}");
+        assert!(outcomes.contains(&Some(0)), "{outcomes:?}");
+        assert!(outcomes.contains(&Some(1)), "{outcomes:?}");
+        assert!(
+            outcomes
+                .iter()
+                .any(|count| count.is_some_and(|count| count > 1)),
+            "{outcomes:?}"
+        );
     }
 }
