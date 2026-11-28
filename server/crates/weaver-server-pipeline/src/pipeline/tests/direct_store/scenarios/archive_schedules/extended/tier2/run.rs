@@ -187,7 +187,7 @@ async fn deliver(pipeline: &mut Pipeline, turns: &mut Turns, post: &Post, file: 
         };
         let raw = super::post::on_the_wire(&body);
         let mut decoder = weaver_nntp::fused_yenc::FusedYencArticleDecoder::new();
-        decoder.set_checkpoint_plan(checkpoint_plan(pipeline, job));
+        decoder.set_checkpoint_plan(checkpoint_plan(pipeline, segment.file_id));
         let mut input = bytes::BytesMut::from(raw.as_slice());
         let source = || SegmentSource {
             servers: PoolServers::stamped(
