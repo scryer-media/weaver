@@ -16,6 +16,7 @@ use std::io;
 use std::sync::Arc;
 
 use crate::deliver::Emit;
+use crate::member::MemberId;
 use crate::seek::Seek;
 use crate::volume::{ByteRange, VolumeIndex};
 
@@ -276,5 +277,13 @@ pub trait Engine {
     // again at this. `None` where every refusal says, or nothing is wider.
     fn widest(&self) -> Option<u64> {
         None
+    }
+
+    // Whether `member` of the object's namespace comes from a run. Every
+    // member of an engine does. An object that places some members itself
+    // and runs for the rest says which: only those a run makes are a run's
+    // to retract, and the others are the object's, as a store's members are.
+    fn makes(&self, _member: MemberId) -> bool {
+        true
     }
 }

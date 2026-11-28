@@ -150,6 +150,7 @@ impl GraphJob {
             one_turn: false,
             moved: 0,
             indexes_kept: None,
+            coming_kept: Default::default(),
         };
         for (node, index) in &snapshot.passwords {
             job.offer_again(*node, *index)?;

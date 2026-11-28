@@ -349,11 +349,13 @@ async fn a_broken_rar4_in_a_zip_in_an_outer_rar_with_whole_bytes_is_withheld_as_
             assert!(
                 !failed.is_empty()
                     && failed.iter().all(|line| {
-                        line.contains("kind=rar_engine")
+                        // Not solid: the store keeps the set, and its run
+                        // makes the book.
+                        line.contains("kind=rar_store")
                             && line.contains("archive=tn60025.rar")
                             && line.contains("error=")
                     }),
-                "{case}: the engine's error is logged under its archive: {failed:?}"
+                "{case}: the run's error is logged under its archive: {failed:?}"
             );
         }
     }

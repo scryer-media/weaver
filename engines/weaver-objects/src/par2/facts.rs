@@ -362,12 +362,11 @@ pub(super) fn par2(facts: &Facts) -> Result<Par2, RestoreError> {
         let mut state =
             SetState::restored(set.first_seen, set.packets, set.hashes, kept.output_limit);
         state.recovery = set.recovery;
-        state.bind(
+        state.restore_members(
             set.members
                 .into_iter()
                 .map(|(file, member)| (FileId::from_bytes(file), member))
                 .collect(),
-            &[],
         );
         state.last = set.last;
         par2.file_set(set.key, state);

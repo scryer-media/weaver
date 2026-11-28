@@ -17,6 +17,7 @@ mod pipeline {
                 harness, rar_fixtures as rar, sfv, stream_fixtures as streams, zip,
             };
             mod classic_rar_crypt;
+            mod covered_revs;
             mod furniture;
             mod header_names;
             mod names_at_delivery;

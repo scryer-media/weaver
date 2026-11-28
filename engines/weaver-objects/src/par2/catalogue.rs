@@ -11,7 +11,7 @@
 use std::collections::BTreeMap;
 use std::hash::{BuildHasher, Hash, Hasher, RandomState};
 
-use par2_rs::Par2FileSet;
+use par2_rs::{FileDescription, FileId, Par2FileSet};
 use weaver_graph::VolumeIndex;
 
 use super::sets::{Front, Length};
@@ -40,22 +40,17 @@ pub(super) struct Catalogue {
     // chosen to crowd one entry; a set a hash finds is still asked whether
     // the name is one it describes.
     hasher: RandomState,
+    // Whether a set was filed or unfiled, or the catalogue cleared, since
+    // binding last asked: a posting may then answer to other sets.
+    changed: bool,
 }
 
 impl Catalogue {
     pub(super) fn file(&mut self, place: Place, index: &Par2FileSet) {
+        self.changed = true;
         self.usable += 1;
         for description in index.files.values() {
-            let front = Front::described(description.length, description.hash_16k);
-            let count = self.fronts.entry((front, place)).or_default();
-            *count += 1;
-            if *count == 1 {
-                let sets = self.sharing.entry(front).or_default();
-                *sets += 1;
-                self.shared += usize::from(*sets == 2);
-            }
-            let name = self.folded(&description.filename);
-            *self.names.entry((name, place)).or_default() += 1;
+            self.file_description(place, description);
         }
         for description in index
             .recovery_file_ids
@@ -66,8 +61,31 @@ impl Catalogue {
         }
     }
 
+    // A filed set came to describe `files` besides, none of them one it
+    // protects: as unfiling it and filing it again, at their cost alone.
+    pub(super) fn describe(&mut self, place: Place, index: &Par2FileSet, files: &[FileId]) {
+        self.changed = true;
+        for description in files.iter().filter_map(|file| index.file_description(file)) {
+            self.file_description(place, description);
+        }
+    }
+
+    fn file_description(&mut self, place: Place, description: &FileDescription) {
+        let front = Front::described(description.length, description.hash_16k);
+        let count = self.fronts.entry((front, place)).or_default();
+        *count += 1;
+        if *count == 1 {
+            let sets = self.sharing.entry(front).or_default();
+            *sets += 1;
+            self.shared += usize::from(*sets == 2);
+        }
+        let name = self.folded(&description.filename);
+        *self.names.entry((name, place)).or_default() += 1;
+    }
+
     pub(super) fn unfile(&mut self, place: Place, index: &Par2FileSet) {
         debug_assert!(self.usable > 0);
+        self.changed = true;
         self.usable = self.usable.saturating_sub(1);
         for description in index.files.values() {
             let front = Front::described(description.length, description.hash_16k);
@@ -93,12 +111,19 @@ impl Catalogue {
     }
 
     pub(super) fn clear(&mut self) {
+        self.changed = true;
         self.usable = 0;
         self.fronts.clear();
         self.sharing.clear();
         self.shared = 0;
         self.names.clear();
         self.lengths.clear();
+    }
+
+    // Whether a set was filed or unfiled, or the catalogue cleared, since
+    // this was last asked.
+    pub(super) fn take_changed(&mut self) -> bool {
+        std::mem::take(&mut self.changed)
     }
 
     // Whether two usable sets describe a file of one front.

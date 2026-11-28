@@ -8,7 +8,7 @@
 use weaver_graph::recovery::RepairOutcome;
 
 use super::harness::{ARTICLE, Post, Scenario, par2_set, par2_volumes, payload, run};
-use super::sfv::{crc, listing};
+use super::sfv::{assert_twin, assert_twin_but_text, crc, listing};
 use crate::jobs::model::JobStatus;
 
 // Two tracks under one PAR2 set of `blocks` recovery blocks, and a text
@@ -239,14 +239,18 @@ async fn a_partial_job_names_twenty_files_and_counts_the_rest() {
 }
 
 // Two pieces under hex names, the first of one article and lost whole when
-// `lose` is set, and an SFV that lists them under names the post does not
-// carry: it binds neither. `beside` adds a whole `.mkv` the SFV does not
-// list either. The pieces are files 0 and 1, the `.mkv` file 2 when posted,
-// the SFV last.
+// `lose` is set, and an SFV, when `listed`, that lists them under names the
+// post does not carry, with CRCs neither has: it names neither. `beside`
+// adds a whole `.mkv` the SFV does not list either. The pieces are files 0
+// and 1, the `.mkv` file 2 when posted, the SFV last.
 const FIRST_PIECE: &str = "e93a07c1d25b4f68a0c3e1f7b9d24c85";
 const SECOND_PIECE: &str = "1b7f3d9e05a24c6f8e1d0b3a7c9f2e64";
 
 fn pieces_beside_an_unrelated_sfv(beside: bool) -> Vec<Post> {
+    pieces_listed(beside, true)
+}
+
+fn pieces_listed(beside: bool, listed: bool) -> Vec<Post> {
     let first = payload(ARTICLE, 51);
     let second = payload(2 * ARTICLE + 3, 52);
     let mut posts = vec![
@@ -256,20 +260,131 @@ fn pieces_beside_an_unrelated_sfv(beside: bool) -> Vec<Post> {
     if beside {
         posts.push(Post::plain("feature.mkv", payload(2 * ARTICLE, 53)));
     }
-    posts.push(listing(
-        "silver.horizon.sfv",
-        &[
-            ("silver.horizon.7z.001", crc(&first)),
-            ("silver.horizon.7z.002", crc(&second)),
-        ],
-    ));
+    if listed {
+        posts.push(listing(
+            "silver.horizon.sfv",
+            &[
+                ("silver.horizon.7z.001", crc(&first) ^ 1),
+                ("silver.horizon.7z.002", crc(&second) ^ 1),
+            ],
+        ));
+    }
     posts
 }
 
-// An SFV that binds no file checked nothing and vouches for nothing: a
-// piece lost whole beside it shortens the job as it would with no SFV at
-// all. Nothing whole is of a type people open, so the job fails; a whole
-// `.mkv` beside the pieces leaves it Partial.
+// The same pieces under a listing whose entries state their CRC32s: each
+// unanswered entry names the one piece with its CRC32, and the job ends as
+// the same posts without the listing, under those names.
+#[tokio::test]
+async fn an_sfv_names_the_pieces_whose_crcs_its_unanswered_entries_state() {
+    let first = payload(ARTICLE, 51);
+    let second = payload(2 * ARTICLE + 3, 52);
+    let posts = |listed: bool| {
+        let mut posts = vec![
+            Post::plain(FIRST_PIECE, first.clone()),
+            Post::plain(SECOND_PIECE, second.clone()),
+            Post::plain("feature.mkv", payload(2 * ARTICLE, 53)),
+        ];
+        if listed {
+            posts.push(listing(
+                "silver.horizon.sfv",
+                &[
+                    ("Silver.Horizon.part1.bin", crc(&first)),
+                    ("Silver.Horizon.part2.bin", crc(&second)),
+                ],
+            ));
+        }
+        Scenario::new(posts)
+    };
+    let graph = run(&posts(true)).await;
+    let twin = run(&posts(false)).await;
+    assert_eq!(graph.status, twin.status, "{:?}", graph.failure);
+    assert_eq!(graph.failure_kind, twin.failure_kind);
+    let mut named: Vec<(String, Vec<u8>)> = graph
+        .files
+        .iter()
+        .map(|(path, bytes)| (path.rsplit('/').next().unwrap().to_owned(), bytes.clone()))
+        .collect();
+    named.sort();
+    assert_eq!(
+        named
+            .iter()
+            .map(|(name, _)| name.as_str())
+            .collect::<Vec<_>>(),
+        [
+            "Silver.Horizon.part1.bin",
+            "Silver.Horizon.part2.bin",
+            "feature.mkv",
+            "silver.horizon.sfv",
+        ]
+    );
+    assert!(named[0].1 == first && named[1].1 == second);
+}
+
+// The same pieces under the entry names the fixture's listing gives them,
+// `.7z.001` and `.7z.002`, with their CRC32s. A name the listing gives is a
+// name, as a PAR2 name is: the pieces become the volumes of a split 7z
+// archive, which is not a file people open, and their bytes open as no
+// archive. So the job ends as the same posts under those names would, not
+// as its twin under hex names: the whole `.mkv` beside them is the one
+// usable file.
+#[tokio::test]
+async fn an_sfv_names_the_pieces_split_archive_volumes_and_the_job_ends_as_under_those_names() {
+    let first = payload(ARTICLE, 51);
+    let second = payload(2 * ARTICLE + 3, 52);
+    let posts = |names: Option<[&str; 2]>, listed: bool| {
+        let [one, two] = names.unwrap_or([FIRST_PIECE, SECOND_PIECE]);
+        let mut posts = vec![
+            Post::plain(one, first.clone()),
+            Post::plain(two, second.clone()),
+            Post::plain("feature.mkv", payload(2 * ARTICLE, 53)),
+        ];
+        if listed {
+            posts.push(listing(
+                "silver.horizon.sfv",
+                &[
+                    ("silver.horizon.7z.001", crc(&first)),
+                    ("silver.horizon.7z.002", crc(&second)),
+                ],
+            ));
+        }
+        Scenario::new(posts)
+    };
+    let graph = run(&posts(None, true)).await;
+    let mut named: Vec<String> = graph
+        .files
+        .keys()
+        .map(|path| path.rsplit('/').next().unwrap().to_owned())
+        .collect();
+    named.sort();
+    assert!(
+        named.contains(&"feature.mkv".to_owned())
+            && !named
+                .iter()
+                .any(|name| name == FIRST_PIECE || name == SECOND_PIECE),
+        "{named:?}"
+    );
+    let hex = run(&posts(None, false)).await;
+    assert_eq!(hex.status, Some(JobStatus::Complete), "{:?}", hex.failure);
+    let posted_so = run(&posts(
+        Some(["silver.horizon.7z.001", "silver.horizon.7z.002"]),
+        false,
+    ))
+    .await;
+    assert_eq!(
+        graph.status,
+        Some(JobStatus::Partial),
+        "{:?}",
+        graph.failure
+    );
+    assert_eq!(graph.status, posted_so.status, "{:?}", posted_so.failure);
+    assert_eq!(graph.failure_kind, posted_so.failure_kind);
+}
+
+// An SFV that names no file vouches for nothing: a piece lost whole beside
+// it shortens the job as it does with no SFV at all. Nothing whole is of a
+// type people open, so the job fails; a whole `.mkv` beside the pieces
+// leaves it Partial.
 #[tokio::test]
 async fn an_sfv_that_binds_no_file_vouches_for_nothing() {
     let graph = run(&Scenario::new(pieces_beside_an_unrelated_sfv(false)).lost(0, 0)).await;
@@ -284,6 +399,11 @@ async fn an_sfv_that_binds_no_file_vouches_for_nothing() {
         "{:?}",
         graph.graph().delivery_debug()
     );
+    // The health the failure gives counts the listing's own bytes.
+    assert_twin_but_text(
+        &graph,
+        &run(&Scenario::new(pieces_listed(false, false)).lost(0, 0)).await,
+    );
 
     let beside = run(&Scenario::new(pieces_beside_an_unrelated_sfv(true)).lost(0, 0)).await;
     assert_eq!(
@@ -296,6 +416,10 @@ async fn an_sfv_that_binds_no_file_vouches_for_nothing() {
         beside.graph().unchecked_files().is_empty(),
         "{:?}",
         beside.graph().delivery_debug()
+    );
+    assert_twin(
+        &beside,
+        &run(&Scenario::new(pieces_listed(true, false)).lost(0, 0)).await,
     );
 }
 
@@ -310,29 +434,34 @@ async fn an_sfv_that_binds_no_file_leaves_a_whole_post_complete() {
         "{:?}",
         graph.failure
     );
+    assert_twin(
+        &graph,
+        &run(&Scenario::new(pieces_listed(false, false))).await,
+    );
 }
 
-// An SFV that binds a whole file vouches for the job: a hex-named file it
-// does not describe, lost whole, is unchecked and leaves the job Complete.
+// An SFV that agrees with a whole file vouches for nothing: a hex-named
+// file beside it, lost whole, shortens the job as it does with no SFV, and
+// nothing is unchecked.
 #[tokio::test]
-async fn an_sfv_that_binds_a_whole_file_vouches_for_the_job() {
+async fn an_sfv_that_binds_a_whole_file_vouches_for_nothing() {
     let feature = payload(2 * ARTICLE, 54);
-    let posts = vec![
-        Post::plain("feature.mkv", feature.clone()),
-        Post::plain(FIRST_PIECE, payload(ARTICLE, 55)),
-        listing("feature.sfv", &[("feature.mkv", crc(&feature))]),
-    ];
-    let graph = run(&Scenario::new(posts).lost(1, 0)).await;
-    assert_eq!(
-        graph.graph().outcomes,
-        vec![Some(RepairOutcome::Clean)],
-        "the SFV checked its file clean"
-    );
-    assert_eq!(
-        graph.status,
-        Some(JobStatus::Complete),
+    let posts = |listed: bool| {
+        let mut posts = vec![
+            Post::plain("feature.mkv", feature.clone()),
+            Post::plain(FIRST_PIECE, payload(ARTICLE, 55)),
+        ];
+        if listed {
+            posts.push(listing("feature.sfv", &[("feature.mkv", crc(&feature))]));
+        }
+        Scenario::new(posts).lost(1, 0)
+    };
+    let graph = run(&posts(true)).await;
+    assert!(graph.graph().outcomes.is_empty(), "the SFV rules nothing");
+    assert!(
+        graph.graph().unchecked_files().is_empty(),
         "{:?}",
-        graph.failure
+        graph.graph().delivery_debug()
     );
-    assert_eq!(graph.graph().unchecked_files(), vec![FIRST_PIECE]);
+    assert_twin(&graph, &run(&posts(false)).await);
 }

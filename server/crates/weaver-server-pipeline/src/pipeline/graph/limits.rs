@@ -642,17 +642,35 @@ impl Caps {
         }
     }
 
-    // The tree retired or dropped namespaces: they hold no entries and keep
-    // nothing resident any more.
-    pub(crate) fn release_gone(&mut self, tree: &Tree) {
-        let gone: Vec<NodeId> = self
-            .accounts
+    // The namespaces charged that the tree retired or dropped, every one
+    // asked.
+    pub(crate) fn gone(&self, tree: &Tree) -> Vec<NodeId> {
+        self.accounts
             .keys()
             .copied()
             .filter(|node| !tree.is_live(*node))
-            .collect();
+            .collect()
+    }
+
+    // Of `nodes`, those charged that the tree no longer holds live, in node
+    // order: what `gone` finds among them.
+    pub(crate) fn gone_of<'a>(
+        &self,
+        tree: &Tree,
+        nodes: impl IntoIterator<Item = &'a NodeId>,
+    ) -> Vec<NodeId> {
+        nodes
+            .into_iter()
+            .copied()
+            .filter(|node| self.accounts.contains_key(node) && !tree.is_live(*node))
+            .collect()
+    }
+
+    // The tree retired or dropped each of `gone`: it holds no entries and
+    // keeps nothing resident any more.
+    pub(crate) fn release_all(&mut self, gone: &[NodeId]) {
         for node in gone {
-            self.release(node);
+            self.release(*node);
         }
     }
 

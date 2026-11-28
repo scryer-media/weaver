@@ -1,9 +1,15 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
-// Compressed and solid RAR: real RARLAB archives, which
-// the store cannot stream, so the graph hands their volumes to the RAR
-// engine and reads its members out of a run over the growing files.
+// Compressed and solid RAR: real RARLAB archives. A solid set, or one whose
+// first member is compressed, the store cannot stream, so the graph hands
+// its volumes to the RAR engine and reads its members out of a run over the
+// growing files. The mixed fixture stores two files before it compresses
+// one: the store streams those and keeps the set, and its own run makes
+// the compressed member from the store's shelf.
+
+use std::collections::BTreeSet;
+use std::sync::{Arc, Mutex};
 
 use super::harness::{
     ARTICLE, Claim, Outcome, Post, Scenario, assert_fetched_once, kinds, payload, run,
@@ -17,9 +23,93 @@ use crate::pipeline::tests::rar5_fixture_bytes;
 use weaver_server_pipeline::pipeline::tests::engines::restart_fixtures::member_check_bytes;
 
 const MIXED: &str = "rar5_multifile_lz.rar";
+// The mixed fixture's compressed member, as the archive numbers it:
+// `hello.txt` and `second.txt` are stored before it.
+const COMPRESSED: u32 = 2;
 
 fn mixed() -> Scenario {
     Scenario::new(vec![Post::plain("mixed.rar", rar5_fixture_bytes(MIXED))])
+}
+
+// What every run said, by the node it ran for.
+type Heard = Arc<Mutex<Vec<(weaver_graph::NodeId, String)>>>;
+
+fn hearing(scenario: Scenario) -> (Scenario, Heard) {
+    let heard = Heard::default();
+    let kept = Arc::clone(&heard);
+    let scenario = scenario.on_run_message(move |node, _, message| {
+        kept.lock().unwrap().push((node, message));
+    });
+    (scenario, heard)
+}
+
+// The mixed fixture stayed the store's: no engine took its volume, and the
+// runs for the RAR store's node named the compressed member alone, as it
+// made it from the store's shelf. Returns what those runs said.
+fn assert_store_ran(graph: &Outcome, heard: &Heard) -> Vec<String> {
+    let kinds = &graph.graph().kinds;
+    assert!(
+        kinds.contains("rar_store") && !kinds.contains("rar_engine"),
+        "{kinds:?}"
+    );
+    let stores: BTreeSet<_> = graph
+        .graph()
+        .shelved_by
+        .iter()
+        .filter(|(_, (kind, _))| kind == "rar_store")
+        .map(|(node, _)| *node)
+        .collect();
+    let said: Vec<String> = heard
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(node, _)| stores.contains(node))
+        .map(|(_, message)| message.clone())
+        .collect();
+    assert!(!said.is_empty(), "no run for the store's node {stores:?}");
+    let mut named = BTreeSet::new();
+    for message in &said {
+        if !(message.starts_with("Emit(") || message.starts_with("Paid(")) {
+            continue;
+        }
+        let mut rest = message.as_str();
+        while let Some(at) = rest.find("MemberId(") {
+            rest = &rest[at + "MemberId(".len()..];
+            let end = rest.find(')').unwrap();
+            named.insert(rest[..end].parse::<u32>().unwrap());
+        }
+    }
+    assert!(
+        named.is_subset(&BTreeSet::from([COMPRESSED])),
+        "the members the store's run named: {named:?}"
+    );
+    said
+}
+
+// The store's run made the compressed member: it named it.
+fn assert_store_made_the_compressed_member(graph: &Outcome, heard: &Heard) {
+    let said = assert_store_ran(graph, heard);
+    assert!(
+        said.iter()
+            .any(|message| message.contains(&format!("MemberId({COMPRESSED})"))),
+        "{said:?}"
+    );
+}
+
+// A compressed set that is not solid stays the store's, whose run makes
+// its members; a solid one goes to the engine whole.
+fn assert_kept_by_solidity(graph: &Outcome, solid: bool) {
+    assert_eq!(
+        graph.graph().kinds.contains("rar_engine"),
+        solid,
+        "{:?}",
+        graph.graph().kinds
+    );
+    assert!(
+        graph.graph().kinds.contains("rar_store"),
+        "{:?}",
+        graph.graph().kinds
+    );
 }
 
 // The engine object ran: the graph bound a RAR engine to the volumes.
@@ -53,10 +143,11 @@ fn assert_mixed_members(outcome: &Outcome) {
 }
 
 #[tokio::test]
-async fn a_compressed_rar5_volume_delivers_every_member_through_the_engine() {
-    let graph = run(&mixed()).await;
+async fn a_compressed_rar5_volume_after_stored_members_delivers_every_member_through_the_store() {
+    let (scenario, heard) = hearing(mixed());
+    let graph = run(&scenario).await;
     assert_mixed_members(&graph);
-    assert_engine_ran(&graph);
+    assert_store_made_the_compressed_member(&graph, &heard);
     assert_fetched_once(&graph);
 }
 
@@ -67,9 +158,10 @@ async fn a_compressed_rar5_volume_delivers_every_member_through_the_engine() {
 async fn a_compressed_rar5_volume_delivers_alike_in_every_frame_size() {
     let mut seen = None;
     for size in [usize::MAX, 4096, 64, 1] {
-        let graph = run(&mixed().framed(size)).await;
+        let (scenario, heard) = hearing(mixed().framed(size));
+        let graph = run(&scenario).await;
         assert_mixed_members(&graph);
-        assert_engine_ran(&graph);
+        assert_store_made_the_compressed_member(&graph, &heard);
         assert_fetched_once(&graph);
         let files = seen.get_or_insert_with(|| graph.files.clone());
         assert_eq!(*files, graph.files, "frames of {size} bytes");
@@ -78,14 +170,15 @@ async fn a_compressed_rar5_volume_delivers_alike_in_every_frame_size() {
 
 // The same frames served last article first, as a crowd of workers may:
 // every article but the first is in hand before the store learns from the
-// headers that the volume needs the engine.
+// headers that a member is compressed and its own run makes it.
 #[tokio::test]
 async fn a_compressed_rar5_volume_served_last_article_first_delivers_alike_in_every_frame_size() {
     let mut seen = None;
     for size in [usize::MAX, 4096, 64, 1] {
-        let graph = run(&mixed().framed(size).backwards()).await;
+        let (scenario, heard) = hearing(mixed().framed(size).backwards());
+        let graph = run(&scenario).await;
         assert_mixed_members(&graph);
-        assert_engine_ran(&graph);
+        assert_store_made_the_compressed_member(&graph, &heard);
         assert_fetched_once(&graph);
         let files = seen.get_or_insert_with(|| graph.files.clone());
         assert_eq!(*files, graph.files, "frames of {size} bytes");
@@ -463,13 +556,15 @@ fn mixed_with_par2() -> Scenario {
 }
 
 // The compressed member's article damaged, PAR2 beside: repaired in the
-// stream before the engine reads it, and the three members are delivered.
+// stream before the store's run reads it, and the three members are
+// delivered.
 #[tokio::test]
 async fn the_compressed_member_damaged_beside_par2_is_repaired_in_the_stream() {
     let scenario = mixed_with_par2().damaged(0, COMPRESSED_ARTICLE);
+    let (scenario, heard) = hearing(scenario);
     let graph = run(&scenario).await;
     assert_mixed_members(&graph);
-    assert_engine_ran(&graph);
+    assert_store_made_the_compressed_member(&graph, &heard);
     assert!(graph.graph().kinds.contains("par2"), "{:?}", kinds(&graph));
     assert!(graph.refetched().is_empty(), "{:?}", graph.refetched());
     assert!(graph.reads > 0, "the repair read its slices");
@@ -480,26 +575,32 @@ async fn the_compressed_member_damaged_beside_par2_is_repaired_in_the_stream() {
 #[tokio::test]
 async fn the_compressed_member_lost_beside_par2_is_repaired() {
     let scenario = mixed_with_par2().lost(0, COMPRESSED_ARTICLE);
+    let (scenario, heard) = hearing(scenario);
     let graph = run(&scenario).await;
     assert_mixed_members(&graph);
-    assert_engine_ran(&graph);
+    assert_store_made_the_compressed_member(&graph, &heard);
     assert!(graph.refetched().is_empty(), "{:?}", graph.refetched());
     assert!(graph.reads > 0, "the repair read its slices");
 }
 
-// The compressed member's stream damaged with no PAR2. The engine's run
-// fails the member's CRC after the two stored members closed whole; the
-// partial-extraction invariant (2026-10-18) wants those two delivered
-// under the job's names, the compressed member the only one damaged or
-// missing, and the job not Failed. Once quiet, `GraphJob::refuse_unrepaired`
-// refuses the engine's namespace for its damaged leaf; the refusal reads
-// mixed.rar back as posted in place of the member the engine had not closed
-// whole, and the two it had stay delivered.
+// The compressed member's stream damaged with no PAR2. The store streamed
+// the two stored members whole; its run fails the compressed member and
+// refuses for the damage. The partial-extraction invariant (2026-10-18)
+// wants those two delivered under the job's names, the compressed member
+// the only one damaged or missing, and the job not Failed: mixed.rar is
+// read back as posted in place of the member no run made whole, and the
+// two the store closed stay delivered.
 #[tokio::test]
 async fn the_compressed_member_damaged_without_par2_delivers_the_members_it_closed() {
-    let scenario = mixed().framed(16).damaged(0, COMPRESSED_ARTICLE);
+    let (scenario, heard) = hearing(mixed().framed(16).damaged(0, COMPRESSED_ARTICLE));
     let graph = run(&scenario).await;
-    assert_engine_ran(&graph);
+    // The store's run read the damage and refused for it.
+    let said = assert_store_ran(&graph, &heard);
+    assert!(
+        said.iter()
+            .any(|message| message == "Emit(Refuse(Unrepairable))"),
+        "{said:?}"
+    );
     assert!(
         !matches!(graph.status, Some(JobStatus::Failed { .. })),
         "{:?}",
@@ -518,8 +619,8 @@ async fn the_compressed_member_damaged_without_par2_delivers_the_members_it_clos
             != clean.files.get(&delivered("zeros_64k.bin")),
         "the failing member is not delivered as posted"
     );
-    // The refusal puts the archive as posted in place of what the engine had
-    // not closed whole, beside the two it had.
+    // The refusal puts the archive as posted in place of the member no run
+    // closed whole, beside the two the store closed.
     assert_eq!(
         graph.files.keys().cloned().collect::<Vec<_>>(),
         [
@@ -534,6 +635,147 @@ async fn the_compressed_member_damaged_without_par2_delivers_the_members_it_clos
         "the archive as posted"
     );
     assert_eq!(graph.graph().claims.get("mixed.rar"), Some(&Claim::Damaged));
+}
+
+// The behaviours above, on a set the store cannot stream: a solid RARLAB
+// archive of three 8193-byte members in one 462-byte volume, which the
+// graph hands to the RAR engine whole. In 16-byte articles, article 25
+// (bytes 400..416) lies inside the last member's packed data (372..454)
+// and touches no header.
+const SOLID_SMALL: &str = "../extraction_profiles/rar5_solid_small.rar";
+const SOLID_SMALL_MEMBERS: [&str; 3] = ["part0.mkv", "part1.mkv", "part2.mkv"];
+const SOLID_LAST_ARTICLE: u32 = 25;
+
+fn solid_small() -> Scenario {
+    Scenario::new(vec![Post::plain(
+        "solid.rar",
+        rar5_fixture_bytes(SOLID_SMALL),
+    )])
+}
+
+fn solid_small_with_par2() -> Scenario {
+    Scenario::new(with_par2(vec![(
+        "solid.rar".into(),
+        rar5_fixture_bytes(SOLID_SMALL),
+    )]))
+    .framed(16)
+}
+
+fn assert_solid_small_members(outcome: &Outcome) {
+    assert!(
+        outcome.completed(),
+        "{:?} {:?}",
+        outcome.status,
+        outcome.failure
+    );
+    assert_eq!(
+        outcome.files.keys().cloned().collect::<Vec<_>>(),
+        SOLID_SMALL_MEMBERS.map(delivered).to_vec(),
+    );
+    for name in SOLID_SMALL_MEMBERS {
+        assert_eq!(outcome.files[&delivered(name)].len(), 8193, "{name}");
+    }
+}
+
+#[tokio::test]
+async fn a_solid_rar5_volume_delivers_every_member_through_the_engine_alike_in_every_frame_size() {
+    let mut seen = None;
+    for size in [usize::MAX, 4096, 64, 1] {
+        let graph = run(&solid_small().framed(size)).await;
+        assert_solid_small_members(&graph);
+        assert_engine_ran(&graph);
+        assert_fetched_once(&graph);
+        let files = seen.get_or_insert_with(|| graph.files.clone());
+        assert_eq!(*files, graph.files, "frames of {size} bytes");
+    }
+}
+
+#[tokio::test]
+async fn a_solid_rar5_volume_served_last_article_first_delivers_alike_in_every_frame_size() {
+    let clean = run(&solid_small()).await;
+    for size in [usize::MAX, 4096, 64, 1] {
+        let graph = run(&solid_small().framed(size).backwards()).await;
+        assert_solid_small_members(&graph);
+        assert_engine_ran(&graph);
+        assert_fetched_once(&graph);
+        assert_eq!(clean.files, graph.files, "frames of {size} bytes");
+    }
+}
+
+#[tokio::test]
+async fn a_solid_volume_whose_recovery_volumes_lost_their_heads_waits_for_its_run() {
+    let bytes = rar5_fixture_bytes(SOLID_SMALL);
+    let recovery = super::harness::par2_volumes("solid", &[("solid.rar", &bytes)], 4, 2);
+    assert_eq!(recovery.len(), 3, "an index and two volumes");
+    let mut posts = vec![Post::plain("solid.rar", bytes)];
+    posts.extend(recovery);
+    let scenario = mixed_framed_posts(posts).lost(2, 0).lost(3, 0);
+    let graph = run(&scenario).await;
+    assert_solid_small_members(&graph);
+    assert_engine_ran(&graph);
+}
+
+#[tokio::test]
+async fn the_solid_member_damaged_beside_par2_is_repaired_in_the_stream() {
+    let scenario = solid_small_with_par2().damaged(0, SOLID_LAST_ARTICLE);
+    let graph = run(&scenario).await;
+    assert_solid_small_members(&graph);
+    assert_engine_ran(&graph);
+    assert!(graph.graph().kinds.contains("par2"), "{:?}", kinds(&graph));
+    assert!(graph.refetched().is_empty(), "{:?}", graph.refetched());
+    assert!(graph.reads > 0, "the repair read its slices");
+}
+
+#[tokio::test]
+async fn the_solid_member_lost_beside_par2_is_repaired() {
+    let scenario = solid_small_with_par2().lost(0, SOLID_LAST_ARTICLE);
+    let graph = run(&scenario).await;
+    assert_solid_small_members(&graph);
+    assert_engine_ran(&graph);
+    assert!(graph.refetched().is_empty(), "{:?}", graph.refetched());
+    assert!(graph.reads > 0, "the repair read its slices");
+}
+
+// The last member's stream damaged with no PAR2: the engine's run decodes
+// the first two members whole and fails the last one's CRC. Those two are
+// delivered, the archive as posted stands in place of the member the
+// engine had not closed whole, and the job is not Failed.
+#[tokio::test]
+async fn the_solid_member_damaged_without_par2_delivers_the_members_it_closed() {
+    let scenario = solid_small().framed(16).damaged(0, SOLID_LAST_ARTICLE);
+    let graph = run(&scenario).await;
+    assert_engine_ran(&graph);
+    assert!(
+        !matches!(graph.status, Some(JobStatus::Failed { .. })),
+        "{:?}",
+        graph.status
+    );
+    assert!(graph.refetched().is_empty(), "{:?}", graph.refetched());
+    let clean = run(&solid_small()).await;
+    for name in ["part0.mkv", "part1.mkv"] {
+        assert!(
+            graph.files.get(&delivered(name)) == clean.files.get(&delivered(name)),
+            "{name}: closed before the failure, delivered whole"
+        );
+    }
+    assert!(
+        graph.files.get(&delivered("part2.mkv")) != clean.files.get(&delivered("part2.mkv")),
+        "the failing member is not delivered as posted"
+    );
+    assert_eq!(
+        graph.files.keys().cloned().collect::<Vec<_>>(),
+        [
+            delivered("part0.mkv"),
+            delivered("part1.mkv"),
+            delivered("solid.rar"),
+        ]
+    );
+    assert_eq!(
+        graph.files[&delivered("solid.rar")].len(),
+        rar5_fixture_bytes(SOLID_SMALL).len(),
+        "the archive as posted"
+    );
+    assert_eq!(graph.graph().claims.get("solid.rar"), Some(&Claim::Damaged));
 }
 
 // A solid RARLAB archive in 1 MiB articles: the store cannot stream a
@@ -647,7 +889,7 @@ async fn a_compressed_rar5_member_corrupted_without_par2_and_posted_backwards_ha
 // A compressed volume beside an index and two recovery volumes whose first
 // articles never arrive: nothing names those volumes, so the rest of their
 // articles stay parked, never fetched. The volume is whole and the set finds
-// it clean while the engine's run is still reading it, and the job waits
+// it clean while the store's run is still reading it, and the job waits
 // for the run before it delivers every member.
 #[tokio::test]
 async fn a_compressed_volume_whose_recovery_volumes_lost_their_heads_waits_for_its_run() {
@@ -656,10 +898,10 @@ async fn a_compressed_volume_whose_recovery_volumes_lost_their_heads_waits_for_i
     assert_eq!(recovery.len(), 3, "an index and two volumes");
     let mut posts = vec![Post::plain("mixed.rar", bytes)];
     posts.extend(recovery);
-    let scenario = mixed_framed_posts(posts).lost(2, 0).lost(3, 0);
+    let (scenario, heard) = hearing(mixed_framed_posts(posts).lost(2, 0).lost(3, 0));
     let graph = run(&scenario).await;
     assert_mixed_members(&graph);
-    assert_engine_ran(&graph);
+    assert_store_made_the_compressed_member(&graph, &heard);
 }
 
 fn mixed_framed_posts(posts: Vec<Post>) -> Scenario {
@@ -683,7 +925,7 @@ async fn a_split_compressed_members_checksum_reaches_the_naming_plan() {
         .collect();
     let graph = run(&Scenario::new(posts(volumes))).await;
     assert!(graph.completed(), "{:?} {:?}", graph.status, graph.failure);
-    assert_engine_ran(&graph);
+    assert_kept_by_solidity(&graph, false);
     let member = delivered("compressible.txt");
     let expected =
         crc_turbo::checksum(crc_turbo::CrcAlgorithm::Crc32IsoHdlc, &graph.files[&member]) as u32;
@@ -724,7 +966,7 @@ async fn a_set_numbered_at_mixed_widths_delivers_its_member() {
             graph.status,
             graph.failure
         );
-        assert_engine_ran(&graph);
+        assert_kept_by_solidity(&graph, false);
         let oracle: serde_json::Value = serde_json::from_str(include_str!(concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/../weaver-server-core/tests/fixtures/extraction_profiles/expected.json"
@@ -816,7 +1058,7 @@ async fn a_compressed_set_renamed_by_par2_while_it_extracts_delivers_every_membe
                 kinds(&graph),
                 graph.graph().delivery,
             );
-            assert_engine_ran(&graph);
+            assert_kept_by_solidity(&graph, fixture.contains("solid"));
             let expected = oracle["archives"][fixture].as_object().unwrap();
             let mut names: Vec<String> = expected.keys().map(|name| delivered(name)).collect();
             names.sort();
@@ -850,7 +1092,7 @@ async fn a_compressed_member_closes_with_no_check_read() {
     let before = member_check_bytes();
     let graph = run(&mixed()).await;
     assert_mixed_members(&graph);
-    assert_engine_ran(&graph);
+    assert_kept_by_solidity(&graph, false);
     let read = member_check_bytes() - before;
     assert_eq!(read, 0, "bytes a member check read back");
 }
@@ -860,7 +1102,7 @@ async fn a_compressed_member_spanning_four_volumes_closes_with_no_check_read() {
     let before = member_check_bytes();
     let graph = run(&Scenario::new(posts(super::rar::lz_four()))).await;
     assert!(graph.completed(), "{:?} {:?}", graph.status, graph.failure);
-    assert_engine_ran(&graph);
+    assert_kept_by_solidity(&graph, false);
     let read = member_check_bytes() - before;
     assert_eq!(read, 0, "bytes a member check read back");
 }

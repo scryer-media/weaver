@@ -60,15 +60,6 @@ pub trait RootJob {
     fn recovery_summary(&self) -> RecoverySummary;
     // Whether the recovery object at `set` covers `member` of its namespace.
     fn covers(&self, set: NodeId, member: MemberId) -> bool;
-    // What the namespace `node` came out of, at some depth, a recovery set
-    // proved (`Tree::vouched_above`). Never the root.
-    fn vouched_above(&self, node: NodeId) -> bool;
-    // Every disagreement of the checking set `set`, below the root at
-    // `node`, is with an archive volume whose object delivered every member
-    // whole against its own CRC (`Tree::answered_below`).
-    fn answered_below(&self, _node: NodeId, _set: NodeId) -> bool {
-        false
-    }
     // Run every recovery object of the root namespace.
     fn repair(&mut self) -> Vec<RepairOutcome>;
     // An object below the root produced members.
@@ -127,14 +118,6 @@ impl RootJob for GraphJob {
         self.tree()
             .recovery(set)
             .is_some_and(|recovery| recovery.covers(member))
-    }
-
-    fn vouched_above(&self, node: NodeId) -> bool {
-        self.tree().vouched_above(node)
-    }
-
-    fn answered_below(&self, node: NodeId, set: NodeId) -> bool {
-        self.tree().answered_below(node, set)
     }
 
     fn repair(&mut self) -> Vec<RepairOutcome> {
@@ -208,15 +191,20 @@ pub fn drive(job: &mut dyn RootJob, slots: &mut RepairSlots, asker: AskerId, lim
     }
     match job.phase() {
         RootPhase::Extracting => Step::Wait,
-        // The delivery takes every file from its name, so it waits for
-        // each file still moving there. Only now do the files move: each
-        // once, to the name the ledger settled on while the job downloaded.
-        _ if job.moves_waiting() => {
-            job.deliver_names();
-            Step::Wait
-        }
-        _ => Step::Deliver,
+        _ => after_recovery(job),
     }
+}
+
+// The step after recovery, wherever the job comes to it: the names move,
+// then the job delivers. The delivery takes every file from its name, so it
+// waits for each file still moving there. Only now do the files move: each
+// once, to the name the ledger settled on while the job downloaded.
+pub(super) fn after_recovery(job: &mut dyn RootJob) -> Step {
+    if job.moves_waiting() {
+        job.deliver_names();
+        return Step::Wait;
+    }
+    Step::Deliver
 }
 
 // The objects that could not rebuild what they found, and that failure
@@ -302,12 +290,7 @@ pub fn failure(
     let failed: Vec<(&SetSummary, u64, u64)> = ruled
         .iter()
         .filter_map(|(set, outcome)| match outcome {
-            RepairOutcome::Impossible { damaged, reachable }
-                if !excused(set)
-                    && !(set.kind == Kind::Sfv
-                        && (job.vouched_above(set.namespace)
-                            || job.answered_below(set.namespace, set.node))) =>
-            {
+            RepairOutcome::Impossible { damaged, reachable } if !excused(set) => {
                 Some((*set, *damaged, *reachable))
             }
             _ => None,

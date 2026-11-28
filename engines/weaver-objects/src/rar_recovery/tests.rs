@@ -1179,6 +1179,69 @@ fn a_volume_posted_twice_binds_the_posting_that_arrived() {
     );
 }
 
+// Of `VOLUMES` data volumes bound, the first `REPOSTED` lost whole and
+// posted again whole: a bind takes the second postings, and forgets what
+// the grid held of each first posting it no longer binds, keeping the
+// grid of each volume it still binds.
+#[test]
+fn a_bind_forgets_the_grid_of_each_volume_it_no_longer_binds() {
+    const VOLUMES: u16 = 8;
+    const REPOSTED: u16 = 3;
+    let mut job = job();
+    let sizes = [300; VOLUMES as usize];
+    rev(
+        &mut job,
+        "lantern.part1.rev",
+        &rev5(VOLUMES, 1, VOLUMES, &sizes),
+    );
+    let name = |at: u16| format!("lantern.part{:02}.rar", at + 1);
+    let mut first = Vec::new();
+    for at in 0..VOLUMES {
+        let member = if at < REPOSTED {
+            let lost = job.namespace.announce(&name(at), Some(300));
+            job.namespace.get_mut(lost).expect("announced").closed = true;
+            lost
+        } else {
+            data(&mut job, &name(at))
+        };
+        first.push(member);
+    }
+    bind(&mut job);
+    assert!(first.iter().all(|member| job.object.covers(*member)));
+    let segment = Segment {
+        range: ByteRange::new(0, 300),
+        crc32: 0,
+        verified: true,
+    };
+    for member in &first {
+        job.object.grid.offer(*member, WHOLE, &segment);
+    }
+    let again: Vec<MemberId> = (0..REPOSTED).map(|at| data(&mut job, &name(at))).collect();
+    bind(&mut job);
+    let held = |job: &Job<RarRecovery>, members: &[MemberId]| {
+        members
+            .iter()
+            .filter(|member| !job.object.grid.sizes(**member).is_empty())
+            .count()
+    };
+    assert_eq!(
+        held(&job, &first[..REPOSTED as usize]),
+        0,
+        "each first posting is forgotten"
+    );
+    assert_eq!(
+        held(&job, &first[REPOSTED as usize..]),
+        (VOLUMES - REPOSTED) as usize,
+        "each volume still bound keeps its grid"
+    );
+    assert!(again.iter().all(|member| job.object.covers(*member)));
+    assert!(
+        !first[..REPOSTED as usize]
+            .iter()
+            .any(|member| job.object.covers(*member))
+    );
+}
+
 // A data volume a range of which will never come asks, before the set has
 // ruled, for the one recovery volume it needs, the one a ruling short of it
 // would raise, and leaves the rest deferred. Nothing refused, nothing asked.
@@ -1441,6 +1504,36 @@ fn a_set_that_covers_no_data_volume_rules_on_nothing_whenever_its_footers_arrive
     assert_eq!(after, before);
     assert_eq!(late.object.outcome(), Some(RepairOutcome::Unread));
     assert_eq!(early.object.outcome(), Some(RepairOutcome::Unread));
+}
+
+// A set its ruling refutes lists no member, under a coverage version it has
+// not said before, so an index of what it covers drops what it listed.
+#[test]
+fn a_refuted_set_lists_nothing_under_a_new_coverage_version() {
+    // Bound by its table under no name, over volumes of the size it gives
+    // that are another set's.
+    let mut job = job();
+    rev(&mut job, "a8f3c1d2", &rev5(3, 1, 3, &[300, 300, 300]))
+        .expect("the first volume of the set");
+    for at in 1..=3 {
+        volume(&mut job, &format!("beacon.part0{at}.rar"), &payload(7, 300));
+    }
+    bind(&mut job);
+    let listed = |object: &RarRecovery| {
+        let mut out = Vec::new();
+        object.covered_members(&mut out);
+        out
+    };
+    let before = (listed(&job.object), job.object.coverage_version());
+    assert!(!before.0.is_empty(), "the set lists what it is bound over");
+    let outcome = job
+        .object
+        .repair(&mut job.store, weaver_graph::Budget::default());
+    assert_eq!(outcome, RepairOutcome::Unread);
+    assert!(job.object.refuted());
+    let after = (listed(&job.object), job.object.coverage_version());
+    assert_eq!(after.0, []);
+    assert_ne!(after.1, before.1);
 }
 
 // A RAR3 footer counts the volumes of a set that covers one: one data volume

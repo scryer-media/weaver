@@ -16,7 +16,9 @@ mod pipeline {
                 harness, rar_fixtures, sevenz_fixtures,
             };
             mod rar;
+            mod rar_mixed;
             mod sevenz;
+            mod sevenz_mixed;
         }
     }
 }

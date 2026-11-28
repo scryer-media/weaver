@@ -468,7 +468,8 @@ async fn three_decoders_deep_xz_in_gzip_in_zstd_delivers() {
 }
 
 // The compressed RAR5 fixture (two stored members, one compressed) as a
-// member of a stored RAR: the store hands it to the engine one deep.
+// member of a stored RAR: one deep, the inner store streams the stored
+// members and its run makes the compressed one; no engine takes the set.
 #[tokio::test]
 async fn a_nested_stored_rar_with_one_compressed_member_among_stored_ones_delivers() {
     let mixed = crate::pipeline::tests::rar5_fixture_bytes("rar5_multifile_lz.rar");
@@ -500,7 +501,7 @@ async fn a_nested_stored_rar_with_one_compressed_member_among_stored_ones_delive
         "the compressed member"
     );
     assert!(
-        graph.graph().kinds.contains("rar_engine"),
+        !graph.graph().kinds.contains("rar_engine"),
         "{:?}",
         graph.graph().kinds
     );

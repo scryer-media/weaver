@@ -248,8 +248,10 @@ impl Tree {
                 checked: false,
                 fronted: member.fronted,
                 refuted: member.refuted,
+                own: Tree::own_word(node.object.as_deref(), member.member).unwrap_or(false),
                 reached: None,
             });
+            node.refront(member.member);
             if member.undecided {
                 // Its front comes again with the replay.
                 node.undecide(member.member);
@@ -265,6 +267,7 @@ impl Tree {
             if !node.namespace.restore_copy(member.member, into) {
                 return Err(refuse("a further posting of a member it does not have"));
             }
+            node.refront(member.member);
         }
         for run in &record.coverage {
             if run.start >= run.end {

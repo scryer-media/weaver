@@ -248,3 +248,45 @@ fn a_repair_over_a_loss_goes_back_into_the_refused_volume() {
         volume(HEADER + 10, &[(0, b"hello"), (5, b"fixed")])
     );
 }
+
+// `volumes` root members, each its own store's one volume, all bound, then
+// refused one after another, each refusal a prune. What the prunes asked of
+// members' files, and what a walk of every file would have asked.
+fn refused_in_turn(volumes: u32) -> (usize, usize) {
+    use crate::pipeline::graph::namespace::hooks::{PRUNE_LEAF_CHECKS, PRUNE_WALKED_CHECKS};
+    let mut job = Job::new(PLENTY);
+    let mut children = Vec::new();
+    for index in 0..volumes {
+        let member = job.member(&format!("pack{index}.bin"), Some(HEADER + job.inner));
+        job.send(member, 0, SIGNATURE, Provenance::Fresh);
+        let (child, _) = job.tree.child_of(NodeId::ROOT, member).expect("bound");
+        children.push(child);
+    }
+    let mut build = job.build();
+    let (asked, walked) = (PRUNE_LEAF_CHECKS.get(), PRUNE_WALKED_CHECKS.get());
+    for child in children {
+        job.writer
+            .said(
+                &mut job.tree,
+                &mut build,
+                &Source,
+                child,
+                Emit::Refuse(Why::Compressed),
+                &mut job.out,
+            )
+            .expect("refuse");
+    }
+    (
+        PRUNE_LEAF_CHECKS.get() - asked,
+        PRUNE_WALKED_CHECKS.get() - walked,
+    )
+}
+
+// A prune asks only the files of what changed since the last one: refusing
+// V volumes asks V files in all, where a walk of every file asks each volume
+// given back so far, V(V+1)/2.
+#[test]
+fn refusing_volumes_in_turn_asks_each_volumes_file_once() {
+    assert_eq!(refused_in_turn(4), (4, 10));
+    assert_eq!(refused_in_turn(16), (16, 136));
+}

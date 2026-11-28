@@ -239,6 +239,9 @@ pub struct GraphJob {
     moved: u64,
     // The recovery indexes still to come as of a count.
     indexes_kept: Option<(u64, Option<Arc<[u32]>>)>,
+    // What the root still fetches unasked, kept between reads and brought
+    // up to date by `refresh_coming`.
+    coming_kept: super::namespace::recovery::ComingKept,
 }
 
 // Something a step of the job did that the job's events say.
@@ -359,6 +362,7 @@ impl GraphJob {
             one_turn: false,
             moved: 0,
             indexes_kept: None,
+            coming_kept: Default::default(),
         };
         // What the announcements released may stand for room.
         job.pay_release();
@@ -905,7 +909,23 @@ impl GraphJob {
         &mut self,
         node: NodeId,
     ) -> Option<Box<dyn weaver_graph::object::Object>> {
-        self.tree.lend_for_test(node)
+        self.coming_kept.owner_moved(node);
+        let lent = self.tree.lend_for_test(node);
+        self.refresh_coming();
+        lent
+    }
+
+    // The object lent by `lend_object_for_test` comes back, as one back
+    // from its work with nothing said: what waited is heard and the runs
+    // are stepped.
+    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
+    pub fn take_back_for_test(
+        &mut self,
+        node: NodeId,
+        object: Box<dyn weaver_graph::object::Object>,
+        limit: usize,
+    ) -> Result<(), GraphError> {
+        self.took_back_worked(node, object, Vec::new(), limit)
     }
 
     #[cfg(any(test, feature = "pipeline-test-fixtures"))]
@@ -966,11 +986,13 @@ impl GraphJob {
         if !self.writer.policy_known() {
             return Ok(false);
         }
+        self.refresh_coming();
         let pending = self.work_pending();
         let mut out = Vec::new();
         self.writer
             .rule_known(&mut self.tree, &mut *self.builder, &self.root, &mut out)?;
         self.heard(out)?;
+        self.refresh_coming();
         Ok(!pending && self.work_pending())
     }
 
@@ -1275,6 +1297,7 @@ impl GraphJob {
     // consumed; its adapter releases every handle before returning paths
     // completion may remove. A logical volume close is not an OS close.
     pub fn release_delivery_files(&mut self) -> Result<Vec<PathBuf>, &'static str> {
+        self.refresh_coming();
         if self.work_pending() || self.runs.live() || self.moves_waiting() {
             return Err("graph storage is still in use before delivery");
         }
@@ -1724,7 +1747,13 @@ impl GraphJob {
     // out: they hold back only their own set's ruling. Root members are
     // numbered as the volumes they are; a further posting of a member is
     // a volume of its own whose articles are the member's.
+    // Answered from the kept answer when the job brought it up to date
+    // since the map or the root changed (`refresh_coming`), and by the walk
+    // otherwise.
     fn payload_waiting(&self) -> bool {
+        if let Some(payload) = self.coming_kept.payload_coming(&self.tree, &self.root.map) {
+            return payload;
+        }
         self.writer.payload_coming(
             &self.tree,
             self.root.map.coming().map(|volume| MemberId(volume.0)),
@@ -1733,12 +1762,28 @@ impl GraphJob {
 
     // What the root still fetches unasked, payload and the sets whose own
     // volumes are still arriving. Only the volumes with such an article are
-    // asked.
+    // asked. Kept as `payload_waiting` is.
     pub fn coming(&self) -> Coming {
+        if let Some(coming) = self.coming_kept.coming(&self.tree, &self.root.map) {
+            return coming;
+        }
         self.writer.coming(
             &self.tree,
             self.root.map.coming().map(|volume| MemberId(volume.0)),
         )
+    }
+
+    // Bring the kept answer of what is to come up to date with the map and
+    // the tree, as every mutable path does before it reads it.
+    pub(crate) fn refresh_coming(&mut self) {
+        self.coming_kept.refresh(&self.tree, &self.root.map);
+    }
+
+    // The volumes refreshes classified, and the reads of `coming` and of
+    // payload that walked, for the tests.
+    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
+    pub fn coming_counts(&self) -> (u64, u64, u64) {
+        self.coming_kept.counts()
     }
 
     // Whether the volume has articles the queue fetches unasked still to
@@ -1828,6 +1873,7 @@ impl GraphJob {
     // Under test every report is held to the long way, so each step of the
     // pipeline tests checks the short way too.
     pub fn phase_change(&mut self) -> Option<RootPhase> {
+        self.refresh_coming();
         #[cfg(any(test, feature = "pipeline-test-fixtures"))]
         let phase = self.checked_phase();
         #[cfg(not(any(test, feature = "pipeline-test-fixtures")))]
@@ -1883,6 +1929,7 @@ impl GraphJob {
         limit: usize,
     ) -> Result<(), GraphError> {
         let mut effects = Vec::new();
+        self.coming_kept.owner_moved(node);
         self.tree.take_back_worked(
             node,
             object,

@@ -77,7 +77,8 @@ impl SevenZipStore {
         };
         let mut plains = Vec::new();
         for (index, folder) in map.folders_in(range) {
-            let Some(part) = range.intersect(folder.pack) else {
+            // A coded folder's packs are the run's, kept in the envelope.
+            let Some(part) = range.intersect(folder.pack).filter(|_| !folder.coded) else {
                 continue;
             };
             let slice =

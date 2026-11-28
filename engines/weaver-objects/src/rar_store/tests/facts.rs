@@ -166,6 +166,43 @@ fn facts_of_the_previous_version_are_refused() {
     ));
 }
 
+// A mixed set cut at every frame: the restored store knows which members
+// its run makes from its facts, goes on as the live one, and faces as it
+// does, run or no run.
+#[test]
+fn a_mixed_rar_restored_at_every_frame_makes_what_the_live_one_makes() {
+    for version in [Version::Rar5, Version::Rar4] {
+        let mut options = Options::new(version);
+        options.split = Some(6_000);
+        let volumes = named(write(&super::mixed::mixed_items(version), &options));
+        let steps = steps(&volumes, 4096, false);
+        for cut in 1..steps.len() {
+            let (_, live, restored) = restores_alike(Box::new(store()), &steps, cut, &[]);
+            let face = |object: &dyn weaver_graph::Object| {
+                object.engine().map(|face| {
+                    (
+                        (0..4)
+                            .map(|id| face.makes(weaver_graph::MemberId(id)))
+                            .collect::<Vec<_>>(),
+                        face.reserve(),
+                    )
+                })
+            };
+            assert_eq!(
+                face(live.as_ref()),
+                face(restored.as_ref()),
+                "{version:?} {cut}"
+            );
+            if cut == steps.len() - 1 {
+                assert_eq!(
+                    face(restored.as_ref()).map(|(makes, _)| makes),
+                    Some(vec![false, true, false, false])
+                );
+            }
+        }
+    }
+}
+
 // A member restored with a padding that does not fit its stream opens
 // afresh with none, whether it was sealed or never opened, and its bytes
 // said again come out whole.

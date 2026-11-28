@@ -6,7 +6,7 @@
 // shared engine object. A 7z posted in numbered pieces is the split store's,
 // which joins them into the one file this engine reads.
 
-mod run;
+pub(crate) mod run;
 
 #[cfg(test)]
 use weaver_graph::{ByteRange, Emit, Engine, MemberId, Object, Placement};
@@ -41,7 +41,7 @@ impl Format for SevenZip {
         None
     }
 
-    fn front(first_bytes: &[u8]) -> Option<u64> {
+    fn front(first_bytes: &[u8], _secret: Option<&str>) -> Option<u64> {
         crate::sevenz_store::measured(first_bytes)
     }
 

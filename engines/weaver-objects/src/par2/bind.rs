@@ -23,7 +23,9 @@ use std::cell::Cell;
 use std::cell::OnceCell;
 use std::collections::{BTreeMap, BTreeSet};
 
-use par2_rs::{FileDescription, FileId, Par2FileSet};
+#[cfg(test)]
+use par2_rs::FileDescription;
+use par2_rs::{FileId, Par2FileSet};
 use weaver_graph::{Member, MemberId, Namespace, ObjectId};
 
 use super::catalogue::Catalogue;
@@ -102,6 +104,7 @@ pub(super) type Bindings = BTreeMap<FileId, MemberId>;
 pub(super) type Fronts = BTreeMap<MemberId, (u64, Option<Front>)>;
 
 // What binding the sets over the namespace came to.
+#[cfg(test)]
 pub(super) struct Bound<S> {
     // Each set's bindings.
     pub(super) sets: S,
@@ -117,12 +120,540 @@ pub(super) struct Bound<S> {
     pub(super) checks: usize,
 }
 
+// The complete members no set binds, with the length each has of its own,
+// in member order, and by kind and length: what a set's free files are
+// weighed against.
+#[derive(Debug, Default)]
+pub(super) struct Unnamed {
+    by_member: BTreeMap<MemberId, Length>,
+    by_length: BTreeSet<(bool, u64, MemberId)>,
+    list: Vec<(MemberId, Length)>,
+}
+
+impl Unnamed {
+    pub(super) fn get(&self, member: MemberId) -> Option<Length> {
+        self.by_member.get(&member).copied()
+    }
+
+    pub(super) fn list(&self) -> &[(MemberId, Length)] {
+        &self.list
+    }
+
+    // The members known to be exactly `length` long.
+    pub(super) fn exact(&self, length: u64) -> impl Iterator<Item = MemberId> + '_ {
+        self.by_length
+            .range((false, length, MemberId(0))..=(false, length, MemberId(u32::MAX)))
+            .map(|(_, _, member)| *member)
+    }
+
+    // The members only bounded, by a bound within `bounds`.
+    pub(super) fn at_most(
+        &self,
+        bounds: impl std::ops::RangeBounds<u64>,
+    ) -> impl Iterator<Item = MemberId> + '_ {
+        use std::ops::Bound::{Excluded, Included, Unbounded};
+        let start = match bounds.start_bound() {
+            Included(at) => Included((true, *at, MemberId(0))),
+            Excluded(at) => Excluded((true, *at, MemberId(u32::MAX))),
+            Unbounded => Included((true, 0, MemberId(0))),
+        };
+        let end = match bounds.end_bound() {
+            Included(at) => Included((true, *at, MemberId(u32::MAX))),
+            Excluded(at) => Excluded((true, *at, MemberId(0))),
+            Unbounded => Included((true, u64::MAX, MemberId(u32::MAX))),
+        };
+        self.by_length
+            .range((start, end))
+            .map(|(_, _, member)| *member)
+    }
+
+    // The member is unnamed at `length`, or not at all; what it was.
+    fn set(&mut self, member: MemberId, length: Option<Length>) -> Option<Length> {
+        let was = match length {
+            Some(length) => self.by_member.insert(member, length),
+            None => self.by_member.remove(&member),
+        };
+        if was == length {
+            return was;
+        }
+        if let Some(was) = was {
+            self.by_length.remove(&keyed(was, member));
+        }
+        if let Some(length) = length {
+            self.by_length.insert(keyed(length, member));
+        }
+        let at = self
+            .list
+            .binary_search_by_key(&member, |(listed, _)| *listed);
+        match (length, at) {
+            (Some(length), Ok(at)) => self.list[at].1 = length,
+            (Some(length), Err(at)) => self.list.insert(at, (member, length)),
+            (None, Ok(at)) => {
+                self.list.remove(at);
+            }
+            (None, Err(_)) => {}
+        }
+        was
+    }
+}
+
+fn keyed(length: Length, member: MemberId) -> (bool, u64, MemberId) {
+    match length {
+        Length::Exact(length) => (false, length, member),
+        Length::AtMost(bound) => (true, bound, member),
+    }
+}
+
+// What one binding by the claims changed: the files whose binding changed,
+// by set; the unnamed members that came, went or changed length, with what
+// each was; and the members whose postings it visited.
+#[derive(Debug, Default)]
+pub(super) struct Pass {
+    // Whether it visited every posting: what it changed is then not told.
+    pub(super) whole: bool,
+    pub(super) files: BTreeMap<[u8; 16], Vec<FileId>>,
+    pub(super) unnamed: Vec<(MemberId, Option<Length>)>,
+    pub(super) members: BTreeSet<MemberId>,
+    #[cfg(test)]
+    pub(super) digests: usize,
+    #[cfg(test)]
+    pub(super) checks: usize,
+}
+
+// One posting's claim: the file of the set it answers to, the member it
+// answers for, and whether by its content.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Claim {
+    key: [u8; 16],
+    file: FileId,
+    member: MemberId,
+    content: bool,
+}
+
+// What binding found of each posting, kept between bindings, so a binding
+// visits only the postings that changed since the last one and derives
+// again only the files they claimed or claim. None of it is in the facts:
+// a restored object, like a new one, finds it in one whole pass.
+#[derive(Default)]
+pub(super) struct Claims {
+    // Whether it stands for the namespace as of `seen`: false until the
+    // first binding, and again once the catalogue changed.
+    synced: bool,
+    seen: u64,
+    // Each posting's claim.
+    postings: BTreeMap<MemberId, Claim>,
+    // The member each posting visited was a posting of at that visit, while
+    // its record stands: a posting that left a member, removed or taken
+    // over by another, leaves that member to be bound again too.
+    owner: BTreeMap<MemberId, MemberId>,
+    // Each complete posting that is its own member, with its length.
+    complete: BTreeMap<MemberId, Length>,
+    // Each claimed file's claimants: each member, by the postings of it
+    // that claim the file and whether each did by content.
+    claimants: BTreeMap<([u8; 16], FileId), Claimants>,
+    // How many files of each set are claimed: a set with any has bindings.
+    claimed: BTreeMap<[u8; 16], usize>,
+    // Each claimed set's bindings, and how many sets bind each member.
+    bindings: BTreeMap<[u8; 16], Bindings>,
+    bound_in: BTreeMap<MemberId, usize>,
+    // The complete members no set binds.
+    unnamed: Unnamed,
+    // Members a set gave up since the last binding.
+    given_up: BTreeSet<MemberId>,
+    // How many postings bindings visited, and how many whole passes ran.
+    #[cfg(test)]
+    pub(super) visits: usize,
+    #[cfg(test)]
+    pub(super) whole_passes: usize,
+    // How many fronts visits hashed, and how many times a posting was
+    // matched against a set.
+    #[cfg(test)]
+    digests: usize,
+    #[cfg(test)]
+    checks: usize,
+}
+
+// Each member claiming one file, by the postings of it that claim it and
+// whether each did by its content.
+type Claimants = BTreeMap<MemberId, BTreeMap<MemberId, bool>>;
+
+// What one posting comes to.
+#[derive(Default)]
+struct Visit {
+    claim: Option<Claim>,
+    complete: Option<Length>,
+    front: Option<(u64, Option<Front>)>,
+    #[cfg(test)]
+    hashed: usize,
+    #[cfg(test)]
+    checks: usize,
+}
+
+impl Claims {
+    // The catalogue changed, or binding went around these claims: the next
+    // binding visits every posting.
+    pub(super) fn stale(&mut self) {
+        self.synced = false;
+    }
+
+    // A set gave the member up: each of its postings is visited again.
+    pub(super) fn given_up(&mut self, member: MemberId) {
+        self.given_up.insert(member);
+    }
+
+    // Each claimed set's bindings.
+    pub(super) fn bindings(&self) -> &BTreeMap<[u8; 16], Bindings> {
+        &self.bindings
+    }
+
+    pub(super) fn unnamed(&self) -> &Unnamed {
+        &self.unnamed
+    }
+
+    // Each claimed file's claimants, and whether each claims it by content.
+    #[cfg(test)]
+    pub(super) fn claimants(&self) -> Claimed {
+        self.claimants
+            .iter()
+            .map(|(place, members)| {
+                let members = members
+                    .iter()
+                    .map(|(member, postings)| (*member, postings.values().any(|content| *content)))
+                    .collect();
+                (*place, members)
+            })
+            .collect()
+    }
+
+    // Bind the usable sets the catalogue files over the namespace, as
+    // `bind_catalogued` binds them, visiting only what changed since the
+    // last binding: the postings of each member the namespace marked since,
+    // and of each member a set gave up. Only a set some member claims has
+    // bindings, by its key.
+    pub(super) fn bind(
+        &mut self,
+        sets: &BTreeMap<[u8; 16], SetState>,
+        catalogue: &Catalogue,
+        namespace: &Namespace,
+        own: ObjectId,
+        fronts: &mut Fronts,
+        given_up: &BTreeSet<([u8; 16], MemberId)>,
+    ) -> Pass {
+        let mut touched = BTreeSet::new();
+        let mut members = BTreeSet::new();
+        let mut pass = Pass {
+            whole: !self.synced,
+            ..Pass::default()
+        };
+        #[cfg(test)]
+        let (digests, checks) = (self.digests, self.checks);
+        let apply = |claims: &mut Self,
+                     posting: MemberId,
+                     kept: Option<(u64, Option<Front>)>,
+                     fronts: &mut Fronts,
+                     touched: &mut BTreeSet<([u8; 16], FileId)>,
+                     members: &mut BTreeSet<MemberId>| {
+            if let Some(old) = claims.postings.remove(&posting) {
+                claims.unclaim(old, posting, touched);
+            }
+            if claims.complete.remove(&posting).is_some() {
+                members.insert(posting);
+            }
+            fronts.remove(&posting);
+            let Some(record) = namespace.get(posting) else {
+                claims.owner.remove(&posting);
+                return;
+            };
+            claims.owner.insert(posting, namespace.resolve(posting));
+            #[cfg(test)]
+            {
+                claims.visits += 1;
+            }
+            let found = visit(sets, catalogue, namespace, own, record, kept, given_up);
+            #[cfg(test)]
+            {
+                claims.digests += found.hashed;
+                claims.checks += found.checks;
+            }
+            if let Some(length) = found.complete {
+                claims.complete.insert(posting, length);
+                members.insert(posting);
+            }
+            if let Some(claim) = found.claim {
+                claims.claim(claim, posting, touched);
+                claims.postings.insert(posting, claim);
+            }
+            if let Some(front) = found.front {
+                fronts.insert(posting, front);
+            }
+        };
+        if self.synced {
+            // The postings to visit, and the members whose postings are
+            // among them.
+            let mut dirty = BTreeSet::new();
+            let mut opened = BTreeSet::new();
+            let mut queue = Vec::new();
+            let mut open = |member: MemberId, queue: &mut Vec<MemberId>| {
+                if opened.insert(member) {
+                    queue.extend(namespace.postings(member).map(|posting| posting.id));
+                }
+            };
+            for changed in namespace.changed_since(self.seen) {
+                queue.push(changed);
+                pass.members.insert(changed);
+                if namespace.get(changed).is_some() {
+                    let member = namespace.resolve(changed);
+                    pass.members.insert(member);
+                    open(member, &mut queue);
+                }
+            }
+            for member in std::mem::take(&mut self.given_up) {
+                pass.members.insert(member);
+                open(member, &mut queue);
+            }
+            // A posting visited is also visited for the member it was a
+            // posting of when last visited, which may since have lost it.
+            while let Some(posting) = queue.pop() {
+                if !dirty.insert(posting) {
+                    continue;
+                }
+                if let Some(&was) = self.owner.get(&posting) {
+                    pass.members.insert(was);
+                    open(was, &mut queue);
+                }
+            }
+            for posting in dirty {
+                let kept = fronts.get(&posting).copied();
+                apply(self, posting, kept, fronts, &mut touched, &mut members);
+            }
+        } else {
+            #[cfg(test)]
+            {
+                self.whole_passes += 1;
+            }
+            let last = std::mem::take(fronts);
+            *self = Self {
+                #[cfg(test)]
+                visits: self.visits,
+                #[cfg(test)]
+                whole_passes: self.whole_passes,
+                #[cfg(test)]
+                digests: self.digests,
+                #[cfg(test)]
+                checks: self.checks,
+                ..Self::default()
+            };
+            for posting in namespace.records() {
+                let kept = last.get(&posting.id).copied();
+                apply(self, posting.id, kept, fronts, &mut touched, &mut members);
+            }
+        }
+        self.synced = true;
+        self.seen = namespace.generation();
+        let keys: BTreeSet<[u8; 16]> = touched.iter().map(|(key, _)| *key).collect();
+        for (key, file) in touched {
+            if self.derive(key, file, &mut members) && !pass.whole {
+                pass.files.entry(key).or_default().push(file);
+            }
+        }
+        // A set no member claims any more has no bindings.
+        for key in keys {
+            if !self.claimed.contains_key(&key) {
+                debug_assert!(self.bindings.get(&key).is_none_or(BTreeMap::is_empty));
+                self.bindings.remove(&key);
+            }
+        }
+        for member in members {
+            let now = self
+                .complete
+                .get(&member)
+                .copied()
+                .filter(|_| !self.bound_in.contains_key(&member));
+            let was = self.unnamed.set(member, now);
+            if was != now && !pass.whole {
+                pass.unnamed.push((member, was));
+            }
+        }
+        #[cfg(test)]
+        {
+            pass.digests = self.digests - digests;
+            pass.checks = self.checks - checks;
+        }
+        pass
+    }
+
+    fn claim(
+        &mut self,
+        claim: Claim,
+        posting: MemberId,
+        touched: &mut BTreeSet<([u8; 16], FileId)>,
+    ) {
+        let place = (claim.key, claim.file);
+        let claimants = self.claimants.entry(place).or_insert_with(|| {
+            *self.claimed.entry(claim.key).or_default() += 1;
+            self.bindings.entry(claim.key).or_default();
+            BTreeMap::new()
+        });
+        claimants
+            .entry(claim.member)
+            .or_default()
+            .insert(posting, claim.content);
+        touched.insert(place);
+    }
+
+    fn unclaim(
+        &mut self,
+        claim: Claim,
+        posting: MemberId,
+        touched: &mut BTreeSet<([u8; 16], FileId)>,
+    ) {
+        let place = (claim.key, claim.file);
+        touched.insert(place);
+        let Some(claimants) = self.claimants.get_mut(&place) else {
+            return;
+        };
+        if let Some(postings) = claimants.get_mut(&claim.member) {
+            postings.remove(&posting);
+            if postings.is_empty() {
+                claimants.remove(&claim.member);
+            }
+        }
+        if !claimants.is_empty() {
+            return;
+        }
+        self.claimants.remove(&place);
+        if let Some(count) = self.claimed.get_mut(&claim.key) {
+            *count -= 1;
+            if *count == 0 {
+                self.claimed.remove(&claim.key);
+            }
+        }
+    }
+
+    // The binding of one file, by its claimants: verified content
+    // outranks a posted name, and only a unique member binds. Whether it
+    // changed.
+    fn derive(&mut self, key: [u8; 16], file: FileId, members: &mut BTreeSet<MemberId>) -> bool {
+        let now = self.claimants.get(&(key, file)).and_then(|claimants| {
+            let mut proven = claimants
+                .iter()
+                .filter(|(_, postings)| postings.values().any(|content| *content))
+                .map(|(member, _)| *member);
+            match proven.next() {
+                Some(member) => proven.next().is_none().then_some(member),
+                None => {
+                    let mut named = claimants.keys().copied();
+                    named.next().filter(|_| named.next().is_none())
+                }
+            }
+        });
+        let bindings = self.bindings.entry(key).or_default();
+        let was = match now {
+            Some(member) => bindings.insert(file, member),
+            None => bindings.remove(&file),
+        };
+        if was == now {
+            return false;
+        }
+        if let Some(member) = was {
+            members.insert(member);
+            if let Some(count) = self.bound_in.get_mut(&member) {
+                *count -= 1;
+                if *count == 0 {
+                    self.bound_in.remove(&member);
+                }
+            }
+        }
+        if let Some(member) = now {
+            members.insert(member);
+            *self.bound_in.entry(member).or_default() += 1;
+        }
+        true
+    }
+}
+
+// What one posting comes to, as `bind_over` takes it: nothing for one the
+// object holds as its own; its length when it is its own member and
+// complete; and the first set, in the catalogue's order, its content
+// answers in that has not given it up, else the first set its content or
+// name answers in.
+fn visit(
+    sets: &BTreeMap<[u8; 16], SetState>,
+    catalogue: &Catalogue,
+    namespace: &Namespace,
+    own: ObjectId,
+    posting: &Member,
+    kept: Option<(u64, Option<Front>)>,
+    given_up: &BTreeSet<([u8; 16], MemberId)>,
+) -> Visit {
+    let member = namespace.resolve(posting.id);
+    if namespace
+        .get(member)
+        .is_some_and(|record| record.bound_to == Some(own))
+    {
+        return Visit::default();
+    }
+    let (stamp, first_bytes) = namespace.stamped_front(posting.id);
+    let kept = kept
+        .filter(|(hashed, _)| *hashed == stamp)
+        .map(|(_, front)| front);
+    let candidate = Candidate::of(posting, first_bytes, kept);
+    let complete = candidate.complete.filter(|_| member == posting.id);
+    let mut first = None;
+    let mut fallback = None;
+    #[cfg(test)]
+    let mut checks = 0;
+    if catalogue.any() {
+        let listed = catalogue
+            .candidates(candidate.front(), candidate.name)
+            .map(|(_, key)| (key, &sets[&key]));
+        for (key, state) in listed {
+            #[cfg(test)]
+            {
+                checks += 1;
+            }
+            if let Some((file, content)) = match_member(state, &candidate) {
+                if content {
+                    if given_up.contains(&(key, member)) {
+                        fallback.get_or_insert((key, (file, content)));
+                        continue;
+                    }
+                    first = Some((key, (file, content)));
+                    break;
+                }
+                first.get_or_insert((key, (file, content)));
+            }
+        }
+    }
+    if let Some(fallback) = fallback
+        && first.is_none_or(|(_, (_, content))| !content)
+    {
+        first = Some(fallback);
+    }
+    Visit {
+        claim: first.map(|(key, (file, content))| Claim {
+            key,
+            file,
+            member,
+            content,
+        }),
+        complete,
+        front: candidate.front.get().map(|front| (stamp, *front)),
+        #[cfg(test)]
+        hashed: candidate.hashed.get(),
+        #[cfg(test)]
+        checks,
+    }
+}
+
 // Bind the usable sets the catalogue files over the namespace. A member is
 // matched only against the sets the catalogue finds for its front or its
 // name: no other set can match it. Only a set some member claimed has
 // bindings, by its key. `fronts` is what the last binding hashed: a front
 // whose stamp is unchanged is not hashed again, and what this binding
-// hashed replaces it.
+// hashed replaces it. What binding did before `Claims`, kept to compare it
+// with.
+#[cfg(test)]
 pub(super) fn bind_catalogued(
     sets: &BTreeMap<[u8; 16], SetState>,
     catalogue: &Catalogue,
@@ -222,6 +753,7 @@ pub(super) fn bind_sets(
 // their order, over the namespace. `any` says whether a usable set is
 // listed at all: only then is a member's front hashed. `passed` says
 // whether a set gave the member up.
+#[cfg(test)]
 fn bind_over<'s, K, I>(
     namespace: &Namespace,
     own: ObjectId,
@@ -234,6 +766,9 @@ where
     K: Copy + Ord,
     I: Iterator<Item = (K, &'s SetState)>,
 {
+    // What this walk compares names with is no bind's cost: the count
+    // stands as the bind left it.
+    let probes = super::NAME_PROBES.with(std::cell::Cell::get);
     let mut claims: BTreeMap<K, BTreeMap<FileId, Vec<(MemberId, bool)>>> = BTreeMap::new();
     let mut complete = BTreeMap::new();
     let last = std::mem::take(fronts);
@@ -328,6 +863,7 @@ where
             complete.remove(member);
         }
     }
+    super::NAME_PROBES.with(|count| count.set(probes));
     // A conflicting name did not identify the member. Keep it available
     // for slice verification and elimination alongside unmatched members.
     Bound {
@@ -358,18 +894,7 @@ fn match_member(state: &SetState, candidate: &Candidate<'_>) -> Option<(FileId, 
         }
         ContentMatch::Inconclusive => {}
     }
-    let mut matches = described(index, |description| description.filename == candidate.name);
-    if matches.is_empty() {
-        // Posted subjects can change case without changing file identity.
-        // Only a unique folded match is usable; length must not resolve a
-        // collision between distinct case-sensitive recovery names.
-        matches = described(index, |description| {
-            description.filename.eq_ignore_ascii_case(candidate.name)
-        });
-        if matches.len() > 1 {
-            return None;
-        }
-    }
+    let mut matches = named(state, index, candidate.name)?;
     // Two names, two descriptions: the posted name of a swapped pair answers
     // to the partner's description. Length breaks that tie whenever the pair
     // differ in it. Only a tie is broken this way: a lone name match keeps
@@ -422,6 +947,47 @@ fn by_content(state: &SetState, index: &Par2FileSet, candidate: &Candidate<'_>) 
     }
 }
 
+// The files the set describes under `name`, each with its length, in file
+// order: those named exactly, or else those named so in another ASCII case.
+// None when more than one is named so in another case.
+fn named(state: &SetState, index: &Par2FileSet, name: &str) -> Option<Vec<(FileId, u64)>> {
+    let folded = state.named(name);
+    let exact: Vec<(FileId, u64)> = folded
+        .iter()
+        .copied()
+        .filter(|(file, _)| {
+            #[cfg(test)]
+            super::NAME_PROBES.with(|probes| probes.set(probes.get() + 1));
+            index
+                .file_description(file)
+                .is_some_and(|description| description.filename == name)
+        })
+        .collect();
+    if !exact.is_empty() {
+        return Some(exact);
+    }
+    // Posted subjects can change case without changing file identity.
+    // Only a unique folded match is usable; length must not resolve a
+    // collision between distinct case-sensitive recovery names.
+    (folded.len() <= 1).then(|| folded.to_vec())
+}
+
+// What `named` answered before the name index: every description scanned.
+#[cfg(test)]
+fn named_by_scan(index: &Par2FileSet, name: &str) -> Option<Vec<(FileId, u64)>> {
+    let mut matches = described(index, |description| description.filename == name);
+    if matches.is_empty() {
+        matches = described(index, |description| {
+            description.filename.eq_ignore_ascii_case(name)
+        });
+        if matches.len() > 1 {
+            return None;
+        }
+    }
+    Some(matches)
+}
+
+#[cfg(test)]
 fn described(index: &Par2FileSet, test: impl Fn(&FileDescription) -> bool) -> Vec<(FileId, u64)> {
     let mut found: Vec<_> = index
         .files
@@ -443,11 +1009,21 @@ fn is_split_fragment_of(candidate_name: &str, described_name: &str) -> bool {
         })
 }
 
+// Claimants of each file of each set, and whether each claims it by
+// content.
+#[cfg(test)]
+pub(super) type Claimed = BTreeMap<([u8; 16], FileId), Vec<(MemberId, bool)>>;
+
 #[cfg(test)]
 mod tests {
+    use std::collections::{BTreeMap, BTreeSet, HashMap};
+
+    use par2_rs::{FileDescription, FileId, Par2FileSet, RecoverySetId};
     use weaver_graph::{MemberId, ObjectId, Provenance, Recovery};
 
     use super::super::Par2;
+    use super::super::sets::SetState;
+    use super::{named, named_by_scan};
     use crate::testing::{Job, par2_set, payload};
 
     const OWN: ObjectId = ObjectId(7);
@@ -514,5 +1090,148 @@ mod tests {
         job.arrive(member, 0, &a, Provenance::Repaired);
         assert_eq!(bind(&mut job), (3, Some("a.bin".to_owned())));
         assert_eq!(bind(&mut job), (3, Some("a.bin".to_owned())));
+    }
+
+    // An index describing `files`, each its id byte, name and length.
+    fn index(files: &[(u8, &str, u64)]) -> Par2FileSet {
+        let files: HashMap<FileId, FileDescription> = files
+            .iter()
+            .map(|&(id, name, length)| {
+                let file_id = FileId::from_bytes([id; 16]);
+                let description = FileDescription {
+                    file_id,
+                    hash_full: [id; 16],
+                    hash_16k: [id; 16],
+                    length,
+                    par2_name: name.to_owned(),
+                    filename: name.to_owned(),
+                };
+                (file_id, description)
+            })
+            .collect();
+        Par2FileSet {
+            recovery_set_id: RecoverySetId::from_bytes([9; 16]),
+            slice_size: 512,
+            recovery_file_ids: files.keys().copied().collect(),
+            non_recovery_file_ids: Vec::new(),
+            files,
+            slice_checksums: HashMap::new(),
+            recovery_slices: BTreeMap::new(),
+            creator: None,
+            unicode_names: Default::default(),
+        }
+    }
+
+    // What `named` found, each file by its id byte; none for a refusal.
+    type Found = Option<Vec<(u8, u64)>>;
+
+    fn ids(found: Option<Vec<(FileId, u64)>>) -> Found {
+        found.map(|found| {
+            found
+                .into_iter()
+                .map(|(file, length)| (file.as_bytes()[0], length))
+                .collect()
+        })
+    }
+
+    // The name index answers every posted name as scanning every
+    // description did: the same files, in the same order, and the same
+    // refusals.
+    #[test]
+    fn the_name_index_answers_as_the_scan_did() {
+        let index = index(&[
+            (1, "movie.mkv", 100),
+            (2, "dup.bin", 60),
+            (3, "dup.bin", 50),
+            (4, "same.bin", 70),
+            (5, "same.bin", 70),
+            (6, "Case.TXT", 10),
+            (7, "Fold.nfo", 5),
+            (8, "fold.NFO", 6),
+            (9, "Exact.srt", 3),
+            (10, "exact.SRT", 4),
+            (11, "\u{c9}t\u{e9}.bin", 8),
+        ]);
+        let state = SetState::indexed(index.clone());
+        assert!(state.usable().is_some());
+        let cases: [(&str, Found); 9] = [
+            // Exact, unique.
+            ("movie.mkv", Some(vec![(1, 100)])),
+            // Exact, two descriptions of one name, lengths apart.
+            ("dup.bin", Some(vec![(2, 60), (3, 50)])),
+            // Exact, two descriptions of one name and length.
+            ("same.bin", Some(vec![(4, 70), (5, 70)])),
+            // Another case, unique.
+            ("case.txt", Some(vec![(6, 10)])),
+            // Two descriptions apart only in case, posted in a third.
+            ("FOLD.Nfo", None),
+            // Exact beside another apart only in case: exact wins.
+            ("Exact.srt", Some(vec![(9, 3)])),
+            // Folding is ASCII only: 'É' is not 'é'.
+            ("\u{e9}t\u{e9}.bin", Some(vec![])),
+            // ASCII letters of a non-ASCII name still fold.
+            ("\u{c9}T\u{e9}.BIN", Some(vec![(11, 8)])),
+            // Nothing of the name.
+            ("nothing.here", Some(vec![])),
+        ];
+        for (name, expected) in cases {
+            let scanned = named_by_scan(&index, name);
+            assert_eq!(ids(scanned.clone()), expected, "scan, {name}");
+            assert_eq!(named(&state, &index, name), scanned, "index, {name}");
+        }
+    }
+
+    // Seeded names over a small alphabet in random case, so exact, folded,
+    // colliding and missing names all occur: the index answers each as the
+    // scan did.
+    #[test]
+    fn the_name_index_answers_seeded_names_as_the_scan_did() {
+        let mut state = 0x2545_f491_4f6c_dd1d_u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        // One to three of 'a', 'b' and 'é', each in either case.
+        fn name(next: &mut dyn FnMut() -> u64) -> String {
+            let length = 1 + next() % 3;
+            (0..length)
+                .map(|_| {
+                    let [lower, upper] =
+                        [['a', 'A'], ['b', 'B'], ['\u{e9}', '\u{c9}']][(next() % 3) as usize];
+                    if next().is_multiple_of(2) {
+                        lower
+                    } else {
+                        upper
+                    }
+                })
+                .collect()
+        }
+        let described: Vec<(u8, String, u64)> = (1..=60u8)
+            .map(|id| (id, name(&mut next), next() % 4))
+            .collect();
+        let files: Vec<(u8, &str, u64)> = described
+            .iter()
+            .map(|(id, name, length)| (*id, name.as_str(), *length))
+            .collect();
+        let index = index(&files);
+        let set = SetState::indexed(index.clone());
+        let mut outcomes = BTreeSet::new();
+        for _ in 0..400 {
+            let posted = name(&mut next);
+            let scanned = named_by_scan(&index, &posted);
+            outcomes.insert(scanned.as_ref().map(Vec::len));
+            assert_eq!(named(&set, &index, &posted), scanned, "{posted}");
+        }
+        assert!(outcomes.contains(&None), "{outcomes:?}");
+        assert!(outcomes.contains(&Some(0)), "{outcomes:?}");
+        assert!(outcomes.contains(&Some(1)), "{outcomes:?}");
+        assert!(
+            outcomes
+                .iter()
+                .any(|count| count.is_some_and(|count| count > 1)),
+            "{outcomes:?}"
+        );
     }
 }

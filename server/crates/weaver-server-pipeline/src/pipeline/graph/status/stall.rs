@@ -18,8 +18,8 @@
 use tracing::warn;
 use weaver_graph::recovery::RepairOutcome;
 
-use super::seams::settle;
-use super::{RootJob, Step};
+use super::seams::{checkpoint_moves, settle};
+use super::{RootJob, Step, after_recovery};
 use crate::pipeline::Pipeline;
 use crate::pipeline::graph::job::GraphJob;
 use crate::pipeline::graph::root::phase::RootPhase;
@@ -116,7 +116,22 @@ impl Pipeline {
 
     // Nothing the quiet freed moved the job: it ends where it stands, under
     // the status every job ends in, as a gate that answered Deliver ends it.
+    // It takes the step after recovery as the gate does: files still to
+    // move go to their names first, and the job delivers on a later turn,
+    // once they have landed and it stalls again.
     async fn end_stalled(&mut self, job_id: JobId, waited: &str) {
+        let Some(job) = self.graph_jobs.get_mut(&job_id) else {
+            return;
+        };
+        if after_recovery(job) == Step::Wait {
+            warn!(
+                job_id = job_id.0,
+                waited = %waited,
+                "graph job still waits with nothing pending after its objects heard nothing more arrives; its files move to their names before it ends as delivered"
+            );
+            checkpoint_moves(self, job_id);
+            return;
+        }
         warn!(
             job_id = job_id.0,
             waited = %waited,

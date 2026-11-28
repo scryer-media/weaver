@@ -18,6 +18,9 @@ mod gaps;
 mod image;
 mod layout;
 mod lock;
+pub(crate) mod made;
+#[cfg(test)]
+mod oracle;
 mod order;
 mod place;
 mod record;
@@ -25,6 +28,11 @@ mod walk;
 
 #[cfg(test)]
 pub(crate) mod tests;
+// A small RAR writer, for this crate's tests and other crates' (never in a
+// product build).
+#[cfg(any(test, feature = "test-support"))]
+#[path = "tests/writer.rs"]
+pub mod writer;
 
 use std::collections::{BTreeMap, BTreeSet, HashSet, btree_map};
 use std::ops::Bound;
@@ -265,12 +273,32 @@ mod counts {
         pub(crate) read_members: usize,
         pub(crate) laid_members: usize,
         pub(crate) recovery_looked: usize,
+        // Headers looked at to find a part by where its data starts, and
+        // made entries whose window was worked out.
+        pub(crate) parts_compared: usize,
+        pub(crate) windows_filed: usize,
+        // Pieces looked at to find a volume range's parts.
+        pub(crate) parts_visited: usize,
     }
 
     thread_local! {
         static COUNTS: RefCell<Counts> = RefCell::default();
         static OLD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
         static WHOLE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        static SCAN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    // Whether a volume range's parts are found by a scan of every piece the
+    // volume holds, and an envelope's kept bytes are searched for padding
+    // whether or not an enciphered member went back, as before the pieces
+    // were filed by where their data starts. The store looking the old way
+    // scans too.
+    pub(crate) fn scan() -> bool {
+        SCAN.with(std::cell::Cell::get) || old()
+    }
+
+    pub(crate) fn set_scan(scan: bool) {
+        SCAN.with(|cell| cell.set(scan));
     }
 
     // Whether a layout is handed a volume's whole facts every time, as it
@@ -315,6 +343,16 @@ enum Lock {
     Locked,
     Open(Arc<Cbc>),
     Sealed(Box<Chain>),
+}
+
+// Where a piece is filed among its volume's: by where its data starts, then
+// by entry and piece.
+fn piece_order(entries: &[Entry], id: usize, at: usize) -> (u64, usize, usize) {
+    let start = entries
+        .get(id)
+        .and_then(|entry| entry.pieces.get(at))
+        .map_or(u64::MAX, |piece| piece.data.start);
+    (start, id, at)
 }
 
 // One volume's part of a file: its data area there and where it starts in
@@ -364,9 +402,40 @@ struct Entry {
     // runs, by piece, for its own.
     plain_runs: CrcRuns,
     parts: BTreeMap<usize, CrcRuns>,
+    // A member the store's run makes, compressed in a set that is not
+    // solid beside members the store streams: its data is the envelope's,
+    // and its bytes, checksum and close are the run's (`made`).
+    made: bool,
+    // A slot whose member was retracted where it stood, its id kept for the
+    // member the layout lays there next: it holds no piece and is said to
+    // nothing until that member is announced into it.
+    waiting: bool,
 }
 
 impl Entry {
+    // The slot a member retracted where it stood leaves: its name, and
+    // nothing of its bytes.
+    fn waiting(name: String) -> Self {
+        Self {
+            name,
+            length: None,
+            crc: None,
+            uses_mac: false,
+            store: None,
+            pieces: Vec::new(),
+            complete: false,
+            lock: Lock::Plain,
+            hash_key: None,
+            trial: None,
+            condemned_on: Coverage::new(),
+            out: Arc::default(),
+            plain_runs: CrcRuns::default(),
+            parts: BTreeMap::new(),
+            made: false,
+            waiting: true,
+        }
+    }
+
     // The part of the file whose packed stream holds all of `stream`: a
     // range the entry has not taken a part for yet is no member's bytes.
     fn piece_of(&self, stream: ByteRange) -> Option<usize> {
@@ -401,12 +470,22 @@ impl Entry {
         }
     }
 
+    // Whether the store places bytes of the member itself, in the step they
+    // arrive: a file it streams, not one its run makes, a directory, an
+    // empty file or a retracted slot.
+    fn streams(&self) -> bool {
+        !self.made && !self.waiting && self.length != Some(0)
+    }
+
     // Whether the member's parts, all in, carry fewer bytes than the size
     // its header states: it ends where they do only once its CRC proves it.
+    // A made member's parts are packed, and say nothing of its size.
     fn short(&self) -> bool {
-        self.length
-            .zip(self.plain_len())
-            .is_some_and(|(stated, carried)| carried < stated)
+        !self.made
+            && self
+                .length
+                .zip(self.plain_len())
+                .is_some_and(|(stated, carried)| carried < stated)
     }
 
     // Whether the store is the one to judge the member's whole checksum: a
@@ -441,6 +520,48 @@ struct Candidate {
     // kept: a restart offers the candidate again and keys it on trial, and
     // condemning it once more costs one more reading of its bytes.
     files_wrong: bool,
+    // Something verified under it besides the headers: a key it derived
+    // passed the check value its header carries, or a file's checksum passed
+    // under a key it keyed on trial (`RarStore::proven`). Not kept, as
+    // `files_wrong` is not.
+    proven: bool,
+}
+
+// What a look changed of what `place` reads beyond the volumes it walked.
+#[derive(Default)]
+enum ReadsMoved {
+    #[default]
+    Nothing,
+    Volumes(BTreeSet<VolumeIndex>),
+    All,
+}
+
+impl ReadsMoved {
+    // What `place` reads of `volume` changed.
+    fn at(&mut self, volume: VolumeIndex) {
+        match self {
+            Self::Nothing => *self = Self::Volumes(BTreeSet::from([volume])),
+            Self::Volumes(volumes) => {
+                volumes.insert(volume);
+            }
+            Self::All => {}
+        }
+    }
+
+    // What `place` reads of any volume changed.
+    fn all(&mut self) {
+        *self = Self::All;
+    }
+
+    // Whether `volume` is said moved.
+    #[cfg(test)]
+    fn covers(&self, volume: VolumeIndex) -> bool {
+        match self {
+            Self::Nothing => false,
+            Self::Volumes(volumes) => volumes.contains(&volume),
+            Self::All => true,
+        }
+    }
 }
 
 pub struct RarStore {
@@ -449,17 +570,35 @@ pub struct RarStore {
     volumes: BTreeMap<VolumeIndex, Volume>,
     // Volumes said to be given back, until the tree takes them.
     giving: BTreeMap<VolumeIndex, Volume>,
-    // The volumes held, here or in `giving`, that no entry's piece lies in:
-    // the ones that can travel to another owner. Filed where a volume comes
+    // The volumes held, here or in `giving`, that no stored entry's piece
+    // lies in: none of their bytes went to a member's file, so they can go
+    // back to be claimed elsewhere. A made entry's pieces leave a volume
+    // here, since its bytes stay in the envelope. Filed where a volume comes
     // or goes and where pieces do, so no question about one scans pieces.
     unmapped: BTreeSet<VolumeIndex>,
+    // The entries the store's run makes, filed as entries come and go, so
+    // the question scans no entry.
+    made: BTreeSet<usize>,
+    // How many entries the store streams itself (`Entry::streams`), counted
+    // where `made` is filed, so whether it passes bytes on scans no entry.
+    streamed: usize,
+    // The slots retracted where they stood, waiting for the member the
+    // layout lays there: filed where `made` is.
+    waiting: BTreeSet<usize>,
+    // The window each made entry's decode holds, by entry, and how many
+    // hold each window: filed where the made entries are, so the run's
+    // reserve reads the widest without a scan.
+    windows: BTreeMap<usize, u64>,
+    widest: BTreeMap<u64, usize>,
     // The volumes held that are bound and not yet closed: more of them is
     // still to come. Filed where a volume is named, closes, comes or goes,
     // so asking whether everything bound has closed scans no volume.
     open: BTreeSet<VolumeIndex>,
     // Every entry's pieces by the volume they lie in, as (entry, piece),
     // filed where `unmapped` is, so finding a volume's parts scans no other
-    // volume's pieces.
+    // volume's pieces. Each volume's are filed in the order their data
+    // starts, then entry and piece (`piece_order`), so the parts in a range
+    // are found by where it starts.
     pieces_in: BTreeMap<VolumeIndex, Vec<(usize, usize)>>,
     // The entries locked or sealed, filed wherever an entry's lock changes
     // and where `pieces_in` is, so opening files scans no open or plain one.
@@ -501,6 +640,9 @@ pub struct RarStore {
     inversions: BTreeSet<u32>,
     entries: Vec<Entry>,
     candidates: Vec<Candidate>,
+    // The candidate the job offered last, one offered before among them: a
+    // run decodes under it, as the engine's run takes the latest offer.
+    offered: Option<usize>,
     // The candidate that opened the headers.
     headers_open: Option<usize>,
     asked: bool,
@@ -521,10 +663,25 @@ pub struct RarStore {
     stale: bool,
     // The object gave its set up; it says nothing more.
     gone: bool,
-    // Moved wherever anything `place` reads may change: a look at what
-    // changed, a volume touched, a condemned file's cipher taken or let go.
-    // Data that only passes through moves nothing.
+    // A run over its made members was started: what the tree marks refuted
+    // since is that run's finding, not only the store's own walk's.
+    started: bool,
+    // Moved wherever anything `place` reads may change: for one volume
+    // where only what `place` reads of that volume changed (a volume
+    // touched, its kept bytes wanted anew, a condemned file's part in it
+    // posted again, a look that walked it), store-wide where what it reads
+    // across volumes did (`reads_moved`, a condemned key). Data that only
+    // passes through moves nothing.
     placed: Placed,
+    // What a look changed of what `place` reads beyond the volumes it
+    // walked: the layout, the entries' pieces, kinds, lengths or locks, for
+    // the volumes named, or for every one.
+    reads_moved: ReadsMoved,
+    // What `place` answered for every volume at the last check, under the
+    // number it was given: every volume no move since names answers so
+    // still.
+    #[cfg(test)]
+    oracle: std::sync::Mutex<Option<(u64, oracle::Answers)>>,
     // The keys a file needs of a candidate that the cache holds no answer
     // for, as (candidate, entry): derived away from the loop while the
     // store is lent out, and the files open once it is back.
@@ -557,6 +714,11 @@ impl RarStore {
             volumes: BTreeMap::new(),
             giving: BTreeMap::new(),
             unmapped: BTreeSet::new(),
+            made: BTreeSet::new(),
+            streamed: 0,
+            waiting: BTreeSet::new(),
+            windows: BTreeMap::new(),
+            widest: BTreeMap::new(),
             open: BTreeSet::new(),
             pieces_in: BTreeMap::new(),
             locked: BTreeSet::new(),
@@ -572,6 +734,7 @@ impl RarStore {
             inversions: BTreeSet::new(),
             entries: Vec::new(),
             candidates: Vec::new(),
+            offered: None,
             headers_open: None,
             asked: false,
             wrong_key: None,
@@ -582,16 +745,25 @@ impl RarStore {
             gaps_said: gaps::Gaps::default(),
             stale: false,
             gone: false,
+            started: false,
             placed: Placed::default(),
+            reads_moved: ReadsMoved::Nothing,
+            #[cfg(test)]
+            oracle: std::sync::Mutex::new(None),
             derive_due: BTreeSet::new(),
             derived: BTreeMap::new(),
             headers_due: BTreeMap::new(),
         }
     }
 
-    // Something `place` reads may have changed.
+    // Something `place` reads may have changed, for any volume.
     fn moved(&mut self) {
         self.placed.moved();
+    }
+
+    // Something `place` reads of `volume` alone may have changed.
+    fn moved_at(&mut self, volume: VolumeIndex) {
+        self.placed.moved_at(volume);
     }
 
     // A volume newly held lies under no piece: a layout maps only volumes
@@ -631,7 +803,7 @@ impl RarStore {
         }
         self.file_place(volume);
         self.dirty.insert(volume);
-        self.moved();
+        self.moved_at(volume);
     }
 
     // File what places a volume beside the others, as it stands now:
@@ -681,7 +853,16 @@ impl RarStore {
         counts::bump(|counts| counts.remaps += 1);
         self.pieces_in.clear();
         self.locked.clear();
+        self.made.clear();
+        self.waiting.clear();
+        self.streamed = self.entries.iter().filter(|entry| entry.streams()).count();
         for (id, entry) in self.entries.iter().enumerate() {
+            if entry.made {
+                self.made.insert(id);
+            }
+            if entry.waiting {
+                self.waiting.insert(id);
+            }
             if matches!(entry.lock, Lock::Locked | Lock::Sealed(_)) {
                 self.locked.insert(id);
             }
@@ -692,7 +873,15 @@ impl RarStore {
                     .push((id, at));
             }
         }
-        let mapped: BTreeSet<VolumeIndex> = self.pieces_in.keys().copied().collect();
+        for pieces in self.pieces_in.values_mut() {
+            pieces.sort_unstable_by_key(|&(id, at)| piece_order(&self.entries, id, at));
+        }
+        let mapped: BTreeSet<VolumeIndex> = self
+            .entries
+            .iter()
+            .filter(|entry| !entry.made)
+            .flat_map(|entry| entry.pieces.iter().map(|piece| piece.volume))
+            .collect();
         self.unmapped = self
             .volumes
             .keys()
@@ -700,6 +889,7 @@ impl RarStore {
             .filter(|volume| !mapped.contains(volume))
             .copied()
             .collect();
+        self.file_windows(0);
     }
 
     // The volumes held say others exist that the store was never given: the
@@ -771,7 +961,6 @@ impl RarStore {
         let mut reached = BTreeMap::new();
         while !self.gone && (std::mem::take(&mut self.stale) | !self.dirty.is_empty()) {
             // The walks, the layout and the keys change only here.
-            self.moved();
             let touched = std::mem::take(&mut self.dirty);
             self.walk(&touched, &mut reached, out);
             // The layout holds to every volume touched so far, those the
@@ -785,6 +974,23 @@ impl RarStore {
             if !self.gone {
                 self.open_files(out);
             }
+            // A look moves the volumes it walked; one that changed what
+            // `place` reads across volumes moves store-wide.
+            match std::mem::take(&mut self.reads_moved) {
+                ReadsMoved::All => self.moved(),
+                ReadsMoved::Nothing => {
+                    for &volume in &touched {
+                        self.moved_at(volume);
+                    }
+                }
+                ReadsMoved::Volumes(volumes) => {
+                    for volume in touched.union(&volumes) {
+                        self.moved_at(*volume);
+                    }
+                }
+            }
+            #[cfg(test)]
+            self.check_moves();
         }
         let mut unkept = Vec::new();
         for (volume, from) in reached {
@@ -829,8 +1035,11 @@ impl RarStore {
             let kept = &self.volumes[&volume].kept;
             match step {
                 Step::Walked { moved, damaged } => {
-                    if moved {
-                        reached.entry(volume).or_insert(before);
+                    // Said once per volume per settle, however many steps
+                    // of its walk moved.
+                    if moved && let btree_map::Entry::Vacant(entry) = reached.entry(volume) {
+                        entry.insert(before);
+                        out.push(Emit::HeadersMoved(volume));
                     }
                     if let Some(range) = damaged {
                         let crc = kept.read(range).map_or(0, crc32);
@@ -948,13 +1157,30 @@ impl RarStore {
     }
 
     // Every volume the store gives back goes through here. One the layout
-    // already placed pieces in stays, whichever path asked: its bytes went
-    // to the store's members, its kept bytes no longer hold them, and the
-    // tree, handed it, would refuse its member with those bytes lost, the
-    // store founded again on the same bytes would give it back again, and
-    // nothing would change between the rounds. It is the store's, as any
-    // volume its members read is.
+    // already placed a stored member's pieces in stays, whichever path
+    // asked: its bytes went to that member's file, its kept bytes no longer
+    // hold them, and the tree, handed it, would refuse its member with those
+    // bytes lost, the store founded again on the same bytes would give it
+    // back again, and nothing would change between the rounds. It is the
+    // store's, as any volume its stored members read is. One only made
+    // members' pieces lie in stays too when the store's own reading of the
+    // headers asks, as at a misfit while a repair is half delivered: the
+    // run reads it where it is. Only a name that places it elsewhere sends
+    // it back (`give_back_named`).
     fn give_back_held(&mut self, going: Vec<VolumeIndex>, out: &mut Vec<Emit>) {
+        let going = going
+            .into_iter()
+            .filter(|index| !self.pieces_in.contains_key(index))
+            .collect();
+        self.give_back_named(going, out);
+    }
+
+    // A volume its name now places elsewhere goes back even when made
+    // members' pieces lie in it: they kept every byte in its envelope, as
+    // the engine's volumes do, and it goes back as they do. The look that
+    // follows finds it gone from the store and retracts what the run made
+    // of it. One a stored member's pieces lie in still stays.
+    fn give_back_named(&mut self, going: Vec<VolumeIndex>, out: &mut Vec<Emit>) {
         for index in going {
             if !self.unmapped.contains(&index) {
                 continue;
@@ -967,6 +1193,23 @@ impl RarStore {
             self.file_open(index);
             self.touch(index);
         }
+    }
+
+    // A volume the store can give back with what it parsed of it: none of
+    // its bytes went to a stored member's file, nothing ties it to a held
+    // neighbour at the place it states, unless the store already said it
+    // gives it back, and what it kept may travel.
+    fn giveable(&self, volume: VolumeIndex) -> Option<&(dyn std::any::Any + Send + Sync)> {
+        if !self.unmapped.contains(&volume)
+            || (!self.giving.contains_key(&volume) && claim::tied(volume, &self.volumes))
+        {
+            return None;
+        }
+        let held = self
+            .giving
+            .get(&volume)
+            .or_else(|| self.volumes.get(&volume))?;
+        (held.kept.len() <= claim::CARRIED).then_some(held)
     }
 
     // Everything bound has closed: nothing more will arrive.
@@ -983,7 +1226,10 @@ impl RarStore {
     // whole, at the length every volume but the last shares. A volume held
     // with no name may place bytes, so it is said alone; the runs between
     // the volumes held hold nothing and are each said once, as a gap. The
-    // cost is that of the volumes held, never of the last one's number.
+    // cost is that of the volumes held, never of the last one's number. A
+    // place said a gap while nothing was held there marks nothing then
+    // (the tree marks only bound volumes), and a volume held there later is
+    // no gap: nothing said of it before damages it or hides it.
     fn say_gaps(&mut self, out: &mut Vec<Emit>) {
         let Some(last) = self.last().filter(|_| self.finished()) else {
             return;
@@ -997,11 +1243,15 @@ impl RarStore {
             return;
         };
         let range = ByteRange::new(0, length);
-        let held: Vec<(u32, bool)> = self
+        // A volume said to be given back arrived and is only moving: it is
+        // held here until the tree takes it, and no gap or damage is its.
+        let mut held: Vec<(u32, bool)> = self
             .volumes
             .range(..last)
             .map(|(index, found)| (index.0, found.name.is_none()))
+            .chain(self.giving.range(..last).map(|(index, _)| (index.0, false)))
             .collect();
+        held.sort_unstable();
         let mut next = 0;
         for (index, nameless) in held {
             self.say_gap(next, index, range, out);
@@ -1037,9 +1287,15 @@ impl Object for RarStore {
     }
 
     // Stored members take their bytes as they arrive, until I give the set
-    // to an engine or up.
+    // to an engine or up. Before any member is laid, any may be one; once
+    // members are laid, only while one of them is streamed here: a set
+    // whose laid members are all made by its run keeps its volumes' bytes
+    // for that run, and none goes on in the step. A later header that lays
+    // the first streamed member makes the answer true from then on; the
+    // step that lays it was armed under the old answer and goes without
+    // the prepay on the members' volume.
     fn passes_on(&self) -> bool {
-        !self.gone
+        !self.gone && (self.entries.is_empty() || self.streamed > 0)
     }
 
     fn facts(&self) -> weaver_graph::Facts {
@@ -1126,7 +1382,7 @@ impl Object for RarStore {
                 break;
             }
             // A range wanted anew is the store's own now, not held.
-            self.moved();
+            self.moved_at(volume);
         }
         self.route(
             volume,
@@ -1232,7 +1488,19 @@ impl Object for RarStore {
         let why = match first.is_none_or(|found| found.name.is_none()) {
             true => Some(Why::FirstBytesLost),
             false => crate::quiet::damaged(standing)
+                // My run found bad what proof above found whole: it cannot
+                // read a member it makes, as the engine's run cannot. With
+                // no run started, what is refuted is the store's own walk's
+                // finding, which a repair answers.
+                .or_else(|| {
+                    (self.started && standing.refuted() && !standing.lost())
+                        .then_some(Why::InvalidArchive)
+                })
                 .or_else(|| self.shut())
+                // My run asked for a password for a member it makes, and
+                // none it was offered opened it: the set is shut by it, as
+                // a set an engine runs is.
+                .or_else(|| (self.started && standing.asking()).then_some(Why::Encrypted))
                 .or_else(|| crate::quiet::unplaced(standing, self.lacks())),
         };
         if let Some(why) = why {
@@ -1276,7 +1544,15 @@ impl Object for RarStore {
     }
 
     fn placement(&self) -> Option<u64> {
+        #[cfg(test)]
+        self.check_moves();
         Some(self.placed.number())
+    }
+
+    fn placement_moves(&self, since: u64) -> weaver_graph::PlacementMoves {
+        #[cfg(test)]
+        self.check_moves();
+        self.placed.since(since)
     }
 
     fn extent(&self, member: MemberId, range: ByteRange, out: &mut Vec<Extent>) -> Located {
@@ -1343,7 +1619,7 @@ impl Object for RarStore {
         // The offer answers the question the store asked: a candidate that
         // opens nothing leaves it free to ask for the next one.
         self.asked = false;
-        self.candidate(secret);
+        self.offered = Some(self.candidate(secret));
         self.dirty.extend(self.volumes.keys().copied());
         self.stale = true;
         self.settle(None, out);
@@ -1370,9 +1646,19 @@ impl Object for RarStore {
         let held = self.volumes.get(&volume)?;
         Some(Box::new(crate::engine::CarriedVolume {
             front: held.stated().cloned(),
+            ended: held.walk.ended,
             length: held.length,
             window: held.stated().and_then(crate::rar_engine::window),
         }))
+    }
+
+    // A mixed set's run, once the set's members are known (`made.rs`).
+    fn engine(&self) -> Option<&dyn weaver_graph::Engine> {
+        self.runs().then_some(self as &dyn weaver_graph::Engine)
+    }
+
+    fn engine_mut(&mut self) -> Option<&mut dyn weaver_graph::Engine> {
+        self.runs().then_some(self as &mut dyn weaver_graph::Engine)
     }
 
     // The place the volume's headers or name give it, held or not: whether
@@ -1380,7 +1666,7 @@ impl Object for RarStore {
     // past its hole has no headers to give one.
     fn claim(&mut self, name: &str, clean: weaver_graph::Clean<'_>, _length: Option<u64>) -> Claim {
         match clean.at {
-            0 => self.claim_volume(name, clean.front()),
+            0 => self.claim_told(name, clean.front(), clean.tail),
             _ => self.claim_past_hole(name),
         }
     }
@@ -1389,17 +1675,13 @@ impl Object for RarStore {
     // parse it owns. This is also the guard on a transfer the tree asks for.
     // A volume tied to a held neighbour at the place it states stays
     // with that neighbour: it is that set's, however its place was taken.
+    // One a made member's pieces lie in feeds the run, as an engine's volume
+    // does, and travels to no sibling; it can still go back.
     fn carried(&self, volume: VolumeIndex) -> Option<&(dyn std::any::Any + Send + Sync)> {
-        if !self.unmapped.contains(&volume)
-            || (!self.giving.contains_key(&volume) && claim::tied(volume, &self.volumes))
-        {
+        if self.pieces_in.contains_key(&volume) {
             return None;
         }
-        let held = self
-            .giving
-            .get(&volume)
-            .or_else(|| self.volumes.get(&volume))?;
-        (held.kept.len() <= claim::CARRIED).then_some(held)
+        self.giveable(volume)
     }
 
     fn carriable(&self, out: &mut Vec<VolumeIndex>) {
@@ -1412,7 +1694,12 @@ impl Object for RarStore {
     }
 
     fn give_back(&mut self, volume: VolumeIndex) -> Option<weaver_graph::Carried> {
-        self.carried(volume)?;
+        // One a made member's pieces lie in goes only once the store said
+        // it gives it back.
+        if !self.giving.contains_key(&volume) && self.pieces_in.contains_key(&volume) {
+            return None;
+        }
+        self.giveable(volume)?;
         let given = self
             .giving
             .remove(&volume)
@@ -1445,15 +1732,26 @@ impl Object for RarStore {
         &self,
         name: &str,
         front: &[u8],
+        length: Option<u64>,
+        carried: &(dyn std::any::Any + Send + Sync),
+    ) -> Claim {
+        self.reclaim_told(name, front, &[], length, carried)
+    }
+
+    fn reclaim_told(
+        &self,
+        name: &str,
+        front: &[u8],
+        tail: &[u8],
         _length: Option<u64>,
         carried: &(dyn std::any::Any + Send + Sync),
     ) -> Claim {
         match carried.downcast_ref::<Volume>() {
-            Some(given) => self.reclaim_volume(name, front, given),
+            Some(given) => self.reclaim_volume(name, (front, tail), given),
             None => carried
                 .downcast_ref::<crate::engine::CarriedVolume<unrar_rs::RarVolumeFacts>>()
                 .map_or_else(Claim::default, |given| {
-                    self.reclaim_front(name, front, given.front.as_ref())
+                    self.reclaim_front(name, (front, tail), given.front.as_ref())
                 }),
         }
     }
@@ -1502,8 +1800,8 @@ impl Object for RarStore {
         // restore reads it again as said already.
         self.file_open(volume);
         self.touch(volume);
-        if misplaced && self.carried(volume).is_some() {
-            self.give_back_held(vec![volume], out);
+        if misplaced && self.giveable(volume).is_some() {
+            self.give_back_named(vec![volume], out);
         }
         self.settle(None, out);
     }

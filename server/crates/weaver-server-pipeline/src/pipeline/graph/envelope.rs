@@ -38,6 +38,9 @@ pub struct Envelopes {
     // latest change: every way to change what a checkpoint says of them
     // marks the node.
     marks: Marks<NodeId>,
+    // The nodes whose shelf was made since the writer last forgot what the
+    // tree dropped: one made for a node already buried is forgotten then.
+    made: BTreeSet<NodeId>,
     // Shared with every shelf: whether the job asks to hear of the next
     // run to begin waiting on one.
     watch: Arc<Watch>,
@@ -201,6 +204,11 @@ pub struct Shelved {
     // Which run may read. Moving it on stops the one reading: a repair
     // behind what it read, or the node going away.
     pub(crate) generation: u64,
+    // How many times repaired bytes, or a clean copy mending damage, landed
+    // behind what a run read: what a candidate key failed on before is
+    // gone, so the job tries its candidates again (`Passwords::rewind`).
+    // A password offer's restart does not move it.
+    pub(crate) repaired: u64,
     // How many times the shelf woke its waiters, and the count a run last
     // began to wait at: a run waits for good while the two agree.
     pub(crate) woken: u64,
@@ -288,6 +296,7 @@ impl Envelopes {
             given: Given::default(),
             shelves: BTreeMap::new(),
             marks: Marks::default(),
+            made: BTreeSet::new(),
             watch: Arc::default(),
             #[cfg(any(test, feature = "pipeline-test-fixtures"))]
             blocked: Arc::default(),
@@ -321,6 +330,15 @@ impl Envelopes {
         &self.given
     }
 
+    // The run reading the node's shelf starts over over the same bytes, and
+    // the node is marked as changed. A node with no shelf has no run.
+    pub fn restart(&mut self, node: NodeId) {
+        if let Some(shelf) = self.shelves.get(&node) {
+            shelf.restart();
+            self.marks.mark(node);
+        }
+    }
+
     // The node's shelf, made empty the first time it is asked for.
     pub fn shelf(&mut self, node: NodeId) -> Arc<Shelf> {
         let dir = &self.working_dir;
@@ -329,7 +347,9 @@ impl Envelopes {
         let watch = &self.watch;
         #[cfg(any(test, feature = "pipeline-test-fixtures"))]
         let blocked = &self.blocked;
+        let made = &mut self.made;
         Arc::clone(self.shelves.entry(node).or_insert_with(|| {
+            made.insert(node);
             Arc::new(Shelf {
                 dir: dir.clone(),
                 to: to.clone(),
@@ -430,6 +450,7 @@ impl Envelopes {
             kept.coverage.write(range, provenance);
             if (provenance == Provenance::Repaired || mends) && range.start < kept.reached {
                 state.generation += 1;
+                state.repaired += 1;
             }
             Ok(())
         })
@@ -464,6 +485,19 @@ impl Envelopes {
     // Every node with a shelf, in node order.
     pub(crate) fn nodes(&self) -> impl Iterator<Item = NodeId> + '_ {
         self.shelves.keys().copied()
+    }
+
+    pub(crate) fn has_shelf(&self, node: NodeId) -> bool {
+        self.shelves.contains_key(&node)
+    }
+
+    // The nodes whose shelf was made since the list was last cleared.
+    pub(crate) fn made(&self) -> &BTreeSet<NodeId> {
+        &self.made
+    }
+
+    pub(crate) fn clear_made(&mut self) {
+        self.made.clear();
     }
 
     // The node's shelf, if anything was ever kept on it.
@@ -831,6 +865,11 @@ impl Shelf {
 
     pub fn generation(&self) -> u64 {
         self.lock().generation
+    }
+
+    // How many times a repair landed behind what a run read (`repaired`).
+    pub fn repaired(&self) -> u64 {
+        self.lock().repaired
     }
 
     // The bytes the run read are good, but the object now knows something

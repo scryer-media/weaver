@@ -505,6 +505,36 @@ mod tests {
         assert!(events[0].file_id.is_none());
     }
 
+    // A listing's note is a row of the job's event history: its kind and
+    // the file and listing in words.
+    #[tokio::test]
+    async fn a_listing_mismatch_is_kept_in_the_job_event_history() {
+        let db = Database::open_in_memory().unwrap();
+        let (tx, rx) = broadcast::channel(8);
+        let task = tokio::spawn(persist_events(
+            rx,
+            db.clone(),
+            Arc::new(tokio::sync::Notify::new()),
+        ));
+        tx.send(PipelineEvent::SfvMismatch {
+            job_id: JobId(7),
+            file: "lantern.mkv".to_string(),
+            listing: "lantern.sfv".to_string(),
+        })
+        .unwrap();
+        drop(tx);
+        task.await.unwrap();
+
+        let events = db.get_job_events(7).unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].kind, "SfvMismatch");
+        assert_eq!(
+            events[0].message,
+            "lantern.mkv does not match its CRC32 in lantern.sfv"
+        );
+        assert!(events[0].file_id.is_none());
+    }
+
     #[tokio::test]
     async fn embedded_repair_warning_survives_database_reopen() {
         let root = tempfile::tempdir().unwrap();

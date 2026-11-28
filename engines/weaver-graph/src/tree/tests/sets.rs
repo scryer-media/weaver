@@ -67,6 +67,9 @@ impl Object for Set {
 }
 
 impl Recovery for Set {
+    // Its bind is the default, which changes nothing it covers.
+    fn take_newly(&mut self, _: &mut Vec<(MemberId, String)>) {}
+
     fn rebuilds(&self) -> bool {
         self.rebuilds
     }

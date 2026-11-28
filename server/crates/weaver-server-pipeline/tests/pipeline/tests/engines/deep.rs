@@ -843,12 +843,33 @@ async fn assert_repaired_header_places_the_bytes_behind_it(
     graph
 }
 
-// The compressed fixture: the member the repaired header names is
-// compressed, so the store gives `mixed.rar` up to the RAR engine, which
-// reads the bytes back where they went.
+// The compressed fixture: a solid RAR5 set, a stored member, then the one
+// the repaired header names, compressed. A solid set is the engine's, so
+// the store gives `mixed.rar` up to the RAR engine, which reads the bytes
+// back where they went.
+fn solid_mixed() -> Vec<u8> {
+    use weaver_objects::rar_store::writer::{Item, Options, Version, lifted, write};
+    let lz = crate::pipeline::tests::rar5_fixture_bytes("rar5_multifile_lz.rar");
+    let (plain, packed, codec) = lifted(&lz, "zeros_64k.bin");
+    let mut options = Options::new(Version::Rar5);
+    options.solid = true;
+    let items = [
+        Item::File("hello.txt", payload(40, 3)),
+        Item::Packed {
+            name: "zeros_64k.bin",
+            plain,
+            packed,
+            codec,
+        },
+    ];
+    let mut volumes = write(&items, &options);
+    assert_eq!(volumes.len(), 1);
+    volumes.remove(0)
+}
+
 async fn assert_repaired_bytes_read_back_after_refusal(wrap: WrapMembers) {
-    let mixed = crate::pipeline::tests::rar5_fixture_bytes("rar5_multifile_lz.rar");
-    let graph = assert_repaired_header_places_the_bytes_behind_it(mixed, "hello.txt", wrap).await;
+    let graph =
+        assert_repaired_header_places_the_bytes_behind_it(solid_mixed(), "hello.txt", wrap).await;
     assert!(kinds(&graph).contains(&"rar_engine"), "{:?}", kinds(&graph));
 }
 
@@ -1232,4 +1253,53 @@ async fn a_stored_member_behind_a_header_repaired_after_a_crash_is_delivered_who
     assert_eq!(restarted.restarts, 1);
     assert_restarted(&restarted, &whole);
     assert_eq!(restarted.graph.outcomes, whole.graph().outcomes);
+}
+
+// A stored RAR inside a stored RAR, one article lost inside a
+// member of the inner archive and nothing to repair it. Whether the loss
+// is told before the outer archive's first article or after it, the loss
+// comes down to the inner archive: it gives that member up and delivers the
+// rest beside it whole, so the job ends Partial.
+#[tokio::test]
+async fn a_loss_inside_a_nested_rar_ends_the_same_told_before_or_after_the_bind() {
+    let members = [
+        ("movie.mkv", payload(6 * ARTICLE + 13, 31)),
+        ("notes.txt", b"lantern release notes\r\n".to_vec()),
+        ("readme.nfo", b"lantern readme\r\n".to_vec()),
+        ("extra.bin", payload(4 * ARTICLE + 9, 37)),
+    ];
+    let inner = rar(&members);
+    let outer = rar(&[("inner.rar", inner.clone())]);
+    let extra = &members[3].1;
+    let at = outer
+        .windows(extra.len())
+        .position(|window| window == extra.as_slice())
+        .expect("a stored archive holds its member's bytes as they are");
+    let ordinal = (at / ARTICLE + 1) as u32;
+    assert!((ordinal as usize + 1) * ARTICLE <= at + extra.len());
+    let posted = || Scenario::new(vec![Post::plain("outer.rar", outer.clone())]).lost(0, ordinal);
+    for (order, scenario) in [
+        ("lost after the first article", posted()),
+        ("lost before the first article", posted().reversed(&[0])),
+    ] {
+        let outcome = run(&scenario).await;
+        assert_eq!(
+            outcome.status,
+            Some(JobStatus::Partial),
+            "{order}: {:?} {:?}",
+            outcome.failure,
+            outcome.files.keys().collect::<Vec<_>>()
+        );
+        for (name, bytes) in &members[..3] {
+            let whole = outcome
+                .files
+                .iter()
+                .any(|(path, held)| path.rsplit('/').next() == Some(*name) && held == bytes);
+            assert!(
+                whole,
+                "{order}: {name} delivered whole: {:?}",
+                outcome.files.keys().collect::<Vec<_>>()
+            );
+        }
+    }
 }

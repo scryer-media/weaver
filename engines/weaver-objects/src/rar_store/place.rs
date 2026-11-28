@@ -13,6 +13,7 @@
 // file's data stays held until a password opens it, and an open one's
 // padding past its length is envelope.
 
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use unrar_rs::{MappedSlice, StoredLayoutBuilder};
@@ -300,7 +301,10 @@ impl RarStore {
     // its headers reached before they moved, to where they reach now, what
     // the map places anywhere but the volume's own envelope, past `fresh`.
     // Every byte past the reach is kept in the envelope as itself, and the
-    // map keeps what it placed below it, so no other kept byte leaves.
+    // map keeps what it placed below it, so no other kept byte leaves. The
+    // cipher padding of an enciphered stored member's record is placed in
+    // the envelope but is the record's: it goes back with the member's
+    // bytes, so their replay feeds the cipher the whole last block.
     pub(super) fn unkept(
         &self,
         volume: VolumeIndex,
@@ -317,6 +321,9 @@ impl RarStore {
         }
         let window = ByteRange::new(from, reach);
         let mut placements = Vec::new();
+        // The enciphered members whose bytes went back here, in volume
+        // order: only their records' padding goes back with them.
+        let mut given = BTreeSet::new();
         for (range, _, _) in found.kept.runs() {
             let Some(range) = range.intersect(window) else {
                 continue;
@@ -327,18 +334,39 @@ impl RarStore {
             for placement in &placements {
                 let piece = ByteRange::at(cursor, placement.len());
                 cursor = piece.end;
-                if *placement
-                    == (Placement::Envelope {
-                        envelope: volume.0,
-                        range: piece,
-                    })
-                {
-                    continue;
-                }
+                let back = match placement {
+                    Placement::Envelope { envelope, range }
+                        if *envelope == volume.0 && *range == piece =>
+                    {
+                        // Kept where it is, but for the padding of an
+                        // enciphered record given back here.
+                        #[cfg(test)]
+                        let old = super::counts::scan();
+                        #[cfg(not(test))]
+                        let old = false;
+                        match given.is_empty() && !old {
+                            true => Vec::new(),
+                            false => self.padding_in(volume, piece, &given),
+                        }
+                    }
+                    Placement::Member { member, .. } => {
+                        // Only an enciphered member's record has padding.
+                        let id = member.0 as usize;
+                        if self
+                            .entries
+                            .get(id)
+                            .is_some_and(|entry| !matches!(entry.lock, Lock::Plain))
+                        {
+                            given.insert(id);
+                        }
+                        vec![piece]
+                    }
+                    _ => vec![piece],
+                };
                 let cut = fresh
                     .filter(|(delivered, _)| *delivered == volume)
                     .map_or(ByteRange::new(piece.end, piece.end), |(_, cut)| cut);
-                for part in outside(piece, cut) {
+                for part in back.into_iter().flat_map(|back| outside(back, cut)) {
                     out.push(Emit::Unkept {
                         volume,
                         range: part,
@@ -404,15 +432,63 @@ impl RarStore {
                     Run::Envelope | Run::Held => None,
                 })
                 .collect(),
-            None => self.parts_in(volume, below),
+            // A made entry's part is the envelope's, never a member's run.
+            None => self
+                .parts_in(volume, below)
+                .into_iter()
+                .filter(|&(id, _, _)| !self.entries[id].made)
+                .collect(),
         }
     }
 
     // The parts the entries hold in a volume range, in volume order: the
-    // member, the volume range and the packed-stream range it is. Only the
-    // volume's own pieces are looked at; parts starting at the same byte
-    // keep entry and piece order.
+    // member, the volume range and the packed-stream range it is, made
+    // entries' as well as stored ones'. Only the volume's own pieces are
+    // looked at; parts starting at the same byte keep entry and piece order.
     pub(super) fn parts_in(
+        &self,
+        volume: VolumeIndex,
+        range: ByteRange,
+    ) -> Vec<(usize, ByteRange, ByteRange)> {
+        #[cfg(test)]
+        if super::counts::scan() {
+            return self.parts_filtered(volume, range);
+        }
+        let filed = self.pieces_in.get(&volume).map_or(&[][..], Vec::as_slice);
+        let piece = |&(id, at): &(usize, usize)| {
+            self.entries.get(id).and_then(|entry| entry.pieces.get(at))
+        };
+        // The volume's data areas do not overlap, so filed by where they
+        // start they also end in order: the first that ends past the start
+        // of the range is the first it can meet.
+        let first = filed.partition_point(|filed| {
+            piece(filed).is_some_and(|piece| piece.data.end <= range.start)
+        });
+        let mut parts = Vec::new();
+        for filed in &filed[first..] {
+            #[cfg(test)]
+            super::counts::bump(|counts| counts.parts_visited += 1);
+            let Some(piece) = piece(filed) else {
+                continue;
+            };
+            if piece.data.start >= range.end {
+                break;
+            }
+            let Some(part) = piece.data.intersect(range) else {
+                continue;
+            };
+            let stream = ByteRange::at(piece.at + (part.start - piece.data.start), part.len());
+            parts.push((filed.0, part, stream));
+        }
+        #[cfg(test)]
+        assert_eq!(parts, self.parts_scanned(volume, range));
+        parts
+    }
+
+    // The parts as found before they were looked up by range: every piece
+    // filed in the volume, filtered, then sorted.
+    #[cfg(test)]
+    fn parts_filtered(
         &self,
         volume: VolumeIndex,
         range: ByteRange,
@@ -423,6 +499,7 @@ impl RarStore {
             .into_iter()
             .flatten()
             .filter_map(|&(id, at)| {
+                super::counts::bump(|counts| counts.parts_visited += 1);
                 let piece = self.entries.get(id)?.pieces.get(at)?;
                 let part = piece.data.intersect(range)?;
                 let stream = ByteRange::at(piece.at + (part.start - piece.data.start), part.len());
@@ -430,13 +507,10 @@ impl RarStore {
             })
             .collect();
         parts.sort_unstable_by_key(|&(start, id, at, _, _)| (start, id, at));
-        let parts: Vec<(usize, ByteRange, ByteRange)> = parts
+        parts
             .into_iter()
             .map(|(_, id, _, part, stream)| (id, part, stream))
-            .collect();
-        #[cfg(test)]
-        assert_eq!(parts, self.parts_scanned(volume, range));
-        parts
+            .collect()
     }
 
     // The scan the index stands for: every entry's every piece.
@@ -467,7 +541,31 @@ impl RarStore {
         parts
     }
 
-    // A member's bytes, by what the store knows of its key.
+    // Of `range`, placed in the volume's envelope, the cipher padding of
+    // the records of stored members in `given`: what lies in such a
+    // member's data, past its length. The rest is the volume's own.
+    fn padding_in(
+        &self,
+        volume: VolumeIndex,
+        range: ByteRange,
+        given: &BTreeSet<usize>,
+    ) -> Vec<ByteRange> {
+        self.parts_in(volume, range)
+            .into_iter()
+            .filter(|(id, _, _)| {
+                given.contains(id)
+                    && self
+                        .entries
+                        .get(*id)
+                        .is_some_and(|entry| !matches!(entry.lock, Lock::Plain))
+            })
+            .map(|(_, part, _)| part)
+            .collect()
+    }
+
+    // A member's bytes, by what the store knows of its key. The piece of a
+    // made entry is the envelope's, where capture put it, whether or not
+    // the layout holds its volume now: the run reads it there.
     fn place_member(
         &self,
         volume: VolumeIndex,
@@ -480,6 +578,15 @@ impl RarStore {
         let Some(entry) = self.entries.get(id) else {
             return push(out, Placement::Held { range: part });
         };
+        if entry.made {
+            return push(
+                out,
+                Placement::Envelope {
+                    envelope: volume.0,
+                    range: part,
+                },
+            );
+        }
         let member = MemberId(id as u32);
         // A condemned file is placed as it stood until its bytes are
         // posted again: what came out of them is uncovered where it lies.
@@ -530,7 +637,12 @@ impl RarStore {
         range: ByteRange,
         out: &mut Vec<Extent>,
     ) -> Located {
-        let Some(entry) = self.entries.get(member.0 as usize) else {
+        // A made member's bytes are the run's to place, not the store's.
+        let Some(entry) = self
+            .entries
+            .get(member.0 as usize)
+            .filter(|entry| !entry.made)
+        else {
             return Located::Never;
         };
         // A cipher block reads with the one before it as its seed. The

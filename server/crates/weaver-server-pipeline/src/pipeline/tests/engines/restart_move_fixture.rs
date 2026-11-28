@@ -219,6 +219,7 @@ pub async fn run_stopping_at(
                 )
                 .await;
                 pipeline = down;
+                graph.restarted();
                 restored = Some(rows);
                 in_memory.extend(owed.iter().copied());
             }
@@ -251,6 +252,7 @@ pub async fn run_stopping_at(
             )
             .await;
             pipeline = down;
+            graph.restarted();
             restored = Some(rows);
             in_memory.extend(owed.iter().copied());
             continue;
@@ -274,6 +276,7 @@ pub async fn run_stopping_at(
             )
             .await;
             pipeline = down;
+            graph.restarted();
             restored = Some(rows);
             in_memory.extend(owed.iter().copied());
             continue;
@@ -300,6 +303,7 @@ pub async fn run_stopping_at(
                 )
                 .await;
                 pipeline = down;
+                graph.restarted();
                 restored = Some(rows);
                 in_memory.extend(owed.iter().copied());
             }
@@ -338,6 +342,7 @@ pub async fn run_stopping_at(
         restarts: usize::from(restored.is_some()),
         order,
         graph,
+        events: Vec::new(),
     };
     (
         restarted,
@@ -502,7 +507,50 @@ pub async fn restart_with_recorded_envelope(
     temp: &tempfile::TempDir,
     pipeline: Pipeline,
     scenario: &Scenario,
+    inspect: impl FnMut(String),
+) -> Pipeline {
+    restart_with_recorded_envelope_of(temp, pipeline, scenario, inspect, |rows| {
+        rows.nodes
+            .iter()
+            .find(|node| node.kind == "rar_engine")
+            .expect("the complete compressed-member header bound an engine")
+            .node
+    })
+    .await
+}
+
+// The same for the RAR store that kept the set and feeds its own run: the
+// shelf envelope that run reads is the recorded input, and no engine is
+// bound.
+pub async fn restart_with_recorded_store_envelope(
+    temp: &tempfile::TempDir,
+    pipeline: Pipeline,
+    scenario: &Scenario,
+    inspect: impl FnMut(String),
+) -> Pipeline {
+    restart_with_recorded_envelope_of(temp, pipeline, scenario, inspect, |rows| {
+        assert!(
+            !rows.nodes.iter().any(|node| node.kind == "rar_engine"),
+            "no engine is bound: {:?}",
+            rows.nodes.iter().map(|node| &node.kind).collect::<Vec<_>>()
+        );
+        rows.nodes
+            .iter()
+            .find(|node| node.kind == "rar_store")
+            .expect("the store kept the set")
+            .node
+    })
+    .await
+}
+
+// The recorded input of the node `feeds` picks out of the checkpoint, by
+// the file it is kept in, is shown to `inspect` before the restore reads it.
+async fn restart_with_recorded_envelope_of(
+    temp: &tempfile::TempDir,
+    pipeline: Pipeline,
+    scenario: &Scenario,
     mut inspect: impl FnMut(String),
+    feeds: impl Fn(&GraphCheckpoint) -> i64,
 ) -> Pipeline {
     restart(
         temp,
@@ -510,16 +558,12 @@ pub async fn restart_with_recorded_envelope(
         scenario,
         &mut BTreeSet::new(),
         &mut |rows| {
-            let engine = rows
-                .nodes
-                .iter()
-                .find(|node| node.kind == "rar_engine")
-                .expect("the complete compressed-member header bound an engine");
+            let node = feeds(rows);
             let envelope = rows
                 .envelopes
                 .iter()
-                .find(|envelope| envelope.node == engine.node)
-                .expect("the engine kept its input");
+                .find(|envelope| envelope.node == node)
+                .expect("the node that feeds the run kept its input");
             let name = envelope.file.clone().unwrap_or_else(|| {
                 format!(
                     ".weaver-chunks/graph-envelope-{}-{}",
@@ -538,4 +582,12 @@ pub fn awaits_graph_mail(pipeline: &Pipeline) -> bool {
 pub async fn hear_one(pipeline: &mut Pipeline, reason: &str) {
     let said = pipeline.graph_runs.recv().await.expect(reason);
     pipeline.graph_run_said(said);
+}
+
+// The same, saying what was heard.
+pub async fn hear_one_told(pipeline: &mut Pipeline, reason: &str) -> String {
+    let said = pipeline.graph_runs.recv().await.expect(reason);
+    let told = format!("{:?}", said.heard);
+    pipeline.graph_run_said(said);
+    told
 }

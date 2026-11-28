@@ -1,18 +1,22 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
+mod chase;
 mod contested;
 mod contradicted;
 mod facts;
+mod literal;
+mod mixed;
+mod nested;
 mod owner;
 mod placement;
 mod recovery_contracts;
+mod reports;
 mod settle;
 mod stray;
-pub(crate) mod writer;
+mod wants;
 
 use std::io::Cursor;
-use std::num::NonZeroUsize;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -21,10 +25,12 @@ use weaver_graph::{
     VolumeIndex, Weight, Why,
 };
 
+pub(crate) use super::writer;
 use super::{RarStore, walk};
 use crate::keys::{CAPACITY, Keys};
 use crate::testing::payload;
 use owner::Owner;
+use writer::unrar;
 use writer::{Item, Options, Version, write};
 
 const PASSWORD: &str = "a-test-passphrase";
@@ -452,6 +458,7 @@ fn a_volume_given_back_is_answered_as_one_offered_fresh() {
         assert_eq!(object.reclaim(name, short, None, &*given), fresh, "{case}");
         let engine = crate::engine::CarriedVolume {
             front: stated(short),
+            ended: false,
             length: None,
             window: None,
         };
@@ -714,26 +721,29 @@ fn a_solid_set_asks_for_an_engine_before_any_member() {
     }
 }
 
+// A file compressed after a stored one: the store streams the stored
+// files and leaves the compressed one to its run, handing nothing to an
+// engine and taking nothing back.
 #[test]
-fn a_compressed_file_among_stored_ones_asks_for_an_engine() {
+fn a_compressed_file_after_a_stored_one_is_left_to_the_run() {
     for version in [Version::Rar5, Version::Rar4] {
         let mut options = Options::new(version);
         options.compressed = Some(1);
         let volumes = write(&items(), &options);
         let mut owner = Owner::named(store(), volumes);
         owner.whole(4096);
-        assert!(owner.said.contains(&Emit::NeedsEngine(Why::Compressed)));
-        // What came before stays announced for the engine's stand-in, with
-        // the bytes routed before the store gave the set up.
-        assert_eq!(owner.members.len(), 1);
-        let alpha = &owner.member("alpha.bin").bytes;
-        assert!(files()[0].1.starts_with(alpha));
-        assert!(
-            !owner
-                .said
-                .iter()
-                .any(|emit| matches!(emit, Emit::Retract(_)))
-        );
+        no_trouble(&owner);
+        assert_eq!(owner.members.len(), 3, "{version:?}");
+        for (name, bytes) in files() {
+            let got = owner.member(name);
+            match name {
+                "beta.bin" => assert!(!got.closed && got.bytes.is_empty(), "{version:?}"),
+                _ => assert!(got.closed && got.bytes == bytes, "{version:?} {name}"),
+            }
+        }
+        let face = owner.object.engine().expect("a mixed set runs");
+        assert!(face.makes(member_id(&owner, "beta.bin")));
+        assert!(!face.makes(member_id(&owner, "alpha.bin")));
     }
 }
 
@@ -1583,7 +1593,7 @@ fn a_volume_unlinked_after_its_parts_were_placed_keeps_them() {
 }
 
 #[test]
-fn a_repair_behind_an_announced_member_retracts_and_rewalks() {
+fn a_repair_behind_an_announced_stored_member_renames_it_where_it_stands() {
     for version in [Version::Rar5, Version::Rar4] {
         let real = write(&items(), &Options::new(version)).remove(0);
         // Wrong bytes whose header checksums hold: the same set with its
@@ -1606,16 +1616,71 @@ fn a_repair_behind_an_announced_member_retracts_and_rewalks() {
         let at = find(&real, b"alpha.bin") as u64;
         let header = ByteRange::new(at.saturating_sub(40), at + 9);
         owner.deliver_as(0, header, Provenance::Repaired, None);
+        // The repaired header names the member otherwise over the same
+        // pieces: it is renamed where it stands, not retracted.
+        assert_eq!(
+            owner.renamed,
+            [(0, "alphz.bin".to_owned(), "alpha.bin".to_owned())],
+            "{version:?}"
+        );
         assert!(
-            owner
+            !owner
                 .said
-                .contains(&Emit::Retract(weaver_graph::MemberId(0))),
+                .iter()
+                .any(|emit| matches!(emit, Emit::Retract(_))),
             "{version:?} {:?}",
             owner.said
         );
         // The rest of the volume comes again from a second source.
         owner.deliver_as(0, ByteRange::new(0, length), Provenance::Repaired, None);
         owner.close(0);
+        streamed(&owner);
+        posted_whole(&owner);
+    }
+}
+
+// A set posted with its first file under another name, every byte passing
+// its checksums, streams each file under the name posted. A repair
+// of the first file's header names it as it should be over the same pieces:
+// the store renames it where it stands, retracts nothing, and writes no byte
+// again, neither of it nor of the files after it.
+#[test]
+fn a_repaired_header_renaming_a_stored_member_writes_nothing_again() {
+    for version in [Version::Rar5, Version::Rar4] {
+        let real = write(&items(), &Options::new(version));
+        let mut other = items();
+        other[0] = Item::File("alphz.bin", files()[0].1.clone());
+        let wrong = write(&other, &Options::new(version));
+        assert_eq!(real.len(), wrong.len(), "{version:?}");
+        let mut owner = Owner::named(store(), real.clone());
+        for (volume, bytes) in wrong.iter().enumerate() {
+            assert_eq!(bytes.len(), real[volume].len(), "{version:?}");
+            owner.deliver_as(
+                volume,
+                ByteRange::new(0, bytes.len() as u64),
+                Provenance::Fresh,
+                Some(bytes),
+            );
+            owner.close(volume);
+        }
+        assert!(owner.member("alphz.bin").closed, "{version:?}");
+        let before = owner.log.len();
+        let at = find(&real[0], b"alpha.bin") as u64;
+        let header = ByteRange::new(at.saturating_sub(40), at + 9);
+        owner.deliver_as(0, header, Provenance::Repaired, None);
+        assert_eq!(
+            owner.renamed,
+            [(0, "alphz.bin".to_owned(), "alpha.bin".to_owned())],
+            "{version:?}"
+        );
+        let since = &owner.log[before..];
+        assert!(
+            !since
+                .iter()
+                .any(|emit| matches!(emit, Emit::Retract(_) | Emit::Bytes { .. })),
+            "{version:?} {since:?}"
+        );
+        no_trouble(&owner);
         streamed(&owner);
         posted_whole(&owner);
     }
@@ -2135,6 +2200,41 @@ fn a_volume_held_without_a_name_is_said_alone() {
     assert!(again.is_empty(), "{again:?}");
 }
 
+// A volume said to be given back arrived and is only moving: until the tree
+// takes it, it is held for the gaps, and one with no name is not said
+// missing alone. Once taken, its place is a gap like any held nowhere.
+#[test]
+fn a_volume_being_given_back_is_no_gap() {
+    let mut object = store();
+    for index in [0u32, 3] {
+        let mut volume = super::Volume::new();
+        volume.name = Some(format!("alpha.part{}.rar", index + 1));
+        volume.length = Some(100);
+        volume.closed = true;
+        object.volumes.insert(VolumeIndex(index), volume);
+    }
+    let mut named = super::Volume::new();
+    named.name = Some("alpha.part2.rar".to_owned());
+    object.giving.insert(VolumeIndex(1), named);
+    object.giving.insert(VolumeIndex(2), super::Volume::new());
+    object.lasts.insert(VolumeIndex(3));
+    let mut out = Vec::new();
+    object.say_gaps(&mut out);
+    assert!(out.is_empty(), "{out:?}");
+    assert_eq!(object.gaps_said.runs().count(), 0);
+    object.giving.clear();
+    let mut taken = Vec::new();
+    object.say_gaps(&mut taken);
+    assert_eq!(
+        taken,
+        vec![Emit::Gap {
+            first: VolumeIndex(1),
+            end: VolumeIndex(3),
+            range: ByteRange::new(0, 100),
+        }]
+    );
+}
+
 // A fixture written by RAR itself streams to what unrar-rs extracts from it.
 fn real_fixture(name: &str, password: &str) -> Owner {
     let bytes = fixture(&format!("rar5/{name}"));
@@ -2178,61 +2278,6 @@ fn a_real_rar5_with_encrypted_headers() {
 
 // The writer's archives are what unrar-rs reads: the cross-check that the
 // store and its writer do not share one misreading of the format.
-struct Memory(Vec<Vec<u8>>);
-
-impl unrar_rs::VolumeProvider for Memory {
-    fn get_volume(
-        &self,
-        index: usize,
-    ) -> Result<Box<dyn unrar_rs::ReadSeek>, unrar_rs::VolumeProviderError> {
-        self.0
-            .get(index)
-            .map(|bytes| Box::new(Cursor::new(bytes.clone())) as Box<dyn unrar_rs::ReadSeek>)
-            .ok_or(unrar_rs::VolumeProviderError::Unavailable {
-                volume: index,
-                reason: "no such volume".into(),
-            })
-    }
-}
-
-fn unrar(volumes: &[Vec<u8>], password: Option<&str>) -> Vec<(String, Vec<u8>)> {
-    let mut archive = unrar_rs::RarArchive::open_prefix(
-        Cursor::new(volumes[0].clone()),
-        password,
-        NonZeroUsize::MIN,
-    )
-    .unwrap();
-    archive.set_verify(true);
-    for (volume, bytes) in volumes.iter().enumerate() {
-        let mut headers = NonZeroUsize::MIN;
-        loop {
-            let found = archive
-                .extend_volume_prefix(volume, Box::new(Cursor::new(bytes.clone())), headers)
-                .unwrap();
-            if found < headers.get() {
-                break;
-            }
-            headers = headers.checked_add(1).unwrap();
-        }
-    }
-    let provider = Memory(volumes.to_vec());
-    let mut out = Vec::new();
-    for index in 0..archive.len() {
-        let info = archive.member_info(index).unwrap();
-        if info.is_directory {
-            continue;
-        }
-        let mut bytes = Vec::new();
-        archive
-            .by_index_via(index, &provider)
-            .unwrap()
-            .copy_to(&mut bytes)
-            .unwrap();
-        out.push((info.raw_name, bytes));
-    }
-    out
-}
-
 #[test]
 fn unrar_reads_what_the_writer_writes() {
     let expected: Vec<_> = files()
@@ -2938,6 +2983,44 @@ fn a_repair_inside_a_run_past_read_back_refeeds_it_in_pieces() {
             }
         }
     }
+}
+
+// A volume rar 6.24 wrote (`rar a -ma4 -m3 -ep1 -v11k`, the first of the
+// fixture set `rar4_lz_four`): its walk says its headers moved when the
+// bytes reach its file header, at most once per settle, and says nothing
+// for bytes inside that file's data, which move no header.
+#[test]
+fn a_header_move_is_said_and_a_delivery_that_moves_no_header_says_none() {
+    let volumes: Vec<(String, Vec<u8>)> = (1..=4)
+        .map(|part| {
+            let name = format!("rar4_lz_four.part0{part}.rar");
+            let bytes = fixture(&format!("extraction_profiles/{name}"));
+            (name, bytes)
+        })
+        .collect();
+    let mut owner = Owner::new(store(), volumes);
+    owner.said.clear();
+    let moved = |owner: &Owner| {
+        owner
+            .said
+            .iter()
+            .filter(|emit| matches!(emit, Emit::HeadersMoved(_)))
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+    owner.deliver(0, ByteRange::new(0, 200));
+    let heard = moved(&owner);
+    assert!(
+        !heard.is_empty()
+            && heard
+                .iter()
+                .all(|emit| *emit == Emit::HeadersMoved(VolumeIndex(0))),
+        "{:?}",
+        owner.said
+    );
+    owner.said.clear();
+    owner.deliver(0, ByteRange::new(2_000, 3_000));
+    assert_eq!(moved(&owner), Vec::new(), "{:?}", owner.said);
 }
 
 // Where a member's bytes lie in the volumes, read off a store that walked

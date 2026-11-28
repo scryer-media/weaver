@@ -14,7 +14,7 @@
 use std::collections::BTreeSet;
 
 use weaver_graph::slots::Ticket;
-use weaver_graph::{MemberId, NodeId, VolumeIndex};
+use weaver_graph::{Effect, MemberId, NodeId, VolumeIndex};
 
 use super::{GraphError, GraphJob};
 use crate::pipeline::graph::namespace::{GivingUp, Lender, WriteError};
@@ -84,6 +84,8 @@ impl GraphJob {
                 let Some(mut object) = self.tree.lend_work(node) else {
                     continue;
                 };
+                // Out for its work, the object answers no recovery face.
+                self.coming_kept.owner_moved(node);
                 if admit {
                     self.works.lend(node, object);
                     continue;
@@ -97,6 +99,8 @@ impl GraphJob {
                 self.took_back_worked(node, object, said, limit)?;
             }
             if admit || !moved {
+                // What went out answers no recovery face while it is out.
+                self.refresh_coming();
                 return Ok(());
             }
         }
@@ -177,6 +181,7 @@ impl GraphJob {
         self.seal_proven();
         // An ended namespace's obligations nothing can check end here.
         if self.writer.verifications_waiting() {
+            self.refresh_coming();
             self.writer
                 .drop_unmet_verifications(&self.tree, &self.coming());
         }
@@ -286,6 +291,7 @@ impl GraphJob {
     // them read back one a turn: the rest waits in `quieting`, and this
     // returns false, as nothing more is to be stepped until it is done.
     pub(super) fn tell_quiet(&mut self) -> Result<bool, GraphError> {
+        self.refresh_coming();
         if self.quieting.is_some() || !self.quiet() {
             return Ok(false);
         }
@@ -306,7 +312,11 @@ impl GraphJob {
         limit: usize,
     ) -> Result<bool, GraphError> {
         let mut changed = false;
-        while self.quieting.is_none() && self.waits_on_nothing() {
+        loop {
+            self.refresh_coming();
+            if self.quieting.is_some() || !self.waits_on_nothing() {
+                break;
+            }
             match self.begin_quiet()? {
                 Some(false) => break,
                 Some(true) => changed = true,
@@ -400,6 +410,7 @@ impl GraphJob {
         // objects hear quiet over it on the next pass.
         if self.writer.lost_waiting() {
             let mut out = Vec::new();
+            self.refresh_coming();
             let coming = self.coming();
             let filled = self.writer.fill_lost_zeros(
                 &mut self.tree,
@@ -538,7 +549,11 @@ impl GraphJob {
                     self.pay_release();
                     return Ok(None);
                 }
-                self.heard(batch.into_out())?;
+                let out = batch.into_out();
+                if let Some(quieting) = self.quieting.as_mut() {
+                    quieting.hold_over(&out);
+                }
+                self.heard(out)?;
             }
             let Some(quieting) = self.quieting.as_mut() else {
                 return Ok(Some(false));
@@ -555,6 +570,10 @@ impl GraphJob {
             };
             let mut effects = Vec::new();
             let placed = self.tree.placement(node);
+            let faced = self.tree.engine(node).is_some();
+            if quiet {
+                self.refuse_unanswered(node);
+            }
             let mut placing = self.writer.placing(&mut *self.builder);
             if quiet {
                 self.tree.quiet(node, &mut placing, &mut effects);
@@ -563,11 +582,22 @@ impl GraphJob {
             }
             // An object that placed its volumes anew changed the job though
             // the tree said nothing: the bytes held for it go down now, as
-            // after any write, and it hears quiet again once they have.
+            // after any write, and it hears quiet again once they have. A
+            // face that shows or goes is a change though the tree said
+            // nothing too: nothing is applied, but the runs are stepped
+            // again, so a run is asked for a face that showed. A quiet that
+            // changed none of these is no change.
             if effects.is_empty() && self.tree.placement(node) == placed {
+                if self.tree.engine(node).is_some() != faced
+                    && let Some(quieting) = self.quieting.as_mut()
+                {
+                    quieting.changed = true;
+                }
                 continue;
             }
-            quieting.changed = true;
+            if let Some(quieting) = self.quieting.as_mut() {
+                quieting.changed = true;
+            }
             let mut out = Vec::new();
             let batch = self.writer.apply_quiet(
                 &mut self.tree,
@@ -577,6 +607,9 @@ impl GraphJob {
                 &mut out,
             )?;
             let Some(batch) = batch else {
+                if let Some(quieting) = self.quieting.as_mut() {
+                    quieting.hold_over(&out);
+                }
                 self.heard(out)?;
                 continue;
             };
@@ -667,6 +700,29 @@ pub(super) struct Quieting {
     changed: bool,
     rung: bool,
     admitted: Vec<NodeId>,
+}
+
+impl Quieting {
+    // An object bound a volume of a sibling's on this pass, given back or
+    // given up and read back, has not read it yet: it hears quiet on the
+    // next pass, not this one. Every other object of the tier is still told
+    // and may give up on this pass. One set of the objects bound, then one
+    // pass over what is left to tell.
+    fn hold_over(&mut self, applied: &[Effect]) {
+        let bound: BTreeSet<NodeId> = applied
+            .iter()
+            .filter_map(|effect| match effect {
+                Effect::Bound { child, .. } => Some(*child),
+                _ => None,
+            })
+            .collect();
+        if bound.is_empty() {
+            return;
+        }
+        self.changed = true;
+        self.told
+            .retain(|(node, quiet)| !(*quiet && bound.contains(node)));
+    }
 }
 
 // What the repair walk asked, for its tests compiled apart in

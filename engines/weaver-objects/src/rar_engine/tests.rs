@@ -30,6 +30,7 @@ const ENCRYPTED_LZ: &[u8] = include_bytes!(
 );
 const ENCRYPTED_LZ_MEMBER_LEN: u64 = 226_943;
 
+mod sealed;
 mod tails;
 
 // RAR5 store volumes, written here the way the format lays them out.
@@ -617,6 +618,64 @@ fn a_stated_volume_is_placed_beside_a_bound_volume_whose_front_is_unread() {
         engine.claim("a1b2.103", (&third).into(), None),
         vec![VolumeIndex(2)]
     );
+}
+
+// The second volume ends on a whole member. Its front read to the end
+// record says the next volume opens on a new member, so a volume that
+// states the next number and opens on a member begun before it is no
+// volume of this set. A front cut short after that member says nothing
+// against it, and it is placed on its number.
+#[test]
+fn a_stated_volume_does_not_follow_a_front_read_to_its_end_on_a_whole_member() {
+    let spanning = spanning();
+    let (head, rest) = spanning.split_at(16);
+    let first = [
+        rar5::start(Some(0)),
+        rar5::file(
+            "lead.bin",
+            rar5::SPLIT_AFTER,
+            head,
+            spanning.len() as u64,
+            None,
+        ),
+        rar5::end(true),
+    ]
+    .concat();
+    let lead = [
+        rar5::start(Some(1)),
+        rar5::file(
+            "lead.bin",
+            rar5::SPLIT_BEFORE,
+            rest,
+            spanning.len() as u64,
+            Some(crc32(&spanning)),
+        ),
+        rar5::file(
+            "notes.txt",
+            0,
+            NOTES,
+            NOTES.len() as u64,
+            Some(crc32(NOTES)),
+        ),
+    ]
+    .concat();
+    let whole = [lead.as_slice(), &rar5::end(true)].concat();
+    let stranger = [
+        rar5::start(Some(2)),
+        rar5::file("other.bin", rar5::SPLIT_BEFORE, NOTES, 99, None),
+    ]
+    .concat();
+    for (second, placed) in [(&whole, Vec::new()), (&lead, vec![VolumeIndex(2)])] {
+        let mut engine = RarEngine::new();
+        engine.bound(VolumeIndex(0), "a1b2.101", &first, None);
+        engine.bound(VolumeIndex(1), "a1b2.102", second, None);
+        assert_eq!(
+            engine.claim("a1b2.103", (&stranger).into(), None),
+            placed,
+            "second volume of {} bytes",
+            second.len()
+        );
+    }
 }
 
 #[test]
@@ -2392,7 +2451,7 @@ fn a_lone_archive_states_its_window() {
         ("rar4_solid_ppmd_plain.rar", 1 << 20),
     ] {
         let bytes = fixture(path);
-        assert!(<Rar as Format>::front(&bytes).is_none(), "{path}");
+        assert!(<Rar as Format>::front(&bytes, None).is_none(), "{path}");
         assert_eq!(<Rar as Format>::window(&bytes), Some(window), "{path}");
     }
 }

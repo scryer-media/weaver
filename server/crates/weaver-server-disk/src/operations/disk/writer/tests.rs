@@ -3464,3 +3464,41 @@ fn a_write_past_its_credit_beside_carried_bytes_and_full_leases_does_not_wait() 
     writers.settle();
     assert_eq!(volume.unwritten_bytes(), 0);
 }
+
+// The volume's two counters read one after the other, counted first and
+// buffered second, with one write retired between them: the writer lowers
+// buffered before it releases what it counted, so the pair read differs by
+// that write though each counter is right when it is read. Hard 1024 (16 x
+// 64), so the write piece is 64; 6 x 64 + 7 bytes are queued in seven
+// pieces, and the hold lets exactly one of them run.
+#[test]
+fn counted_then_buffered_read_across_one_retirement_differ_by_that_write() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("dawn");
+    let (writers, _reports) = writers();
+    let volume = volume("output");
+    volume.set_buffer_limits(1024, 1024);
+    assert_eq!(volume.write_piece(), 64);
+    let hold = writers.hold(&volume);
+    let job = writers.test_submitter(&volume, 1);
+    job.write(
+        LoopSite::LeafWrite,
+        1,
+        0,
+        Bytes::from(vec![9u8; 6 * 64 + 7]),
+        create(&path),
+    );
+    hold.wait_held();
+    let consistent = (volume.unwritten_bytes(), count(&volume.buffered_bytes));
+    let counted = volume.unwritten_bytes();
+    hold.release(1);
+    hold.wait_held();
+    let buffered = count(&volume.buffered_bytes);
+    let after = (volume.unwritten_bytes(), count(&volume.buffered_bytes));
+    assert_eq!(consistent, (391, 391));
+    assert_eq!((counted, buffered), (391, 327));
+    assert_eq!(after, (327, 327));
+    hold.open();
+    writers.settle();
+    assert_eq!(volume.unwritten_bytes(), 0);
+}

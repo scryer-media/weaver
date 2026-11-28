@@ -251,15 +251,19 @@ pub async fn blocked_for_good_and_handed_on(scenario: &Scenario) -> BlockedForGo
 // nothing moves, the job's one run reads and waits on its shelf, and the
 // job has asked nothing of the wait.
 pub async fn waiting_on_articles_still_out(scenario: &Scenario, held: u32) -> Held {
-    run_holding_where(
-        scenario,
-        |article| article.0 == held,
-        |pipeline| {
-            let job = &pipeline.graph_jobs[&JOB];
-            assert!(job.reads(), "the archive's run reads");
-            assert!(job.runs_blocked(), "the run waits on its shelf");
-            assert_eq!((job.watch().asks(), job.watch().told()), (0, 0));
-        },
-    )
+    waiting_on_held_articles(scenario, |article| article.0 == held).await
+}
+
+// The same, with the articles `held` names out with the server.
+pub async fn waiting_on_held_articles(
+    scenario: &Scenario,
+    held: impl Fn((u32, u32)) -> bool,
+) -> Held {
+    run_holding_where(scenario, held, |pipeline| {
+        let job = &pipeline.graph_jobs[&JOB];
+        assert!(job.reads(), "the archive's run reads");
+        assert!(job.runs_blocked(), "the run waits on its shelf");
+        assert_eq!((job.watch().asks(), job.watch().told()), (0, 0));
+    })
     .await
 }

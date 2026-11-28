@@ -18,7 +18,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use sevenz_turbo::AesProperties;
-use weaver_graph::{ByteRange, Emit, Evidenced, Why};
+use weaver_graph::{ByteRange, Emit, Evidenced, MemberId, Why};
 use zeroize::Zeroizing;
 
 use super::header::{self, Start};
@@ -161,6 +161,7 @@ impl SevenZipStore {
                 verdict @ (Verdict::Right | Verdict::Unproven) => {
                     self.opened = Some(index);
                     self.proven = matches!(verdict, Verdict::Right);
+                    self.rerun_under(index, out);
                     return self.open_all(index, out);
                 }
                 Verdict::Wrong => self.candidates[index].folder_wrong = true,
@@ -168,6 +169,39 @@ impl SevenZipStore {
             }
         }
         self.ask(out);
+    }
+
+    // The store opened under `index`, and its coded run last started under
+    // another candidate: what the run made, or will make, is under the
+    // wrong key. Its members are taken back, which ends the run, and the
+    // next starts under the candidate that opened the store.
+    fn rerun_under(&mut self, index: usize, out: &mut Vec<Emit>) {
+        if self.ran.is_none_or(|ran| ran == index) {
+            return;
+        }
+        self.ran = None;
+        let Some(map) = &self.map else {
+            return;
+        };
+        out.extend(
+            (0..map.entries.len())
+                .map(|id| MemberId(id as u32))
+                .filter(|member| map.is_coded(*member))
+                .map(Emit::Retract),
+        );
+    }
+
+    // Whether a proof file is still to rule on a candidate: none opened the
+    // folders, a file of the map can prove one, and a candidate it has not
+    // ruled wrong is there to try. A store with nothing that proves a
+    // password, or no candidate left to try, is never proving.
+    pub(super) fn proving(&self) -> bool {
+        self.opened.is_none()
+            && self.proof.is_some()
+            && self
+                .candidates
+                .iter()
+                .any(|candidate| !candidate.folder_wrong)
     }
 
     // Whether the folders are open under a candidate nothing proved.
