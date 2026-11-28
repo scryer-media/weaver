@@ -5,6 +5,7 @@ use crate::jobs::persistence::JobsPersistenceQueries;
 use crate::jobs::queries::JobsQueries;
 use crate::settings::archive_passwords::SettingsArchivePasswordsInternalQueries;
 pub mod activation;
+pub(crate) mod adoption;
 pub(crate) use activation::read_stored_spec_and_passwords;
 pub(crate) use completion::finalize::{ActiveRuntimeValues, RestoredPostProcessing};
 pub mod archive;
@@ -2040,6 +2041,11 @@ pub struct Pipeline {
     pub(super) db_reply_tx: mpsc::UnboundedSender<db_reply::DbReply>,
     pub(super) db_reply_rx: mpsc::UnboundedReceiver<db_reply::DbReply>,
     pub(super) job_activated_rx: mpsc::Receiver<activation::JobActivated>,
+    // Channel for local files adopted from an existing directory.
+    pub(super) adopted_tx: mpsc::Sender<adoption::AdoptedMessage>,
+    pub(super) adopted_rx: mpsc::Receiver<adoption::AdoptedMessage>,
+    // Active activation id per job currently receiving adopted chunks.
+    pub(super) adopted_activations: HashMap<JobId, u64>,
     pub(super) move_done_tx: mpsc::Sender<MoveToCompleteDone>,
     pub move_done_rx: mpsc::Receiver<MoveToCompleteDone>,
     // Channel for failed jobs whose working directory was released.

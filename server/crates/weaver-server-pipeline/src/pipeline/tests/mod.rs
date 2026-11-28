@@ -1933,7 +1933,15 @@ pub async fn insert_active_job_with_persisted_nzb_named(
         },
     );
     // The fixture's articles are built as a job's first handout builds them.
-    pipeline.activate_job_articles(job_id, &HashSet::new(), None, None, Vec::new(), &[]);
+    pipeline.activate_job_articles(
+        job_id,
+        &HashSet::new(),
+        &HashSet::new(),
+        None,
+        None,
+        Vec::new(),
+        &[],
+    );
     pipeline.job_order.push(job_id);
     pipeline.report_all_for_test();
     working_dir

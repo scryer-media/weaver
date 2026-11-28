@@ -26,6 +26,19 @@ pub fn no_memory_limit(metadata: &[(String, String)]) -> bool {
 // sets this. A reprocess drops it.
 pub const FAILED_FOR_MEMORY_ATTRIBUTE_KEY: &str = "__weaver_failed_for_memory";
 
+// Set on an NZB job submitted with an existing directory of already-downloaded
+// files to adopt before fetching missing ones from NNTP.
+pub const EXISTING_DIR_ATTRIBUTE_KEY: &str = "__weaver_existing_dir";
+
+// The existing directory a job's metadata asks to adopt files from, if any.
+pub fn existing_dir(metadata: &[(String, String)]) -> Option<&str> {
+    metadata
+        .iter()
+        .find(|(key, _)| key == EXISTING_DIR_ATTRIBUTE_KEY)
+        .map(|(_, value)| value.as_str())
+        .filter(|value| !value.trim().is_empty())
+}
+
 // Whether a job's metadata says it failed over the profile's ceiling.
 pub fn failed_for_memory(metadata: &[(String, String)]) -> bool {
     metadata

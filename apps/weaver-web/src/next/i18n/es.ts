@@ -2801,6 +2801,7 @@ export const nextEs: LocaleDictionary = {
   "next.torrent.unpacked": "Descomprimido",
   "next.addNzb.link": "Enlace",
   "next.addNzb.paused": "Añadir en pausa",
+  "next.addNzb.existingDir": "Reanudar desde",
   "next.quota.remaining": "quedan {{size}}",
   "next.networking.egress.quota": "Cuota",
   "next.networking.egress.enabled": "Activada",

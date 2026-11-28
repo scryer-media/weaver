@@ -2702,6 +2702,7 @@ export const nextKo: LocaleDictionary = {
   "next.torrent.unpacked": "압축 해제됨",
   "next.addNzb.link": "링크",
   "next.addNzb.paused": "일시 정지 상태로 추가",
+  "next.addNzb.existingDir": "이어받기 폴더",
   "next.quota.remaining": "{{size}} 남음",
   "next.networking.egress.quota": "할당량",
   "next.networking.egress.enabled": "사용",
