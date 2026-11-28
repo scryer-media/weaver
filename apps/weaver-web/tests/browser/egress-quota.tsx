@@ -8,7 +8,11 @@ import { fromValue, mergeMap, pipe } from "wonka";
 import { TranslateContext } from "@/lib/context/translate-context";
 import en from "@/lib/i18n/locales/en";
 import type { Egress, EgressQuota, QuotaState } from "@/lib/networking";
-import { NextDataContext, type NextData } from "@/next/data/next-data";
+import {
+  NextDataContext,
+  type NextData,
+  type ProviderHealth,
+} from "@/next/data/next-data";
 import type {
   NetworkingAction,
   NetworkingData,
@@ -22,7 +26,7 @@ import {
 } from "@/next/pages/settings/framework";
 import { SearchRegistry } from "@/next/pages/settings/search";
 import { SETTINGS_REDIRECTS } from "@/next/pages/settings/redirects";
-import { AttentionBlock } from "@/next/shell/rail-blocks";
+import { AttentionBlock, ProvidersBlock } from "@/next/shell/rail-blocks";
 import "@/next/fonts.css";
 import "@/next/theme.css";
 
@@ -322,7 +326,64 @@ function Redirects() {
   ]);
 }
 
+// Six servers, listed in configured order with their active connections; one carries a cause line.
+const provider = (
+  host: string,
+  connectionsActive: number,
+  rest: Partial<ProviderHealth> = {},
+): ProviderHealth => ({
+  host,
+  port: 563,
+  label: host,
+  tier: "BACKUP",
+  state: "HEALTHY",
+  activity: connectionsActive ? "downloading" : "idle",
+  activityUntilEpochMs: null,
+  connectionsOpen: connectionsActive,
+  connectionsBusy: connectionsActive,
+  connectionsActive,
+  connectionsMax: 20,
+  connectionsConfigured: 20,
+  capacityPenaltyUntilEpochMs: null,
+  measuredLatencyMs: null,
+  bodyLatencyMs: null,
+  bodyTransferMs: null,
+  bodyLatencyBand: null,
+  bodyPipelineDepth: 1,
+  bodyPipeliningPinnedSequential: false,
+  successCount: 0,
+  failureCount: 0,
+  consecutiveFailures: 0,
+  prematureDeaths: 0,
+  ...rest,
+});
+const providers = [
+  provider("idle-a.example", 0),
+  provider("busy-3.example", 3),
+  provider("idle-b.example", 0, { connectionsOpen: 2 }),
+  provider("busy-12.example", 12),
+  provider("degraded-1.example", 1, { activity: "degraded" }),
+  provider("busy-7.example", 7),
+];
+
 function Fixture() {
+  if (screen === "providers") {
+    // `count` keeps the first that many servers.
+    const count = Number(query.get("count") ?? providers.length);
+    return (
+      <NextDataContext.Provider
+        value={{
+          ...blockedBy(null),
+          providers: providers.slice(0, count),
+          providersLoaded: true,
+        }}
+      >
+        <aside style={{ width: 300 }}>
+          <ProvidersBlock />
+        </aside>
+      </NextDataContext.Provider>
+    );
+  }
   if (screen === "banner" || screen === "banner-open-ended") {
     const block = blockedBy(screen === "banner" ? windowEnd : null);
     return (

@@ -1,7 +1,14 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
-import { Fragment, memo, type ReactNode } from "react";
+import {
+  Fragment,
+  memo,
+  useLayoutEffect,
+  useRef,
+  useState,
+  type ReactNode,
+} from "react";
 import { Link, NavLink, useLocation } from "react-router";
 import { useQuery } from "urql";
 import {
@@ -25,7 +32,7 @@ import {
 import { sameItems } from "../data/settled";
 import { categoryColor, UNCATEGORISED_COLOR, WV } from "../data/palette";
 import { UNTAGGED } from "../data/tags";
-import { jobIds } from "../testids";
+import { jobIds, testIds } from "../testids";
 import { useNow } from "../data/clock";
 import {
   formatClock,
@@ -78,6 +85,48 @@ export function providerLoadPercent(provider: ProviderHealth): number {
   return (provider.connectionsActive / max) * 100;
 }
 
+/** How many providers the rail shows before the rest scroll. */
+const PROVIDERS_IN_VIEW = 4;
+
+/** Busiest first: most active connections, then most open, then the daemon's own order. */
+export function providersByActivity(
+  providers: readonly ProviderHealth[],
+): ProviderHealth[] {
+  return [...providers].sort(
+    (a, b) =>
+      b.connectionsActive - a.connectionsActive ||
+      b.connectionsOpen - a.connectionsOpen,
+  );
+}
+
+/**
+ * The height that shows the first `count` children of a list whole, or none
+ * while the list holds no more than that. Rows differ in height (a cause line
+ * comes and goes), so it is measured, and measured again as they change.
+ */
+function useListWindow(count: number) {
+  const ref = useRef<HTMLDivElement>(null);
+  const [height, setHeight] = useState<number | undefined>(undefined);
+  useLayoutEffect(() => {
+    const list = ref.current;
+    if (!list) return;
+    const measure = () => {
+      const rows = list.children;
+      if (rows.length <= count) {
+        setHeight(undefined);
+        return;
+      }
+      const last = rows[count - 1] as HTMLElement;
+      setHeight(last.offsetTop + last.offsetHeight);
+    };
+    measure();
+    const observer = new ResizeObserver(measure);
+    for (const row of Array.from(list.children)) observer.observe(row);
+    return () => observer.disconnect();
+  });
+  return { ref, height };
+}
+
 export const ProvidersBlock = memo(function ProvidersBlock() {
   const t = useTranslate();
   const { providers, providersLoaded } = useNextData(
@@ -102,6 +151,8 @@ export const ProvidersBlock = memo(function ProvidersBlock() {
     pause: !healthEmpty,
   });
   const configured = healthEmpty ? configuredData?.servers : undefined;
+  const ordered = providersByActivity(providers);
+  const list = useListWindow(PROVIDERS_IN_VIEW);
 
   return (
     <RailBlock eyebrow={t("next.rail.providers")} className="gap-3">
@@ -115,59 +166,70 @@ export const ProvidersBlock = memo(function ProvidersBlock() {
           {configured?.length === 0 ? <AddProviderButton /> : null}
         </>
       ) : (
-        providers.map((provider) => {
-          const activity = providerActivityLabel(provider, t, now);
-          const open = connectionPercent(provider.connectionsOpen, provider);
-          const busy = connectionPercent(provider.connectionsBusy, provider);
-          return (
-            <div
-              key={`${provider.host}:${provider.port}`}
-              className="flex flex-col gap-[5px]"
-            >
-              <div className="flex items-baseline justify-between gap-2 text-[12.5px]">
-                <span className="truncate text-wv-tertiary">
-                  {provider.host}
-                </span>
-                <span
-                  className="flex-none font-wv-mono text-[11px] text-wv-muted"
-                  style={{ color: ACTIVITY_TONE[activity.tone] }}
-                  title={activity.fraction}
-                >
-                  {activity.word}
-                </span>
-              </div>
-              {/* Two readings on one track: the connected sockets underneath,
+        <div
+          ref={list.ref}
+          className={cn(
+            "relative flex flex-col gap-3",
+            list.height !== undefined &&
+              "-mr-3 overflow-y-auto overscroll-contain pr-3",
+          )}
+          style={{ maxHeight: list.height }}
+          data-testid={testIds.shellProviders}
+        >
+          {ordered.map((provider) => {
+            const activity = providerActivityLabel(provider, t, now);
+            const open = connectionPercent(provider.connectionsOpen, provider);
+            const busy = connectionPercent(provider.connectionsBusy, provider);
+            return (
+              <div
+                key={`${provider.host}:${provider.port}`}
+                className="flex flex-col gap-[5px]"
+              >
+                <div className="flex items-baseline justify-between gap-2 text-[12.5px]">
+                  <span className="truncate text-wv-tertiary">
+                    {provider.host}
+                  </span>
+                  <span
+                    className="flex-none font-wv-mono text-[11px] text-wv-muted"
+                    style={{ color: ACTIVITY_TONE[activity.tone] }}
+                    title={activity.fraction}
+                  >
+                    {activity.word}
+                  </span>
+                </div>
+                {/* Two readings on one track: the connected sockets underneath,
                   the ones carrying a request on top. Where the two part company
                   is exactly where "1 / 100" used to look like a fault. */}
-              <div className="relative">
-                <Bar percent={open} color={OPEN_COLOR} height={10} live />
-                <Bar
-                  percent={busy}
-                  color={BUSY_COLOR}
-                  height={10}
-                  live
-                  className="absolute inset-0"
-                  style={{ backgroundImage: "none" }}
-                />
-              </div>
-              {/* The counts never leave: the state word answers "why", and the
+                <div className="relative">
+                  <Bar percent={open} color={OPEN_COLOR} height={10} live />
+                  <Bar
+                    percent={busy}
+                    color={BUSY_COLOR}
+                    height={10}
+                    live
+                    className="absolute inset-0"
+                    style={{ backgroundImage: "none" }}
+                  />
+                </div>
+                {/* The counts never leave: the state word answers "why", and the
                   summary under the bar stays the thing you can check. The cause
                   sits below it in the state word's own colour, so the two read
                   as one statement. */}
-              <div className="text-center font-wv-mono text-[10.5px] leading-[1.35] text-wv-faint">
-                {activity.fraction}
-              </div>
-              {activity.cause ? (
-                <div
-                  className="font-wv-mono text-[10.5px] leading-[1.35] text-wv-muted"
-                  style={{ color: ACTIVITY_TONE[activity.tone] }}
-                >
-                  {activity.cause}
+                <div className="text-center font-wv-mono text-[10.5px] leading-[1.35] text-wv-faint">
+                  {activity.fraction}
                 </div>
-              ) : null}
-            </div>
-          );
-        })
+                {activity.cause ? (
+                  <div
+                    className="font-wv-mono text-[10.5px] leading-[1.35] text-wv-muted"
+                    style={{ color: ACTIVITY_TONE[activity.tone] }}
+                  >
+                    {activity.cause}
+                  </div>
+                ) : null}
+              </div>
+            );
+          })}
+        </div>
       )}
     </RailBlock>
   );

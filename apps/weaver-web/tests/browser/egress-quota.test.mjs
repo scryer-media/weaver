@@ -575,6 +575,52 @@ test("with torrents off the limits dialog hides every upload limit and cap and s
   await page.close();
 });
 
+test("the rail lists providers busiest first and scrolls past four", async () => {
+  const { page, errors } = await open("providers");
+  const list = page.getByTestId("shell-providers");
+  const hosts = list.locator(
+    ":scope > div > div:first-child > span:first-child",
+  );
+  assert.deepEqual(await hosts.allInnerTexts(), [
+    "busy-12.example",
+    "busy-7.example",
+    "busy-3.example",
+    "degraded-1.example",
+    "idle-b.example",
+    "idle-a.example",
+  ]);
+  // The window ends at the fourth provider's last line; the rest scroll.
+  const fit = await list.evaluate((element) => {
+    const fourth = element.children[3];
+    return {
+      overflow: getComputedStyle(element).overflowY,
+      height: element.clientHeight,
+      fourthEnd: fourth.offsetTop + fourth.offsetHeight,
+      scrolls: element.scrollHeight > element.clientHeight,
+    };
+  });
+  assert.equal(fit.overflow, "auto");
+  assert.equal(fit.height, fit.fourthEnd);
+  assert.equal(fit.scrolls, true);
+  if (shot("providers"))
+    await page.locator("aside").screenshot({ path: shot("providers") });
+  assert.equal(errors.length, 0, errors.join("\n"));
+  await page.close();
+});
+
+test("the rail shows four providers or fewer whole, with no scroll", async () => {
+  const { page, errors } = await open("providers", { count: "4" });
+  const list = page.getByTestId("shell-providers");
+  await list.locator(":scope > div").nth(3).waitFor();
+  const fit = await list.evaluate((element) => ({
+    overflow: getComputedStyle(element).overflowY,
+    maxHeight: element.style.maxHeight,
+  }));
+  assert.deepEqual(fit, { overflow: "visible", maxHeight: "" });
+  assert.equal(errors.length, 0, errors.join("\n"));
+  await page.close();
+});
+
 test("an egress's editor has no DNS of its own: a route's DNS profile says who answers", async () => {
   const { page, errors } = await open("egress");
   await page.getByText("WAN Fiber", { exact: true }).click();
