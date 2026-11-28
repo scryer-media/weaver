@@ -253,6 +253,13 @@ pub trait Recovery {
         0
     }
 
+    // Whether what the object took since its last bind leaves a bind
+    // something to do. An object that cannot tell says it does, and is
+    // bound after each of its volumes' bytes.
+    fn bind_due(&self) -> bool {
+        true
+    }
+
     // Whether the object has yet to learn what some set of it describes:
     // its own volumes may still say, once something asks for them. The
     // owner asks it to rule once the namespace holds every other member,

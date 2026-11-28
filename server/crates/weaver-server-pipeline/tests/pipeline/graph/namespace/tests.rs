@@ -343,6 +343,8 @@ impl Builder for Build {
                 fix: self.fix,
                 seen: Arc::clone(&self.par),
                 last: None,
+                due: false,
+                described: false,
             })),
             _ => None,
         }
@@ -396,6 +398,15 @@ struct Seen {
     par3: bool,
     // Whether the member it fixes was withheld from it when it repaired.
     withheld: Option<bool>,
+    // Whether it says when a bind is due: its volume's bytes past the
+    // front describe the obfuscated member, and only they leave a bind
+    // something to do. Otherwise a bind is always due, and it recognises
+    // the member by its bytes alone.
+    gated: bool,
+    // Where each of its volume's deliveries it took began, and how many
+    // binds reached it, while gated.
+    took: Vec<u64>,
+    binds: usize,
 }
 
 // The repair the pretend set makes: read the named member, write a fix.
@@ -433,6 +444,10 @@ struct Par {
     seen: Arc<Mutex<Seen>>,
     // What its last repair came to, until a bind changes what it covers.
     last: Option<RepairOutcome>,
+    // While gated: whether what it took since its last bind leaves the bind
+    // something to do, and whether its volume described the members yet.
+    due: bool,
+    described: bool,
 }
 
 impl Object for Par {
@@ -448,10 +463,18 @@ impl Object for Par {
 
     fn deliver(
         &mut self,
-        _: Delivery<'_>,
+        delivery: Delivery<'_>,
         _: &mut dyn FnMut(&weaver_graph::Placement, &mut Vec<u8>) -> bool,
         _: &mut Vec<Emit>,
     ) {
+        let mut seen = self.seen.lock().unwrap();
+        if seen.gated {
+            seen.took.push(delivery.offset);
+            if delivery.offset >= FIRST_BYTES as u64 && !self.described {
+                self.described = true;
+                self.due = true;
+            }
+        }
     }
     fn volume_closed(&mut self, _: VolumeIndex, _: &mut Vec<Emit>) {}
     fn volume_lost(&mut self, _: VolumeIndex, _: ByteRange, _: &mut Vec<Emit>) {}
@@ -501,7 +524,18 @@ impl Recovery for Par {
         self.seen.lock().unwrap().par3
     }
 
+    fn bind_due(&self) -> bool {
+        !self.seen.lock().unwrap().gated || self.due
+    }
+
     fn bind(&mut self, namespace: &mut weaver_graph::Namespace, renamed: &mut Vec<MemberId>) {
+        let gated = {
+            let mut seen = self.seen.lock().unwrap();
+            seen.binds += usize::from(seen.gated);
+            seen.gated
+        };
+        self.due = false;
+        let described = !gated || self.described;
         let covered = (self.volume, self.others.clone());
         self.volume = namespace.find_by_name("set.par2").map(|own| own.id);
         self.fixing = self
@@ -510,7 +544,9 @@ impl Recovery for Par {
             .map(|member| member.id);
         let recognised: Vec<MemberId> = namespace
             .members()
-            .filter(|member| member.name == "3f9a.bin" && member.coverage.bytes_covered() > 0)
+            .filter(|member| {
+                described && member.name == "3f9a.bin" && member.coverage.bytes_covered() > 0
+            })
             .map(|member| member.id)
             .collect();
         // What it does not describe, and the obfuscated member until its
@@ -5653,4 +5689,124 @@ fn a_refused_name_recognised_and_rebuilt_is_a_usable_file() {
         crate::jobs::model::JobStatus::Partial,
         "{delivery:?}"
     );
+}
+
+// What one run of a set lent while its volume's bytes arrive came to: each
+// member's name, where each delivery the set took began, the binds that
+// reached it, and the recovery-volume articles counted, found due and bound.
+#[derive(Debug, PartialEq)]
+struct LentVolume {
+    names: Vec<String>,
+    took: Vec<u64>,
+    binds: usize,
+}
+
+fn lent_volume_bytes(stopped: bool, open: bool) -> (LentVolume, [usize; 3]) {
+    use super::recovery::{VOLUME_ARTICLES, VOLUME_BINDS, VOLUME_BINDS_DUE, VOLUME_BINDS_OPEN};
+    VOLUME_BINDS_OPEN.with(|gate| gate.set(open));
+    for counter in [&VOLUME_ARTICLES, &VOLUME_BINDS_DUE, &VOLUME_BINDS] {
+        counter.with(|count| count.set(0));
+    }
+    let job = Job::new(PLENTY);
+    job.par.lock().unwrap().gated = true;
+    let mut job = job.with_set(None);
+    let hidden = job.member("3f9a.bin", Some(4));
+    job.send(hidden, 0, b"data", Provenance::Fresh);
+    let name = |job: &Job| job.root().get(hidden).expect("member").name.to_string();
+    let volume = job.root().find_by_name("set.par2").expect("volume").id;
+    let due = job.tree.recovery_nodes(NodeId::ROOT);
+    let [set] = due[..] else {
+        panic!("one set: {due:?}");
+    };
+    assert!(!job.tree.bind_due(set));
+    assert_eq!(name(&job), "3f9a.bin", "nothing described it yet");
+
+    let mut lent = Inline::default();
+    job.writer
+        .repair(&mut job.tree, NodeId::ROOT, &due, &mut lent)
+        .expect("lent");
+    assert!(job.tree.lent(set));
+    // The bytes that describe the member arrive while the set is out: the
+    // set does not take them, and no bind is due, as none could reach it.
+    let past = FIRST_BYTES as u64;
+    job.send(volume, past, b"more", Provenance::Fresh);
+    assert!(!job.tree.bind_due(set), "a lent set is not due");
+    assert!(!job.par.lock().unwrap().took.contains(&past), "queued");
+    assert_eq!(name(&job), "3f9a.bin");
+    let mut build = job.build();
+    if stopped {
+        // The shutdown began before the repair ran: it comes back stopped.
+        let shutdown = crate::pipeline::graph::hardware::Shutdown::of(Arc::new(
+            std::sync::atomic::AtomicBool::new(true),
+        ));
+        for loan in lent.0 {
+            let returned = loan.run(weaver_graph::Budget::default(), &shutdown);
+            assert!(returned.stopped());
+            job.writer
+                .returned(
+                    &mut job.tree,
+                    &mut build,
+                    &Source,
+                    &weaver_objects::Objects::default(),
+                    returned,
+                    &mut job.out,
+                )
+                .expect("returned");
+        }
+    } else {
+        job.run_lent(&mut build, lent);
+    }
+    assert!(!job.tree.lent(set));
+    assert!(
+        job.par.lock().unwrap().took.contains(&past),
+        "the queued delivery is heard at take-back"
+    );
+    if stopped {
+        // The stopped return binds nothing: what the queued delivery left
+        // is due, and the next recovery-volume article binds it.
+        assert!(job.tree.bind_due(set));
+        assert_eq!(name(&job), "3f9a.bin");
+        job.send(volume, past + 4, b"next", Provenance::Fresh);
+    }
+    assert!(!job.tree.bind_due(set), "the bind took what was due");
+    assert_eq!(name(&job), "show.mkv");
+    let seen = job.par.lock().unwrap();
+    let run = LentVolume {
+        names: job
+            .root()
+            .members()
+            .map(|member| member.name.to_string())
+            .collect(),
+        took: seen.took.clone(),
+        binds: seen.binds,
+    };
+    let counted = [&VOLUME_ARTICLES, &VOLUME_BINDS_DUE, &VOLUME_BINDS]
+        .map(|counter| counter.with(std::cell::Cell::get));
+    (run, counted)
+}
+
+// A set's volume bytes heard while the set is lent for a repair are taken at
+// its return, and the return's bind names what they described.
+#[test]
+fn volume_bytes_heard_while_the_set_is_lent_bind_at_its_return() {
+    let (gated, counted) = lent_volume_bytes(false, false);
+    let (open, forced) = lent_volume_bytes(false, true);
+    assert_eq!(gated, open);
+    assert_eq!(counted, [1, 0, 0], "the lent article bound nothing");
+    assert_eq!(forced, [1, 0, 1]);
+}
+
+// A stopped return binds nothing, so what its queued deliveries left stays
+// due, and the next recovery-volume article binds it.
+#[test]
+fn volume_bytes_heard_while_a_stopped_set_is_lent_bind_at_the_next_article() {
+    let (gated, counted) = lent_volume_bytes(true, false);
+    let (open, forced) = lent_volume_bytes(true, true);
+    assert_eq!(gated, open);
+    assert_eq!(
+        counted,
+        [2, 1, 1],
+        "only the article after the return bound"
+    );
+    assert_eq!(forced, [2, 1, 2]);
 }

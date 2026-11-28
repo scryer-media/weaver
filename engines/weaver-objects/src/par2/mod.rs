@@ -1450,6 +1450,14 @@ impl Recovery for Par2 {
         self.covered.changes
     }
 
+    // A take leaves a bind two things: the sets it filed or whose index it
+    // changed (`rebound`), and the members a set came to describe, to be
+    // said again for it (`unfed`). A member a set gives up moves without
+    // one.
+    fn bind_due(&self) -> bool {
+        !self.rebound.is_empty() || self.moved()
+    }
+
     fn feed(&mut self, member: MemberId, segments: &[Segment]) {
         let grids = self.list_grids(member);
         if !grids

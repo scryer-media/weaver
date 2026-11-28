@@ -1975,21 +1975,45 @@ impl NamespaceWriter {
             );
             arrival.range().len()
         };
-        let recovery_volume = tree
+        // A recovery volume's object took the bytes in `deliver` above.
+        let volume_of = tree
             .child_of(node, member)
-            .is_some_and(|(child, _)| tree.recovers(child));
+            .map(|(child, _)| child)
+            .filter(|child| tree.recovers(*child));
         let applied = self.apply_drain(tree, builder, segments, &mut effects, write, out);
         self.effects = effects;
         applied?;
         // The front decides content matches, a finished member has the
-        // length matches need, and a recovery volume's bytes may describe
-        // more of the members.
+        // length matches need, and a recovery volume's bytes bind only when
+        // what its object took, here or as the effects were applied, left a
+        // bind something to do: a set it filed or whose index changed, or a
+        // member a set came to describe. An object on loan for a repair is
+        // not due: a bind cannot reach it, its deliveries are queued and
+        // heard at take-back, and what they leave is then seen by the
+        // return path's bind or by the next arrival's `bind_due`.
         let front = arrival.offset < FIRST_BYTES as u64;
         let complete = tree
             .namespace(node)
             .and_then(|namespace| namespace.get(member))
             .is_some_and(|record| record.is_complete());
-        if recovery_volume || front || complete {
+        let due = volume_of.is_some_and(|child| tree.bind_due(child));
+        #[cfg(any(test, feature = "pipeline-test-fixtures"))]
+        let due = {
+            use recovery::{VOLUME_ARTICLES, VOLUME_BINDS, VOLUME_BINDS_DUE, VOLUME_BINDS_OPEN};
+            let alone = volume_of.is_some() && !front && !complete;
+            let open = alone && VOLUME_BINDS_OPEN.with(std::cell::Cell::get);
+            if alone {
+                VOLUME_ARTICLES.with(|count| count.set(count.get() + 1));
+                if due {
+                    VOLUME_BINDS_DUE.with(|count| count.set(count.get() + 1));
+                }
+                if due || open {
+                    VOLUME_BINDS.with(|count| count.set(count.get() + 1));
+                }
+            }
+            due || open
+        };
+        if due || front || complete {
             self.bind_recoveries(tree, builder, segments, node, out)?;
         }
         Ok(took)

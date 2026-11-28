@@ -1174,6 +1174,17 @@ impl Tree {
         self.recovery(node).is_some() || self.lent_for_repair(node)
     }
 
+    // Whether what the recovery object at `node` took since its last bind
+    // leaves a bind something to do (`Recovery::bind_due`). Read only: the
+    // node is not marked. An object on loan for a repair is not due: a bind
+    // cannot reach it (`with_recovery` is None), its deliveries are queued
+    // and heard at take-back, and what they leave is then seen by the
+    // return path's bind or by the next arrival's `bind_due`.
+    pub fn bind_due(&self, node: NodeId) -> bool {
+        self.recovery(node)
+            .is_some_and(|recovery| recovery.bind_due())
+    }
+
     // Whether the job spends the member of `node`'s namespace rather than
     // hand it over: it is a volume an object bound in the namespace
     // consumed, whose output is what the object hands over in its stead,

@@ -51,6 +51,19 @@ thread_local! {
     pub static NAMES_KEPT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
+// For the tests that count the binds a recovery volume's bytes make: past
+// its front, of a volume not yet whole, how many articles there were, how
+// many of them left their object a bind to do, and how many bound. Set,
+// `VOLUME_BINDS_OPEN` binds after every such article, as each did before
+// its object could say whether a bind was due.
+#[cfg(any(test, feature = "pipeline-test-fixtures"))]
+thread_local! {
+    pub static VOLUME_ARTICLES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    pub static VOLUME_BINDS_DUE: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    pub static VOLUME_BINDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    pub static VOLUME_BINDS_OPEN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 // What one set says of the members it covers.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SetState {
