@@ -222,5 +222,7 @@ pub mod hooks {
     thread_local! {
         pub static SEEK_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
         pub static SEEK_MAPPED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+        // The articles the mappings looked at.
+        pub static SEEK_EXAMINED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     }
 }

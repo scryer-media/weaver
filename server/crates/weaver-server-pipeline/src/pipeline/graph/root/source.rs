@@ -12,6 +12,8 @@
 // bounds of the articles around it.
 
 mod durable;
+#[cfg(test)]
+mod tests;
 
 use std::collections::btree_map::Entry;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -146,15 +148,15 @@ impl Open {
     }
 }
 
-// File the article in or out of its volume's entry. True when the volume
-// gained or lost its entry.
-fn file_in(
-    sets: &mut BTreeMap<VolumeIndex, BTreeSet<usize>>,
-    volume: VolumeIndex,
+// File the article in or out of its key's entry, a volume's or a class's.
+// True when the key gained or lost its entry.
+fn file_in<K: Ord>(
+    sets: &mut BTreeMap<K, BTreeSet<usize>>,
+    key: K,
     index: usize,
     held: bool,
 ) -> bool {
-    match (sets.entry(volume), held) {
+    match (sets.entry(key), held) {
         (Entry::Vacant(entry), true) => {
             entry.insert(BTreeSet::from([index]));
             true
@@ -173,6 +175,19 @@ fn file_in(
         }
         (Entry::Vacant(_), false) => false,
     }
+}
+
+// The articles a seek's mapping looked at, for the tests that hold a mapping
+// to the articles it can move.
+fn count_examined(_examined: usize) {
+    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
+    super::hooks::SEEK_EXAMINED.with(|count| count.set(count.get() + _examined));
+}
+
+// The classes `Volume::raised` files: every class but the two `parkable` and
+// `parked` hold.
+fn is_raised(class: Class) -> bool {
+    !matches!(class, Class::Ordinary | Class::Parked)
 }
 
 #[derive(Debug)]
@@ -204,6 +219,12 @@ struct Volume {
     parked: BTreeSet<usize>,
     // The post's encoded bytes of the parked articles. Kept beside `parked`.
     parked_bytes: u64,
+    // The articles waiting above the ordinary class, by class: with
+    // `parkable` (waiting, ordinary) and `parked` (waiting, parked), every
+    // waiting article by its class, so a raise visits only the articles it
+    // can still move. Filed beside `parkable`, and a class with none has
+    // no entry.
+    raised: BTreeMap<Class, BTreeSet<usize>>,
     // The articles carry no position of their own, so the volume can only
     // be placed in order, from the front.
     ordered_only: bool,
@@ -259,6 +280,7 @@ impl Volume {
             parkable: (0..sizes.len()).collect(),
             parked: BTreeSet::new(),
             parked_bytes: 0,
+            raised: BTreeMap::new(),
             ordered_only: false,
             starts: BTreeMap::new(),
             cut: BTreeMap::new(),
@@ -304,7 +326,7 @@ impl Volume {
         open.in_hand = open.in_hand - decoded(was) + decoded(state);
         self.articles[index].state = state;
         open.file(self.at, index, state);
-        self.file_parkable(index);
+        self.file_parkable(index, self.articles[index].class);
         self.marks.mark(Chunk::Articles(of_ordinal(ordinal)));
         let (from, to) = (start_of(was), start_of(state));
         if from == to {
@@ -350,10 +372,11 @@ impl Volume {
         if article.class == class {
             return;
         }
+        let was = article.class;
         article.class = class;
         let chunk = of_ordinal(article.ordinal);
         self.changed();
-        self.file_parkable(index);
+        self.file_parkable(index, was);
         self.marks.mark(Chunk::Articles(chunk));
     }
 
@@ -371,9 +394,17 @@ impl Volume {
         (!decided).then(|| (self.encoded_len - self.settled_bytes, self.encoded_len))
     }
 
-    fn file_parkable(&mut self, index: usize) {
+    // File the article by its state and class, `was` being its class before
+    // the change.
+    fn file_parkable(&mut self, index: usize, was: Class) {
         let article = self.articles[index];
         let waiting = article.state == State::Waiting;
+        if was != article.class && is_raised(was) {
+            file_in(&mut self.raised, was, index, false);
+        }
+        if is_raised(article.class) {
+            file_in(&mut self.raised, article.class, index, waiting);
+        }
         if waiting && article.class == Class::Ordinary {
             self.parkable.insert(index);
         } else {
@@ -503,10 +534,54 @@ impl Volume {
             .filter(move |index| self.may_carry(*index, range))
     }
 
-    // The articles whose bytes may fall in the range.
+    // The articles whose bytes may fall in the range: what a seek tested
+    // before it visited only the articles it can move, kept for the tests
+    // that hold the two to one answer.
+    #[cfg(test)]
     fn covering(&self, range: ByteRange) -> impl Iterator<Item = usize> + '_ {
         self.run(range)
             .filter(move |index| self.may_carry(*index, range))
+    }
+
+    // The covering articles a raise to `class` can move: those waiting in a
+    // class it outranks, in index order. `examined` counts the articles the
+    // run held in those classes.
+    fn raisable_covering(
+        &self,
+        class: Class,
+        range: ByteRange,
+        examined: &mut usize,
+    ) -> Vec<usize> {
+        let run = self.run(range);
+        let raised = self
+            .raised
+            .range((Bound::Excluded(class), Bound::Unbounded))
+            .map(|(_, held)| held);
+        let ordinary = (class < Class::Ordinary).then_some(&self.parkable);
+        // A raise outranks every parked article: only a deferral parks.
+        let mut out: Vec<usize> = raised
+            .chain(ordinary)
+            .chain([&self.parked])
+            .flat_map(|held| held.range(run.clone()).copied())
+            .inspect(|_| *examined += 1)
+            .filter(|index| self.may_carry(*index, range))
+            .collect();
+        out.sort_unstable();
+        out
+    }
+
+    // Whether a lost article surely carries some of the range.
+    fn lost_in(
+        &self,
+        lost: Option<&BTreeSet<usize>>,
+        range: ByteRange,
+        examined: &mut usize,
+    ) -> bool {
+        lost.is_some_and(|lost| {
+            lost.range(self.run(range))
+                .inspect(|_| *examined += 1)
+                .any(|index| self.may_carry(*index, range) && self.surely_in(*index, range))
+        })
     }
 
     // The covering articles a deferral can still park.
@@ -1179,17 +1254,92 @@ impl ArticleMap {
                 Pull::Unseekable
             };
         }
-        // A deferral moves only what it can park, and is never lost.
-        let mut covering: Vec<usize> = if parks {
-            found.parkable_covering(range).collect()
-        } else {
-            found.covering(range).collect()
+        // A deferral moves only what it can park, and is never lost. A raise
+        // visits only the articles it can move, and the lost ones for its
+        // answer; an article in hand neither moves nor loses it.
+        let mut examined = 0;
+        let mut covering: Vec<usize> = match class {
+            Some(Class::Parked) => found
+                .parkable_covering(range)
+                .inspect(|_| examined += 1)
+                .collect(),
+            Some(class) => found.raisable_covering(class, range, &mut examined),
+            None => Vec::new(),
         };
+        let lost = !parks && found.lost_in(self.open.lost.get(&volume), range, &mut examined);
         // Once the post's placements disagree, the bounds of an article
         // still to come say nothing of where its own header puts it: one
         // after an article placed past the volume's end is bounded past it
         // too. A raise that runs to the volume's end takes every article of
         // the volume still waited on, so none it may need is left behind.
+        if !parks
+            && found.disorder > 0
+            && range.end == end
+            && let Some(waiting) = self.open.waiting.get(&volume)
+        {
+            covering.extend(
+                waiting
+                    .iter()
+                    .copied()
+                    .inspect(|_| examined += 1)
+                    .filter(|index| !found.may_carry(*index, range)),
+            );
+        }
+        count_examined(examined);
+        let mut moved = 0;
+        for index in covering {
+            let article = found.articles[index];
+            let moves = |class: &Class| match class {
+                Class::Parked => article.class == Class::Ordinary,
+                _ => *class < article.class,
+            };
+            if let Some(class) = class.filter(moves)
+                && article.state == State::Waiting
+            {
+                found.set_class(index, class);
+                self.moves.push(Move {
+                    volume,
+                    ordinal: article.ordinal,
+                    class,
+                });
+                moved += 1;
+            }
+        }
+        if lost && !parks {
+            Pull::Lost
+        } else {
+            Pull::Moved(moved)
+        }
+    }
+
+    // The mapping as it was before a raise visited only the articles it can
+    // move: every article of the run is tested. The tests hold `map_seek` to
+    // its answers and moves.
+    #[cfg(test)]
+    fn map_seek_by_scan(
+        &mut self,
+        volume: VolumeIndex,
+        range: ByteRange,
+        class: Option<Class>,
+    ) -> Pull {
+        let parks = class == Some(Class::Parked);
+        let Some(found) = self.volumes.get_mut(volume.0 as usize) else {
+            return if parks { Pull::Moved(0) } else { Pull::Lost };
+        };
+        let end = found.bounds(found.articles.len()).1;
+        let range = ByteRange::new(range.start.min(end), range.end.min(end));
+        if found.ordered_only {
+            return if parks || range.end <= found.front() {
+                Pull::Moved(0)
+            } else {
+                Pull::Unseekable
+            };
+        }
+        let mut covering: Vec<usize> = if parks {
+            found.parkable_covering(range).collect()
+        } else {
+            found.covering(range).collect()
+        };
         if !parks
             && found.disorder > 0
             && range.end == end
