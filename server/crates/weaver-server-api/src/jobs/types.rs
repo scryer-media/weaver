@@ -1167,6 +1167,9 @@ pub struct SubmitNzbInput {
     /// The tags the job is added with.
     #[graphql(default)]
     pub tags: Vec<String>,
+    /// Optional directory holding already-downloaded files to verify and adopt
+    /// before fetching remaining files from NNTP.
+    pub existing_dir: Option<String>,
 }
 
 #[derive(Debug, InputObject)]
@@ -1198,6 +1201,9 @@ pub struct SubmitInput {
     /// The tags the job is added with.
     #[graphql(default)]
     pub tags: Vec<String>,
+    /// Optional directory holding already-downloaded files to verify and adopt
+    /// before fetching remaining files from NNTP.
+    pub existing_dir: Option<String>,
 }
 
 #[derive(Debug, Clone, SimpleObject)]
@@ -1229,6 +1235,9 @@ pub struct SubmitStagedNzbsInput {
     /// The tags each job is added with.
     #[graphql(default)]
     pub tags: Vec<String>,
+    /// Optional directory holding already-downloaded files to verify and adopt
+    /// before fetching remaining files from NNTP.
+    pub existing_dir: Option<String>,
 }
 
 #[derive(Debug, Clone, SimpleObject)]

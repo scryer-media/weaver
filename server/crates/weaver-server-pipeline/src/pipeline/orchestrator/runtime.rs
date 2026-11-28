@@ -256,6 +256,7 @@ impl Pipeline {
         let (move_done_tx, move_done_rx) = mpsc::channel(32);
         let (failed_release_tx, failed_release_rx) = mpsc::channel(32);
         let (job_activated_tx, job_activated_rx) = mpsc::channel(32);
+        let (adopted_tx, adopted_rx) = mpsc::channel(16);
         let (db_reply_tx, db_reply_rx) = mpsc::unbounded_channel();
         // The one listener for the history archives the writer keeps for
         // want of room: each is told to the loop as a database reply.
@@ -459,6 +460,9 @@ impl Pipeline {
             nntp_handoff_drained_rx,
             job_activated_tx,
             job_activated_rx,
+            adopted_tx,
+            adopted_rx,
+            adopted_activations: HashMap::new(),
             db_reply_tx,
             db_reply_rx,
             move_done_tx,
@@ -1535,6 +1539,11 @@ impl Pipeline {
                                 hear!(12);
                                 turn_timer.resume(PipelinePhase::JobActivated);
                                 self.handle_job_activated(done);
+                            }
+                            Some(msg) = self.adopted_rx.recv(), if open!(31) => {
+                                hear!(31);
+                                turn_timer.resume(PipelinePhase::DecodeDone);
+                                self.handle_adopted_message(msg);
                             }
                             Some(reply) = self.db_reply_rx.recv(), if open!(13) => {
                                 hear!(13);

@@ -167,6 +167,9 @@ pub(crate) struct ReadArticles {
     // That staging directory, when it is not the one the job had: made by
     // this read, and the job's to lose should the job leave first.
     made_staging: Option<PathBuf>,
+    // Complete files verified in `existing_dir` on first activation, to be
+    // streamed from disk into the graph instead of fetched over NNTP.
+    adopted: Vec<crate::pipeline::adoption::AdoptedFile>,
 }
 
 #[cfg(all(feature = "pipeline-test-fixtures", not(test)))]
@@ -755,14 +758,37 @@ impl Pipeline {
                     }
                     None => (None, HashSet::new(), Vec::new()),
                 };
+                let mut adopted_segments = HashSet::new();
+                for file in &read.adopted {
+                    let file_id = NzbFileId {
+                        job_id,
+                        file_index: file.file_index,
+                    };
+                    for &ordinal in &file.ordinals {
+                        adopted_segments.insert(SegmentId {
+                            file_id,
+                            segment_number: ordinal,
+                        });
+                    }
+                }
                 self.activate_job_articles(
                     job_id,
                     &skip,
+                    &adopted_segments,
                     graph,
                     read.repeated,
                     held,
                     &read.volumes,
                 );
+                if !read.adopted.is_empty() {
+                    self.adopted_activations.insert(job_id, activation);
+                    crate::pipeline::adoption::spawn_adopted_reader(
+                        job_id,
+                        activation,
+                        read.adopted,
+                        self.adopted_tx.clone(),
+                    );
+                }
                 self.report_job(job_id);
                 self.download_dispatch_wake = true;
             }
@@ -779,10 +805,12 @@ impl Pipeline {
     // parts its checkpoint names, and its repeated-article index. Everything
     // built is charged, never refused, and held until the job pauses or
     // leaves the pipeline.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn activate_job_articles(
         &mut self,
         job_id: JobId,
         skip: &HashSet<SegmentId>,
+        adopted: &HashSet<SegmentId>,
         graph: Option<crate::pipeline::graph::job::GraphJob>,
         repeated: Option<Arc<RepeatedArticles>>,
         held_parts: Vec<HeldPart>,
@@ -796,8 +824,32 @@ impl Pipeline {
         };
         let mut held = Self::held_parts(&self.uu_files, &self.unanchored_parked, job_id);
         held.extend(held_parts.iter().map(HeldPart::segment_id));
-        let (mut assembly, download_queue) =
+        held.extend(adopted.iter().copied());
+        let (mut assembly, mut download_queue) =
             Self::build_job_assembly(job_id, &state.spec, skip, &held);
+        let mut recovery_queue = DownloadQueue::new();
+        // When existing files were adopted from disk, only a small number of
+        // missing payload files remain in `download_queue`. Park optional
+        // recovery volumes upfront so NNTP connections do not eagerly fetch
+        // them before the PAR2 index parses; the graph will unpark any needed
+        // recovery blocks if a missing payload article is damaged or absent.
+        if !adopted.is_empty() && graph.is_none() {
+            let recovery_files: HashSet<u32> = state
+                .spec
+                .files
+                .iter()
+                .enumerate()
+                .filter(|(_, file)| file.role.is_recovery())
+                .map(|(index, _)| index as u32)
+                .collect();
+            if !recovery_files.is_empty() {
+                for work in download_queue.extract_matching(|work| {
+                    recovery_files.contains(&work.segment_id.file_id.file_index)
+                }) {
+                    recovery_queue.push(work);
+                }
+            }
+        }
         // A graph root brought back holds the articles it placed. Each one's
         // placement is recorded again, so an article that arrives now is
         // checked against its neighbours exactly as it would have been
@@ -817,7 +869,7 @@ impl Pipeline {
         state.articles = JobArticles::Active(Box::new(ActiveArticles {
             assembly,
             download_queue,
-            recovery_queue: DownloadQueue::new(),
+            recovery_queue,
         }));
         if let Some(cache) = repeated {
             self.repeated_articles.insert(job_id, cache);
@@ -828,7 +880,7 @@ impl Pipeline {
                 self.install_graph_job(job_id, graph, held_parts);
                 self.post_restored(job_id);
             }
-            None => self.admit_graph_job(job_id, volumes),
+            None => self.admit_graph_job(job_id, volumes, adopted),
         }
         self.abandon_dead_files(job_id);
     }
@@ -841,6 +893,7 @@ impl Pipeline {
     // park holds, as its next activation would, and a read of its articles
     // still out is disowned. The caller removes a job that leaves.
     pub(crate) fn release_job_articles(&mut self, job_id: JobId) {
+        self.adopted_activations.remove(&job_id);
         let graph = self.graph_jobs.get(&job_id);
         if let (Some(graph), Some(state)) = (graph, self.jobs.get(&job_id)) {
             let figures = Self::graph_remaining(graph, &state.spec);
@@ -1217,6 +1270,13 @@ fn read_job_articles(
         Err(GraphRestoreError::NoCheckpoint(_)) => None,
         Err(error) => return Err(error.to_string()),
     };
+    let adopted = if restored.is_none() {
+        crate::history::attributes::existing_dir(&spec.metadata)
+            .map(|dir| crate::pipeline::adoption::scan_existing_dir(Path::new(dir), &spec.files))
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
     let lists = spec.files.into_iter().map(|file| file.segments).collect();
     Ok(ReadArticles {
         lists,
@@ -1225,6 +1285,7 @@ fn read_job_articles(
         staging: None,
         volumes: Vec::new(),
         made_staging: None,
+        adopted,
     })
 }
 

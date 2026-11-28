@@ -2790,6 +2790,7 @@ export const nextPt: LocaleDictionary = {
   "next.torrent.unpacked": "Extraído",
   "next.addNzb.link": "Link",
   "next.addNzb.paused": "Adicionar pausado",
+  "next.addNzb.existingDir": "Retomar de",
   "next.quota.remaining": "{{size}} restantes",
   "next.networking.egress.quota": "Cota",
   "next.networking.egress.enabled": "Ativada",

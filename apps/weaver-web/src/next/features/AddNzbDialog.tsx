@@ -11,6 +11,7 @@ import {
 import { cn } from "@/lib/utils";
 import { ConfirmDialog } from "@/next/components/ConfirmDialog";
 import { Dialog } from "@/next/components/Dialog";
+import { PathField } from "@/next/features/DirectoryBrowserDialog";
 import { Eyebrow } from "@/next/components/chrome";
 import { FormRow } from "@/next/components/rows";
 import {
@@ -329,6 +330,17 @@ export function AddNzbDialog({
               className="w-[268px] max-w-full"
             />
           </FormRow>
+          {!torrent ? (
+            <FormRow label={t("next.addNzb.existingDir")}>
+              <PathField
+                label={t("next.addNzb.existingDir")}
+                value={upload.existingDir}
+                onChange={upload.setExistingDir}
+                placeholder={t("next.common.optional")}
+                className="w-[268px] max-w-full"
+              />
+            </FormRow>
+          ) : null}
         </div>
       </div>
       <ConfirmDialog

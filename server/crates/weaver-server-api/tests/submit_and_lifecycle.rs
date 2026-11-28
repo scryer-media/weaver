@@ -1404,3 +1404,52 @@ async fn redownload_nonexistent_job() {
 
     assert_has_errors(&resp);
 }
+
+#[tokio::test]
+async fn submit_nzb_existing_dir_enforces_path_and_scope() {
+    let h = TestHarness::new().await;
+    let b64 = encode_nzb(&minimal_nzb("resume-test"));
+
+    let submit_with_dir = |dir: &str| {
+        let escaped = serde_json::to_string(dir).unwrap();
+        format!(
+            r#"mutation {{ submitNzb(input: {{ nzbBase64: "{b64}", filename: "resume.nzb", existingDir: {escaped} }}) {{ accepted status item {{ id }} }} }}"#
+        )
+    };
+
+    // Relative path is rejected as INVALID_INPUT.
+    let rel = h.execute(&submit_with_dir("relative/dir")).await;
+    assert_has_errors(&rel);
+
+    // Path containing `..` is rejected as INVALID_INPUT.
+    let outside = tempfile::tempdir().unwrap();
+    let traversal = outside.path().join("..").display().to_string();
+    let dotdot = h.execute(&submit_with_dir(&traversal)).await;
+    assert_has_errors(&dotdot);
+
+    // Nonexistent absolute directory is rejected as INVALID_INPUT.
+    let missing = outside.path().join("does-not-exist").display().to_string();
+    let nonexistent = h.execute(&submit_with_dir(&missing)).await;
+    assert_has_errors(&nonexistent);
+
+    // Control key cannot point outside configured download folders (FORBIDDEN).
+    let outside_str = outside.path().display().to_string();
+    let forbidden = h
+        .execute_as(&submit_with_dir(&outside_str), CallerScope::Control)
+        .await;
+    assert_has_errors(&forbidden);
+    assert!(
+        forbidden
+            .errors
+            .iter()
+            .any(|err| err.message.contains("outside the allowed download folders")),
+        "{:?}",
+        forbidden.errors
+    );
+
+    // Admin/Local caller can submit with any existing directory.
+    let ok = h.execute(&submit_with_dir(&outside_str)).await;
+    assert_no_errors(&ok);
+    let data = ok.data.into_json().unwrap();
+    assert_eq!(data["submitNzb"]["accepted"], true);
+}

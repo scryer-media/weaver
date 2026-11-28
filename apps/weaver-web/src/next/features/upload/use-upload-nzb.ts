@@ -216,6 +216,7 @@ async function submitStagedNzbs(input: {
   tags: string[];
   priority: string;
   paused: boolean;
+  existingDir: string;
   duplicate: ReturnType<typeof duplicateSubmissionInput>;
 }): Promise<SubmitStagedNzbsResponse> {
   const response = await fetchWithSessionRetry(graphqlUrl(), {
@@ -238,6 +239,7 @@ async function submitStagedNzbs(input: {
           tags: input.tags,
           attributes: [{ key: "priority", value: input.priority }],
           paused: input.paused,
+          existingDir: input.existingDir.trim() || null,
           ...input.duplicate,
         },
       },
@@ -281,6 +283,7 @@ async function submitOne(input: {
   password: string;
   /** Whether a torrent's archives are extracted; null inherits. */
   unpack: boolean | null;
+  existingDir: string;
 }): Promise<string | null> {
   const operations = {
     query: SUBMIT_OPERATION,
@@ -296,6 +299,7 @@ async function submitOne(input: {
         paused: input.paused,
         password: input.password.trim() || null,
         unpack: input.unpack,
+        existingDir: input.existingDir.trim() || null,
       },
     },
   };
@@ -381,6 +385,7 @@ export function useUploadNzb(options?: {
   const [priority, setPriority] = useState("NORMAL");
   const [paused, setPaused] = useState(false);
   const [unpack, setUnpack] = useState<boolean | null>(null);
+  const [existingDir, setExistingDir] = useState("");
   // One NZB or torrent URL, magnet link or infohash, sent as it is on submit.
   const [text, setTextState] = useState("");
   const [textError, setTextError] = useState<string | null>(null);
@@ -600,6 +605,7 @@ export function useUploadNzb(options?: {
       setPriority("NORMAL");
       setPaused(false);
       setUnpack(null);
+      setExistingDir("");
       setTextState("");
       setTextError(null);
       setForce(false);
@@ -763,6 +769,7 @@ export function useUploadNzb(options?: {
         paused,
         password,
         unpack,
+        existingDir,
       };
       let anyAccepted = false;
       const textOutcome: UploadNzbEntryStatus[] = [];
@@ -824,6 +831,7 @@ export function useUploadNzb(options?: {
           tags: splitTags(tags),
           priority,
           paused,
+          existingDir,
           duplicate: duplicateSubmissionInput({
             force: submitOptions?.force || force,
             mode: duplicateMode,
@@ -955,6 +963,7 @@ export function useUploadNzb(options?: {
       duplicateKey,
       duplicateMode,
       duplicateScore,
+      existingDir,
       force,
       options,
       password,
@@ -995,6 +1004,7 @@ export function useUploadNzb(options?: {
     priority,
     paused,
     unpack,
+    existingDir,
     text,
     textError,
     force,
@@ -1010,6 +1020,7 @@ export function useUploadNzb(options?: {
     setPriority,
     setPaused,
     setUnpack,
+    setExistingDir,
     setText,
     setForce,
     setDuplicateMode,

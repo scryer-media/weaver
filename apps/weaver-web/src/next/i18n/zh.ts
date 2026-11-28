@@ -2553,6 +2553,7 @@ export const nextZh: LocaleDictionary = {
   "next.torrent.unpacked": "已解压",
   "next.addNzb.link": "链接",
   "next.addNzb.paused": "添加时暂停",
+  "next.addNzb.existingDir": "从此目录续传",
   "next.quota.remaining": "剩余 {{size}}",
   "next.networking.egress.quota": "配额",
   "next.networking.egress.enabled": "已启用",

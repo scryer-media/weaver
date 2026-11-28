@@ -842,7 +842,7 @@ pub fn stage_on_disk(pipeline: &mut Pipeline, library: &Path) -> std::path::Path
     crate::pipeline::queue::make_staging_dir(&staging, JOB).unwrap();
     pipeline.retire_graph_job(JOB);
     pipeline.jobs.get_mut(&JOB).unwrap().staging_dir = Some(staging.clone());
-    pipeline.admit_graph_job(JOB, &[]);
+    pipeline.admit_graph_job(JOB, &[], &std::collections::HashSet::new());
     staging
 }
 

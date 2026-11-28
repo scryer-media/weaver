@@ -175,6 +175,14 @@ impl JobsMutation {
                 ));
             }
         };
+        let mut metadata = Vec::new();
+        if let Some(existing_dir) = resolve_existing_dir(ctx, input.existing_dir.as_deref()).await?
+        {
+            metadata.push((
+                weaver_server_core::history::attributes::EXISTING_DIR_ATTRIBUTE_KEY.to_string(),
+                existing_dir,
+            ));
+        }
         submit_nzb_source(
             ctx,
             NzbSubmission {
@@ -183,7 +191,7 @@ impl JobsMutation {
                 source_url,
                 password: input.password,
                 category,
-                metadata: Vec::new(),
+                metadata,
                 options,
                 client_request_id: None,
             },
@@ -287,8 +295,15 @@ impl JobsMutation {
         let manager = ctx.data::<StagedUploadManager>()?;
         let caller_identity = caller_identity(ctx)?;
         let client_request_id = input.client_request_id.clone();
-        let metadata = submit_metadata(input.attributes, client_request_id.clone())
+        let mut metadata = submit_metadata(input.attributes, client_request_id.clone())
             .map_err(|message| graphql_error("INVALID_INPUT", message))?;
+        if let Some(existing_dir) = resolve_existing_dir(ctx, input.existing_dir.as_deref()).await?
+        {
+            metadata.push((
+                weaver_server_core::history::attributes::EXISTING_DIR_ATTRIBUTE_KEY.to_string(),
+                existing_dir,
+            ));
+        }
         let category = input.category.clone();
         let password = input.password.clone();
         let idempotency_key = input.idempotency_key.clone();
@@ -1580,8 +1595,14 @@ async fn submit_from_facade_input(
     );
     options.supplied_password_candidates = supplied_password_candidates;
     options.tags = input.tags;
-    let metadata = submit_metadata(input.attributes, input.client_request_id.clone())
+    let mut metadata = submit_metadata(input.attributes, input.client_request_id.clone())
         .map_err(|message| graphql_error("INVALID_INPUT", message))?;
+    if let Some(existing_dir) = resolve_existing_dir(ctx, input.existing_dir.as_deref()).await? {
+        metadata.push((
+            weaver_server_core::history::attributes::EXISTING_DIR_ATTRIBUTE_KEY.to_string(),
+            existing_dir,
+        ));
+    }
     let source = match (nzb_bytes, upload) {
         (_, Some(upload)) => NzbSource::Upload(upload),
         (bytes, None) => NzbSource::Bytes(bytes.expect("nzb bytes should be present")),
@@ -1600,6 +1621,55 @@ async fn submit_from_facade_input(
         },
     )
     .await
+}
+
+// Validate `existing_dir` against caller scope (Admin/Local may name any
+// absolute path with no `..`; Control keys are restricted to under the
+// configured complete/category folders) and confirm it is an existing
+// directory off the async runtime.
+async fn resolve_existing_dir(ctx: &Context<'_>, raw: Option<&str>) -> Result<Option<String>> {
+    let Some(trimmed) = raw.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(None);
+    };
+    let path = std::path::PathBuf::from(trimmed);
+    if !path.is_absolute()
+        || path
+            .components()
+            .any(|component| matches!(component, std::path::Component::ParentDir))
+    {
+        return Err(graphql_error(
+            "INVALID_INPUT",
+            "existingDir must be an absolute path with no '..'",
+        ));
+    }
+    let caller = *ctx.data::<weaver_server_core::auth::CallerScope>()?;
+    let (complete_dir, categories) = {
+        let config = ctx.data::<SharedConfig>()?.read().await;
+        (
+            std::path::PathBuf::from(config.complete_dir()),
+            config.categories.clone(),
+        )
+    };
+    if !weaver_server_core::categories::model::may_place(caller, &path, &complete_dir, &categories)
+    {
+        return Err(graphql_error(
+            "FORBIDDEN",
+            "existingDir is outside the allowed download folders",
+        ));
+    }
+    let check_path = path.clone();
+    let is_dir = tokio::task::spawn_blocking(move || {
+        std::fs::metadata(&check_path).is_ok_and(|meta| meta.is_dir())
+    })
+    .await
+    .map_err(|error| graphql_error("INTERNAL", format!("existingDir check failed: {error}")))?;
+    if !is_dir {
+        return Err(graphql_error(
+            "INVALID_INPUT",
+            "existingDir does not exist or is not a directory",
+        ));
+    }
+    Ok(Some(trimmed.to_string()))
 }
 
 // An NZB to submit: its bytes in hand, or an upload parsed as it is read.

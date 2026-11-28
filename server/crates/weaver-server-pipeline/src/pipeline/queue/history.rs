@@ -347,13 +347,16 @@ impl Queue {
                         .map_err(|error| SchedulerError::Internal(error.to_string()))?
                         .unwrap_or_default();
                     use crate::history::attributes::{
-                        FAILED_FOR_MEMORY_ATTRIBUTE_KEY, NO_MEMORY_LIMIT_ATTRIBUTE_KEY,
+                        EXISTING_DIR_ATTRIBUTE_KEY, FAILED_FOR_MEMORY_ATTRIBUTE_KEY,
+                        NO_MEMORY_LIMIT_ATTRIBUTE_KEY,
                     };
                     metadata.retain(|(key, _)| {
                         !crate::history::attributes::is_password_attribute_key(key)
                             && key != NO_MEMORY_LIMIT_ATTRIBUTE_KEY
                             && key != FAILED_FOR_MEMORY_ATTRIBUTE_KEY
-                            && (reprocess || key != crate::ingest::FULL_FILE_NAMES_METADATA_KEY)
+                            && (reprocess
+                                || (key != crate::ingest::FULL_FILE_NAMES_METADATA_KEY
+                                    && key != EXISTING_DIR_ATTRIBUTE_KEY))
                     });
                     // Kept with the job, so a restart or a restore of it
                     // keeps the limit lifted; a later restart decides again.

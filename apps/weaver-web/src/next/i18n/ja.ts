@@ -2764,6 +2764,7 @@ export const nextJa: LocaleDictionary = {
   "next.torrent.unpacked": "展開済み",
   "next.addNzb.link": "リンク",
   "next.addNzb.paused": "一時停止で追加",
+  "next.addNzb.existingDir": "再開元フォルダ",
   "next.quota.remaining": "残り {{size}}",
   "next.networking.egress.quota": "容量",
   "next.networking.egress.enabled": "有効",

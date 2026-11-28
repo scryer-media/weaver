@@ -1441,6 +1441,7 @@ impl Pipeline {
             self.activate_job_articles(
                 job_id,
                 &skip,
+                &HashSet::new(),
                 graph_restore,
                 repeated,
                 held_parts,

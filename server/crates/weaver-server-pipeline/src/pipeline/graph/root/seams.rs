@@ -52,6 +52,7 @@ impl Pipeline {
             std::path::PathBuf,
             Arc<weaver_server_disk::operations::disk::volume::Volume>,
         )],
+        adopted: &std::collections::HashSet<SegmentId>,
     ) {
         // Read before the job is borrowed, in the order they are tried, each
         // with its source for the download summary.
@@ -121,7 +122,10 @@ impl Pipeline {
             active.download_queue.extend_segment_ids(&mut queued);
             active.recovery_queue.extend_segment_ids(&mut queued);
         }
-        graph.arrived_before(|volume, ordinal| queued.contains(&segment(job_id, volume, ordinal)));
+        graph.arrived_before(|volume, ordinal| {
+            let seg = segment(job_id, volume, ordinal);
+            queued.contains(&seg) || adopted.contains(&seg)
+        });
         self.install_graph_job(job_id, graph, Vec::new());
     }
 
