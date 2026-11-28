@@ -15,6 +15,7 @@ use serde::{Deserialize, Serialize};
 use weaver_graph::recovery::{RepairOutcome, UnboundReason};
 use weaver_graph::{ByteRange, Coverage, MemberId, Sealed, Seek, VolumeIndex, Weight};
 
+use super::bind::{Bindings, Unnamed};
 use super::facts::Packets;
 use super::repair::SetRepair;
 use super::walker::Walker;
@@ -71,6 +72,30 @@ pub(super) struct SetState {
     unnamed: Vec<(MemberId, Length)>,
     // What the set's last repair came to, over the members bound then.
     pub(super) last: Option<SetRepair>,
+    // Kept beside `members`, so a binding weighs only the files and
+    // members it changes: the files the set protects with their lengths,
+    // while its index is usable; each bound member with each file it is
+    // bound to; and how many protected files no member is bound to, by
+    // length.
+    protected: BTreeMap<FileId, u64>,
+    by_member: BTreeSet<(MemberId, FileId)>,
+    free: BTreeMap<u64, u32>,
+    // How many files and unnamed members binding the set weighed.
+    #[cfg(test)]
+    pub(super) visited: usize,
+}
+
+// What a binding changed of a set: the members it came to bind, and those
+// it bound no longer.
+#[derive(Debug, Default)]
+pub(super) struct Change {
+    pub(super) left: Vec<MemberId>,
+    pub(super) entered: Vec<MemberId>,
+}
+
+// The entries of `by_member` for one member.
+fn files_of(member: MemberId) -> std::ops::RangeInclusive<(MemberId, FileId)> {
+    (member, FileId::from_bytes([0; 16]))..=(member, FileId::from_bytes([u8::MAX; 16]))
 }
 
 impl SetState {
@@ -90,6 +115,11 @@ impl SetState {
             members: BTreeMap::new(),
             unnamed: Vec::new(),
             last: None,
+            protected: BTreeMap::new(),
+            by_member: BTreeSet::new(),
+            free: BTreeMap::new(),
+            #[cfg(test)]
+            visited: 0,
         }
     }
 
@@ -133,6 +163,14 @@ impl SetState {
                 .iter()
                 .all(|id| index.file_checksums(id).is_some())
         });
+        self.protected = self.usable().map_or_else(BTreeMap::new, |index| {
+            index
+                .recovery_file_ids
+                .iter()
+                .filter_map(|file| Some((*file, index.file_description(file)?.length)))
+                .collect()
+        });
+        self.free = free_of(&self.protected, &self.members);
     }
 
     // A set as a checkpoint recorded it: the index is rebuilt from its
@@ -245,10 +283,295 @@ impl SetState {
         })
     }
 
-    // A verdict was on the members bound then and the unnamed ones it read;
-    // others, or the same members bound to other files, void it. Returns
-    // the members it was bound to when it was voided.
-    pub(super) fn bind(
+    // The members a checkpoint recorded, as a binding with no unnamed member
+    // binds them.
+    pub(super) fn restore_members(&mut self, members: BTreeMap<FileId, MemberId>) {
+        self.replace_members(members);
+        self.unnamed.clear();
+    }
+
+    // Bind the set to `given` and the unnamed members `unnamed` keeps, as
+    // `bind_whole` binds it, weighing every file and every unnamed member
+    // that could be one of its free files: for a set whose members changed
+    // other than by binding, or that was not bound when the unnamed members
+    // last changed.
+    pub(super) fn recompute(&mut self, given: &Bindings, unnamed: &Unnamed) -> Option<Change> {
+        let mut members = given.clone();
+        for (file, member) in &self.members {
+            if unnamed.get(*member).is_some() {
+                members.entry(*file).or_insert(*member);
+            }
+        }
+        #[cfg(test)]
+        {
+            self.visited += self.members.len() + given.len();
+        }
+        let mut change = Change::default();
+        let members_changed = members != self.members;
+        if members_changed {
+            let was: BTreeSet<MemberId> = self.members.values().copied().collect();
+            let now: BTreeSet<MemberId> = members.values().copied().collect();
+            change.left = was.difference(&now).copied().collect();
+            change.entered = now.difference(&was).copied().collect();
+            self.replace_members(members);
+        }
+        // The unnamed members that fit a free file: those of a free length
+        // exactly, and those bounded at or past the shortest free length.
+        let mut fitting = BTreeSet::new();
+        for length in self.free.keys() {
+            fitting.extend(unnamed.exact(*length));
+        }
+        if let Some((shortest, _)) = self.free.first_key_value() {
+            fitting.extend(unnamed.at_most(*shortest..));
+        }
+        let now: Vec<(MemberId, Length)> = fitting
+            .into_iter()
+            .filter(|member| !self.is_bound(*member))
+            .filter_map(|member| Some((member, unnamed.get(member)?)))
+            .collect();
+        #[cfg(test)]
+        {
+            self.visited += now.len();
+        }
+        if !members_changed && now == self.unnamed {
+            return None;
+        }
+        self.unnamed = now;
+        self.last = None;
+        Some(change)
+    }
+
+    // Bind the set as `bind_whole` binds it, weighing only what changed
+    // since its last binding: `files`, whose given member changed, and
+    // `changed`, the unnamed members that came, went or changed length.
+    // The set's last binding was by these rules, over the unnamed members
+    // as they were before `changed`, and nothing changed its members since.
+    pub(super) fn bind_changes(
+        &mut self,
+        given: &Bindings,
+        files: &[FileId],
+        unnamed: &Unnamed,
+        changed: &[MemberId],
+    ) -> Option<Change> {
+        // A file is weighed when its given member changed, or when the
+        // member bound to it came or went among the unnamed.
+        let mut weighed: BTreeSet<FileId> = files.iter().copied().collect();
+        for member in changed {
+            weighed.extend(
+                self.by_member
+                    .range(files_of(*member))
+                    .map(|(_, file)| *file),
+            );
+        }
+        let decided: Vec<(FileId, Option<MemberId>)> = weighed
+            .iter()
+            .map(|file| {
+                let kept = self
+                    .members
+                    .get(file)
+                    .copied()
+                    .filter(|member| unnamed.get(*member).is_some());
+                (*file, given.get(file).copied().or(kept))
+            })
+            .collect();
+        #[cfg(test)]
+        {
+            self.visited += decided.len();
+        }
+        let mut moving = BTreeSet::new();
+        for (file, now) in &decided {
+            let was = self.members.get(file).copied();
+            if was != *now {
+                moving.extend(was);
+                moving.extend(*now);
+            }
+        }
+        let shortest = self.free.first_key_value().map(|(length, _)| *length);
+        let before: Vec<bool> = moving.iter().map(|member| self.is_bound(*member)).collect();
+        let mut toggled = BTreeSet::new();
+        let mut members_changed = false;
+        for (file, now) in decided {
+            let free = self
+                .protected
+                .get(&file)
+                .map(|length| self.free.contains_key(length));
+            if self.put(file, now) != now {
+                members_changed = true;
+                if let Some(free) = free {
+                    let length = self.protected[&file];
+                    if free != self.free.contains_key(&length) {
+                        toggled.insert(length);
+                    }
+                }
+            }
+        }
+        let mut change = Change::default();
+        for (member, was) in moving.iter().zip(before) {
+            match (was, self.is_bound(*member)) {
+                (true, false) => change.left.push(*member),
+                (false, true) => change.entered.push(*member),
+                _ => {}
+            }
+        }
+        // The unnamed members whose place among the set's may change: those
+        // that changed, those bound or unbound here, those of a length that
+        // came free or stopped being, and those bounded between the
+        // shortest free length before and after.
+        let mut weigh: BTreeSet<MemberId> = changed.iter().copied().collect();
+        weigh.extend(moving.iter().copied());
+        for length in &toggled {
+            weigh.extend(unnamed.exact(*length));
+        }
+        let after = self.free.first_key_value().map(|(length, _)| *length);
+        if shortest != after {
+            let (low, high) = match (shortest, after) {
+                (Some(a), Some(b)) => (a.min(b), Some(a.max(b))),
+                (Some(a), None) | (None, Some(a)) => (a, None),
+                (None, None) => unreachable!(),
+            };
+            match high {
+                Some(high) => weigh.extend(unnamed.at_most(low..high)),
+                None => weigh.extend(unnamed.at_most(low..)),
+            }
+        }
+        #[cfg(test)]
+        {
+            self.visited += weigh.len();
+        }
+        let mut unnamed_changed = false;
+        for member in weigh {
+            let now = unnamed
+                .get(member)
+                .filter(|length| self.fits_free(*length) && !self.is_bound(member));
+            let at = self
+                .unnamed
+                .binary_search_by_key(&member, |(listed, _)| *listed);
+            match (now, at) {
+                (Some(length), Ok(at)) => {
+                    if self.unnamed[at].1 != length {
+                        self.unnamed[at].1 = length;
+                        unnamed_changed = true;
+                    }
+                }
+                (Some(length), Err(at)) => {
+                    self.unnamed.insert(at, (member, length));
+                    unnamed_changed = true;
+                }
+                (None, Ok(at)) => {
+                    self.unnamed.remove(at);
+                    unnamed_changed = true;
+                }
+                (None, Err(_)) => {}
+            }
+        }
+        if !members_changed && !unnamed_changed {
+            return None;
+        }
+        self.last = None;
+        Some(change)
+    }
+
+    // Bind the file to `member`, or to none; the member it was bound to.
+    fn put(&mut self, file: FileId, member: Option<MemberId>) -> Option<MemberId> {
+        let was = match member {
+            Some(member) => self.members.insert(file, member),
+            None => self.members.remove(&file),
+        };
+        if was == member {
+            return was;
+        }
+        if let Some(was) = was {
+            self.by_member.remove(&(was, file));
+        }
+        if let Some(member) = member {
+            self.by_member.insert((member, file));
+        }
+        if let Some(length) = self.protected.get(&file).copied() {
+            match (was, member) {
+                (None, Some(_)) => {
+                    if let Some(count) = self.free.get_mut(&length) {
+                        *count -= 1;
+                        if *count == 0 {
+                            self.free.remove(&length);
+                        }
+                    }
+                }
+                (Some(_), None) => *self.free.entry(length).or_default() += 1,
+                _ => {}
+            }
+        }
+        was
+    }
+
+    fn replace_members(&mut self, members: BTreeMap<FileId, MemberId>) {
+        self.by_member = members
+            .iter()
+            .map(|(file, member)| (*member, *file))
+            .collect();
+        self.free = free_of(&self.protected, &members);
+        self.members = members;
+    }
+
+    fn is_bound(&self, member: MemberId) -> bool {
+        self.by_member.range(files_of(member)).next().is_some()
+    }
+
+    // Whether an unnamed member of `length` fits a file no member is bound
+    // to.
+    fn fits_free(&self, length: Length) -> bool {
+        match length {
+            Length::Exact(length) => self.free.contains_key(&length),
+            Length::AtMost(bound) => self
+                .free
+                .first_key_value()
+                .is_some_and(|(shortest, _)| *shortest <= bound),
+        }
+    }
+
+    // The files `member` is bound to, in file order.
+    pub(super) fn files_of(&self, member: MemberId) -> impl Iterator<Item = FileId> + '_ {
+        self.by_member
+            .range(files_of(member))
+            .map(|(_, file)| *file)
+    }
+
+    // What is kept beside the members agrees with them, and the unnamed
+    // members are those of `unnamed` that fit a free file.
+    #[cfg(test)]
+    pub(super) fn assert_kept(&self, unnamed: Option<&[(MemberId, Length)]>) {
+        let by_member: BTreeSet<_> = self
+            .members
+            .iter()
+            .map(|(file, member)| (*member, *file))
+            .collect();
+        assert_eq!(self.by_member, by_member, "members by member");
+        let protected: BTreeMap<FileId, u64> = self.usable().map_or_else(BTreeMap::new, |index| {
+            index
+                .recovery_file_ids
+                .iter()
+                .filter_map(|file| Some((*file, index.file_description(file)?.length)))
+                .collect()
+        });
+        assert_eq!(self.protected, protected, "protected");
+        assert_eq!(self.free, free_of(&protected, &self.members), "free");
+        if let Some(unnamed) = unnamed {
+            let free: Vec<u64> = self.free.keys().copied().collect();
+            let fitting: Vec<_> = unnamed
+                .iter()
+                .copied()
+                .filter(|(member, length)| {
+                    free.iter().any(|long| length.fits(*long))
+                        && !self.members.values().any(|bound| bound == member)
+                })
+                .collect();
+            assert_eq!(self.unnamed, fitting, "unnamed");
+        }
+    }
+
+    // What binding did before it weighed only what changed, kept to
+    // compare with: every file and every unnamed member weighed.
+    #[cfg(test)]
+    pub(super) fn bind_whole(
         &mut self,
         mut members: BTreeMap<FileId, MemberId>,
         unnamed: &[(MemberId, Length)],
@@ -281,7 +604,9 @@ impl SetState {
         }
         self.unnamed = unnamed;
         self.last = None;
-        Some(std::mem::replace(&mut self.members, members))
+        let was = self.members.clone();
+        self.replace_members(members);
+        Some(was)
     }
 
     pub(super) fn unnamed(&self) -> &[(MemberId, Length)] {
@@ -298,7 +623,7 @@ impl SetState {
     // back or by elimination: it is it.
     pub(super) fn know(&mut self, file: FileId, member: MemberId) {
         self.unnamed.retain(|(candidate, _)| *candidate != member);
-        self.members.insert(file, member);
+        self.put(file, Some(member));
     }
 
     // Damage shown since an unread verdict may be what the descriptions
@@ -345,10 +670,7 @@ impl SetState {
     }
 
     pub(super) fn bound(&self, member: MemberId) -> Option<FileId> {
-        self.members
-            .iter()
-            .find(|(_, bound)| **bound == member)
-            .map(|(file, _)| *file)
+        self.files_of(member).next()
     }
 }
 
@@ -552,6 +874,20 @@ impl Front {
             md5: hash_16k,
         }
     }
+}
+
+// How many protected files no member is bound to, by length.
+fn free_of(
+    protected: &BTreeMap<FileId, u64>,
+    members: &BTreeMap<FileId, MemberId>,
+) -> BTreeMap<u64, u32> {
+    let mut free = BTreeMap::new();
+    for (file, length) in protected {
+        if !members.contains_key(file) {
+            *free.entry(*length).or_default() += 1;
+        }
+    }
+    free
 }
 
 fn fronts_of(index: Option<&Par2FileSet>) -> BTreeMap<Front, Vec<FileId>> {

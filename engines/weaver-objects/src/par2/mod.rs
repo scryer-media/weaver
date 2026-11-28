@@ -33,7 +33,9 @@ use weaver_graph::{
     Placement, Pull, Recovery, Seek, Segment, SliceVerdict, VolumeIndex,
 };
 
-use self::bind::{Bindings, Bound, Fronts, bind_catalogued};
+#[cfg(test)]
+use self::bind::Bound;
+use self::bind::{Bindings, Claims, Fronts, Pass};
 use self::catalogue::Catalogue;
 use self::evidence::Evidence;
 use self::repair::{SetRepair, repair_set};
@@ -97,6 +99,10 @@ pub struct Par2 {
     // What binding last hashed of each posting's front, by the front's
     // stamp. Not kept across a restart: a restored front is hashed again.
     fronts: Fronts,
+    // What binding found of each posting, kept to the next binding, which
+    // visits only what changed since. Not kept across a restart: the first
+    // binding after one visits every posting.
+    claims: Claims,
     // What the usable sets describe, across all of them.
     catalogue: Catalogue,
     // The sets that bind each member: a member any set binds is covered,
@@ -111,6 +117,15 @@ pub struct Par2 {
     // Sets the next binding binds whatever it finds: their index changed,
     // or an unmatched member came that may be one of their files.
     rebound: BTreeSet<[u8; 16]>,
+    // What a binding that weighs only what changed reads beside the
+    // claims. Sets whose members or index changed other than by binding:
+    // the next binding that binds one weighs all of it. Sets whose last
+    // verdict was written or voided since the last binding, and the sets
+    // binding a member whose verdict verified as of then: a set whose
+    // verdict came to verify, or stopped, is renamed by again.
+    disturbed: BTreeSet<[u8; 16]>,
+    relast: BTreeSet<[u8; 16]>,
+    verified: BTreeSet<[u8; 16]>,
     // The complete members the last binding matched to no set.
     unmatched: Vec<(MemberId, Length)>,
     // Each member a set gave up, under that set: binding passes over the
@@ -129,7 +144,14 @@ pub struct Par2 {
     set_checks: usize,
     #[cfg(test)]
     set_binds: usize,
-    // Binding matches every member against every set and binds every set.
+    // How many set-member entries binding visited: files and unnamed
+    // members weighed, members renamed by and lengths read.
+    #[cfg(test)]
+    entries: usize,
+    // Binding matches every member against every set and binds every set,
+    // weighing every file and unnamed member, renaming by every member and
+    // listing every length: binding as it was before it weighed only what
+    // changed, kept to compare with.
     #[cfg(test)]
     scanning: bool,
     // How many times listing the grids needed new room.
@@ -172,11 +194,15 @@ impl Par2 {
             output_limit: MAX_JOB_BYTES,
             memory_limit: REPAIR_MEMORY_LIMIT,
             fronts: Fronts::new(),
+            claims: Claims::default(),
             catalogue: Catalogue::default(),
             covered: Cover::default(),
             binding: BTreeSet::new(),
             holding: BTreeSet::new(),
             rebound: BTreeSet::new(),
+            disturbed: BTreeSet::new(),
+            relast: BTreeSet::new(),
+            verified: BTreeSet::new(),
             unmatched: Vec::new(),
             given_up: BTreeSet::new(),
             grids: Vec::new(),
@@ -186,6 +212,8 @@ impl Par2 {
             set_checks: 0,
             #[cfg(test)]
             set_binds: 0,
+            #[cfg(test)]
+            entries: 0,
             #[cfg(test)]
             scanning: false,
             #[cfg(test)]
@@ -244,6 +272,8 @@ impl Par2 {
         );
         self.held(key);
         self.rebound.insert(key);
+        self.disturbed.insert(key);
+        self.relast.insert(key);
         self.describes_anew(key);
         if let Some(was) = &was
             && let Some(index) = was.usable()
@@ -707,6 +737,7 @@ impl Par2 {
         let mut changed: BTreeMap<[u8; 16], Bindings> = BTreeMap::new();
         for (file, member) in members {
             self.given_up.insert((key, member));
+            self.claims.given_up(member);
             let Some((to, at)) = bind::next_holder(
                 &self.sets,
                 &self.catalogue,
@@ -733,17 +764,27 @@ impl Par2 {
                 .remove(&file);
         }
         let mut moved = BTreeSet::new();
+        #[cfg(test)]
+        let weigh = if self.scanning {
+            Weigh::Whole(&self.unmatched)
+        } else {
+            Weigh::Kept(self.claims.unnamed())
+        };
+        #[cfg(not(test))]
+        let weigh = Weigh::Kept(self.claims.unnamed());
         for (set, given) in changed {
+            self.disturbed.insert(set);
             rebind(
                 &mut self.sets,
                 &mut self.covered,
                 set,
-                given,
-                &self.unmatched,
+                &given,
+                &weigh,
                 &mut moved,
             );
         }
         for set in &moved {
+            self.relast.insert(*set);
             self.held(*set);
             self.fold_set(*set);
         }
@@ -805,35 +846,65 @@ impl Par2 {
         order
     }
 
-    // Each usable set's bindings over the namespace, by key.
-    fn bind_sets(&mut self, namespace: &Namespace) -> Bound<BTreeMap<[u8; 16], Bindings>> {
-        #[cfg(test)]
-        if self.scanning {
-            let (keys, usable): (Vec<[u8; 16]>, Vec<&SetState>) = self
-                .order
-                .iter()
-                .map(|key| (*key, &self.sets[key]))
-                .filter(|(_, state)| state.usable().is_some())
-                .unzip();
-            let given_up = &self.given_up;
-            let found = bind::bind_sets(&usable, namespace, self.id, &mut self.fronts, |at, m| {
-                given_up.contains(&(keys[at], m))
-            });
-            return Bound {
-                sets: keys.into_iter().zip(found.sets).collect(),
-                unnamed: found.unnamed,
-                digests: found.digests,
-                checks: found.checks,
-            };
+    // Each usable set's bindings over the namespace, by key, as the scan
+    // finds them.
+    #[cfg(test)]
+    fn scan_sets(&mut self, namespace: &Namespace) -> Bound<BTreeMap<[u8; 16], Bindings>> {
+        let (keys, usable): (Vec<[u8; 16]>, Vec<&SetState>) = self
+            .order
+            .iter()
+            .map(|key| (*key, &self.sets[key]))
+            .filter(|(_, state)| state.usable().is_some())
+            .unzip();
+        // The scan goes around the claims: the next binding by them
+        // visits every posting.
+        self.claims.stale();
+        let given_up = &self.given_up;
+        let found = bind::bind_sets(&usable, namespace, self.id, &mut self.fronts, |at, m| {
+            given_up.contains(&(keys[at], m))
+        });
+        Bound {
+            sets: keys.into_iter().zip(found.sets).collect(),
+            unnamed: found.unnamed,
+            digests: found.digests,
+            checks: found.checks,
         }
-        bind_catalogued(
+    }
+
+    // Each usable set's bindings over the namespace, kept by the claims:
+    // what changed of them since the last binding.
+    fn bind_sets(&mut self, namespace: &Namespace) -> Pass {
+        // A set filed, unfiled or cleared may answer for any posting.
+        if self.catalogue.take_changed() {
+            self.claims.stale();
+        }
+        #[cfg(test)]
+        let before = self.fronts.clone();
+        let found = self.claims.bind(
             &self.sets,
             &self.catalogue,
             namespace,
             self.id,
             &mut self.fronts,
             &self.given_up,
-        )
+        );
+        // What binding every posting comes to, from the same fronts.
+        #[cfg(test)]
+        {
+            let mut fronts = before;
+            let whole = bind::bind_catalogued(
+                &self.sets,
+                &self.catalogue,
+                namespace,
+                self.id,
+                &mut fronts,
+                &self.given_up,
+            );
+            assert_eq!(*self.claims.bindings(), whole.sets, "bindings");
+            assert_eq!(self.claims.unnamed().list(), whole.unnamed, "unnamed");
+            assert_eq!(self.fronts, fronts, "fronts");
+        }
+        found
     }
 
     // What binding keeps beside the sets agrees with the sets.
@@ -886,6 +957,9 @@ impl Par2 {
                 self.binding.clear();
                 self.holding.clear();
                 self.rebound.clear();
+                self.disturbed.clear();
+                self.relast.clear();
+                self.verified.clear();
                 self.unmatched.clear();
                 self.given_up.clear();
                 return;
@@ -939,6 +1013,8 @@ impl Par2 {
                 }
             }
             self.rebound.insert(set);
+            self.disturbed.insert(set);
+            self.relast.insert(set);
             self.fold_set(set);
         }
         for set in &usable {
@@ -1250,147 +1326,39 @@ impl Recovery for Par2 {
     }
 
     fn bind(&mut self, namespace: &mut Namespace, renamed: &mut Vec<MemberId>) {
-        if self.shown.bind(namespace, self.id) {
-            self.damage_shown();
-        }
-        let found = self.bind_sets(namespace);
-        #[cfg(test)]
-        {
-            self.digests += found.digests;
-            self.set_checks += found.checks;
-        }
-        let Bound {
-            sets: bound,
-            unnamed,
-            ..
-        } = found;
-        // A set binds again where what it binds may change: it was given
-        // members, it binds some, or it was marked to. A set given none,
-        // binding none and unmarked binds what it did, unless the unmatched
-        // members changed: then each set holding one binds again, and each
-        // with a file a newly unmatched member could be.
-        if unnamed != self.unmatched {
-            self.rebound.extend(self.holding.iter().copied());
-            for entry in &unnamed {
-                let known = self
-                    .unmatched
-                    .binary_search_by_key(&entry.0, |(member, _)| *member)
-                    .is_ok_and(|at| self.unmatched[at] == *entry);
-                if !known {
-                    self.catalogue.fitting(entry.1, |(_, key)| {
-                        self.rebound.insert(key);
-                    });
-                }
-            }
-        }
         #[cfg(test)]
         if self.scanning {
-            self.rebound.extend(self.sets.keys().copied());
-        }
-        let rebound = std::mem::take(&mut self.rebound);
-        let mut moved = BTreeSet::new();
-        let unchanged = self
-            .binding
-            .iter()
-            .chain(rebound.iter().filter(|key| !self.binding.contains(*key)))
-            .filter(|key| !bound.contains_key(*key));
-        for key in unchanged {
-            #[cfg(test)]
-            {
-                self.set_binds += 1;
+            if self.shown.bind(namespace, self.id) {
+                self.damage_shown();
             }
-            rebind(
-                &mut self.sets,
-                &mut self.covered,
-                *key,
-                Bindings::new(),
-                &unnamed,
-                &mut moved,
-            );
+            let found = self.scan_sets(namespace);
+            self.digests += found.digests;
+            self.set_checks += found.checks;
+            self.bind_all(namespace, renamed, found.sets, found.unnamed);
+            self.assert_filed();
+            return;
         }
-        for (key, given) in bound {
-            #[cfg(test)]
-            {
-                self.set_binds += 1;
-            }
-            rebind(
-                &mut self.sets,
-                &mut self.covered,
-                key,
-                given,
-                &unnamed,
-                &mut moved,
-            );
+        if self.shown.bind_changed(namespace, self.id) {
+            self.damage_shown();
         }
-        for key in &moved {
-            self.held(*key);
-        }
-        self.unmatched = unnamed;
-        // A member a set bound under a name none of its postings answers
-        // to the description with, even folded, is recognised: it takes the
-        // description's name and length. One bound under its own name keeps
-        // it, and takes the description's length as
-        // `Namespace::take_described` says, once the set's blocks verify.
-        for key in &self.binding {
-            let state = &self.sets[key];
-            let Some(index) = state.usable() else {
-                continue;
-            };
-            let verified = matches!(
-                state.concluded(),
-                Some(RepairOutcome::Clean | RepairOutcome::Repaired { .. })
-            );
-            for (file, member) in state.members() {
-                let Some(description) = index.file_description(file) else {
-                    continue;
-                };
-                let answers = namespace
-                    .postings(*member)
-                    .any(|record| record.name.eq_ignore_ascii_case(&description.filename));
-                if !answers {
-                    if namespace
-                        .recognise(*member, &description.filename, description.length)
-                        .is_some()
-                    {
-                        renamed.push(*member);
-                    }
-                    continue;
-                }
-                if namespace.take_described(*member, description.length, verified) {
-                    renamed.push(*member);
-                }
-            }
-        }
-        // A set none of whose bindings changed, and none of whose members'
-        // lengths, leaves the lengths as they are: they are its members'.
-        for key in &self.binding {
-            let lengthened = self.sets[key].members().values().any(|member| {
-                complete_length(namespace, *member) != self.lengths.get(member).copied()
-            });
-            if lengthened {
-                moved.insert(*key);
-            }
-        }
-        if !moved.is_empty() {
-            self.lengths = self
-                .binding
-                .iter()
-                .flat_map(|key| self.sets[key].members().values())
-                .filter_map(|member| Some((*member, complete_length(namespace, *member)?)))
-                .collect();
-            #[cfg(test)]
-            {
-                self.length_lists += 1;
-            }
-        }
-        for key in &moved {
-            self.fold_set(*key);
-        }
-        // A set whose binding changed may bind a member it stands short of,
-        // as after a restart, which keeps no member given up.
-        self.settle_short(moved);
+        let pass = self.bind_sets(namespace);
         #[cfg(test)]
-        self.assert_filed();
+        {
+            self.digests += pass.digests;
+            self.set_checks += pass.checks;
+        }
+        if pass.whole {
+            let bound = self.claims.bindings().clone();
+            let unnamed = self.claims.unnamed().list().to_vec();
+            self.bind_all(namespace, renamed, bound, unnamed);
+        } else {
+            self.bind_changed(namespace, renamed, pass);
+        }
+        #[cfg(test)]
+        {
+            self.assert_filed();
+            self.assert_bound(namespace);
+        }
     }
 
     // Every file a usable set can rebuild that no member is bound to or may
@@ -1480,6 +1448,7 @@ impl Recovery for Par2 {
                         })
                 {
                     state.last = None;
+                    self.relast.insert(*key);
                 }
             }
         }
@@ -1749,6 +1718,9 @@ impl Par2 {
                 continue;
             };
             let mut known = false;
+            if state.concluded().is_none() {
+                self.relast.insert(key);
+            }
             let result = match state.concluded() {
                 Some(concluded) => concluded,
                 // A set with no description waits on a volume that may carry
@@ -1779,6 +1751,7 @@ impl Par2 {
                 }
             };
             if known {
+                self.disturbed.insert(key);
                 self.held(key);
             }
             outcome = combine(outcome, result);
@@ -1882,23 +1855,449 @@ impl Par2 {
     }
 }
 
+impl Par2 {
+    // Bind every set whose binding may change over the claims' `bound` and
+    // `unnamed`, renaming by every member and listing every length: the
+    // first binding, the one after a restart or after the catalogue
+    // changed, and every binding kept to compare with.
+    fn bind_all(
+        &mut self,
+        namespace: &mut Namespace,
+        renamed: &mut Vec<MemberId>,
+        bound: BTreeMap<[u8; 16], Bindings>,
+        unnamed: Vec<(MemberId, Length)>,
+    ) {
+        // A set binds again where what it binds may change: it was given
+        // members, it binds some, or it was marked to. A set given none,
+        // binding none and unmarked binds what it did, unless the unmatched
+        // members changed: then each set holding one binds again, and each
+        // with a file a newly unmatched member could be.
+        if unnamed != self.unmatched {
+            self.rebound.extend(self.holding.iter().copied());
+            for entry in &unnamed {
+                let known = self
+                    .unmatched
+                    .binary_search_by_key(&entry.0, |(member, _)| *member)
+                    .is_ok_and(|at| self.unmatched[at] == *entry);
+                if !known {
+                    self.catalogue.fitting(entry.1, |(_, key)| {
+                        self.rebound.insert(key);
+                    });
+                }
+            }
+        }
+        #[cfg(test)]
+        if self.scanning {
+            self.rebound.extend(self.sets.keys().copied());
+        }
+        let rebound = std::mem::take(&mut self.rebound);
+        let mut moved = BTreeSet::new();
+        #[cfg(test)]
+        let weigh = if self.scanning {
+            Weigh::Whole(&unnamed)
+        } else {
+            Weigh::Kept(self.claims.unnamed())
+        };
+        #[cfg(not(test))]
+        let weigh = Weigh::Kept(self.claims.unnamed());
+        // The sets given nothing first, those binding and then those
+        // marked, then the sets given members: the order the covered
+        // members' changes are counted in.
+        let empty = Bindings::new();
+        let unchanged = self
+            .binding
+            .iter()
+            .chain(rebound.iter().filter(|key| !self.binding.contains(*key)))
+            .filter(|key| !bound.contains_key(*key))
+            .map(|key| (*key, &empty));
+        for (key, given) in unchanged.chain(bound.iter().map(|(key, given)| (*key, given))) {
+            #[cfg(test)]
+            {
+                self.set_binds += 1;
+            }
+            self.disturbed.remove(&key);
+            rebind(
+                &mut self.sets,
+                &mut self.covered,
+                key,
+                given,
+                &weigh,
+                &mut moved,
+            );
+        }
+        for key in &moved {
+            self.held(*key);
+        }
+        self.unmatched = unnamed;
+        // A member a set bound under a name none of its postings answers
+        // to the description with, even folded, is recognised: it takes the
+        // description's name and length. One bound under its own name keeps
+        // it, and takes the description's length as
+        // `Namespace::take_described` says, once the set's blocks verify.
+        let mut verified = BTreeSet::new();
+        for key in &self.binding {
+            let state = &self.sets[key];
+            let verifies = verifies(state);
+            if verifies {
+                verified.insert(*key);
+            }
+            let Some(index) = state.usable() else {
+                continue;
+            };
+            for (file, member) in state.members() {
+                #[cfg(test)]
+                {
+                    self.entries += 1;
+                }
+                if let Some(description) = index.file_description(file) {
+                    rename_by(namespace, description, *member, verifies, renamed);
+                }
+            }
+        }
+        self.verified = verified;
+        self.relast.clear();
+        // A set none of whose bindings changed, and none of whose members'
+        // lengths, leaves the lengths as they are: they are its members'.
+        for key in &self.binding {
+            #[cfg(test)]
+            {
+                self.entries += self.sets[key].members().len();
+            }
+            let lengthened = self.sets[key].members().values().any(|member| {
+                complete_length(namespace, *member) != self.lengths.get(member).copied()
+            });
+            if lengthened {
+                moved.insert(*key);
+            }
+        }
+        if !moved.is_empty() {
+            self.lengths = self
+                .binding
+                .iter()
+                .flat_map(|key| self.sets[key].members().values())
+                .filter_map(|member| Some((*member, complete_length(namespace, *member)?)))
+                .collect();
+            #[cfg(test)]
+            {
+                self.length_lists += 1;
+            }
+        }
+        self.covered.touched.clear();
+        for key in &moved {
+            self.fold_set(*key);
+        }
+        // A set whose binding changed may bind a member it stands short of,
+        // as after a restart, which keeps no member given up.
+        self.settle_short(moved);
+    }
+
+    // Bind only what the claims' `pass` changed since the last binding,
+    // as `bind_all` would: the sets whose files it gave other members, the
+    // sets the unmatched members may change, and those whose members
+    // changed other than by binding; then rename by, and list the lengths
+    // of, only the members that changed, the members those sets came to
+    // bind or stopped binding, and every member of a set whose members or
+    // index changed other than by binding, or whose verdict came to verify
+    // or stopped.
+    fn bind_changed(&mut self, namespace: &mut Namespace, renamed: &mut Vec<MemberId>, pass: Pass) {
+        let Pass {
+            files,
+            unnamed: changes,
+            members: dirty,
+            ..
+        } = pass;
+        #[cfg(test)]
+        assert_eq!(
+            changes.is_empty(),
+            self.claims.unnamed().list() == self.unmatched.as_slice(),
+            "unnamed changes"
+        );
+        if !changes.is_empty() {
+            self.rebound.extend(self.holding.iter().copied());
+            for (member, _) in &changes {
+                if let Some(now) = self.claims.unnamed().get(*member) {
+                    self.catalogue.fitting(now, |(_, key)| {
+                        self.rebound.insert(key);
+                    });
+                }
+            }
+        }
+        let rebound = std::mem::take(&mut self.rebound);
+        let changed: Vec<MemberId> = changes.iter().map(|(member, _)| *member).collect();
+        let claimed = self.claims.bindings();
+        let binding = &self.binding;
+        let mut group: BTreeSet<[u8; 16]> = files.keys().copied().collect();
+        group.extend(rebound.iter().copied());
+        group.extend(self.disturbed.iter().copied());
+        group.retain(|key| {
+            binding.contains(key) || rebound.contains(key) || claimed.contains_key(key)
+        });
+        // In the order `bind_all` binds them: the order the covered
+        // members' changes are counted in.
+        let order: Vec<[u8; 16]> = group
+            .iter()
+            .filter(|key| binding.contains(*key) && !claimed.contains_key(*key))
+            .chain(
+                group
+                    .iter()
+                    .filter(|key| !binding.contains(*key) && !claimed.contains_key(*key)),
+            )
+            .chain(group.iter().filter(|key| claimed.contains_key(*key)))
+            .copied()
+            .collect();
+        let unnamed = self.claims.unnamed();
+        let empty = Bindings::new();
+        let mut moved = BTreeSet::new();
+        for key in &order {
+            #[cfg(test)]
+            {
+                self.set_binds += 1;
+            }
+            let Some(state) = self.sets.get_mut(key) else {
+                continue;
+            };
+            let given = claimed.get(key).unwrap_or(&empty);
+            let change = if self.disturbed.contains(key) {
+                state.recompute(given, unnamed)
+            } else {
+                let files = files.get(key).map_or(&[][..], Vec::as_slice);
+                state.bind_changes(given, files, unnamed, &changed)
+            };
+            if let Some(change) = change {
+                self.covered
+                    .moved(*key, change.left.iter(), change.entered.iter());
+                moved.insert(*key);
+            }
+        }
+        // Every member of a set whose members or index changed other than
+        // by binding is renamed by.
+        let mut whole = BTreeSet::new();
+        for key in &order {
+            if self.disturbed.remove(key) {
+                whole.insert(*key);
+            }
+        }
+        for key in &moved {
+            self.held(*key);
+        }
+        for (member, _) in &changes {
+            let now = self.claims.unnamed().get(*member);
+            let at = self
+                .unmatched
+                .binary_search_by_key(member, |(listed, _)| *listed);
+            match (now, at) {
+                (Some(length), Ok(at)) => self.unmatched[at].1 = length,
+                (Some(length), Err(at)) => self.unmatched.insert(at, (*member, length)),
+                (None, Ok(at)) => {
+                    self.unmatched.remove(at);
+                }
+                (None, Err(_)) => {}
+            }
+        }
+        // A set binding members whose verdict came to verify, or stopped,
+        // is renamed by whole.
+        let relast = std::mem::take(&mut self.relast);
+        for key in relast.iter().chain(moved.iter()) {
+            let now = self.sets.get(key).is_some_and(verifies);
+            let was = if now {
+                !self.verified.insert(*key)
+            } else {
+                self.verified.remove(key)
+            };
+            if now != was && self.binding.contains(key) {
+                whole.insert(*key);
+            }
+        }
+        let mut members = dirty;
+        members.extend(std::mem::take(&mut self.covered.touched));
+        for key in &whole {
+            if let Some(state) = self.sets.get(key) {
+                members.extend(state.members().values().copied());
+            }
+        }
+        // Each member is renamed by in every set binding it, in the order
+        // `bind_all` renames: by set, then by file.
+        let mut entries = BTreeSet::new();
+        for member in &members {
+            for key in self.covered.sets(*member) {
+                for file in self.sets[key].files_of(*member) {
+                    entries.insert((*key, file, *member));
+                }
+            }
+        }
+        #[cfg(test)]
+        {
+            self.entries += entries.len();
+        }
+        let from = renamed.len();
+        for (key, file, member) in entries {
+            let state = &self.sets[&key];
+            let Some(description) = state
+                .usable()
+                .and_then(|index| index.file_description(&file))
+            else {
+                continue;
+            };
+            rename_by(namespace, description, member, verifies(state), renamed);
+        }
+        // The lengths that may have changed: of each member above, and of
+        // each renamed.
+        members.extend(renamed[from..].iter().copied());
+        #[cfg(test)]
+        {
+            self.entries += members.len();
+        }
+        for member in &members {
+            let sets = self.covered.sets(*member);
+            if !sets.is_empty()
+                && complete_length(namespace, *member) != self.lengths.get(member).copied()
+            {
+                moved.extend(sets.iter().copied());
+            }
+        }
+        if !moved.is_empty() {
+            for member in &members {
+                let length = complete_length(namespace, *member)
+                    .filter(|_| self.covered.by.contains_key(member));
+                match length {
+                    Some(length) => self.lengths.insert(*member, length),
+                    None => self.lengths.remove(member),
+                };
+            }
+            #[cfg(test)]
+            {
+                self.length_lists += 1;
+            }
+        }
+        for key in &moved {
+            self.fold_set(*key);
+        }
+        self.settle_short(moved);
+    }
+
+    // What binding keeps agrees with what binding everything again comes
+    // to over the state it left: the lengths listed afresh, each set's
+    // members as the claims bind them with those it keeps, its unnamed
+    // members and free files, the unmatched members, and the sets whose
+    // verdict verifies.
+    #[cfg(test)]
+    fn assert_bound(&self, namespace: &Namespace) {
+        let lengths: BTreeMap<MemberId, u64> = self
+            .binding
+            .iter()
+            .flat_map(|key| self.sets[key].members().values())
+            .filter_map(|member| Some((*member, complete_length(namespace, *member)?)))
+            .collect();
+        assert_eq!(self.lengths, lengths, "lengths");
+        let unnamed = self.claims.unnamed();
+        assert_eq!(unnamed.list(), self.unmatched.as_slice(), "unmatched");
+        let empty = Bindings::new();
+        for (key, state) in &self.sets {
+            if self.disturbed.contains(key) {
+                state.assert_kept(None);
+                continue;
+            }
+            state.assert_kept(Some(unnamed.list()));
+            let given = self.claims.bindings().get(key).unwrap_or(&empty);
+            for (file, member) in given {
+                assert_eq!(state.members().get(file), Some(member), "given");
+            }
+            for (file, member) in state.members() {
+                if !given.contains_key(file) {
+                    assert!(unnamed.get(*member).is_some(), "kept {member:?}");
+                }
+            }
+        }
+        for key in self
+            .binding
+            .iter()
+            .filter(|key| !self.relast.contains(*key))
+        {
+            assert_eq!(
+                verifies(&self.sets[key]),
+                self.verified.contains(key),
+                "verified"
+            );
+        }
+    }
+
+    // How many set-member entries binding has visited.
+    #[cfg(test)]
+    fn entries(&self) -> usize {
+        self.entries + self.sets.values().map(|state| state.visited).sum::<usize>()
+    }
+}
+
+// Whether the set's last verdict verifies its blocks.
+fn verifies(state: &SetState) -> bool {
+    matches!(
+        state.concluded(),
+        Some(RepairOutcome::Clean | RepairOutcome::Repaired { .. })
+    )
+}
+
+// A member a set binds to a file it describes, named as the description
+// says when none of its postings answers to it.
+fn rename_by(
+    namespace: &mut Namespace,
+    description: &par2_rs::FileDescription,
+    member: MemberId,
+    verified: bool,
+    renamed: &mut Vec<MemberId>,
+) {
+    let answers = namespace
+        .postings(member)
+        .any(|record| record.name.eq_ignore_ascii_case(&description.filename));
+    if !answers {
+        if namespace
+            .recognise(member, &description.filename, description.length)
+            .is_some()
+        {
+            renamed.push(member);
+        }
+        return;
+    }
+    if namespace.take_described(member, description.length, verified) {
+        renamed.push(member);
+    }
+}
+
 // Bind the set to what binding gave it: one whose binding changed has
 // moved, and its members are counted as covered in place of those it had.
 fn rebind(
     sets: &mut BTreeMap<[u8; 16], SetState>,
     covered: &mut Cover,
     key: [u8; 16],
-    given: Bindings,
-    unnamed: &[(MemberId, Length)],
+    given: &Bindings,
+    weigh: &Weigh<'_>,
     moved: &mut BTreeSet<[u8; 16]>,
 ) {
     let Some(state) = sets.get_mut(&key) else {
         return;
     };
-    if let Some(was) = state.bind(given, unnamed) {
-        covered.rebound(key, was.values(), state.members().values());
-        moved.insert(key);
+    match weigh {
+        Weigh::Kept(unnamed) => {
+            if let Some(change) = state.recompute(given, unnamed) {
+                covered.moved(key, change.left.iter(), change.entered.iter());
+                moved.insert(key);
+            }
+        }
+        #[cfg(test)]
+        Weigh::Whole(unnamed) => {
+            if let Some(was) = state.bind_whole(given.clone(), unnamed) {
+                covered.rebound(key, was.values(), state.members().values());
+                moved.insert(key);
+            }
+        }
     }
+}
+
+// The unnamed members a set is bound over: as the claims keep them, or,
+// for the binding kept to compare with, as a list weighed whole.
+enum Weigh<'a> {
+    Kept(&'a bind::Unnamed),
+    #[cfg(test)]
+    Whole(&'a [(MemberId, Length)]),
 }
 
 // Which sets bind each member, and how many times the members bound
@@ -1913,6 +2312,9 @@ struct Cover {
     // described it then, so the namespace says it again for this one.
     unfed: BTreeSet<MemberId>,
     changes: u64,
+    // Members a set came to bind or stopped binding since the last
+    // binding took them: binding renames by them, and lists their lengths.
+    touched: BTreeSet<MemberId>,
 }
 
 impl Cover {
@@ -1927,6 +2329,7 @@ impl Cover {
         }
         self.by.clear();
         self.unfed.clear();
+        self.touched.clear();
     }
 
     // The set `key` bound the members `was` and binds the members `now`.
@@ -1938,7 +2341,19 @@ impl Cover {
     ) {
         let was: BTreeSet<MemberId> = was.copied().collect();
         let now: BTreeSet<MemberId> = now.copied().collect();
-        for member in was.difference(&now) {
+        self.moved(key, was.difference(&now), now.difference(&was));
+    }
+
+    // The set `key` stopped binding the members `left` and came to bind
+    // the members `entered`.
+    fn moved<'a>(
+        &mut self,
+        key: [u8; 16],
+        left: impl Iterator<Item = &'a MemberId>,
+        entered: impl Iterator<Item = &'a MemberId>,
+    ) {
+        for member in left {
+            self.touched.insert(*member);
             if let Some(sets) = self.by.get_mut(member) {
                 sets.retain(|set| *set != key);
                 if sets.is_empty() {
@@ -1947,7 +2362,8 @@ impl Cover {
                 }
             }
         }
-        for member in now.difference(&was) {
+        for member in entered {
+            self.touched.insert(*member);
             if !self.by.contains_key(member) {
                 self.changes += 1;
             }

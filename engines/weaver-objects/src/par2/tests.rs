@@ -2,6 +2,7 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 mod bind_due;
+mod bind_members;
 mod carriers;
 mod countless_names;
 mod cross_sets;
