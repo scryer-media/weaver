@@ -345,7 +345,7 @@ export function ProxiesPanel({ onChanged }: { onChanged?: () => void }) {
         searchText: `${profile.name} ${proxyLabels[profile.kind]} ${profile.host}`,
         cells: [
           <span key="name" className="flex min-w-0 items-center gap-[10px]">
-            <Square color={profile.enabled ? WV.accent : WV.inert} />
+            <Square color={profile.enabled ? WV.ok : WV.inert} />
             <span className="min-w-0 truncate">{profile.name}</span>
           </span>,
           <Cell key="kind" className="text-wv-secondary">

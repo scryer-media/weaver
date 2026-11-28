@@ -940,7 +940,10 @@ async fn test_via_torrent(
     ctx.data::<weaver_server_core::torrents::TorrentAvailability>()?
         .may_test()
         .map_err(refusal_error)?;
-    route.legs.first().ok_or("the route has no leg")?;
+    route
+        .legs
+        .first()
+        .ok_or_else(|| crate::auth::invalid_input("the route has no leg"))?;
     // Tests point the test torrent at a loopback source.
     let source = ctx
         .data_opt::<weaver_server_core::speed_test::TestTorrentSource>()
@@ -1584,7 +1587,10 @@ impl NetworkingMutation {
             db.create_egress_interface(&egress)
         })
         .await?;
-        runtime.reload().await.map_err(async_graphql::Error::new)?;
+        runtime
+            .reload()
+            .await
+            .map_err(|error| crate::auth::graphql_error("INTERNAL", error))?;
         Ok(egress_gql(
             saved,
             &runtime.network.interfaces(),
@@ -1617,7 +1623,10 @@ impl NetworkingMutation {
             db.update_egress_interface(&egress)
         })
         .await?;
-        runtime.reload().await.map_err(async_graphql::Error::new)?;
+        runtime
+            .reload()
+            .await
+            .map_err(|error| crate::auth::graphql_error("INTERNAL", error))?;
         Ok(egress_gql(
             saved,
             &runtime.network.interfaces(),
@@ -1645,7 +1654,10 @@ impl NetworkingMutation {
             db.update_egress_interface(&egress)
         })
         .await?;
-        runtime.reload().await.map_err(async_graphql::Error::new)?;
+        runtime
+            .reload()
+            .await
+            .map_err(|error| crate::auth::graphql_error("INTERNAL", error))?;
         Ok(egress_gql(
             saved,
             &runtime.network.interfaces(),
@@ -1669,7 +1681,7 @@ impl NetworkingMutation {
                 weaver_server_core::SchedulerError::State(error) => {
                     crate::observability::state_error(error)
                 }
-                error => async_graphql::Error::new(error.to_string()),
+                error => crate::observability::scheduler_error(error),
             })?;
         Ok(bandwidth.into())
     }
@@ -1701,7 +1713,10 @@ impl NetworkingMutation {
             .await?;
         }
         drop(schedules_guard);
-        runtime.reload().await.map_err(async_graphql::Error::new)?;
+        runtime
+            .reload()
+            .await
+            .map_err(|error| crate::auth::graphql_error("INTERNAL", error))?;
         Ok(true)
     }
     #[graphql(guard = "AdminGuard")]
@@ -1716,7 +1731,10 @@ impl NetworkingMutation {
         let pool = input.pool(1);
         let saved =
             spawn_blocking_db("network.create_pool", move || db.create_proxy_pool(&pool)).await?;
-        runtime.reload().await.map_err(async_graphql::Error::new)?;
+        runtime
+            .reload()
+            .await
+            .map_err(|error| crate::auth::graphql_error("INTERNAL", error))?;
         Ok(saved.into())
     }
     #[graphql(guard = "AdminGuard")]
@@ -1732,7 +1750,10 @@ impl NetworkingMutation {
         let pool = input.pool(id);
         let saved =
             spawn_blocking_db("network.update_pool", move || db.update_proxy_pool(&pool)).await?;
-        runtime.reload().await.map_err(async_graphql::Error::new)?;
+        runtime
+            .reload()
+            .await
+            .map_err(|error| crate::auth::graphql_error("INTERNAL", error))?;
         Ok(saved.into())
     }
     #[graphql(guard = "AdminGuard")]
@@ -1741,7 +1762,10 @@ impl NetworkingMutation {
         let _guard = runtime.mutations.lock().await;
         let db = ctx.data::<Database>()?.clone();
         spawn_blocking_db("network.delete_pool", move || db.delete_proxy_pool(id)).await?;
-        runtime.reload().await.map_err(async_graphql::Error::new)?;
+        runtime
+            .reload()
+            .await
+            .map_err(|error| crate::auth::graphql_error("INTERNAL", error))?;
         Ok(true)
     }
     #[graphql(guard = "AdminGuard")]
@@ -1788,7 +1812,10 @@ impl NetworkingMutation {
             db.proxy_routing_policy(consumer)
         })
         .await?;
-        runtime.reload().await.map_err(async_graphql::Error::new)?;
+        runtime
+            .reload()
+            .await
+            .map_err(|error| crate::auth::graphql_error("INTERNAL", error))?;
         Ok(NetworkRoute {
             consumer: consumer.key(),
             legs: route.legs.into_iter().map(Into::into).collect(),
@@ -1853,7 +1880,7 @@ impl NetworkingMutation {
         .into_iter()
         .next()
         .map(Into::into)
-        .ok_or_else(|| "the test tried no path".into())
+        .ok_or_else(|| crate::auth::graphql_error("INTERNAL", "the test tried no path"))
     }
     #[graphql(
         guard = "AdminGuard",
@@ -1873,13 +1900,15 @@ impl NetworkingMutation {
             .await?
             .into_iter()
             .find(|pool| pool.id == id)
-            .ok_or("proxy pool does not exist")?;
+            .ok_or_else(|| crate::auth::not_found("proxy pool does not exist"))?;
         if matches!(
             pool.kind,
             core::ProxyKind::Socks5 | core::ProxyKind::HttpConnect
         ) && (host.is_none() || port.is_none())
         {
-            return Err("host and port are required for a SOCKS5 or HTTP CONNECT pool test".into());
+            return Err(crate::auth::invalid_input(
+                "host and port are required for a SOCKS5 or HTTP CONNECT pool test",
+            ));
         }
         let target = host.zip(port);
         Ok(test_via(

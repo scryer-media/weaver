@@ -5,7 +5,10 @@
 // descriptions answer to, and obfuscated names a set's descriptions undo.
 
 use super::archive_scenario_fixtures::sets::{delivered, delivered_as_described};
-use super::harness::{ARTICLE, Claim, Post, Scenario, assert_fetched_once, par2_set, payload, run};
+use super::harness::{
+    ARTICLE, Claim, Post, Scenario, assert_fetched_once, par2_set, par2_volumes_sliced, payload,
+    run,
+};
 use std::collections::BTreeMap;
 use weaver_graph::recovery::RepairOutcome;
 use weaver_server_pipeline::pipeline::tests::engines::archive_scenario_fixtures::sets::namespace_move_counts;
@@ -40,6 +43,87 @@ async fn two_sets_in_one_job_each_repair_their_own_damage() {
         graph.graph().outcomes,
         vec![Some(RepairOutcome::Repaired { slices: 2 })]
     );
+}
+
+// Forty sets in one job, each of its own slice size and its own file, with
+// articles no slice size divides, leased as a lane leases them. Each file's
+// articles are cut at its own set's slices alone, so forty sizes cost an
+// article one, and every set is vouched for without a byte read back.
+#[tokio::test]
+async fn sets_of_many_slice_sizes_are_each_vouched_for_without_a_read() {
+    const SETS: usize = 40;
+    let files: Vec<(String, Vec<u8>, u64)> = (0..SETS)
+        .map(|at| {
+            let slice = 64 + 4 * at as u64;
+            (
+                format!("file{at:02}.bin"),
+                payload(4 * slice as usize + 10, 50 + at as u8),
+                slice,
+            )
+        })
+        .collect();
+    let mut posts: Vec<Post> = files
+        .iter()
+        .map(|(name, bytes, _)| Post::plain(name, bytes.clone()))
+        .collect();
+    for (at, (name, bytes, slice)) in files.iter().enumerate() {
+        posts.extend(par2_volumes_sliced(
+            &format!("set{at:02}"),
+            &[(name.as_str(), bytes.as_slice())],
+            *slice,
+            2,
+            1,
+        ));
+    }
+    let graph = run(&Scenario::new(posts).framed(90).leased()).await;
+    assert!(graph.completed(), "{:?}", graph.failure);
+    assert!(claims_all(&graph.claims, Claim::Complete));
+    assert_eq!(graph.reads, 0);
+    for (name, bytes, _) in &files {
+        assert_eq!(delivered(&graph, name), Some(bytes.as_slice()));
+    }
+}
+
+// The first set that describes `ember.bin` cannot rebuild it and gives it
+// to a set of other slices. What arrived was cut and recorded on both
+// sets' slices, so the second rebuilds the member having read back no more
+// than it reads when it is the only set.
+#[tokio::test]
+async fn a_member_given_to_a_set_of_other_slices_costs_no_read() {
+    let lantern = payload(4 * ARTICLE, 31);
+    let ember = payload(4 * ARTICLE, 32);
+    let beacon =
+        || par2_volumes_sliced("beacon", &[("ember.mkv", &ember)], 2 * ARTICLE as u64, 2, 1);
+    let first = || {
+        let mut posts = vec![
+            Post::plain("lantern.mkv", lantern.clone()),
+            Post::plain("ember.mkv", ember.clone()),
+        ];
+        posts.extend(par2_volumes_sliced(
+            "lantern",
+            &[("lantern.mkv", &lantern), ("ember.mkv", &ember)],
+            ARTICLE as u64,
+            1,
+            1,
+        ));
+        posts
+    };
+    let mut posts = first();
+    posts.extend(beacon());
+    let moved = run(&Scenario::new(posts).damaged(1, 0).damaged(1, 1)).await;
+    assert!(moved.completed(), "{:?}", moved.failure);
+    assert!(claims_all(&moved.claims, Claim::Complete));
+    assert_eq!(delivered(&moved, "ember.mkv"), Some(ember.as_slice()));
+    // Each set alone under the same damage: the lantern set reads what it
+    // must to rule itself short, the beacon set what it must to rebuild.
+    // Together they read that and no more: the move cost no read.
+    let short = run(&Scenario::new(first()).damaged(1, 0).damaged(1, 1)).await;
+    assert!(!short.completed());
+    let mut alone = vec![Post::plain("ember.mkv", ember.clone())];
+    alone.extend(beacon());
+    let alone = run(&Scenario::new(alone).damaged(0, 0).damaged(0, 1)).await;
+    assert!(alone.completed(), "{:?}", alone.failure);
+    assert_eq!(moved.reads, short.reads + alone.reads);
 }
 
 // `ember.bin` is described by both sets; the lantern set, posted first,

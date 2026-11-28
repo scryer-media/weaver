@@ -462,3 +462,33 @@ fn sequential_jobs_spread_their_times_over_the_whole_period() {
     assert!(most <= 2 * even, "{most} in one tick, even share {even}");
     assert!(least > 0, "a tick took none");
 }
+
+// A pass that read the clock before the torrents were in hand settles a
+// torrent at that older time after a later reading was kept: the time
+// between the two is not counted twice.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_pass_held_off_does_not_count_time_twice() {
+    let seeded = seeded().await;
+    seeded.rig.service.tick().await;
+    seeded.rig.service.restored().await;
+    let before = seeded.kept().await.active_duration_s;
+    let job_id = seeded.job_id;
+    let held = seeded.rig.service.inner.live.lock().await;
+    let service = seeded.rig.service.clone();
+    let pass = tokio::spawn(async move {
+        service.save_checkpoints(BTreeSet::from([job_id])).await;
+    });
+    seeded.advance(super::TIMES_EVERY_MS);
+    let mut held = held;
+    let now = seeded.clock.unix_ms();
+    held.get_mut(&job_id).unwrap().settle(now);
+    drop(held);
+    pass.await.unwrap();
+    seeded.rig.service.tick().await;
+    seeded.rig.service.restored().await;
+    assert_eq!(
+        seeded.kept().await.active_duration_s,
+        before + (super::TIMES_EVERY_MS / 1000) as u64
+    );
+    seeded.stop().await;
+}

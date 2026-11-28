@@ -252,7 +252,7 @@ async fn article(pipeline: &mut Pipeline, fixture: &Fixture, file: u32, ordinal:
     }
     raw.extend_from_slice(b".\r\n");
     let mut decoder = weaver_nntp::fused_yenc::FusedYencArticleDecoder::new();
-    decoder.set_checkpoint_plan(checkpoint_plan(pipeline, JOB));
+    decoder.set_checkpoint_plan(checkpoint_plan(pipeline, segment_id.file_id));
     let decoded = decoder
         .decode_available(&mut bytes::BytesMut::from(raw.as_slice()))
         .unwrap()

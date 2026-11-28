@@ -210,6 +210,37 @@ async fn the_clock_alone_moves_only_one_torrents_follower() {
     seeded.rig.service.stop().await;
 }
 
+// A wall clock moved on far past the tick's span, as an e2e offset moves
+// it, credits the whole jump to the seeding time, and a seed-time goal the
+// jump passes reads as met.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_clock_jump_while_seeding_counts_toward_the_seed_time_goal() {
+    let seeded = seeded().await;
+    seeded
+        .rig
+        .service
+        .set_policy_override(
+            seeded.job_id,
+            Some(SeedingPolicy {
+                seed_time_counting: Default::default(),
+                ratio_goal: Leaf::Off,
+                seed_time_goal_minutes: Leaf::Set(60),
+                inactive_goal_minutes: Leaf::Off,
+                mode: Leaf::Set(SeedingGoalMode::Any),
+                action: Leaf::Set(SeedingAction::Stop),
+            }),
+        )
+        .await
+        .unwrap();
+    let before = seeded.view().await;
+    assert!(!before.seeding_goal_met, "{:?}", before.seeding_goals);
+    seeded.advance(60 * 60 * 1000);
+    let after = seeded.view().await;
+    assert_eq!(after.seeding_seconds, before.seeding_seconds + 60 * 60);
+    assert!(after.seeding_goal_met, "{:?}", after.seeding_goals);
+    seeded.rig.service.stop().await;
+}
+
 // A follower hears a tracker's answer as it lands, with nothing in the queue
 // to say so: the rig has no queue, and the answer moves the torrent's row.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -622,8 +653,8 @@ async fn a_torrent_given_its_session_is_published_in_it_open() {
 }
 
 // A file's level changed on a paused torrent moves nothing a list's row
-// shows: one torrent's follower is told of it, with the new level, and the
-// row is not marked moved for a list.
+// shows: the follower of the torrent's files is told of it, with the new
+// level, and the row is not marked moved for a list.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_files_level_reaches_its_torrents_follower_and_no_list() {
     use FilePriority::*;
@@ -660,17 +691,17 @@ async fn a_files_level_reaches_its_torrents_follower_and_no_list() {
         .await
         .unwrap();
     rig.service.publish().await;
-    let mut one = rig.service.updates(job_id);
-    let first = one.next().await.torrents;
-    assert_eq!(first[0].files[0].priority, Normal);
+    let mut one = rig.service.file_updates(job_id, 0, 10);
+    let first = one.next().await.unwrap();
+    assert_eq!(first.files[0].0.priority, Normal);
     let row = rig.service.snapshot().row(job_id).unwrap();
 
     rig.service
         .set_file_priorities(job_id, &[(0, High)])
         .await
         .unwrap();
-    let told = one.next().await.torrents;
-    assert_eq!(told[0].files[0].priority, High);
+    let told = one.next().await.unwrap();
+    assert_eq!(told.files[0].0.priority, High);
     let after = rig.service.snapshot().row(job_id).unwrap();
     assert_eq!((after.moved, after.listed), (row.moved, row.listed));
     rig.service.stop().await;

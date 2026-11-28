@@ -61,7 +61,7 @@ export type TestForm = {
 };
 
 /** The decode chart's line, apart from the download chart's accent. */
-const DECODE_COLOR = "#6aa7e8";
+const DECODE_COLOR = "var(--color-wv-dns)";
 const SAB_SIZES: SabTestSize[] = ["MB_100", "GB_1", "GB_10"];
 export const MAX_DURATION = 900;
 /** The job statuses that are fetching from a server, which a run pauses. */

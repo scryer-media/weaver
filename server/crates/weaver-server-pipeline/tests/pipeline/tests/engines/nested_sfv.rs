@@ -4,11 +4,11 @@
 // An SFV packed inside an archive, beside the files it lists, under a PAR2
 // set that proved the archive's volumes: every file it lists came out of
 // that proved archive, so its bytes are what was posted, and the SFV makes
-// no claim of damage, whatever CRCs it states. Elsewhere an SFV says what it
-// says, as it did.
+// no claim of damage, whatever CRCs it states. Elsewhere it claims none
+// either: a job with it ends as the same posts without it.
 
 use super::harness::{ARTICLE, Outcome, Post, Scenario, par2_set, payload, run};
-use super::sfv::{crc, listing_text};
+use super::sfv::{assert_twin, crc, listing_text};
 use crate::jobs::model::JobStatus;
 use crate::pipeline::tests::direct_store::multi_member_store_set;
 
@@ -28,7 +28,12 @@ fn wrong_sfv() -> Vec<u8> {
 // The movie and `sfv` as the members of an outer stored RAR set of two
 // volumes, under a PAR2 set over those volumes when `recovery` says so.
 fn in_outer_rar(sfv: Vec<u8>, recovery: bool) -> Scenario {
-    let entries: Vec<(&str, Vec<u8>)> = vec![(MOVIE, movie()), (SFV, sfv)];
+    in_outer_rar_of(vec![(MOVIE, movie()), (SFV, sfv)], recovery)
+}
+
+// `entries` as the members of an outer stored RAR set of two volumes,
+// under a PAR2 set over those volumes when `recovery` says so.
+fn in_outer_rar_of(entries: Vec<(&str, Vec<u8>)>, recovery: bool) -> Scenario {
     let outer: Vec<(String, Vec<u8>)> = multi_member_store_set(&entries, 2)
         .into_iter()
         .enumerate()
@@ -91,17 +96,20 @@ async fn an_sfv_over_files_of_a_proved_archive_makes_no_damage_claim() {
     }
 }
 
-// Guard: the same archive with no recovery set over it. Nothing proved its
-// bytes, and the SFV's claim stands as it did: the job is not Complete.
+// The same archive with no recovery set over it. Nothing proved its bytes,
+// and the SFV still claims no damage: the job ends as the same archive
+// without the SFV.
 #[tokio::test]
-async fn an_sfv_inside_an_archive_nothing_proved_keeps_its_claim() {
+async fn an_sfv_inside_an_archive_nothing_proved_ends_as_without_it() {
     let outcome = run(&in_outer_rar(wrong_sfv(), false)).await;
-    assert_ne!(
+    let twin = run(&in_outer_rar_of(vec![(MOVIE, movie())], false)).await;
+    assert_eq!(
         outcome.status,
         Some(JobStatus::Complete),
         "{}",
         said(&outcome)
     );
+    assert_twin(&outcome, &twin);
 }
 
 // Guard: an SFV posted at the root beside the movie, stating the wrong
@@ -175,8 +183,13 @@ fn in_lzma2_7z(entries: &[(String, Vec<u8>)]) -> Vec<u8> {
 // `spoil_member`, a byte of the first RAR's stored member `hello.txt` is
 // flipped, so that member fails its own CRC as it extracts. No PAR2 set.
 // No real post is named: it stands for a game release posted as one 7z of
-// per-disc folders, each a RAR with its SFV.
+// per-disc folders, each a RAR with its SFV, or without it when `listed`
+// says not.
 fn folders(spoil_member: bool) -> Vec<(String, Vec<u8>)> {
+    folders_listed(spoil_member, true)
+}
+
+fn folders_listed(spoil_member: bool, listed_sfv: bool) -> Vec<(String, Vec<u8>)> {
     let mut entries = Vec::new();
     for folder in 0..2u8 {
         let name = format!("game{folder}.rar");
@@ -187,6 +200,9 @@ fn folders(spoil_member: bool) -> Vec<(String, Vec<u8>)> {
             volume[HELLO_DATA] ^= 0x20;
         }
         entries.push((format!("Game {folder}/{name}"), volume));
+        if !listed_sfv {
+            continue;
+        }
         let sfv = listing_text("; game\n", &[(&name, listed)]);
         entries.push((format!("Game {folder}/game{folder}.sfv"), sfv));
     }
@@ -217,11 +233,11 @@ async fn a_listing_inside_an_archive_that_disagrees_with_a_volume_extracted_whol
     );
 }
 
-// Guard: the same shape, the first RAR's `hello.txt` failing its own CRC.
-// The volume did not extract whole, so the SFV's claim against it stands:
-// the job is not Complete.
+// The same shape, the first RAR's `hello.txt` failing its own CRC. The
+// volume did not extract whole: the job is not Complete, for the member's
+// own CRC, and ends as the same archive without the SFVs.
 #[tokio::test]
-async fn a_listing_inside_an_archive_over_a_volume_whose_member_fails_its_crc_keeps_its_claim() {
+async fn a_listing_inside_an_archive_over_a_volume_whose_member_fails_its_crc_ends_as_without_it() {
     let scenario = Scenario::new(vec![Post::plain("lantern.7z", in_lzma2_7z(&folders(true)))]);
     let outcome = run(&scenario).await;
     assert_ne!(
@@ -230,4 +246,9 @@ async fn a_listing_inside_an_archive_over_a_volume_whose_member_fails_its_crc_ke
         "{}",
         said(&outcome)
     );
+    let twin = Scenario::new(vec![Post::plain(
+        "lantern.7z",
+        in_lzma2_7z(&folders_listed(true, false)),
+    )]);
+    assert_twin(&outcome, &run(&twin).await);
 }

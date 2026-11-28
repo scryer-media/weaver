@@ -115,6 +115,33 @@ async fn a_deflate_zip_delivers_alike_in_every_frame_size() {
     }
 }
 
+// The zip library checks a deflated member's bytes against its stated CRC32
+// as it inflates them, so the member's own check takes that CRC32 as what
+// its file holds, hashes none of its bytes as they are written, and reads
+// nothing of it back at the close: the run hashes fewer bytes than its
+// members hold.
+#[tokio::test]
+async fn a_deflated_member_closes_with_no_check_read() {
+    use weaver_server_pipeline::pipeline::tests::engines::restart_fixtures::member_check_bytes;
+    let hashed = weaver_graph::evidence::counting::hashed;
+    let read_before = member_check_bytes();
+    let hashed_before = hashed();
+    let graph = run(&Scenario::new(vec![Post::plain("lantern.zip", deflated())])).await;
+    let hashed = hashed() - hashed_before;
+    assert_members(&graph);
+    assert!(kinds(&graph).contains(&"zip_engine"), "{:?}", kinds(&graph));
+    assert_eq!(
+        member_check_bytes() - read_before,
+        0,
+        "bytes a member check read back"
+    );
+    let members: u64 = graph.files.values().map(|bytes| bytes.len() as u64).sum();
+    assert!(
+        hashed < members,
+        "the run hashed {hashed} bytes; its members hold {members}"
+    );
+}
+
 // A zip posted under an index's name, stored and deflated: the name
 // proposes a recovery index, the bytes say zip, and the bytes decide. The
 // members are delivered and the posted file is not.

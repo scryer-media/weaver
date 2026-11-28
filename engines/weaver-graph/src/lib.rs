@@ -50,6 +50,8 @@ mod wire;
 pub use deliver::{Delivery, Emit, Handed, Posted, Provenance, RecoveryKind, Why};
 pub use engine::{Budget, Engine, Extraction, Lost, Pool, Sink, Volumes};
 pub use evidence::{Algorithm, Digest, Evidence, Evidenced};
+#[cfg(any(test, feature = "test-support"))]
+pub use facts::sealed_encodes;
 pub use facts::{
     Change, Durable, Facts, Give, Part, Restore, RestoreError, Sealed, Shelf, Take, Taken,
     decode_parts, encode_parts, encode_since,
@@ -59,8 +61,8 @@ pub use marks::{Marked, Marks};
 pub use member::{Coverage, Member, MemberId, Namespace, Run};
 pub use names::NameLedger;
 pub use object::{
-    Beside, Carried, Claim, Clean, Extent, Kind, Located, Object, ObjectId, Placement, Placements,
-    Posting, Standing,
+    Beside, Carried, Claim, Clean, Extent, Kind, Located, Object, ObjectId, Placement,
+    PlacementMoves, Placements, Posting, Standing, WANTS_MOST,
 };
 pub use records::{
     CoverageRecord, CryptRecord, EnvelopeRecord, LiftRecord, MemberRecord, NodeRecord, NodeState,
@@ -73,7 +75,7 @@ pub use sniff::{
     signs_a_head, sniff,
 };
 pub use tree::{
-    AGAIN_PIECE, Builder, Disclaim, Effect, LentWaits, NeverOpen, NodeId, Rewalk, Tree,
+    AGAIN_PIECE, Builder, Disclaim, Effect, LentWaits, NeverOpen, NodeId, Rewalk, Took, Tree,
 };
 pub use volume::{ByteRange, VolumeIndex};
 pub use window::{WindowLender, WindowMemory};

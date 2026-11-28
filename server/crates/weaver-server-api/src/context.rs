@@ -53,6 +53,7 @@ pub struct SchemaContext {
         Arc<weaver_server_core::servers::transfer_policy::ServerTransferPolicyRegistry>,
     pub auth_cache: LoginAuthCache,
     pub api_key_cache: ApiKeyCache,
+    pub appearance: crate::settings::appearance::AppearanceStore,
     // The security settings the process actually started with, so resolvers
     // can report the running bind address rather than re-deriving it.
     pub security: weaver_server_core::security::RuntimeSecurityConfig,
@@ -176,6 +177,7 @@ pub fn build_schema_with_backup(
     .data(context.pipeline_state)
     .data(context.scheduled_resume)
     .data(context.config)
+    .data(context.appearance)
     .data(context.db)
     .data(context.server_transfer_policy)
     .data(context.auth_cache)

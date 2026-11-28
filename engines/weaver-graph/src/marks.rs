@@ -78,6 +78,13 @@ impl<K: Ord + Copy, V> Marked<K, V> {
         Some(found)
     }
 
+    // An entry handed out unmarked, for a change to what its owner neither
+    // records nor reads as the entry's state: memory kept beside it for a
+    // while and let go.
+    pub fn get_mut_unmarked(&mut self, key: &K) -> Option<&mut V> {
+        self.map.get_mut(key)
+    }
+
     pub fn get_or_insert_with(&mut self, key: K, make: impl FnOnce() -> V) -> &mut V {
         self.marks.mark(key);
         self.map.entry(key).or_insert_with(make)

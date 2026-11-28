@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
+use serde_json::json;
+use weaver_server_api::settings::appearance::AppearanceStore;
 use weaver_server_core::post_processing::settings::PostProcessingSettingsQueries;
 use weaver_server_core::settings::SettingsSchedulesQueries;
 use weaver_server_core::settings::queries::SettingsQueries;
@@ -195,6 +197,202 @@ async fn archive_password_settings_require_admin() {
             assert!(!h.execute_as(query, scope).await.errors.is_empty());
         }
     }
+}
+
+#[tokio::test]
+async fn web_appearance_requires_admin_for_reads_and_writes() {
+    let h = TestHarness::new().await;
+    let query = "{ webAppearance { palette mode accent } }";
+    let mutation = "mutation { updateWebAppearance(input: { palette: AMBER }) { palette } }";
+
+    for scope in [CallerScope::Read, CallerScope::Control] {
+        for operation in [query, mutation] {
+            let response = h.execute_as(operation, scope).await;
+            assert_eq!(response.errors.len(), 1);
+            assert_eq!(
+                response.errors[0]
+                    .extensions
+                    .as_ref()
+                    .and_then(|extensions| extensions.get("code")),
+                Some(&async_graphql::Value::String("FORBIDDEN".into()))
+            );
+        }
+    }
+
+    let response = h.execute_as(query, CallerScope::Admin).await;
+    assert_no_errors(&response);
+    assert_eq!(
+        response_data(&response)["webAppearance"]["palette"],
+        "WEAVER"
+    );
+}
+
+#[tokio::test]
+async fn web_appearance_defaults_and_persists_partial_updates_and_reset() {
+    let h = TestHarness::new().await;
+    // Existing installations have their settings but no saved appearance.
+    let defaults = json!({ "palette": "WEAVER", "mode": "SYSTEM", "accent": null });
+    assert_eq!(saved_appearance(&h), defaults);
+
+    let query = "{ webAppearance { palette mode accent } }";
+    let response = h.execute_as(query, CallerScope::Admin).await;
+    assert_no_errors(&response);
+    assert_eq!(response_data(&response)["webAppearance"], defaults);
+
+    for (input, expected) in [
+        (
+            "palette: PHOSPHOR, mode: LIGHT, accent: VIOLET",
+            json!({ "palette": "PHOSPHOR", "mode": "LIGHT", "accent": "VIOLET" }),
+        ),
+        (
+            "mode: SYSTEM",
+            json!({ "palette": "PHOSPHOR", "mode": "SYSTEM", "accent": "VIOLET" }),
+        ),
+        (
+            "accent: null",
+            json!({ "palette": "PHOSPHOR", "mode": "SYSTEM", "accent": null }),
+        ),
+        (
+            "palette: TERMINAL",
+            json!({ "palette": "TERMINAL", "mode": "SYSTEM", "accent": null }),
+        ),
+        (
+            "palette: WEAVER, mode: SYSTEM, accent: null",
+            defaults.clone(),
+        ),
+    ] {
+        let mutation = format!(
+            "mutation {{ updateWebAppearance(input: {{ {input} }}) {{ palette mode accent }} }}"
+        );
+        let updated = h.execute_as(&mutation, CallerScope::Admin).await;
+        assert_no_errors(&updated);
+        assert_eq!(response_data(&updated)["updateWebAppearance"], expected);
+
+        let fetched = h.execute_as(query, CallerScope::Admin).await;
+        assert_no_errors(&fetched);
+        assert_eq!(response_data(&fetched)["webAppearance"], expected);
+        assert_eq!(saved_appearance(&h), expected);
+    }
+
+    for invalid in [
+        "palette: UNKNOWN",
+        "palette: AMBER, mode: UNKNOWN",
+        "palette: AMBER, accent: UNKNOWN",
+    ] {
+        let mutation =
+            format!("mutation {{ updateWebAppearance(input: {{ {invalid} }}) {{ palette }} }}");
+        assert!(
+            !h.execute_as(&mutation, CallerScope::Admin)
+                .await
+                .errors
+                .is_empty()
+        );
+        assert_eq!(saved_appearance(&h), defaults);
+    }
+}
+
+/// The saved palette, mode and accent, as the GraphQL fields read them.
+fn saved_appearance(h: &TestHarness) -> serde_json::Value {
+    let saved = serde_json::to_value(AppearanceStore::load(&h.db).unwrap().current()).unwrap();
+    json!({ "palette": saved["palette"], "mode": saved["mode"], "accent": saved["accent"] })
+}
+
+#[tokio::test]
+async fn web_appearance_keeps_progress_colours_per_palette() {
+    let h = TestHarness::new().await;
+    let query = "{ webAppearance { palette progressColors { palette stage color } } }";
+    let response = h.execute_as(query, CallerScope::Admin).await;
+    assert_no_errors(&response);
+    assert_eq!(
+        response_data(&response)["webAppearance"]["progressColors"],
+        json!([])
+    );
+
+    let save = |changes: &str| {
+        format!(
+            "mutation {{ updateWebAppearance(input: {{ progressColors: [{changes}] }}) \
+             {{ palette progressColors {{ palette stage color }} }} }}"
+        )
+    };
+    // Picks for two palettes, given out of order, come back ordered by palette then stage.
+    let picked = h
+        .execute_as(
+            &save(
+                "{ palette: TERMINAL, stage: COMPLETED, color: GREY }, \
+                 { palette: WEAVER, stage: FAILED, color: MAGENTA }, \
+                 { palette: WEAVER, stage: DOWNLOADING, color: CYAN }",
+            ),
+            CallerScope::Admin,
+        )
+        .await;
+    assert_no_errors(&picked);
+    let weaver_and_terminal = json!([
+        { "palette": "WEAVER", "stage": "DOWNLOADING", "color": "CYAN" },
+        { "palette": "WEAVER", "stage": "FAILED", "color": "MAGENTA" },
+        { "palette": "TERMINAL", "stage": "COMPLETED", "color": "GREY" },
+    ]);
+    assert_eq!(
+        response_data(&picked)["updateWebAppearance"]["progressColors"],
+        weaver_and_terminal
+    );
+
+    // Changing the palette keeps every palette's picks.
+    let switched = h
+        .execute_as(
+            "mutation { updateWebAppearance(input: { palette: TERMINAL }) \
+             { palette progressColors { palette stage color } } }",
+            CallerScope::Admin,
+        )
+        .await;
+    assert_no_errors(&switched);
+    assert_eq!(
+        response_data(&switched)["updateWebAppearance"]["progressColors"],
+        weaver_and_terminal
+    );
+
+    // A new colour replaces the pick; null restores one stage of one palette.
+    let changed = h
+        .execute_as(
+            &save(
+                "{ palette: WEAVER, stage: DOWNLOADING, color: LIME }, \
+                 { palette: WEAVER, stage: FAILED, color: null }",
+            ),
+            CallerScope::Admin,
+        )
+        .await;
+    assert_no_errors(&changed);
+    let expected = json!([
+        { "palette": "WEAVER", "stage": "DOWNLOADING", "color": "LIME" },
+        { "palette": "TERMINAL", "stage": "COMPLETED", "color": "GREY" },
+    ]);
+    assert_eq!(
+        response_data(&changed)["updateWebAppearance"]["progressColors"],
+        expected
+    );
+    let reloaded = serde_json::to_value(AppearanceStore::load(&h.db).unwrap().current()).unwrap();
+    assert_eq!(reloaded["progressColors"], expected);
+
+    // More changes than palette and stage pairs are refused before anything is saved.
+    let too_many = vec!["{ palette: AMBER, stage: PAUSED, color: RED }"; 29].join(", ");
+    assert!(
+        !h.execute_as(&save(&too_many), CallerScope::Admin)
+            .await
+            .errors
+            .is_empty()
+    );
+    let after = serde_json::to_value(AppearanceStore::load(&h.db).unwrap().current()).unwrap();
+    assert_eq!(after["progressColors"], expected);
+}
+
+#[test]
+fn appearance_saved_before_progress_colours_still_loads() {
+    let saved: weaver_server_api::settings::appearance::WebAppearance =
+        serde_json::from_str(r#"{"palette":"AMBER","mode":"DARK","accent":"ROSE"}"#).unwrap();
+    assert!(saved.progress_colors.is_empty());
+    assert_eq!(
+        saved.palette,
+        weaver_server_api::settings::appearance::WebPalette::Amber
+    );
 }
 
 #[tokio::test]
@@ -897,6 +1095,63 @@ async fn the_profile_in_force_is_reported_beside_the_choice() {
     assert!(profile["scheduled"].is_null());
 }
 
+// Without `WEAVER_TORRENT_PORT` the listen port is the saved one and is
+// not pinned.
+#[tokio::test]
+async fn an_unpinned_torrent_port_reads_as_not_pinned() {
+    let h = TestHarness::new().await;
+    let resp = h
+        .execute("{ settings { torrent { basePort basePortPinned } } }")
+        .await;
+    assert_no_errors(&resp);
+    let torrent = &response_data(&resp)["settings"]["torrent"];
+    assert_eq!(torrent["basePort"], 6881);
+    assert_eq!(torrent["basePortPinned"], false);
+}
+
+// While the environment pins the listen port, it is the port read, and a
+// save that names that same port is taken without writing the saved port.
+#[tokio::test]
+async fn a_pinned_torrent_port_reads_as_pinned_and_saves_unchanged() {
+    use weaver_server_core::settings::persistence::SettingsPersistenceQueries;
+    let h = TestHarness::new_with_torrent_port_pin(51_413).await;
+    let resp = h
+        .execute("{ settings { torrent { basePort basePortPinned } } }")
+        .await;
+    assert_no_errors(&resp);
+    let torrent = &response_data(&resp)["settings"]["torrent"];
+    assert_eq!(torrent["basePort"], 51413);
+    assert_eq!(torrent["basePortPinned"], true);
+
+    // No port saved: a save naming the pin writes none.
+    let saved = h
+        .execute(
+            "mutation { updateSettings(input: { torrent: { basePort: 51413, maxActiveDownloads: 9 } }) { torrent { basePort basePortPinned maxActiveDownloads } } }",
+        )
+        .await;
+    assert_no_errors(&saved);
+    let torrent = &response_data(&saved)["updateSettings"]["torrent"];
+    assert_eq!(torrent["basePort"], 51413);
+    assert_eq!(torrent["basePortPinned"], true);
+    assert_eq!(torrent["maxActiveDownloads"], 9);
+    assert_eq!(h.db.get_setting("torrent.base_port").unwrap(), None);
+    assert!(h.config.read().await.torrent.base_port_pinned);
+    assert_eq!(h.db.load_config().unwrap().torrent.max_active_downloads, 9);
+
+    // A saved port is kept as it was.
+    h.db.set_setting("torrent.base_port", "6881").unwrap();
+    let saved = h
+        .execute(
+            "mutation { updateSettings(input: { torrent: { basePort: 51413, upnp: false } }) { torrent { basePort } } }",
+        )
+        .await;
+    assert_no_errors(&saved);
+    assert_eq!(
+        h.db.get_setting("torrent.base_port").unwrap().as_deref(),
+        Some("6881")
+    );
+}
+
 #[tokio::test]
 async fn seeding_and_torrent_settings_default_then_persist_and_clear() {
     let h = TestHarness::new().await;
@@ -1223,7 +1478,7 @@ async fn the_ssl_listener_keeps_its_port() {
     assert_eq!(h.db.load_config().unwrap().torrent.ssl_port, None);
 }
 
-// A request on a server started without `WEAVER_TORRENTS`.
+// A request on a server started with `WEAVER_TORRENTS` turned off.
 fn without_torrents(query: &str) -> async_graphql::Request {
     local_request(query).data(weaver_server_core::torrents::TorrentAvailability::UNAVAILABLE)
 }
@@ -1254,8 +1509,14 @@ async fn a_server_without_torrents_refuses_turning_them_on_and_names_the_variabl
         error_code(&refused).as_deref(),
         Some("TORRENTS_UNAVAILABLE")
     );
+    assert_eq!(
+        refused.errors[0].message,
+        weaver_server_core::torrents::TORRENTS_UNAVAILABLE
+    );
     assert!(
-        refused.errors[0].message.contains("WEAVER_TORRENTS"),
+        refused.errors[0]
+            .message
+            .contains("started with WEAVER_TORRENTS turned off; remove it or set it to 1"),
         "{}",
         refused.errors[0].message
     );
@@ -1327,7 +1588,7 @@ async fn a_server_without_torrents_says_so_whatever_is_saved() {
     // Every torrent query answers as it does while torrents are off.
     let listed = h
         .schema
-        .execute(without_torrents("{ torrents { id } }"))
+        .execute(without_torrents("{ torrents { items { id } } }"))
         .await;
     assert_eq!(error_code(&listed).as_deref(), Some("TORRENTS_DISABLED"));
 }

@@ -284,7 +284,7 @@ impl NetworkRuntime {
         consumer: Consumer,
         policy: RoutingPolicy,
         timeout: Duration,
-    ) -> Result<Arc<DraftNetworkRoute>, String> {
+    ) -> Result<Arc<DraftNetworkRoute>, RouteError> {
         self.draft_route_without_members(consumer, policy, timeout, &[])
     }
     // A draft whose pools leave out `removed` proxies. Only the draft's own
@@ -295,7 +295,7 @@ impl NetworkRuntime {
         policy: RoutingPolicy,
         timeout: Duration,
         removed: &[u32],
-    ) -> Result<Arc<DraftNetworkRoute>, String> {
+    ) -> Result<Arc<DraftNetworkRoute>, RouteError> {
         self.validate_policy(&policy)?;
         // Drafts share unchanged live carriers. Carried tunnels are sized
         // by the provider in the same way before and after saving the route.

@@ -250,20 +250,54 @@ async fn write_hosts(tx: &mut SqlTx<'_>, id: u32, patterns: &[String]) -> Result
     Ok(())
 }
 
+// Why a tracker rule was not saved, by kind. Each kind words itself as the
+// sentence it replaced.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TrackerRuleRefusal {
+    // A field or host the rule's tracker file locked, worded by the lock.
+    Locked(String),
+    // Another rule has the name, whatever the case.
+    NameTaken(String),
+    // Another rule covers one of the rule's hosts.
+    Covered { pattern: String, by: String },
+    // No rule has the id.
+    NotFound(u32),
+}
+
+impl std::fmt::Display for TrackerRuleRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Locked(sentence) => f.write_str(sentence),
+            Self::NameTaken(name) => write!(f, "a rule named {name} exists"),
+            Self::Covered { pattern, by } => write!(f, "{pattern} is covered by {by}"),
+            Self::NotFound(id) => write!(f, "no tracker rule {id}"),
+        }
+    }
+}
+
+impl std::error::Error for TrackerRuleRefusal {}
+
 // Why `rule` may not be saved beside `rules` as the rule `id` names (none
 // for a new rule): another rule has its name, whatever the case, or covers
 // one of its hosts.
-fn collision(rules: &[TrackerRule], id: Option<u32>, rule: &TrackerRule) -> Option<String> {
+fn collision(
+    rules: &[TrackerRule],
+    id: Option<u32>,
+    rule: &TrackerRule,
+) -> Option<TrackerRuleRefusal> {
     let others = || rules.iter().filter(move |other| Some(other.id) != id);
     let key = TrackerRule::name_key(&rule.name);
     if let Some(other) = others().find(|other| TrackerRule::name_key(&other.name) == key) {
-        return Some(format!("a rule named {} exists", other.name));
+        return Some(TrackerRuleRefusal::NameTaken(other.name.clone()));
     }
     others().find_map(|other| {
         rule.host_patterns
             .iter()
             .find(|pattern| other.host_patterns.contains(pattern))
-            .map(|pattern| format!("{pattern} is covered by {}", other.name))
+            .map(|pattern| TrackerRuleRefusal::Covered {
+                pattern: pattern.clone(),
+                by: other.name.clone(),
+            })
     })
 }
 
@@ -283,7 +317,7 @@ pub trait SettingsRepositoryQueries {
         keeps_ssl: bool,
         keeps_passwords: bool,
         now_ms: i64,
-    ) -> Result<Result<Vec<TrackerRule>, String>, StateError>;
+    ) -> Result<Result<Vec<TrackerRule>, TrackerRuleRefusal>, StateError>;
     fn apply_tracker_file(
         &self,
         file: &super::tracker_file::TrackerFile,
@@ -447,7 +481,7 @@ impl<T: std::borrow::Borrow<Database> + ?Sized> SettingsRepositoryQueries for T 
         keeps_ssl: bool,
         keeps_passwords: bool,
         now_ms: i64,
-    ) -> Result<Result<Vec<TrackerRule>, String>, StateError> {
+    ) -> Result<Result<Vec<TrackerRule>, TrackerRuleRefusal>, StateError> {
         let rules = self.list_tracker_rules()?;
         let existing = id.and_then(|id| rules.iter().find(|other| other.id == id));
         if keeps_ssl {
@@ -462,14 +496,14 @@ impl<T: std::borrow::Borrow<Database> + ?Sized> SettingsRepositoryQueries for T 
         if let Some(existing) = existing
             && let Err(refusal) = super::tracker_file::check_locks(existing, &rule)
         {
-            return Ok(Err(refusal));
+            return Ok(Err(TrackerRuleRefusal::Locked(refusal)));
         }
         if let Some(refusal) = collision(&rules, id, &rule) {
             return Ok(Err(refusal));
         }
         match id {
             Some(_) if !self.update_tracker_rule(&rule, now_ms)? => {
-                return Ok(Err(format!("no tracker rule {}", rule.id)));
+                return Ok(Err(TrackerRuleRefusal::NotFound(rule.id)));
             }
             Some(_) => {}
             None => {
@@ -491,7 +525,7 @@ impl<T: std::borrow::Borrow<Database> + ?Sized> SettingsRepositoryQueries for T 
         let existing = file.rule_in(&rules).map_err(StateError::Conflict)?;
         let rule = file.apply(existing, now_ms);
         if let Some(refusal) = collision(&rules, existing.map(|rule| rule.id), &rule) {
-            return Err(StateError::Conflict(refusal));
+            return Err(StateError::Conflict(refusal.to_string()));
         }
         match existing {
             Some(_) => {
@@ -516,5 +550,36 @@ impl<T: std::borrow::Borrow<Database> + ?Sized> SettingsRepositoryQueries for T 
             .await?;
             Ok(changed > 0)
         })
+    }
+}
+
+#[cfg(test)]
+mod tracker_rule_refusal_tests {
+    use super::TrackerRuleRefusal;
+
+    // Each kind words itself as the sentence it replaced.
+    #[test]
+    fn each_kind_words_itself_as_the_sentence_it_replaced() {
+        let cases = [
+            (
+                TrackerRuleRefusal::Locked("the tracker file locks the name".into()),
+                "the tracker file locks the name",
+            ),
+            (
+                TrackerRuleRefusal::NameTaken("Linux".into()),
+                "a rule named Linux exists",
+            ),
+            (
+                TrackerRuleRefusal::Covered {
+                    pattern: "*.example.org".into(),
+                    by: "Linux".into(),
+                },
+                "*.example.org is covered by Linux",
+            ),
+            (TrackerRuleRefusal::NotFound(7), "no tracker rule 7"),
+        ];
+        for (refusal, sentence) in cases {
+            assert_eq!(refusal.to_string(), sentence);
+        }
     }
 }

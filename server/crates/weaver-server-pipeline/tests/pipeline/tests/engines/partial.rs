@@ -634,10 +634,11 @@ async fn an_lzma2_7z_inside_a_stored_rar_is_refused_compressed_and_delivered_who
     .await;
 }
 
-// The store refuses the member compressed; the engine it goes to cannot
-// decode it, and the volume is delivered damaged as it stands.
+// The set is not solid: the store keeps its compressed member, and the
+// store's run cannot decode it. The volume is delivered damaged as it
+// stands.
 #[tokio::test]
-async fn a_rar_whose_member_names_a_method_its_bytes_do_not_decode_is_delivered_damaged_unrepairable_after_the_store_refuses_it_compressed()
+async fn a_rar_whose_member_names_a_method_its_bytes_do_not_decode_is_delivered_damaged_unrepairable_by_the_stores_run()
  {
     let volumes = miscompressed_rar();
     let scenario = Scenario::new(beside(posts(&volumes)));
@@ -651,10 +652,7 @@ async fn a_rar_whose_member_names_a_method_its_bytes_do_not_decode_is_delivered_
             damaged: &["silver.horizon.rar"],
             unrepaired: &[],
             withheld: &[],
-            refused: &[
-                "kind=rar_engine member=silver.horizon.rar why=unrepairable",
-                "kind=rar_store member=silver.horizon.rar why=compressed",
-            ],
+            refused: &["kind=rar_store member=silver.horizon.rar why=unrepairable"],
             delivered: &[
                 "name=silver.horizon.rar from=silver.horizon.rar depth=0 whole=false",
                 QUILL,
@@ -681,10 +679,7 @@ async fn a_rar_inside_a_stored_rar_whose_member_names_a_method_its_bytes_do_not_
             damaged: &["silver.horizon.rar"],
             unrepaired: &[],
             withheld: &[],
-            refused: &[
-                "kind=rar_engine member=silver.horizon.rar why=unrepairable",
-                "kind=rar_store member=silver.horizon.rar why=compressed",
-            ],
+            refused: &["kind=rar_store member=silver.horizon.rar why=unrepairable"],
             delivered: &[
                 "name=silver.horizon.rar from=silver.horizon.rar depth=1 whole=false",
                 QUILL,

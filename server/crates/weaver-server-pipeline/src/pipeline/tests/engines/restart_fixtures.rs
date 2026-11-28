@@ -43,6 +43,9 @@ pub struct Restarted {
     pub order: Vec<(u32, u32)>,
     // The graph job as last seen before it finished, across every restart.
     pub graph: GraphView,
+    // Every event the pipeline that finished the job sent, from its start
+    // on, in order.
+    pub events: Vec<PipelineEvent>,
 }
 
 // Called with each checkpoint as it stood when the pipeline went down.
@@ -73,6 +76,10 @@ pub enum Down<'a> {
     // its namespace and is not finished: between a lift and the read of the
     // set the volume rose to. Only there, not after articles.
     Lifting,
+    // As a crash, once, after the first article served once a run has
+    // refused to make the members it makes and the job is not finished:
+    // between the refusal and the job's end. Only there.
+    RunRefused,
 }
 
 // As `run_restarting_inspecting`, going down as `down` says and only after the articles
@@ -88,6 +95,7 @@ pub(in crate::pipeline::tests) async fn run_restarting_at_inspecting(
         new_direct_pipeline_with_backlog(&temp_dir, backlog_base_bytes(), 1).await;
     scenario.prepare(&mut pipeline);
     insert_active_job(&mut pipeline, JOB, scenario.spec()).await;
+    let mut sent = pipeline.event_tx.subscribe();
 
     let mut requests = BTreeMap::new();
     let mut order = Vec::new();
@@ -102,6 +110,7 @@ pub(in crate::pipeline::tests) async fn run_restarting_at_inspecting(
     let mut graph = GraphView::default();
     let mut reads = 0;
     let mut lifting = down == Down::Lifting;
+    let mut refusing = down == Down::RunRefused;
     loop {
         // Down between a lift and the read of the set it rose to, once.
         if lifting
@@ -113,6 +122,8 @@ pub(in crate::pipeline::tests) async fn run_restarting_at_inspecting(
         {
             lifting = false;
             pipeline = restart(&temp_dir, pipeline, scenario, &mut owed, &mut *inspect).await;
+            sent = pipeline.event_tx.subscribe();
+            graph.restarted();
             crate::pipeline::tests::hear_rewalks(&mut pipeline, JOB).await;
             in_memory.extend(owed.iter().copied());
             restarts += 1;
@@ -144,11 +155,25 @@ pub(in crate::pipeline::tests) async fn run_restarting_at_inspecting(
             if finished(&pipeline) {
                 break;
             }
+            if refusing
+                && pipeline
+                    .graph_jobs
+                    .get(&JOB)
+                    .is_some_and(|job| !job.writer().unmade(job.tree()).is_empty())
+            {
+                refusing = false;
+                pipeline = restart(&temp_dir, pipeline, scenario, &mut owed, &mut *inspect).await;
+                sent = pipeline.event_tx.subscribe();
+                graph.restarted();
+                in_memory.extend(owed.iter().copied());
+                restarts += 1;
+                continue;
+            }
             // Only after an article asked for the first time: what a restart
             // fetches again comes back before the next one, so the run moves.
             // A live run is no reason to wait: the checkpoint describes what
             // is on disk, never how far a run has read.
-            if first && down != Down::Lifting && at(requests.len()) {
+            if first && !matches!(down, Down::Lifting | Down::RunRefused) && at(requests.len()) {
                 if down == Down::RefusingForHolds {
                     pipeline
                         .graph_jobs
@@ -182,6 +207,8 @@ pub(in crate::pipeline::tests) async fn run_restarting_at_inspecting(
                 };
                 let before = figures(&pipeline);
                 pipeline = restart(&temp_dir, pipeline, scenario, &mut owed, &mut going_down).await;
+                sent = pipeline.event_tx.subscribe();
+                graph.restarted();
                 // Its recovery reads what arrived of it again before the job
                 // fetches: the figures stand once that is heard.
                 crate::pipeline::tests::hear_rewalks(&mut pipeline, JOB).await;
@@ -252,6 +279,8 @@ pub(in crate::pipeline::tests) async fn run_restarting_at_inspecting(
     pipeline.db.flush_write_queue().await.unwrap();
     let mut files = BTreeMap::new();
     collect(&complete_dir, &complete_dir, &mut files);
+    let mut events = Vec::new();
+    drain(&mut sent, &mut events);
     retire_pipeline_database(pipeline).await;
     Restarted {
         status,
@@ -262,6 +291,7 @@ pub(in crate::pipeline::tests) async fn run_restarting_at_inspecting(
         restarts,
         order,
         graph,
+        events,
     }
 }
 
@@ -630,12 +660,21 @@ pub struct RestartedDone {
 // The job served as `run` serves it, and the pipeline drained and taken down
 // once, the first time a repair of the job is out on a thread. Whether the
 // restored job lent a repair again.
+//
+// The first repair stands on its thread until the shutdown has started, so
+// it comes back stopped however fast its thread is: one let run could end
+// before the drain stopped it, and would leave nothing to lend again.
 pub async fn run_restarted_while_repairing(scenario: &Scenario) -> (RestartedDone, bool) {
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, complete_dir) =
         new_direct_pipeline_with_backlog(&temp_dir, backlog_base_bytes(), 1).await;
     scenario.prepare(&mut pipeline);
     insert_active_job(&mut pipeline, JOB, scenario.spec()).await;
+    let hold = pipeline
+        .graph_jobs
+        .get_mut(&JOB)
+        .expect("the job is a graph job")
+        .hold_next_repair();
     let mut sent = pipeline.event_tx.subscribe();
     let mut events = Vec::new();
     let mut in_memory = BTreeSet::new();
@@ -673,6 +712,13 @@ pub async fn run_restarted_while_repairing(scenario: &Scenario) -> (RestartedDon
             // A repair out writes the job's files: the drain waits for it to
             // its end rather than for a bound.
             assert!(pipeline.graph_drain_waits_for_loans());
+            // The shutdown the drain starts, started before the repair is
+            // let go: the repair finds it as it begins.
+            pipeline
+                .shared_state
+                .shutdown_started()
+                .store(true, std::sync::atomic::Ordering::Release);
+            hold.let_go();
             pipeline.drain().await;
             assert!(
                 !pipeline.graph_jobs[&JOB].awaits_mail(),
@@ -1212,4 +1258,11 @@ pub async fn run_restarted_after_repairing(scenario: &Scenario) -> RestartedDone
 
 pub fn member_check_bytes() -> u64 {
     crate::pipeline::graph::namespace::checked::so_far()
+}
+
+// The job served as `run` serves it, and taken down once, as a crash drops
+// it, after a run refused to make the members it makes and before the job
+// ends.
+pub async fn run_restarted_after_refusal(scenario: &Scenario) -> Restarted {
+    run_restarting_at_inspecting(scenario, &mut |_| {}, Down::RunRefused, &|_| false).await
 }

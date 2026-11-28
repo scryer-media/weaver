@@ -1,11 +1,17 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
-// The SFV object: a list of names and CRC32s. It checks the members it
-// names, from the whole-member CRC32 the grid folds as bytes pass, or by
-// reading a member back when the feed did not cover it. It never repairs.
-// An entry that names no member of the namespace fails nothing: an SFV is
-// often written over files the post does not carry.
+// The SFV object: a list of names and CRC32s. It binds as a recovery set
+// and always stands aside: it is never fed, never repairs, never rules,
+// vouches or proves, and never holds a job up. The job ends as it would with
+// no listing. An SFV is often written over files the post does not carry,
+// or over files as they were before they were packed again.
+//
+// What it does do it does from the source's checksums of whole members,
+// asked once a run: it notes a file it names whose CRC disagrees, and it
+// names a file no entry names whose CRC only one entry states. It never
+// reads a file back, so a member the source kept no checksums of, one
+// below the root or one a set sealed, is neither noted nor named.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -17,15 +23,12 @@ use weaver_graph::{
     Object, ObjectId, Placement, Pull, Recovery, Seek, Segment, SliceVerdict, Take, VolumeIndex,
 };
 
-use crate::grid::{self, Grid, WHOLE};
+use crate::grid::{crc32, crc32_combine};
 
 // An SFV is a line per file; past this it is not one.
 const TEXT_CAP: usize = 4 * 1024 * 1024;
-// A readback is checked in pieces of this size.
-const READ_CHUNK: u64 = 4 * 1024 * 1024;
 
-// Its facts are the whole of it: the text, the checksums bound and what
-// the last check came to.
+// Its facts are the whole of it: the text.
 #[derive(Serialize, Deserialize)]
 pub struct Sfv {
     id: ObjectId,
@@ -36,34 +39,55 @@ pub struct Sfv {
     // whatever lies past its text.
     #[serde(skip)]
     held: BTreeMap<usize, Vec<u8>>,
-    // Bound members and the CRC32 their entry gives.
-    bound: BTreeMap<MemberId, u32>,
-    // Each bound member's length once all of it arrived.
-    lengths: BTreeMap<MemberId, u64>,
-    grid: Grid,
-    // What the last check came to, for the members bound then.
-    outcome: Option<RepairOutcome>,
+    // The entries of the text, parsed when the text changes. A restored
+    // listing parses its text again where it reads them.
+    #[serde(skip)]
+    listed: Option<Listing>,
+    // What the source's checksums said of each member asked for, by
+    // member id, under the name it had then. Kept with the text, so a
+    // listing restored, or back from being out of its node, asks no
+    // member again. Bounded by the members asked for, at most the members
+    // of its node, each once: one fixed record of a name, a length and a
+    // CRC32.
+    checked: BTreeMap<u32, Checked>,
+}
+
+// Entries by lower-cased basename: the basename in the listing's own case
+// and the CRC32 it states.
+type Listing = BTreeMap<String, Entry>;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Entry {
+    name: String,
+    crc32: u32,
+}
+
+// A member's CRC32, folded from the source's checksums of all of its
+// bytes, or `None` when the source no longer kept every one of them.
+#[derive(Serialize, Deserialize)]
+struct Checked {
+    name: String,
+    length: u64,
+    crc32: Option<u32>,
 }
 
 impl Durable for Sfv {
     // 2: the grid shelved by chunk of blocks, kept apart from the bytes.
     // 3: a sealed value encodes as nothing, numbered by its owner's walk.
-    const VERSION: u16 = 3;
+    // 4: a listing stands aside: it binds, rules nothing, and keeps the
+    //    CRC32 the source's checksums gave each member it asked for.
+    const VERSION: u16 = 4;
 
-    fn parts(&self, take: &mut Take) -> Result<(), String> {
-        self.grid.parts(take)
+    fn parts(&self, _take: &mut Take) -> Result<(), String> {
+        Ok(())
     }
 
-    fn restore_parts(&mut self, give: &mut Give) -> Result<(), String> {
-        self.grid.restore_parts(give)
+    fn restore_parts(&mut self, _give: &mut Give) -> Result<(), String> {
+        Ok(())
     }
 
     fn impossible(&self) -> Option<&'static str> {
-        let sized = self
-            .lengths
-            .keys()
-            .all(|member| self.bound.contains_key(member));
-        (self.text.len() > TEXT_CAP || !sized).then_some("an overlong text or an unbound length")
+        (self.text.len() > TEXT_CAP).then_some("an overlong text")
     }
 }
 
@@ -73,10 +97,16 @@ impl Sfv {
             id,
             text: Vec::new(),
             held: BTreeMap::new(),
-            bound: BTreeMap::new(),
-            lengths: BTreeMap::new(),
-            grid: Grid::default(),
-            outcome: None,
+            listed: None,
+            checked: BTreeMap::new(),
+        }
+    }
+
+    // The entries, parsed now when the text was restored and not read since.
+    fn with_listing<R>(&self, read: impl FnOnce(&Listing) -> R) -> R {
+        match &self.listed {
+            Some(listed) => read(listed),
+            None => read(&entries(&self.text)),
         }
     }
 
@@ -88,21 +118,6 @@ impl Sfv {
         }
         self.text[offset..end].copy_from_slice(bytes);
     }
-
-    fn verdict(&self, member: MemberId, expected: u32) -> SliceVerdict {
-        let Some(length) = self.lengths.get(&member).copied() else {
-            return SliceVerdict::Unknown;
-        };
-        if length == 0 {
-            return if expected == grid::crc32(&[]) {
-                SliceVerdict::Intact
-            } else {
-                SliceVerdict::Damaged
-            };
-        }
-        let folded = self.grid.fold(member, WHOLE, 0, ByteRange::new(0, length));
-        grid::verdict(folded, length, 0, expected)
-    }
 }
 
 // The entries of the text, keyed by lower-cased basename.
@@ -113,7 +128,7 @@ impl Sfv {
 // case-insensitive filesystem and the case it records is not evidence of
 // anything. A basename listed with disagreeing CRCs is withdrawn: the
 // listing contradicts itself, so neither value is evidence.
-fn entries(text: &[u8]) -> BTreeMap<String, u32> {
+fn entries(text: &[u8]) -> Listing {
     let text = String::from_utf8_lossy(text);
     // A listing written on Windows commonly carries a UTF-8 BOM, which
     // would otherwise become part of the first entry's name.
@@ -146,7 +161,7 @@ fn entries(text: &[u8]) -> BTreeMap<String, u32> {
         let Ok(crc32) = u32::from_str_radix(checksum, 16) else {
             continue;
         };
-        let basename = sfv_basename(name);
+        let basename = last_component(name);
         if basename.is_empty() {
             continue;
         }
@@ -155,56 +170,54 @@ fn entries(text: &[u8]) -> BTreeMap<String, u32> {
     entries
 }
 
-fn insert_entry(
-    entries: &mut BTreeMap<String, u32>,
-    conflicting: &mut BTreeSet<String>,
-    basename: String,
-    crc32: u32,
-) {
-    if conflicting.contains(&basename) {
+fn insert_entry(entries: &mut Listing, conflicting: &mut BTreeSet<String>, name: &str, crc32: u32) {
+    let key = name.to_ascii_lowercase();
+    if conflicting.contains(&key) {
         return;
     }
-    match entries.get(&basename) {
-        // A listing repeated verbatim is not a contradiction.
-        Some(existing) if *existing == crc32 => {}
+    match entries.get(&key) {
+        // A listing repeated verbatim is not a contradiction; the first
+        // spelling of the name stands.
+        Some(existing) if existing.crc32 == crc32 => {}
         Some(_) => {
-            entries.remove(&basename);
-            conflicting.insert(basename);
+            entries.remove(&key);
+            conflicting.insert(key);
         }
         None => {
-            entries.insert(basename, crc32);
+            let name = name.to_owned();
+            entries.insert(key, Entry { name, crc32 });
         }
     }
 }
 
-// The last path component, lower-cased. Both separators are honoured because
-// a listing packed on Windows records `subdir\file.rar` and the same release
-// unpacked elsewhere records `subdir/file.rar`.
-fn sfv_basename(name: &str) -> String {
-    name.rsplit(['/', '\\'])
-        .next()
-        .unwrap_or(name)
-        .trim()
-        .to_ascii_lowercase()
+// The last path component, in its own case. Both separators are honoured
+// because a listing packed on Windows records `subdir\file.rar` and the same
+// release unpacked elsewhere records `subdir/file.rar`.
+fn last_component(name: &str) -> &str {
+    name.rsplit(['/', '\\']).next().unwrap_or(name).trim()
 }
 
-// The CRC32 of a member, read back in pieces.
-fn read_crc32(member: MemberId, length: u64, access: &mut dyn MemberAccess) -> Option<u32> {
-    let mut crc = grid::crc32(&[]);
-    let mut buffer = Vec::new();
-    let mut offset = 0;
-    while offset < length {
-        let end = (offset + READ_CHUNK).min(length);
-        buffer.clear();
-        if !access.read(member, ByteRange::new(offset, end), &mut buffer)
-            || buffer.len() as u64 != end - offset
-        {
+// The key a name answers an entry under: its last component, lower-cased.
+fn sfv_basename(name: &str) -> String {
+    last_component(name).to_ascii_lowercase()
+}
+
+// The CRC32 of a member `length` long from the source's checksums of its
+// bytes: verified, in order, each starting where the last ended, from the
+// first byte to the last. Anything short of that says nothing.
+fn folded(segments: &[Segment], length: u64) -> Option<u32> {
+    let mut sorted: Vec<&Segment> = segments.iter().collect();
+    sorted.sort_by_key(|segment| segment.range.start);
+    let mut at = 0;
+    let mut crc = crc32(&[]);
+    for segment in sorted {
+        if !segment.verified || segment.range.start != at {
             return None;
         }
-        crc = grid::crc32_combine(crc, grid::crc32(&buffer), end - offset);
-        offset = end;
+        crc = crc32_combine(crc, segment.crc32, segment.range.len());
+        at = segment.range.end;
     }
-    Some(crc)
+    (at == length).then_some(crc)
 }
 
 impl Object for Sfv {
@@ -238,6 +251,7 @@ impl Object for Sfv {
             let (at, bytes) = piece.remove_entry();
             self.write(at, &bytes);
         }
+        self.listed = Some(entries(&self.text));
     }
 
     fn volume_closed(&mut self, _volume: VolumeIndex, _out: &mut Vec<Emit>) {}
@@ -291,8 +305,11 @@ impl Object for Sfv {
     }
 }
 
+// A listing stands aside (a set that does not rebuild): the namespace
+// never feeds it as a cover, never asks it to rule and never reads a
+// verdict of it. What it must answer as a recovery object it answers as
+// covering nothing.
 impl Recovery for Sfv {
-    // A listing checks what it lists and rebuilds none of it.
     fn rebuilds(&self) -> bool {
         false
     }
@@ -305,112 +322,183 @@ impl Recovery for Sfv {
         false
     }
 
-    // By lower-cased basename. Two members whose names differ only by case
-    // cannot be told apart by a listing that records neither reliably, so
-    // neither binds.
-    fn bind(&mut self, namespace: &mut Namespace, _renamed: &mut Vec<MemberId>) {
-        let mut by_basename: BTreeMap<String, Option<MemberId>> = BTreeMap::new();
-        for member in namespace
-            .members()
-            .filter(|member| member.bound_to != Some(self.id))
-        {
-            by_basename
-                .entry(sfv_basename(&member.name))
-                .and_modify(|found| *found = None)
-                .or_insert(Some(member.id));
-        }
-        let entries = entries(&self.text);
-        let bound: BTreeMap<MemberId, u32> = by_basename
-            .into_iter()
-            .filter_map(|(basename, member)| Some((member?, *entries.get(&basename)?)))
-            .collect();
-        let lengths = bound
-            .keys()
-            .filter_map(|member| {
-                let record = namespace.get(*member)?;
-                record
-                    .length
-                    .filter(|_| record.is_complete())
-                    .map(|length| (*member, length))
-            })
-            .collect();
-        if bound != self.bound || lengths != self.lengths {
-            self.outcome = None;
-        }
-        self.lengths = lengths;
-        self.bound = bound;
-    }
-
-    fn covers(&self, member: MemberId) -> bool {
-        self.bound.contains_key(&member)
+    fn covers(&self, _member: MemberId) -> bool {
+        false
     }
 
     fn covers_some(&self) -> bool {
-        !self.bound.is_empty()
+        false
     }
+
+    fn covers_any_of(&self, _namespace: &Namespace) -> bool {
+        false
+    }
+
+    // A listing covers nothing, so its bind covers nothing newly.
+    fn take_newly(&mut self, _out: &mut Vec<(MemberId, String)>) {}
 
     // A listing ships beside what it lists.
     fn released(&self) -> bool {
         true
     }
 
-    fn feed(&mut self, member: MemberId, segments: &[Segment]) {
-        if self.covers(member) && !self.grid.matches(member, segments) {
-            self.outcome = None;
-        }
-        self.feed_proven(member, segments);
+    fn feed(&mut self, _member: MemberId, _segments: &[Segment]) {}
+
+    fn verdicts(&self, _member: MemberId, _out: &mut Vec<SliceVerdict>) {}
+
+    // The whole members no set that stands covers: those it names, for a
+    // note, and while an entry names no member, those no entry names, for
+    // a name. Each once.
+    fn evidence(
+        &self,
+        namespace: &Namespace,
+        covered: &dyn Fn(MemberId) -> bool,
+        out: &mut Vec<MemberId>,
+    ) {
+        self.with_listing(|listed| {
+            if listed.is_empty() {
+                return;
+            }
+            let mut answered = BTreeSet::new();
+            let mut unnamed = Vec::new();
+            for member in namespace.members() {
+                let key = sfv_basename(&member.name);
+                let named = listed.contains_key(&key);
+                if named {
+                    answered.insert(key);
+                }
+                if !member.is_whole()
+                    || self.checked.contains_key(&member.id.0)
+                    || covered(member.id)
+                {
+                    continue;
+                }
+                if named {
+                    out.push(member.id);
+                } else {
+                    unnamed.push(member.id);
+                }
+            }
+            if answered.len() < listed.len() {
+                out.extend(unnamed);
+            }
+        });
     }
 
-    fn feed_proven(&mut self, member: MemberId, segments: &[Segment]) {
-        self.grid.offer_all(member, WHOLE, segments);
+    // An entry no member answers names the one member its CRC32 is the
+    // CRC32 of, when no other entry no member answers states that CRC32
+    // and no other such member has it. A member is such when its CRC32
+    // was asked for under the name it still has, while no entry named it.
+    // The name is the entry's, in the listing's own case. A set that names
+    // the member after renames it again, and the listing never takes it
+    // back: its name is no longer the one it was asked under.
+    fn bind(&mut self, namespace: &mut Namespace, renamed: &mut Vec<MemberId>) {
+        if self.listed.is_none() {
+            self.listed = Some(entries(&self.text));
+        }
+        let Some(listed) = &self.listed else {
+            return;
+        };
+        let answered: BTreeSet<String> = namespace
+            .members()
+            .map(|member| sfv_basename(&member.name))
+            .filter(|key| listed.contains_key(key))
+            .collect();
+        if answered.len() == listed.len() {
+            return;
+        }
+        // Each CRC32 the entries no member answers state: the entry, or
+        // `None` when two of them state it.
+        let mut wanted: BTreeMap<u32, Option<&Entry>> = BTreeMap::new();
+        for (key, entry) in listed {
+            if answered.contains(key) {
+                continue;
+            }
+            wanted
+                .entry(entry.crc32)
+                .and_modify(|one| *one = None)
+                .or_insert(Some(entry));
+        }
+        // Each wanted CRC32 the candidates have: the member, or `None` when
+        // two of them have it.
+        let mut found: BTreeMap<u32, Option<MemberId>> = BTreeMap::new();
+        for (member, checked) in &self.checked {
+            let Some(crc32) = checked.crc32 else {
+                continue;
+            };
+            if !wanted.contains_key(&crc32) {
+                continue;
+            }
+            let member = MemberId(*member);
+            let candidate = namespace.get(member).is_some_and(|record| {
+                record.name == checked.name
+                    && record.length == Some(checked.length)
+                    && !listed.contains_key(&sfv_basename(&record.name))
+            });
+            if candidate {
+                found
+                    .entry(crc32)
+                    .and_modify(|one| *one = None)
+                    .or_insert(Some(member));
+            }
+        }
+        for (crc32, member) in found {
+            let (Some(member), Some(Some(entry))) = (member, wanted.get(&crc32)) else {
+                continue;
+            };
+            if namespace.rename(member, &entry.name).is_some() {
+                renamed.push(member);
+            }
+        }
     }
 
-    // One verdict for the whole member: an SFV has no slices.
-    fn verdicts(&self, member: MemberId, out: &mut Vec<SliceVerdict>) {
-        if let Some(expected) = self.bound.get(&member) {
-            out.push(self.verdict(member, *expected));
-        }
+    fn evidenced(&mut self, namespace: &Namespace, member: MemberId, segments: &[Segment]) {
+        let Some(record) = namespace.get(member) else {
+            return;
+        };
+        let Some(length) = record.length else {
+            return;
+        };
+        self.checked.insert(
+            member.0,
+            Checked {
+                name: record.name.clone(),
+                length,
+                crc32: folded(segments, length),
+            },
+        );
+    }
+
+    // Each member it names whose bytes, as the source checked them at the
+    // length the member has, have another CRC32 than the entry states.
+    fn disputed(&self, namespace: &Namespace, out: &mut Vec<MemberId>) {
+        self.with_listing(|listed| {
+            for (member, checked) in &self.checked {
+                let member = MemberId(*member);
+                let Some(record) = namespace.get(member) else {
+                    continue;
+                };
+                let Some(crc32) = checked.crc32 else {
+                    continue;
+                };
+                let Some(entry) = listed.get(&sfv_basename(&record.name)) else {
+                    continue;
+                };
+                if record.length == Some(checked.length) && entry.crc32 != crc32 {
+                    out.push(member);
+                }
+            }
+        });
     }
 
     fn wants(&self, _out: &mut Vec<Seek>) {}
 
-    fn repair(&mut self, access: &mut dyn MemberAccess, _: weaver_graph::Budget) -> RepairOutcome {
-        let mut damaged = 0;
-        for (&member, &expected) in &self.bound {
-            // Whether the member's bytes matched the checksum: `None` for one
-            // that could not be read, which is not proven anything.
-            let matched = match self.verdict(member, expected) {
-                SliceVerdict::Intact => Some(true),
-                SliceVerdict::Damaged => Some(false),
-                SliceVerdict::Unknown => access
-                    .length(member)
-                    .and_then(|length| read_crc32(member, length, access))
-                    .map(|crc| crc == expected),
-            };
-            if matched != Some(true) {
-                damaged += 1;
-            }
-            // One checksum over the member: all of it is what failed.
-            if matched == Some(false)
-                && let Some(length) = access.length(member)
-            {
-                access.found_damaged(member, ByteRange::new(0, length));
-            }
-        }
-        let outcome = if damaged == 0 {
-            RepairOutcome::Clean
-        } else {
-            RepairOutcome::Impossible {
-                damaged,
-                reachable: 0,
-            }
-        };
-        self.outcome = Some(outcome);
-        outcome
+    fn repair(&mut self, _access: &mut dyn MemberAccess, _: weaver_graph::Budget) -> RepairOutcome {
+        RepairOutcome::Clean
     }
 
     fn outcome(&self) -> Option<RepairOutcome> {
-        self.outcome
+        None
     }
 }
 

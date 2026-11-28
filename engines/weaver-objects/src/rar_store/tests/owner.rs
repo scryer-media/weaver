@@ -7,11 +7,13 @@
 // does and holds them again when the store says they are no longer its own,
 // answers seeks, and writes members the way a namespace does.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
+use std::io;
+use std::sync::{Arc, Mutex};
 
 use weaver_graph::{
-    ByteRange, Coverage, Delivery, Digest, Emit, Evidence, Evidenced, Object, Placement,
-    Provenance, Pull, Seek, Standing, VolumeIndex,
+    Budget, ByteRange, Coverage, Delivery, Digest, Emit, Evidence, Evidenced, MemberId, Object,
+    Placement, Provenance, Pull, Seek, Standing, VolumeIndex, Volumes,
 };
 
 use super::super::RarStore;
@@ -28,10 +30,60 @@ pub(super) struct Got {
     pub closed: bool,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 struct Shelf {
     bytes: Vec<u8>,
     coverage: Coverage,
+}
+
+// The set's volumes as a run reads them off the shelf: each envelope's
+// bytes where they were kept, at their volume offsets, and an error for
+// any other, recorded as volume, offset and length asked.
+pub(super) struct Shelved {
+    lengths: Vec<u64>,
+    shelves: BTreeMap<u32, Shelf>,
+    pub strays: Mutex<Vec<(u32, u64, usize)>>,
+}
+
+impl Volumes for Shelved {
+    fn next(&self, after: Option<VolumeIndex>) -> io::Result<Option<VolumeIndex>> {
+        let next = after.map_or(0, |after| after.0 + 1);
+        Ok(((next as usize) < self.lengths.len()).then_some(VolumeIndex(next)))
+    }
+
+    fn len(&self, volume: VolumeIndex) -> Option<u64> {
+        self.lengths.get(volume.0 as usize).copied()
+    }
+
+    fn settled(&self, volume: VolumeIndex) -> bool {
+        (volume.0 as usize) < self.lengths.len()
+    }
+
+    fn read_at(&self, volume: VolumeIndex, offset: u64, into: &mut [u8]) -> io::Result<usize> {
+        let length = self.lengths[volume.0 as usize];
+        let end = (offset + into.len() as u64).min(length);
+        let range = ByteRange::new(offset.min(end), end);
+        // At or past the volume's end, which a shelf need not reach: a
+        // volume may end in a stored file's data.
+        if range.is_empty() {
+            return Ok(0);
+        }
+        let kept = self
+            .shelves
+            .get(&volume.0)
+            .is_some_and(|shelf| shelf.coverage.covered(range));
+        if !kept {
+            self.strays
+                .lock()
+                .unwrap()
+                .push((volume.0, offset, into.len()));
+            return Err(io::Error::from(io::ErrorKind::NotFound));
+        }
+        let shelf = &self.shelves[&volume.0];
+        let taken = range.len() as usize;
+        into[..taken].copy_from_slice(&shelf.bytes[range.start as usize..range.end as usize]);
+        Ok(taken)
+    }
 }
 
 pub(super) struct Owner {
@@ -53,6 +105,9 @@ pub(super) struct Owner {
     delivered: BTreeMap<u32, Coverage>,
     bound: Vec<bool>,
     next: u32,
+    // Members retracted, whose records the tree keeps for them to be
+    // announced into again.
+    retracted: BTreeSet<u32>,
     // When set, every delivery comes with the CRC32 of each article of this
     // size it holds, cut where the delivery is cut, as a decoder hands it.
     pub articles: Option<u64>,
@@ -71,6 +126,9 @@ pub(super) struct Owner {
     // The most bytes one read of a range asked for again took from any
     // place they lie.
     pub again_read_most: u64,
+    // Each member said again under another name: its id, the name it had
+    // and the one it took.
+    pub renamed: Vec<(u32, String, String)>,
 }
 
 impl Owner {
@@ -96,12 +154,14 @@ impl Owner {
             delivered: BTreeMap::new(),
             bound: vec![false; count],
             next: 0,
+            retracted: BTreeSet::new(),
             articles: None,
             asked: None,
             skipped: false,
             gated: Vec::new(),
             doing: ("found", first),
             again_read_most: 0,
+            renamed: Vec::new(),
         };
         let (name, bytes) = &owner.volumes[first];
         let front = &bytes[..bytes.len().min(FRONT)];
@@ -381,6 +441,64 @@ impl Owner {
         }
     }
 
+    // A volume named anew, as a repair's recovery set names it, and what
+    // the store says of it applied as the tree applies it.
+    pub fn renamed(&mut self, volume: usize, name: &str) {
+        self.doing = ("rename", volume);
+        name.clone_into(&mut self.volumes[volume].0);
+        let mut out = Vec::new();
+        self.object
+            .renamed(VolumeIndex(volume as u32), name, &mut out);
+        self.apply(out);
+        self.settle();
+    }
+
+    // Two volumes the store said it gives back, each taken again at the
+    // other's place with what was parsed of it, as the tree parks a volume
+    // and holds it where its name now places it: what came for each, what
+    // its envelope kept and what the tree holds of it move with it.
+    pub fn exchanged(&mut self, a: usize, b: usize) {
+        let (one, two) = (VolumeIndex(a as u32), VolumeIndex(b as u32));
+        let mut parked = Vec::new();
+        for volume in [one, two] {
+            parked.push(self.object.give_back(volume).expect("a volume going back"));
+        }
+        self.volumes.swap(a, b);
+        self.bound.swap(a, b);
+        let mut delivered = BTreeMap::new();
+        let mut shelves = BTreeMap::new();
+        for (from, to) in [(a, b), (b, a)] {
+            if let Some(coverage) = self.delivered.remove(&(from as u32)) {
+                delivered.insert(to as u32, coverage);
+            }
+            if let Some(shelf) = self.shelves.remove(&(from as u32)) {
+                shelves.insert(to as u32, shelf);
+            }
+        }
+        self.delivered.extend(delivered);
+        self.shelves.extend(shelves);
+        for (volume, ..) in &mut self.held {
+            *volume = match *volume {
+                held if held == one => two,
+                held if held == two => one,
+                held => held,
+            };
+        }
+        for (volume, carried) in [two, one].into_iter().zip(parked) {
+            let (name, bytes) = &self.volumes[volume.0 as usize];
+            let front = &bytes[..bytes.len().min(FRONT)];
+            assert_eq!(
+                self.object.claim(name, front.into(), None),
+                vec![volume],
+                "claims {name}"
+            );
+            let name = name.clone();
+            self.object.adopt(volume, &name, &[], None, carried);
+        }
+        self.doing = ("exchange", a);
+        self.settle();
+    }
+
     // Nothing more will arrive, and every member stands whole and placed.
     pub fn quiet(&mut self) {
         struct Whole;
@@ -422,6 +540,15 @@ impl Owner {
         self.apply(out);
     }
 
+    // The namespace's check of the member's file failed.
+    pub fn refuted(&mut self, member: MemberId) {
+        self.doing = ("refuted", 0);
+        let mut out = Vec::new();
+        self.object.member_refuted(member, &mut out);
+        self.apply(out);
+        self.settle();
+    }
+
     pub fn held(&self) -> usize {
         self.held.len()
     }
@@ -434,6 +561,35 @@ impl Owner {
                 Emit::Again { volume, range } => {
                     self.said.push(Emit::Again { volume, range });
                     again.push((volume, range));
+                }
+                Emit::Member {
+                    member,
+                    name,
+                    length,
+                } if self.retracted.remove(&member.0) => {
+                    // Announced again into the record its retraction kept,
+                    // as the tree takes it: a fresh member at the same id.
+                    self.members.insert(
+                        member.0,
+                        Got {
+                            name,
+                            length,
+                            ..Got::default()
+                        },
+                    );
+                }
+                Emit::Member {
+                    member,
+                    name,
+                    length,
+                } if member.0 < self.next => {
+                    // Said again under another name, as the tree takes it:
+                    // the member is renamed where it stands, its bytes kept.
+                    let got = self.members.get_mut(&member.0).expect("announced first");
+                    assert_eq!(got.length, length, "a rename keeps the length");
+                    self.renamed
+                        .push((member.0, got.name.clone(), name.clone()));
+                    got.name = name;
                 }
                 Emit::Member {
                     member,
@@ -472,8 +628,10 @@ impl Owner {
                     got.closed = true;
                 }
                 Emit::Retract(member) => {
+                    // The tree keeps the member's record, unbound, for it
+                    // to be announced into again.
                     self.members.remove(&member.0);
-                    self.next = self.next.min(member.0);
+                    self.retracted.insert(member.0);
                     self.said.push(Emit::Retract(member));
                 }
                 Emit::Unkept {
@@ -565,6 +723,111 @@ impl Owner {
         for (piece, provenance, bytes) in read_back {
             self.push(volume, piece, provenance, Some(&bytes));
         }
+    }
+
+    // The set's volumes as they stand on the shelf.
+    pub fn shelved(&self) -> Arc<Shelved> {
+        Arc::new(Shelved {
+            lengths: self
+                .volumes
+                .iter()
+                .map(|(_, bytes)| bytes.len() as u64)
+                .collect(),
+            shelves: self.shelves.clone(),
+            strays: Mutex::default(),
+        })
+    }
+
+    // Whether the shelf holds any verified byte of `range` of an envelope:
+    // what a run, which reads verified bytes only, can read there.
+    pub fn shelf_verified_in(&self, envelope: u32, range: ByteRange) -> bool {
+        self.shelves.get(&envelope).is_some_and(|shelf| {
+            shelf
+                .coverage
+                .overlapping(range)
+                .any(|run| run.provenance.is_verified())
+        })
+    }
+
+    // The bytes the shelf holds, every envelope together.
+    pub fn shelf_bytes(&self) -> u64 {
+        self.shelves
+            .values()
+            .map(|shelf| {
+                shelf
+                    .coverage
+                    .overlapping(ByteRange::new(0, shelf.bytes.len() as u64))
+                    .map(|run| run.range.len())
+                    .sum::<u64>()
+            })
+            .sum()
+    }
+
+    // The store's run, over the shelf as it stands, its emits applied as
+    // the tree applies a run's: what it reads that the shelf never kept.
+    pub fn run(&mut self) -> Vec<(u32, u64, usize)> {
+        let started = self.start();
+        self.run_started(started)
+    }
+
+    // The store's run started again behind a repair that replaced bytes
+    // its shelf holds, as the job restarts it: each member it makes starts
+    // over, the member staying the store's, with nothing written.
+    pub fn rerun(&mut self) -> Vec<(u32, u64, usize)> {
+        let made: Vec<u32> = {
+            let engine = self.object.engine().expect("a mixed set runs");
+            self.members
+                .keys()
+                .copied()
+                .filter(|&member| engine.makes(weaver_graph::MemberId(member)))
+                .collect()
+        };
+        for member in made {
+            if let Some(got) = self.members.get_mut(&member) {
+                got.bytes.clear();
+                got.coverage = Coverage::default();
+                got.closed = false;
+            }
+        }
+        self.run()
+    }
+
+    // The store's run as it starts now, to be run later (`run_started`).
+    pub fn start(&mut self) -> Box<dyn weaver_graph::Extraction> {
+        self.object.engine_mut().expect("a mixed set runs").start()
+    }
+
+    // A run started earlier, over the shelf as it stands now, as `run`.
+    pub fn run_started(
+        &mut self,
+        started: Box<dyn weaver_graph::Extraction>,
+    ) -> Vec<(u32, u64, usize)> {
+        let shelved = self.shelved();
+        let mut emits = Vec::new();
+        let mut sink = |emit| {
+            emits.push(emit);
+            true
+        };
+        let view: Arc<dyn Volumes> = shelved.clone();
+        started.run(view, &mut sink, Budget::default());
+        // A run's retract starts its member over, as the tree does: the
+        // member stays the store's, with nothing written.
+        let (retracts, emits): (Vec<Emit>, Vec<Emit>) = emits
+            .into_iter()
+            .partition(|emit| matches!(emit, Emit::Retract(_)));
+        for emit in retracts {
+            if let Emit::Retract(member) = emit
+                && let Some(got) = self.members.get_mut(&member.0)
+            {
+                got.bytes.clear();
+                got.coverage = Coverage::default();
+                got.closed = false;
+            }
+            self.log.push(emit.clone());
+            self.said.push(emit);
+        }
+        self.apply(emits);
+        shelved.strays.lock().unwrap().clone()
     }
 
     // A member by name.

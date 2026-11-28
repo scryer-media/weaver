@@ -23,6 +23,7 @@ thread_local! {
 }
 
 #[derive(Debug)]
+#[cfg_attr(test, derive(Clone, PartialEq, Eq))]
 pub(super) struct Evidence {
     // Written only by `refold`, which counts the damaged ones as it goes.
     slices: Vec<SliceVerdict>,

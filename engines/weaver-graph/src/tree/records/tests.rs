@@ -362,7 +362,7 @@ fn a_member_a_buried_refusal_left_open_comes_back_buried() {
 // answers what an earlier one asked.
 #[test]
 fn a_run_reports_progress_without_marking_its_node_or_its_facts() {
-    let bids = |tree: &Tree| {
+    let bids = |tree: &mut Tree| {
         let mut out = Vec::new();
         tree.collect_wants(&mut out);
         out.into_iter()
@@ -382,15 +382,79 @@ fn a_run_reports_progress_without_marking_its_node_or_its_facts() {
     assert_eq!(tree.generation(), at);
     assert_eq!(tree.changed_since(at).count(), 0, "progress marks no node");
     assert_eq!(tree.records(), record, "no record carries progress");
-    assert_eq!(bids(&tree), vec![(engine, VolumeIndex(1))]);
+    assert_eq!(bids(&mut tree), vec![(engine, VolumeIndex(1))]);
 
     let mut rebuilt = Tree::rebuild(&record, &Objects).expect("rebuilds");
-    assert!(bids(&rebuilt).is_empty(), "a rebuilt tree knows no run yet");
+    assert!(
+        bids(&mut rebuilt).is_empty(),
+        "a rebuilt tree knows no run yet"
+    );
     rebuilt.run_reached(engine, VolumeIndex(0));
-    assert_eq!(bids(&rebuilt), bids(&tree));
+    assert_eq!(bids(&mut rebuilt), bids(&mut tree));
     rebuilt.run_asked(engine);
     assert!(rebuilt.start(engine).is_some());
     assert_eq!(refused(&mut rebuilt, engine), None, "the new run asks anew");
 
     assert_eq!(refused(&mut tree, engine), Some(Why::EncryptedHeader));
+}
+
+// A round reads again only what changed: of `ARCHIVES` wrappers below the
+// root, each with a run that reached its first volume, the first round
+// reads every node (the root and the wrappers), a round with nothing
+// changed reads none, and a round after one run moved on reads that one
+// node. The kept wants are each wrapper's one bid all along, the moved one
+// for the volume after the one it reached.
+#[test]
+fn a_round_reads_again_only_the_node_whose_run_moved() {
+    const ARCHIVES: u32 = 16;
+    let mut tree = Tree::new();
+    let mut engines = Vec::new();
+    for at in 0..ARCHIVES {
+        let archive = tree.announce_root(&format!("a{at}.xz"), None, &mut Vec::new());
+        // The magic alone: the wrapper names its member, which brings no
+        // bytes, so no node opens below it.
+        tree.deliver(
+            NodeId::ROOT,
+            archive,
+            Posted {
+                offset: 0,
+                bytes: Bytes::from_static(XZ).into(),
+                provenance: Provenance::Fresh,
+            },
+            &mut Objects,
+            &mut Vec::new(),
+        );
+        let (engine, _) = tree.child_of(NodeId::ROOT, archive).expect("opens");
+        tree.run_reached(engine, VolumeIndex(0));
+        engines.push(engine);
+    }
+    assert_eq!(tree.nodes.len(), 1 + ARCHIVES as usize);
+    let round = |tree: &mut Tree| {
+        let mut out = Vec::new();
+        tree.collect_wants(&mut out);
+        let read = tree.wants.read;
+        let bids: Vec<_> = out
+            .into_iter()
+            .map(|(node, seek)| (node, seek.volume))
+            .collect();
+        (read, bids)
+    };
+    let bids = |active: Option<(NodeId, u32)>| {
+        engines
+            .iter()
+            .map(|engine| match active {
+                Some((moved, reached)) if moved == *engine => (*engine, VolumeIndex(reached + 1)),
+                _ => (*engine, VolumeIndex(1)),
+            })
+            .collect::<Vec<_>>()
+    };
+
+    assert_eq!(round(&mut tree), (1 + ARCHIVES as usize, bids(None)));
+    assert_eq!(round(&mut tree), (0, bids(None)));
+    let active = engines[ARCHIVES as usize / 2];
+    for reached in 1..=8 {
+        tree.run_reached(active, VolumeIndex(reached));
+        assert_eq!(round(&mut tree), (1, bids(Some((active, reached)))));
+    }
+    assert_eq!(round(&mut tree), (0, bids(Some((active, 8)))));
 }

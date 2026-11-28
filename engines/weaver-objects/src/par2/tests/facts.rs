@@ -307,3 +307,28 @@ fn par2_packet_facts_written_without_name_bytes_still_decode() {
     assert_eq!(description.par2_name_bytes, b"a.bin");
     assert_eq!(description.file_length, 4);
 }
+
+// Facts written at version 5 kept each chunk as a map of blocks, which a
+// chunk still reads: they restore. Facts older than that are refused.
+#[test]
+fn par2_facts_of_the_previous_version_restore_and_older_ones_are_refused() {
+    let data = payload(32, 5000);
+    let files = par2_set("previous", &[("payload.bin", &data)], BLOCK, 3, 2);
+    let mut live = twin(&files, &data);
+    for step in acts(&files) {
+        act(&mut live, step);
+    }
+    let mut facts = live.job.object.facts();
+    assert_eq!(facts.version, 6);
+    facts.version = 5;
+    let restored = par2(&facts).expect("version 5 restores");
+    assert_eq!(restored.facts(), live.job.object.facts());
+    facts.version = 4;
+    assert!(matches!(
+        par2(&facts),
+        Err(weaver_graph::RestoreError::Version {
+            kind: Kind::Par2,
+            version: 4
+        })
+    ));
+}

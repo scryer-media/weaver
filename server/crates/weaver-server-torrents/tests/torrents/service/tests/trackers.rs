@@ -1257,6 +1257,94 @@ async fn a_paused_and_resumed_torrent_keeps_its_key_and_peer_id() {
     rig.service.stop().await;
 }
 
+// A tracker rule saved while a torrent runs takes that torrent at once. When
+// the rule names another client, the tracker hears the torrent stop under
+// its old peer id and start again under the new client's, with the same
+// key, and no restart is needed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_rule_saved_later_renames_a_running_torrent() {
+    let (url, mut announces) = heard_tracker(&[]).await;
+    let rig = rig(set_clock());
+    on_loopback(&rig.routes);
+    rig.service.open().await.unwrap();
+    let job_id = rig
+        .service
+        .add_opened(AddRequest {
+            paused: true,
+            ..request(AddSource::Metainfo(plain("renamed", 8)))
+        })
+        .await
+        .unwrap();
+    tracked(&rig.service, job_id, &url).await;
+    rig.service.resume(job_id).await.unwrap();
+    let started = next_event(&mut announces).await;
+    assert_eq!(started.event.as_deref(), Some("started"));
+    assert!(started.peer_id.starts_with("-WV"), "{started:?}");
+    started_accepted(&rig.service, job_id).await;
+
+    let rule = rig
+        .db
+        .insert_tracker_rule(
+            &TrackerRule {
+                transports: Default::default(),
+                archive_passwords: Default::default(),
+                bound: None,
+                id: 0,
+                name: "loopback".into(),
+                host_patterns: vec!["127.0.0.1".into()],
+                seeding: None,
+                never_pause: false,
+                unpack: None,
+                client: Some(Client::QBittorrent),
+                torrent_route: false,
+                dht: None,
+                pex: None,
+                lsd: None,
+                encryption: None,
+                upload_cap: Default::default(),
+                forced: false,
+                ssl: None,
+            },
+            EPOCH_MS,
+        )
+        .unwrap();
+    rig.service.reload_tracker_rules().await.unwrap();
+    assert_eq!(
+        rig.service.inner.live.lock().await[&job_id].rule_id,
+        Some(rule.id)
+    );
+    rig.service.follow_routes().await;
+
+    let stopped = next_event(&mut announces).await;
+    assert_eq!(stopped.event.as_deref(), Some("stopped"));
+    assert_eq!(stopped.identity(), started.identity());
+    let again = next_event(&mut announces).await;
+    assert_eq!(again.event.as_deref(), Some("started"));
+    assert!(again.peer_id.starts_with("-qB5300-"), "{again:?}");
+    // The torrent's own bytes after the prefix are kept; the two shapes
+    // escape them differently, so they are compared unescaped.
+    let unescaped = |id: &str| {
+        let mut bytes = Vec::new();
+        let mut rest = id.as_bytes();
+        while let Some((&byte, tail)) = rest.split_first() {
+            if byte == b'%' {
+                let hex = std::str::from_utf8(&tail[..2]).unwrap();
+                bytes.push(u8::from_str_radix(hex, 16).unwrap());
+                rest = &tail[2..];
+            } else {
+                bytes.push(byte);
+                rest = tail;
+            }
+        }
+        bytes
+    };
+    assert_eq!(
+        unescaped(&again.peer_id)[8..],
+        unescaped(&started.peer_id)[8..]
+    );
+    rig.service.stop().await;
+}
+
 // A private torrent whose every file is on the unwanted list is added with
 // nothing wanted, as qBittorrent adds it (`applyFilenameFilter`), and is
 // finished at once (libtorrent `piece_picker::is_finished` with every piece
@@ -1374,6 +1462,8 @@ async fn finished_by_ignoring() -> FinishedByIgnoring {
         .service
         .add_opened(AddRequest {
             paused: true,
+            // Nothing to unpack: its content reads as ready once it seeds.
+            unpack: Some(false),
             ..request(AddSource::Metainfo(meta.clone()))
         })
         .await
@@ -1516,19 +1606,21 @@ async fn an_ignored_file_wanted_again_downloads_and_completes_once() {
         .unwrap()
         .completed_at_ms
         .unwrap();
+    assert!(rig.service.torrent(job_id).await.unwrap().content_ready);
     let mut settled = rig.service.inner.settled.subscribe();
     rig.service
         .set_file_priorities(job_id, &[(1, FilePriority::Normal)])
         .await
         .unwrap();
     // Its job is short of complete again, as stored and as shown: it is
-    // downloading, not seeding.
+    // downloading, not seeding, and its content is not ready.
     assert_eq!(
         rig.db.get_torrent(job_id).unwrap().unwrap().completed_at_ms,
         None
     );
     let view = rig.service.torrent(job_id).await.unwrap();
     assert_eq!(view.completed_at_ms, None);
+    assert!(!view.content_ready);
     assert_ne!(view.state, TorrentState::Seeding);
     assert!(matches!(
         job_status(&view),
@@ -1560,6 +1652,7 @@ async fn an_ignored_file_wanted_again_downloads_and_completes_once() {
     let view = rig.service.torrent(job_id).await.unwrap();
     assert!(view.completed_at_ms.is_some_and(|at| at >= first));
     assert_eq!(view.state, TorrentState::Seeding);
+    assert!(view.content_ready);
     assert_eq!(job_status(&view), JobStatus::Seeding);
 
     rig.service.stop().await;

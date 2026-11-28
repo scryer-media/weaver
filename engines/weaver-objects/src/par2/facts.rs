@@ -228,7 +228,8 @@ impl Durable for Par2Facts {
     // 4: no outcome of the object's own, it is its sets' last repairs; a
     // sealed value encodes as nothing, numbered by its owner's walk.
     // 5: the ranges of members the parent refused.
-    const VERSION: u16 = 5;
+    // 6: a chunk's closed blocks as a bit and a CRC32 each.
+    const VERSION: u16 = 6;
 
     fn parts(&self, take: &mut Take) -> Result<(), String> {
         for set in &self.sets {
@@ -261,6 +262,27 @@ impl Durable for Par2Facts {
                     .all(|at| at.volume.0 < count && !at.range.is_empty())
         });
         (!placed).then_some("a packet in no volume")
+    }
+}
+
+// Version 5 kept a chunk as a map of blocks, which a chunk still reads.
+#[derive(Serialize, Deserialize)]
+#[serde(transparent)]
+struct Five(Par2Facts);
+
+impl Durable for Five {
+    const VERSION: u16 = 5;
+
+    fn parts(&self, take: &mut Take) -> Result<(), String> {
+        self.0.parts(take)
+    }
+
+    fn restore_parts(&mut self, give: &mut Give) -> Result<(), String> {
+        self.0.restore_parts(give)
+    }
+
+    fn impossible(&self) -> Option<&'static str> {
+        self.0.impossible()
     }
 }
 
@@ -316,7 +338,10 @@ pub(super) fn of(par2: &Par2) -> Facts {
 }
 
 pub(super) fn par2(facts: &Facts) -> Result<Par2, RestoreError> {
-    let kept: Par2Facts = facts.read(Kind::Par2)?;
+    let kept: Par2Facts = match facts.version {
+        Five::VERSION => facts.read::<Five>(Kind::Par2)?.0,
+        _ => facts.read(Kind::Par2)?,
+    };
     let mut par2 = Par2::new(kept.id);
     par2.volumes = kept
         .volumes
@@ -337,12 +362,11 @@ pub(super) fn par2(facts: &Facts) -> Result<Par2, RestoreError> {
         let mut state =
             SetState::restored(set.first_seen, set.packets, set.hashes, kept.output_limit);
         state.recovery = set.recovery;
-        state.bind(
+        state.restore_members(
             set.members
                 .into_iter()
                 .map(|(file, member)| (FileId::from_bytes(file), member))
                 .collect(),
-            &[],
         );
         state.last = set.last;
         par2.file_set(set.key, state);

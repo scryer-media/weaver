@@ -455,6 +455,12 @@ impl NamespaceWriter {
         if actual != check.stated {
             let mut effects = Vec::new();
             tree.checksum_failed(check.node, check.member, &mut effects);
+            tree.member_refuted(
+                check.node,
+                check.member,
+                &mut self.placing(builder),
+                &mut effects,
+            );
             self.apply_each(
                 tree,
                 builder,

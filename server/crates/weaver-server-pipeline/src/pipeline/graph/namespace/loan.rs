@@ -689,10 +689,10 @@ impl Repaired {
             start: self.written,
             end: self.written + bytes.len() as u64,
         };
-        let written = self
-            .output
-            .create_within()
-            .and_then(|()| self.output.write(LoopSite::Repair, at.start, bytes, None));
+        let written = self.output.create_within().and_then(|()| {
+            self.output
+                .write(LoopSite::Repair, at.start, bytes, None, false)
+        });
         match written {
             Ok(()) => {
                 self.written = at.end;
@@ -794,9 +794,11 @@ impl Repaired {
 
 impl NamespaceWriter {
     // Lend the set's object out of the tree with everything its repair
-    // reads. `None` when the node holds no recovery object.
+    // reads. `None` when the node holds no recovery object. From here until
+    // its return is taken back or given up, what it read may be checked, so
+    // members' leaves keep what their writes change (`repair_reads`).
     pub fn lend(
-        &self,
+        &mut self,
         tree: &mut Tree,
         namespace: NodeId,
         set: NodeId,
@@ -874,6 +876,7 @@ impl NamespaceWriter {
         let Some(object) = tree.lend(set) else {
             return Ok(None);
         };
+        self.repair_reads = true;
         Ok(Some(Loan {
             set,
             namespace,
@@ -914,7 +917,12 @@ impl NamespaceWriter {
                                 .and_then(|files| files.leaves.get(&input.member))
                                 .is_none_or(|leaf| {
                                     leaf.path() != path
-                                        || leaf.changed_since(*seen, range.start, range.end)
+                                        || leaf.changed_since(
+                                            *seen,
+                                            range.start,
+                                            range.end,
+                                            self.repair_reads,
+                                        )
                                 })
                         })
                 })

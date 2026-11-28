@@ -1,0 +1,193 @@
+{
+  "slug": "par2-many-grids-clean",
+  "title": "Lattice.Harbor.PAR2.ManyGrids.2026-TESTGRP",
+  "description": "Thirty-four clean payloads, each described by its own PAR2 set at its own slice size. That is more slice sizes than one decode pass cuts at, so each payload must be cut at its own set's slices alone and every set must settle clean from its grid without read-back verification.",
+  "category": "2000",
+  "expected_outcome": "success",
+  "forbiddenJobEvents": [
+    "RepairStarted",
+    "RepairComplete",
+    "RepairFailed"
+  ],
+  "runtimeAssertions": {
+    "par2CleanSettlement": {
+      "expectedSetSliceSizes": {
+        "5cae870ae9ffabe4a05266cc3f2aeea5": 16384,
+        "3c6b3eb390a49c950d8b009141dd1ecc": 20480,
+        "826fac9ff4688bf8ada77795dff2414a": 24576,
+        "44f85e189c9fa0f1083c988863d96780": 28672,
+        "dfe859d6f4cc15283db447ec76063c11": 32768,
+        "fe224ee96ae5f8340e5e93576c2432ed": 36864,
+        "de8d3bf5509ca977d0fe34450d434e01": 40960,
+        "cc9abe5cad26b06d497aa295ae5473c0": 45056,
+        "b551a3956af90143f046da3b59b8e7c7": 49152,
+        "bd3877ce9db8c4df26f3ec8f7ab3e6d4": 53248,
+        "14bd6a00fa5c0f69ce20013cc6b9a40c": 57344,
+        "59ce5d8da818416b5e063d9ca6c4a19c": 61440,
+        "d6a0bd532ba0b532c747ccd3a77047a6": 65536,
+        "6ef032852ff99e3be3ee3326ec0ae9b5": 69632,
+        "97e814ddd8367688405d3701a3568e76": 73728,
+        "c9a233154ca51095474b11837d8dfc5f": 77824,
+        "fa9f06a45161119aab1570211a3a22c2": 81920,
+        "a24b1ce295b7b1a3054bec690e528c24": 86016,
+        "0a3fbaef76eff765d316eead39a5d77b": 90112,
+        "4654738f02b44dad485780ae2b76c1d4": 94208,
+        "cb940995550eb1728a10999c77f9cd8d": 98304,
+        "27b628a51a09ecebee53ecb9e25ceee0": 102400,
+        "773bacfb70ea5b8f5a8ef8fcc77a9ebf": 106496,
+        "e10b782fbd4630c2380b4458e71dcd55": 110592,
+        "91796d7398a3af7d529251bee2439741": 114688,
+        "9f93f50c9da63600891f368e05b7258e": 118784,
+        "18761a9ab6ce3163da5f61512ee40e6c": 122880,
+        "ccf47f1bc7d9c9ab06765095bd9cf263": 126976,
+        "9046a651d423681bf5dddd766c65324d": 131072,
+        "6910b7c8a68e5f4f9000294079c40f60": 135168,
+        "81ab2e0639273378ff80b242daaec966": 139264,
+        "61eb4eb666c70b2816651b18ad54dfb2": 143360,
+        "a675dd66407e45294457aec2deac1a15": 147456,
+        "42e0b9148e4c9d70f92f3ac3eba1b641": 151552
+      },
+      "expectedSetVerificationModes": {
+        "5cae870ae9ffabe4a05266cc3f2aeea5": [
+          "grid"
+        ],
+        "3c6b3eb390a49c950d8b009141dd1ecc": [
+          "grid"
+        ],
+        "826fac9ff4688bf8ada77795dff2414a": [
+          "grid"
+        ],
+        "44f85e189c9fa0f1083c988863d96780": [
+          "grid"
+        ],
+        "dfe859d6f4cc15283db447ec76063c11": [
+          "grid"
+        ],
+        "fe224ee96ae5f8340e5e93576c2432ed": [
+          "grid"
+        ],
+        "de8d3bf5509ca977d0fe34450d434e01": [
+          "grid"
+        ],
+        "cc9abe5cad26b06d497aa295ae5473c0": [
+          "grid"
+        ],
+        "b551a3956af90143f046da3b59b8e7c7": [
+          "grid"
+        ],
+        "bd3877ce9db8c4df26f3ec8f7ab3e6d4": [
+          "grid"
+        ],
+        "14bd6a00fa5c0f69ce20013cc6b9a40c": [
+          "grid"
+        ],
+        "59ce5d8da818416b5e063d9ca6c4a19c": [
+          "grid"
+        ],
+        "d6a0bd532ba0b532c747ccd3a77047a6": [
+          "grid"
+        ],
+        "6ef032852ff99e3be3ee3326ec0ae9b5": [
+          "grid"
+        ],
+        "97e814ddd8367688405d3701a3568e76": [
+          "grid"
+        ],
+        "c9a233154ca51095474b11837d8dfc5f": [
+          "grid"
+        ],
+        "fa9f06a45161119aab1570211a3a22c2": [
+          "grid"
+        ],
+        "a24b1ce295b7b1a3054bec690e528c24": [
+          "grid"
+        ],
+        "0a3fbaef76eff765d316eead39a5d77b": [
+          "grid"
+        ],
+        "4654738f02b44dad485780ae2b76c1d4": [
+          "grid"
+        ],
+        "cb940995550eb1728a10999c77f9cd8d": [
+          "grid"
+        ],
+        "27b628a51a09ecebee53ecb9e25ceee0": [
+          "grid"
+        ],
+        "773bacfb70ea5b8f5a8ef8fcc77a9ebf": [
+          "grid"
+        ],
+        "e10b782fbd4630c2380b4458e71dcd55": [
+          "grid"
+        ],
+        "91796d7398a3af7d529251bee2439741": [
+          "grid"
+        ],
+        "9f93f50c9da63600891f368e05b7258e": [
+          "grid"
+        ],
+        "18761a9ab6ce3163da5f61512ee40e6c": [
+          "grid"
+        ],
+        "ccf47f1bc7d9c9ab06765095bd9cf263": [
+          "grid"
+        ],
+        "9046a651d423681bf5dddd766c65324d": [
+          "grid"
+        ],
+        "6910b7c8a68e5f4f9000294079c40f60": [
+          "grid"
+        ],
+        "81ab2e0639273378ff80b242daaec966": [
+          "grid"
+        ],
+        "61eb4eb666c70b2816651b18ad54dfb2": [
+          "grid"
+        ],
+        "a675dd66407e45294457aec2deac1a15": [
+          "grid"
+        ],
+        "42e0b9148e4c9d70f92f3ac3eba1b641": [
+          "grid"
+        ]
+      },
+      "verificationReadBytes": 0
+    }
+  },
+  "expectedOutputBLAKE3": {
+    "lattice-00.bin": "c40027120130e3743fc66c61de84a7f6826bf9c757b36eb63dd268287204ce74",
+    "lattice-01.bin": "3e8370d776651f1bff2a5031a0f39e4ae6522f9aa552eb0ff3a4e34c88af18c4",
+    "lattice-02.bin": "d9d9a8aad3f2afed284b23eaf289d7e358aba4d9b5df6fdc5895810375d474bb",
+    "lattice-03.bin": "56e54e43528428e0c1e542f3264a4210b890a72cb2fa34d6e90fc08cb8cb1204",
+    "lattice-04.bin": "1bc63c51b89dbfba732af6935df5178868446163bc70f300bb04d06082941676",
+    "lattice-05.bin": "338cc3ce55f69fcd365d79127c1308feae6084471b9e5f72bc0aac5cdebdd6d3",
+    "lattice-06.bin": "63b5762404a7d9f4ba6ef3e0aa79f7cc30cad6c6d0e2e0ce45bda3faeb5bfc06",
+    "lattice-07.bin": "ed7af5561d6e14e227ee5a421899339a0832d97ce9745c88f70728f8b835cf3c",
+    "lattice-08.bin": "5dcb5c48b7bb014f80c10dfe092a6f14b53bf51ec2990b22977f180732eecc39",
+    "lattice-09.bin": "e721d8be21c52bd3d09bea00d9eb15bd089cb98bada0cec70bf1cd34502cbe77",
+    "lattice-10.bin": "85226faa358ce6dd72fd79711eb6f8d25d61498097003fa2746a941dc76412f9",
+    "lattice-11.bin": "767480806a9499f1298f3ed15255b0571d69b493fc2d8677308151817d6af85e",
+    "lattice-12.bin": "242c9ef72d1665ef44f2ef574fe2873af09b9113dc7efe2b38108536bc3e12c1",
+    "lattice-13.bin": "f9f7e49283b75c88cf535b14228183137b24ad6cae9003d841b128644dca0b22",
+    "lattice-14.bin": "c5ac92b971eb6157f13a2beb9d76d581ec6017c2ca9c9b4fddca9edc9f98a0ce",
+    "lattice-15.bin": "91d97cde327aa497f6f918ae7773b8326003519abfd2699d82be56df1232a193",
+    "lattice-16.bin": "8c48f40257e53524e3d745edf8fe466907ae8e97e50636a94acd6ab82e1d0c51",
+    "lattice-17.bin": "13e31bf851a4def93b0d2cbc9e5a8948aee1df19c3b78056a4d88396a1669426",
+    "lattice-18.bin": "94657fd428b70e5d59d216a7b64e1ce18de1d708834712dfea3ece79820455b7",
+    "lattice-19.bin": "eb2da7168c6ebfc8d6979a308965081ffea74ed098f2228cfa1a8ecf987449b3",
+    "lattice-20.bin": "a042c1b65d0331baa419107278005ab4b4e89557ff542601507c5ee373912e29",
+    "lattice-21.bin": "c4fdaa64d748f9ecb005bc882ccf0c8232d7f99e4485910623a71d6ee32326ec",
+    "lattice-22.bin": "dbfa52ab7d94981cb56967fde4aed91b1e8154f62abd8d0dfe6ecaf8720b21f6",
+    "lattice-23.bin": "97326aacd5d2189fa67b51e14173a12125538fd030c44be7a393e06f4d008b04",
+    "lattice-24.bin": "f5e58c9ae4c9c29d39e35db476baf0c6af77c0501234a7962570588f465c81cc",
+    "lattice-25.bin": "849f9d36e8109544b4ec2f3526d2abf709a989cd9c4d9f68be4c2c9fc1e50268",
+    "lattice-26.bin": "df8bff079310cc12b18647206aeb0760a3dda449626f06183f11e3014cc5db94",
+    "lattice-27.bin": "50c2805ad575bbb9e77771b2708640f8c6b26505d968ab4537452e01aa20fd86",
+    "lattice-28.bin": "c36d39ec01d4618cbdf7e54270384bf903e91446be49bbed30492febb4ca74ef",
+    "lattice-29.bin": "d14168b91385aeddefab487ae7d6278af0c8b79826a0bbf8fc58aece9a5c5d4a",
+    "lattice-30.bin": "a2cced7cc344076ae2dc0ec769670ef2f77ea710f47ce07ec4792d74d26da324",
+    "lattice-31.bin": "6c5aecc7d0a28542032588c17b9f8c19e4274a06e6ba66613d72cc38f08b7624",
+    "lattice-32.bin": "0f341ed909b6f98fb1079e83039f045b9af3a7d0cf1ffdb8ec46492853746c9d",
+    "lattice-33.bin": "334b1297739e2a8c6f93b81b28edc4a7e4ee7be12120b4a89f7d9669d603f891"
+  }
+}

@@ -1,0 +1,31 @@
+{{- if .Values.torrents.enabled }}
+{{- $svc := .Values.torrents.service }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ printf "%s-torrent" (include "weaver.fullname" .) }}
+  labels:
+    {{- include "weaver.labels" . | nindent 4 }}
+  {{- with include "weaver.annotations" (dict "root" . "extra" $svc.annotations) }}{{ . | nindent 2 }}{{- end }}
+spec:
+  type: {{ $svc.type }}
+  # Peers see their own addresses, and no other node relays their packets.
+  externalTrafficPolicy: Local
+  selector:
+    {{- include "weaver.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: torrent-tcp
+      port: {{ .Values.torrents.port }}
+      targetPort: torrent-tcp
+      protocol: TCP
+      {{- if and (eq $svc.type "NodePort") $svc.nodePort }}
+      nodePort: {{ $svc.nodePort }}
+      {{- end }}
+    - name: torrent-udp
+      port: {{ .Values.torrents.port }}
+      targetPort: torrent-udp
+      protocol: UDP
+      {{- if and (eq $svc.type "NodePort") $svc.nodePort }}
+      nodePort: {{ $svc.nodePort }}
+      {{- end }}
+{{- end }}

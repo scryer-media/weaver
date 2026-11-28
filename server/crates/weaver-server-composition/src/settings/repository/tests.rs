@@ -45,6 +45,90 @@ fn a_database_naming_no_listen_port_draws_one_and_keeps_it() {
     assert_eq!(db.load_config().unwrap().torrent.base_port, 6881);
 }
 
+// While the environment pins the listen port, a database naming none
+// reports the pin, draws no port and writes no row for it.
+#[test]
+fn a_pinned_listen_port_with_none_saved_is_the_pin_and_writes_no_row() {
+    let mut db = Database::open_in_memory().unwrap();
+    db.set_torrent_port_pin(Some(51_413));
+    let torrent = db.load_config().unwrap().torrent;
+    assert_eq!(torrent.base_port, 51_413);
+    assert!(torrent.base_port_pinned);
+    assert_eq!(db.get_setting("torrent.base_port").unwrap(), None);
+    db.load_config().unwrap();
+    assert_eq!(db.get_setting("torrent.base_port").unwrap(), None);
+}
+
+// A saved port is left as it is while the pin is the one reported, and
+// comes back once the pin is gone.
+#[test]
+fn a_pinned_listen_port_over_a_saved_one_leaves_the_saved_row() {
+    let mut db = Database::open_in_memory().unwrap();
+    db.set_setting("torrent.base_port", "6881").unwrap();
+    db.set_torrent_port_pin(Some(51_413));
+    let torrent = db.load_config().unwrap().torrent;
+    assert_eq!(torrent.base_port, 51_413);
+    assert!(torrent.base_port_pinned);
+    assert_eq!(
+        db.get_setting("torrent.base_port").unwrap().as_deref(),
+        Some("6881")
+    );
+    db.set_torrent_port_pin(None);
+    let torrent = db.load_config().unwrap().torrent;
+    assert_eq!(torrent.base_port, 6881);
+    assert!(!torrent.base_port_pinned);
+}
+
+// Removing the pin from a database that never saved a port draws one, as
+// a database without a pin always does.
+#[test]
+fn an_unpinned_load_after_a_pinned_one_draws_as_today() {
+    let mut db = Database::open_in_memory().unwrap();
+    db.set_torrent_port_pin(Some(51_413));
+    db.load_config().unwrap();
+    db.set_torrent_port_pin(None);
+    let torrent = db.load_config().unwrap().torrent;
+    assert!(!torrent.base_port_pinned);
+    assert!(crate::torrents::sessions::LISTEN_PORTS.contains(&torrent.base_port));
+    assert_eq!(
+        db.get_setting("torrent.base_port").unwrap(),
+        Some(torrent.base_port.to_string())
+    );
+}
+
+// Saving pinned settings writes every other torrent key and keeps the
+// port row as it was: unchanged when saved, absent when not.
+#[test]
+fn saving_pinned_torrent_settings_leaves_the_port_row_as_it_was() {
+    let mut db = Database::open_in_memory().unwrap();
+    db.set_torrent_port_pin(Some(51_413));
+    let mut torrent = db.load_config().unwrap().torrent;
+    torrent.max_active_downloads = 7;
+    db.save_torrent_config(&torrent).unwrap();
+    assert_eq!(db.get_setting("torrent.base_port").unwrap(), None);
+    assert_eq!(
+        db.get_setting("torrent.max_active_downloads")
+            .unwrap()
+            .as_deref(),
+        Some("7")
+    );
+
+    db.set_setting("torrent.base_port", "6881").unwrap();
+    db.save_torrent_config(&torrent).unwrap();
+    assert_eq!(
+        db.get_setting("torrent.base_port").unwrap().as_deref(),
+        Some("6881")
+    );
+
+    // Unpinned, the save writes the port as it always has.
+    torrent.base_port_pinned = false;
+    db.save_torrent_config(&torrent).unwrap();
+    assert_eq!(
+        db.get_setting("torrent.base_port").unwrap().as_deref(),
+        Some("51413")
+    );
+}
+
 #[test]
 fn settings_upsert() {
     let db = Database::open_in_memory().unwrap();
@@ -134,6 +218,7 @@ fn config_roundtrip() {
         torrent: crate::settings::TorrentConfig {
             enabled: true,
             base_port: 51_413,
+            base_port_pinned: false,
             announce_port: Some(40_000),
             upnp: false,
             encryption: crate::settings::TorrentEncryption::Require,
@@ -785,7 +870,7 @@ fn a_bound_rule_refuses_a_change_to_a_locked_field() {
             .unwrap()
             .unwrap_err();
         assert_eq!(
-            refusal,
+            refusal.to_string(),
             format!(
                 "{field} is locked by Example Tracker's tracker file; unbind the rule to change it."
             )
@@ -888,7 +973,9 @@ fn a_tracker_file_fills_and_locks_a_rules_encryption_and_transports() {
             .unwrap()
             .unwrap_err();
         assert!(
-            refusal.starts_with(&format!("{field} is locked")),
+            refusal
+                .to_string()
+                .starts_with(&format!("{field} is locked")),
             "{refusal}"
         );
     }
@@ -953,7 +1040,7 @@ fn a_bound_rule_refuses_dropping_its_files_hosts() {
         .unwrap()
         .unwrap_err();
     assert_eq!(
-        refusal,
+        refusal.to_string(),
         "*.tracker.example is locked by Example Tracker's tracker file; unbind the rule to remove it."
     );
     assert_eq!(
@@ -1029,7 +1116,7 @@ fn a_rule_holds_its_name_and_patterns_alone() {
         .save_tracker_rule(None, made("ipt", &["*.other.example"]), true, true, 2)
         .unwrap()
         .unwrap_err();
-    assert_eq!(refusal, "a rule named IPT exists");
+    assert_eq!(refusal.to_string(), "a rule named IPT exists");
     let refusal = db
         .save_tracker_rule(
             None,
@@ -1040,7 +1127,7 @@ fn a_rule_holds_its_name_and_patterns_alone() {
         )
         .unwrap()
         .unwrap_err();
-    assert_eq!(refusal, "ssl.empirehost.me is covered by IPT");
+    assert_eq!(refusal.to_string(), "ssl.empirehost.me is covered by IPT");
     assert_eq!(db.list_tracker_rules().unwrap(), std::slice::from_ref(&ipt));
 
     // The rule's own name and patterns are no collision with itself.

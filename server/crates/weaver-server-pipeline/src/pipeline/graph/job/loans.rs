@@ -34,6 +34,42 @@ pub struct Loans {
     ticket: Option<Ticket>,
     // What a repair is granted as it goes out.
     hardware: Hardware,
+    // Where the next repair to go out stands before it reads anything.
+    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
+    hold: Option<Arc<RepairHold>>,
+}
+
+// A repair kept on its thread, before it reads anything, until it is let
+// go: a test decides what the repair finds when it starts.
+#[cfg(any(test, feature = "pipeline-test-fixtures"))]
+#[derive(Default)]
+pub struct RepairHold {
+    gone: std::sync::Mutex<bool>,
+    wake: std::sync::Condvar,
+}
+
+#[cfg(any(test, feature = "pipeline-test-fixtures"))]
+impl RepairHold {
+    pub fn let_go(&self) {
+        *self
+            .gone
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = true;
+        self.wake.notify_all();
+    }
+
+    fn wait(&self) {
+        let mut gone = self
+            .gone
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        while !*gone {
+            gone = self
+                .wake
+                .wait(gone)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+    }
 }
 
 // The repair that is out: its set, its number, and what the set said of
@@ -73,7 +109,16 @@ impl Loans {
             out: None,
             ticket: None,
             hardware,
+            #[cfg(any(test, feature = "pipeline-test-fixtures"))]
+            hold: None,
         }
+    }
+
+    // The next repair to go out stands on its thread until the hold is let
+    // go.
+    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
+    pub(crate) fn hold_next_repair(&mut self) -> Arc<RepairHold> {
+        Arc::clone(self.hold.get_or_insert_with(Arc::default))
     }
 
     pub(crate) fn out(&self) -> bool {
@@ -299,6 +344,11 @@ impl Loans {
         self.out.as_ref().is_some_and(|out| out.kind == kind)
     }
 
+    // Whether a repair is out on its thread.
+    pub(crate) fn repair_out(&self) -> bool {
+        self.is_out(Work::Repair)
+    }
+
     pub(crate) fn request_stop(&self) {
         if let Some(stop) = self.out.as_ref().and_then(|out| out.stop.as_ref()) {
             stop.raise();
@@ -393,6 +443,8 @@ impl Lender for Lending<'_> {
         // it goes out: a later profile reaches the next repair, not this one.
         let grant = loans.hardware.grant();
         let shutdown = loans.hardware.shutdown().clone();
+        #[cfg(any(test, feature = "pipeline-test-fixtures"))]
+        let hold = loans.hold.take();
         tokio::task::spawn_blocking(move || {
             let _job =
                 weaver_server_base::runtime::panic_trap::JobScope::enter(crate::JobId(scope));
@@ -402,6 +454,10 @@ impl Lender for Lending<'_> {
                 generation = serial,
                 "graph repair worker started"
             );
+            #[cfg(any(test, feature = "pipeline-test-fixtures"))]
+            if let Some(hold) = hold {
+                hold.wait();
+            }
             weaver_server_base::e2e_failpoint::maybe_delay(
                 weaver_server_base::e2e_failpoint::REPAIR_TASK_START,
             );

@@ -161,11 +161,13 @@ fn cancelled_and_stale_par3_returns_keep_damaged_carriers_repairable() {
             // worker's staged repair before acknowledgment.
             wrong[1700] ^= 0x55;
             job.writer
-                .files_mut(NodeId::ROOT)
-                .leaves
-                .get_mut(&member)
-                .unwrap()
-                .write(LoopSite::LeafWrite, 1700, &wrong[1700..1701], None)
+                .write_file(
+                    &mut job.tree,
+                    (NodeId::ROOT, member),
+                    1700,
+                    &wrong[1700..1701].to_vec().into(),
+                    LoopSite::LeafWrite,
+                )
                 .unwrap();
             assert!(
                 job.file("payload.bin") == wrong,

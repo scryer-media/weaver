@@ -1123,8 +1123,11 @@ impl NetworkRuntime {
         config: &Configuration,
         id: u32,
         timeout: Duration,
-    ) -> Result<Arc<Egress>, String> {
-        let egress = config.egresses.get(&id).ok_or("egress does not exist")?;
+    ) -> Result<Arc<Egress>, RouteError> {
+        let egress = config
+            .egresses
+            .get(&id)
+            .ok_or(RouteError::Missing("egress does not exist"))?;
         Ok(Arc::new(Self::socket_egress(egress, timeout)))
     }
     // The saved egress's sockets, naming what they dial by the DNS profile
@@ -1153,8 +1156,11 @@ impl NetworkRuntime {
         inner: Arc<dyn Dialer>,
         bottom: Arc<Egress>,
         prefix: &[u32],
-    ) -> Result<Arc<dyn Dialer>, String> {
-        let profile = config.profiles.get(&id).ok_or("proxy does not exist")?;
+    ) -> Result<Arc<dyn Dialer>, RouteError> {
+        let profile = config
+            .profiles
+            .get(&id)
+            .ok_or(RouteError::Missing("proxy does not exist"))?;
         if !profile.enabled {
             return Ok(Arc::new(Unavailable(format!("proxy {id} is disabled"))));
         }
@@ -1254,7 +1260,9 @@ impl NetworkRuntime {
                         // The carrier's capacity stays at its configured MTU.
                         // The provider sizes a carried tunnel to fit after
                         // resolving its endpoint through that carrier.
-                        let spec = profile.wireguard_spec().map_err(|e| e.to_string())?;
+                        let spec = profile
+                            .wireguard_spec()
+                            .map_err(|e| RouteError::Invalid(e.to_string()))?;
                         let provider = WireGuardTunnelProvider::new(spec, observer);
                         let provider = match tunnel_capture_path(
                             std::env::var_os(TUNNEL_CAPTURE_DIR_ENV).as_deref(),
@@ -1276,7 +1284,7 @@ impl NetworkRuntime {
                                 if config.profiles.get(beneath).map(|p| p.kind)
                                     != Some(ProxyKind::WireGuard)
                                 {
-                                    return Err("WireGuard must be the first hop on an egress or sit directly on another WireGuard hop".into());
+                                    return Err(RouteError::Invalid("WireGuard must be the first hop on an egress or sit directly on another WireGuard hop".into()));
                                 }
                                 let Some(carrier) = inner.clone().carrier_datagrams() else {
                                     return Ok(Arc::new(Unavailable(format!(
@@ -1300,13 +1308,17 @@ impl NetworkRuntime {
                     }
                     ProxyKind::Http3Connect => {
                         if !prefix.is_empty() {
-                            return Err("HTTP/3 must be the first hop on an egress".into());
+                            return Err(RouteError::Invalid(
+                                "HTTP/3 must be the first hop on an egress".into(),
+                            ));
                         }
                         Arc::new(
                             Http3TunnelProvider::new(
-                                profile.http3_spec().map_err(|e| e.to_string())?,
+                                profile
+                                    .http3_spec()
+                                    .map_err(|e| RouteError::Invalid(e.to_string()))?,
                             )
-                            .map_err(|e| e.to_string())?
+                            .map_err(|e| RouteError::Fault(e.to_string()))?
                             .with_udp_factory(bottom.clone())
                             .with_endpoint_resolver(Arc::new(EndpointNames(
                                 bottom.clone(),
@@ -1392,8 +1404,11 @@ impl NetworkRuntime {
         id: u32,
         bottom: Arc<Egress>,
         whole: bool,
-    ) -> Result<Arc<dyn Dialer>, String> {
-        let pool = config.pools.get(&id).ok_or("proxy pool does not exist")?;
+    ) -> Result<Arc<dyn Dialer>, RouteError> {
+        let pool = config
+            .pools
+            .get(&id)
+            .ok_or(RouteError::Missing("proxy pool does not exist"))?;
         let key = (id, bottom.id());
         if !pool.enabled {
             if let Some(stage) = self.pools.lock().expect("network pools").get(&key) {
@@ -1418,7 +1433,7 @@ impl NetworkRuntime {
                     self.hop(config, *id, bottom.clone(), bottom.clone(), &[])?,
                 ))
             })
-            .collect::<Result<Vec<_>, String>>()?;
+            .collect::<Result<Vec<_>, RouteError>>()?;
         let mut pools = self.pools.lock().expect("network pools");
         let stage = if let Some(stage) = pools.get(&key) {
             if whole {
@@ -1460,7 +1475,7 @@ impl NetworkRuntime {
         leg: &RouteLeg,
         timeout: Duration,
         profile: Option<u32>,
-    ) -> Result<LiveLeg, String> {
+    ) -> Result<LiveLeg, RouteError> {
         if !config.egresses.contains_key(&leg.egress_id) {
             let warning = config.missing_egress_warning(&consumer.key(), position, leg.egress_id);
             return Ok(LiveLeg {
@@ -1507,7 +1522,10 @@ impl NetworkRuntime {
                             self.hop(config, *id, bottom.clone(), bottom.clone(), &[])?
                         }
                         Rung::Pool { id } => {
-                            let pool = config.pools.get(id).ok_or("proxy pool does not exist")?;
+                            let pool = config
+                                .pools
+                                .get(id)
+                                .ok_or(RouteError::Missing("proxy pool does not exist"))?;
                             // An edit to the pool's members reaches, through
                             // the pool's stage, only the members it touches,
                             // so it keeps the leg: every other member keeps
@@ -1546,7 +1564,7 @@ impl NetworkRuntime {
             "{}:{:?}:{}:{versions:?}:{pool_versions:?}",
             leg.egress_id,
             bottom.binding(),
-            serde_json::to_string(&leg.path).map_err(|e| e.to_string())?
+            serde_json::to_string(&leg.path).map_err(|e| RouteError::Fault(e.to_string()))?
         );
         // A DNS change rebuilds no leg: the leg reads its names from the slot
         // at each dial, and a torrent leg is shared whatever its routes'

@@ -128,11 +128,22 @@ pub struct Leaf {
     // writes land so the member's own digest is known without reading the
     // file back.
     pub written: BTreeMap<u64, Written>,
-    // The bytes that changed after they were written, by start and the
-    // revision that changed them, to where they end: what a write replaced,
-    // a close cut off or a start over emptied. A byte written for the first
-    // time changes nothing anyone read.
-    changed: BTreeMap<(u64, u64), u64>,
+    // The checked stamp was applied (`fold_checked`): a digest it gave that
+    // a later write took away is not given again without a check. Not kept;
+    // a start over (`truncate`) takes it back, and a retraction drops the
+    // whole leaf.
+    stamped: bool,
+    // The bytes that changed after they were written, by start, to the
+    // latest revision that changed them and where they end: what a write
+    // replaced, a close cut off or a start over emptied. The stretches are
+    // disjoint. A byte written for the first time changes nothing anyone
+    // read. Only a repair's check of what it read asks (`changed_since`),
+    // so a change is kept only while one may still be checked: its caller
+    // says so (`record`), and the namespace writer empties the map once no
+    // repair's read is left to check. A repair lent at revision R counts
+    // only changes past R, and every one of those is made while its read
+    // may be checked, so each is here when it asks.
+    changed: BTreeMap<u64, (u64, u64)>,
     // The volume writer the file's operations go to, when the leaf does not
     // run them itself. Everything the leaf records of its file is as it
     // will be once what it submitted has returned; whoever needs the disk
@@ -375,6 +386,7 @@ impl Leaf {
             file: None,
             on_disk,
             written: BTreeMap::new(),
+            stamped: false,
             changed: BTreeMap::new(),
             queued: None,
         }
@@ -479,28 +491,80 @@ impl Leaf {
     }
 
     // Whether a byte of `start..end` changed since the leaf stood at `seen`,
-    // or the leaf is another file than the one seen then.
-    pub(crate) fn changed_since(&self, seen: (u64, u64), start: u64, end: u64) -> bool {
+    // or the leaf is another file than the one seen then. The map holds, for
+    // every byte, the latest revision that changed it, so a range changed
+    // since `seen` exactly when one of the stretches it spans did. Asked
+    // only for a read that may still be checked (`checked`), whose changes
+    // the map kept.
+    pub(crate) fn changed_since(
+        &self,
+        seen: (u64, u64),
+        start: u64,
+        end: u64,
+        checked: bool,
+    ) -> bool {
+        debug_assert!(checked, "a change asked of a read no longer checked");
         seen.0 != self.identity
             || self
-                .changed
-                .range(..(end, 0))
-                .any(|(&(from, revision), &to)| revision > seen.1 && to > start && from < end)
+                .spanned(start, end)
+                .any(|(from, (revision, to))| revision > seen.1 && to > start && from < end)
     }
 
-    // `start..end` changed at this revision; what it changed before, within
-    // it, is answered by it.
-    fn change(&mut self, start: u64, end: u64) {
-        let within: Vec<(u64, u64)> = self
+    // The stretches of `changed` that `start..end` may reach: the one at or
+    // before its start, which may end before it, and every one starting
+    // inside it. They are disjoint, so no stretch before those reaches it.
+    fn spanned(&self, start: u64, end: u64) -> impl Iterator<Item = (u64, (u64, u64))> + '_ {
+        let from = self
             .changed
-            .range((start, 0)..(end, 0))
-            .filter(|(_, to)| **to <= end)
-            .map(|(key, _)| *key)
-            .collect();
-        for key in within {
-            self.changed.remove(&key);
+            .range(..=start)
+            .next_back()
+            .map_or(start, |(from, _)| *from);
+        self.changed
+            .range(from..end.max(from))
+            .map(|(from, stretch)| (*from, *stretch))
+    }
+
+    // `start..end` changed at this revision, which is the latest: every
+    // stretch it overlaps keeps only what lies outside it, at the revision
+    // that stretch had, and it is joined to a neighbour it abuts that
+    // changed at this revision too. Nothing is kept unless `record`: no
+    // repair's read is left to check against it.
+    fn change(&mut self, record: bool, mut start: u64, mut end: u64) {
+        if !record || start >= end {
+            return;
         }
-        self.changed.insert((start, self.revision), end);
+        let overlapped: Vec<(u64, (u64, u64))> = self
+            .spanned(start, end)
+            .filter(|(_, (_, to))| *to > start)
+            .collect();
+        for (from, (revision, to)) in overlapped {
+            self.changed.remove(&from);
+            if from < start {
+                self.changed.insert(from, (revision, start));
+            }
+            if to > end {
+                self.changed.insert(end, (revision, to));
+            }
+        }
+        if let Some((&from, &(revision, to))) = self.changed.range(..start).next_back()
+            && to == start
+            && revision == self.revision
+        {
+            self.changed.remove(&from);
+            start = from;
+        }
+        if let Some(&(revision, to)) = self.changed.get(&end)
+            && revision == self.revision
+        {
+            self.changed.remove(&end);
+            end = to;
+        }
+        self.changed.insert(start, (self.revision, end));
+    }
+
+    // No repair's read is left to check: what the leaf kept for one goes.
+    pub(crate) fn forget_changes(&mut self) {
+        self.changed.clear();
     }
 
     pub fn path(&self) -> &Path {
@@ -560,13 +624,14 @@ impl Leaf {
 
     // The file already holds `len` bytes at `offset` that a write of them
     // would put there again: it is recorded as that write, folding nothing,
-    // and nothing goes to disk.
-    pub(crate) fn wrote_in_place(&mut self, offset: u64, len: u64) {
+    // and nothing goes to disk. `record`: a repair's read may still be
+    // checked against what it replaced (`changed`).
+    pub(crate) fn wrote_in_place(&mut self, offset: u64, len: u64, record: bool) {
         self.revision += 1;
         let span = (offset, offset + len);
         let overlapped = self.overlapped(span);
         for (from, to) in &overlapped {
-            self.change(*from, *to);
+            self.change(record, *from, *to);
         }
         let replaced = vec![None; overlapped.len()];
         self.wrote(span, None, &overlapped, &replaced);
@@ -594,15 +659,18 @@ impl Leaf {
     // of it holes, where its filesystem is known to make holes
     // (`sparse::create_sized` has the rule); anywhere else writes grow the
     // file only as far as their bytes, so a declared length never takes
-    // unwritten space. Close sets the final size either way.
+    // unwritten space. Close sets the final size either way. `record`: a
+    // repair's read may still be checked against what it replaces
+    // (`changed`).
     pub fn write(
         &mut self,
         site: LoopSite,
         offset: u64,
         bytes: &[u8],
         length: Option<u64>,
+        record: bool,
     ) -> Result<(), LeafError> {
-        self.put(site, offset, bytes, None, length)
+        self.put(site, offset, bytes, None, length, record)
     }
 
     // Write `bytes` at `offset` and fold their `algorithm` digest, from the
@@ -614,8 +682,16 @@ impl Leaf {
         bytes: &Evidenced,
         algorithm: Algorithm,
         length: Option<u64>,
+        record: bool,
     ) -> Result<(), LeafError> {
-        self.put(site, offset, bytes, Some((algorithm, bytes)), length)
+        self.put(
+            site,
+            offset,
+            bytes,
+            Some((algorithm, bytes)),
+            length,
+            record,
+        )
     }
 
     // `site` is where the write was made from: what its waits count under.
@@ -626,6 +702,7 @@ impl Leaf {
         bytes: &[u8],
         fold: Option<(Algorithm, &Evidenced)>,
         length: Option<u64>,
+        record: bool,
     ) -> Result<(), LeafError> {
         self.revision += 1;
         if self.queued.is_none() {
@@ -634,7 +711,7 @@ impl Leaf {
         let span = (offset, offset + bytes.len() as u64);
         let overlapped = self.overlapped(span);
         for (from, to) in &overlapped {
-            self.change(*from, *to);
+            self.change(record, *from, *to);
         }
         let replaced = self.replaced(site, &overlapped, fold.map(|(algorithm, _)| algorithm))?;
         if let Some(open) = self.queued.as_ref().map(|queued| queued.open) {
@@ -806,11 +883,11 @@ impl Leaf {
     // The file ends at `length`: the runs past it go, and a run it cuts
     // keeps the CRC of what stays, the bytes it loses undone from it, read
     // before they go.
-    fn cut(&mut self, site: LoopSite, length: u64) -> Result<(), LeafError> {
+    fn cut(&mut self, site: LoopSite, length: u64, record: bool) -> Result<(), LeafError> {
         if let Some((_, last)) = self.written.iter().next_back()
             && last.end > length
         {
-            self.change(length, last.end);
+            self.change(record, length, last.end);
         }
         let past: Vec<u64> = self
             .written
@@ -901,6 +978,25 @@ impl Leaf {
                     digest: Some(digest),
                 },
             );
+        }
+    }
+
+    // The fold of a member whose producer checked the `length` bytes it
+    // wrote against `digest` as it decoded them: the one run written over
+    // exactly them, which folded nothing, takes the digest, and nothing is
+    // hashed or read. A write that lands on the run after this takes the
+    // digest away again, as from any folded run it cannot fold, and it is
+    // given once: what a later write took away is checked, not stamped.
+    pub fn fold_checked(&mut self, length: u64, digest: Digest) {
+        if self.stamped || length == 0 || self.written.len() != 1 {
+            return;
+        }
+        if let Some(run) = self.written.get_mut(&0)
+            && run.end == length
+            && run.digest.is_none()
+        {
+            run.digest = Some(digest);
+            self.stamped = true;
         }
     }
 
@@ -1080,14 +1176,15 @@ impl Leaf {
     // Every byte is in: the file takes its final length. The writer keeps
     // its handle for a repair's writes and later closes; a move, a removal,
     // a release at delivery or the job's end lets it go. A directory has no
-    // bytes to take: it is made.
-    pub fn close(&mut self, site: LoopSite, length: u64) -> Result<(), LeafError> {
+    // bytes to take: it is made. `record`: a repair's read may still be
+    // checked against what the close cuts off (`changed`).
+    pub fn close(&mut self, site: LoopSite, length: u64, record: bool) -> Result<(), LeafError> {
         if self.directory {
             return self.create_directory();
         }
         self.revision += 1;
         if self.queued.is_some() {
-            self.cut(site, length)?;
+            self.cut(site, length, record)?;
             let create = self.create(Some(length));
             let made = self.on_disk;
             let queued = self.queued.as_mut().expect("checked above");
@@ -1104,7 +1201,7 @@ impl Leaf {
             return Ok(());
         }
         self.open(Some(length))?;
-        self.cut(site, length)?;
+        self.cut(site, length, record)?;
         let file = self.file.as_ref().expect("opened above");
         file.set_len(length)
             .map_err(LeafError::on(&self.path, self.device))?;
@@ -1135,11 +1232,13 @@ impl Leaf {
     }
 
     // The member starts over: the file stays, so the name stays reserved on
-    // disk, but none of its bytes do.
-    pub fn truncate(&mut self) -> Result<(), LeafError> {
+    // disk, but none of its bytes do. `record`: a repair's read may still
+    // be checked against what went (`changed`).
+    pub fn truncate(&mut self, record: bool) -> Result<(), LeafError> {
         self.revision += 1;
         self.written.clear();
-        self.change(0, u64::MAX);
+        self.stamped = false;
+        self.change(record, 0, u64::MAX);
         let create = self.queued.is_some().then(|| self.create(None));
         if let (Some(create), Some(queued)) = (create, self.queued.as_mut()) {
             queued.let_go();
@@ -1480,3 +1579,6 @@ pub mod counting {
         (READ.with(Cell::get), WRITTEN.with(Cell::get))
     }
 }
+
+#[cfg(test)]
+mod tests;

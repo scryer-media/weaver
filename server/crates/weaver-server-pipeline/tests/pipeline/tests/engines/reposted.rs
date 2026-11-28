@@ -221,6 +221,37 @@ fn lose_posting(posts: Vec<Post>, file: u32) -> Scenario {
     })
 }
 
+// Each reading of the delivery reads the places of what arrived once, and
+// only when it asks of a posting the feed gave up, however many it asks
+// of: with both first postings of a twice-posted set lost whole, every
+// reading asks of both and reads the places once; with nothing lost, no
+// reading reads them.
+#[tokio::test]
+async fn a_delivery_reads_what_arrived_once_for_all_it_lost() {
+    use weaver_server_pipeline::pipeline::graph::status::seams::{ARRIVED_COST, ArrivedCost};
+    let body = body();
+    let cost_of = async |scenario: Scenario| {
+        ARRIVED_COST.with(|cost| cost.set(ArrivedCost::default()));
+        assert_one_member(&run(&scenario).await, &body);
+        ARRIVED_COST.with(std::cell::Cell::get)
+    };
+    let lost = cost_of(lose_each(
+        twice(single_member_store_set(MEMBER, &body, 2)),
+        &[0, 1],
+    ))
+    .await;
+    assert!(lost.calls > 0, "{lost:?}");
+    assert_eq!(lost.lost_calls, lost.calls, "{lost:?}");
+    assert_eq!(lost.most_asks, 2, "{lost:?}");
+    assert_eq!(lost.reads, lost.lost_calls, "{lost:?}");
+    let whole = cost_of(Scenario::new(twice(single_member_store_set(
+        MEMBER, &body, 2,
+    ))))
+    .await;
+    assert!(whole.calls > 0, "{whole:?}");
+    assert_eq!((whole.lost_calls, whole.reads), (0, 0), "{whole:?}");
+}
+
 // One posting lost whole and no recovery set: the copy numbered alike
 // brings the volume and the set extracts whole. The lost posting is no file
 // of its own, and the post's health counts the volume once, so the job

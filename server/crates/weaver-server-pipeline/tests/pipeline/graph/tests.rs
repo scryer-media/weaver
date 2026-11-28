@@ -913,6 +913,46 @@ async fn a_blocked_checkpoint_of_a_job_outside_the_pipeline_goes_to_it() {
     retire_pipeline_database(pipeline).await;
 }
 
+// A job outside the pipeline, such as a torrent's unpacking, is never
+// admitted as an NZB: its runs' mail comes with the pipeline's slots, so a
+// run it queued on that mail starts. It holds back its own runs while it is
+// paused or stopped.
+#[tokio::test]
+async fn a_job_outside_the_pipeline_hears_its_mail_with_the_pipelines_slots() {
+    use std::sync::Arc;
+
+    use super::engine::Hears;
+
+    #[derive(Default)]
+    struct Slots(std::sync::Mutex<Vec<usize>>);
+    impl Hears for Slots {
+        fn said(&self, _said: Said, slots: usize) {
+            self.0.lock().unwrap().push(slots);
+        }
+
+        fn hold_clock(&self, _paused: bool) {}
+    }
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let outside = JobId(92_112);
+    let heard = Arc::new(Slots::default());
+    pipeline
+        .graph_outside
+        .join(outside.0, Arc::clone(&heard) as Arc<dyn Hears>);
+    pipeline.graph_run_said(Said {
+        scope: outside.0,
+        node: weaver_graph::NodeId::ROOT,
+        generation: 0,
+        heard: Heard::Ended,
+    });
+    let limit = pipeline.tuner.max_concurrent_extractions();
+    assert!(limit > 0);
+    assert_eq!(*heard.0.lock().unwrap(), [limit]);
+    pipeline.graph_outside.leave(outside.0);
+    retire_pipeline_database(pipeline).await;
+}
+
 // A graph job kept across a pause holds its extraction clock while paused
 // and lets it run again on resume, so the pause is never charged as
 // extraction time.
@@ -1505,6 +1545,7 @@ async fn a_delivery_with_a_damaged_member_settles_to_partial() {
             unchecked: Vec::new(),
             unrepaired: Vec::new(),
             withheld: Vec::new(),
+            unmade: Vec::new(),
             removed: Vec::new(),
             files: vec![
                 delivered("echo-0.mkv", 1, true),

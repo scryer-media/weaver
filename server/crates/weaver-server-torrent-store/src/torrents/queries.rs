@@ -3,7 +3,7 @@
 
 use crate::torrents::model::{
     ContentLayout, FilePriority, Infohash, KeptIntent, TorrentCounters, TorrentRecord,
-    TorrentSource, TrackerEntry, UnpackEnd, UnpackResult,
+    TorrentSource, TrackerEntry, UnpackCause, UnpackEnd, UnpackResult,
 };
 use crate::torrents::model::{parse_file_priorities, parse_named_by};
 use weaver_server_base::jobs::ids::JobId;
@@ -18,7 +18,7 @@ pub const TORRENT_COLUMNS: &str = "job_id, infohash_v1, infohash_v2, name, sourc
      category_id, added_at_ms, state, forced, completed_at_ms, storage_dir, \
      policy_override, unpack, unpack_in_force, metadata, upload_limit, download_limit, \
      sequential, first_last_piece_first, save_path, content_layout, files_dir, seed_mode, move_to, \
-     queue_position, pool_member, private, unpack_over, download_ends, unpack_end, unpack_why";
+     queue_position, pool_member, private, unpack_over, download_ends, unpack_end, unpack_why, unpack_cause";
 
 pub fn corrupt(what: &str, value: impl std::fmt::Display) -> StateError {
     StateError::Database(format!("stored torrent {what} is not valid: {value}"))
@@ -153,6 +153,11 @@ fn unpack_end_of(row: &SqlRow) -> Result<Option<UnpackEnd>, StateError> {
     Ok(Some(UnpackEnd {
         result,
         why: row.opt_text("unpack_why")?,
+        // A code it does not know, as from a later release, reads as none.
+        cause: row
+            .opt_text("unpack_cause")?
+            .as_deref()
+            .and_then(UnpackCause::parse),
     }))
 }
 
@@ -913,6 +918,7 @@ impl<T: TorrentDatabase> TorrentsInternalQueries for T {
 
 pub trait TorrentsQueries {
     fn get_torrent(&self, job_id: JobId) -> Result<Option<TorrentRecord>, StateError>;
+    fn torrent_metadata(&self, job_id: JobId) -> Result<Vec<(String, String)>, StateError>;
     fn get_torrent_by_infohash(
         &self,
         infohashes: &[Infohash],
@@ -943,6 +949,27 @@ impl<T: TorrentDatabase> TorrentsQueries for T {
             .as_ref()
             .map(|row| torrent_from_row(row, key.as_ref()))
             .transpose()
+        })
+    }
+
+    // The metadata the torrent of `job_id` was added with, and nothing else
+    // of its row; none for no such torrent. One read by key.
+    fn torrent_metadata(&self, job_id: JobId) -> Result<Vec<(String, String)>, StateError> {
+        let datastore = self.borrow().datastore();
+        self.borrow().run_sql_blocking_read(async move {
+            let row = SqlRuntime::fetch_optional(
+                datastore.read_exec(),
+                "SELECT metadata FROM torrents WHERE job_id = {}",
+                &[SqlArg::I64(job_id.0 as i64)],
+            )
+            .await?;
+            Ok(row
+                .map(|row| row.opt_text("metadata"))
+                .transpose()?
+                .flatten()
+                .map(|json| serde_json::from_str(&json).map_err(|error| corrupt("metadata", error)))
+                .transpose()?
+                .unwrap_or_default())
         })
     }
 

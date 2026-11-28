@@ -14,7 +14,7 @@ use weaver_graph::{Emit, Engine, MemberId, NodeId, VolumeIndex, Why};
 
 use super::{GraphError, GraphJob};
 use crate::pipeline::graph::engine::{Heard, Reservation, Said};
-use crate::pipeline::graph::namespace::{Coming, Returned, Tailed, WriteError};
+use crate::pipeline::graph::namespace::{Coming, Returned, Tailed, WriteError, archive_name};
 use crate::pipeline::graph::status::RepairSlots;
 
 // Words for a job no one is left to hear: the staged output a repair, a
@@ -46,6 +46,7 @@ impl GraphJob {
             }
             Heard::Repaired(returned) => {
                 self.loans.returned(said.node, said.generation);
+                self.end_repair_reads();
                 returned.repaired.remove().map_err(WriteError::from)?;
             }
             Heard::Replayed(replayed) => {
@@ -425,11 +426,24 @@ impl GraphJob {
                     job_id = self.runs.scope(),
                     node = node.0,
                     kind = %self.tree.kind(node).map(|kind| kind.to_string()).unwrap_or_default(),
-                    archive = %self.archive_name(node),
+                    archive = %archive_name(&self.tree, node),
                     error = %error,
                     "extraction failed"
                 );
                 return Ok(());
+            }
+            // A run of an object that places members of its own fails only
+            // the members the run makes: they stay as it left them, and the
+            // object, and what it placed, stand. A window the job waits for
+            // room for is waited for as below.
+            Heard::Emit(Emit::Refuse(why))
+                if self.runs.has(node)
+                    && self.tree.places_own(node)
+                    && !(matches!(why, Why::TooLarge { .. })
+                        && self.runs.window_needs(node).is_some()) =>
+            {
+                self.writer.refuse_made(&self.tree, node, why);
+                Vec::new()
             }
             Heard::Emit(emit) => {
                 // A window no folder had room for, asked by a run held to
@@ -517,6 +531,7 @@ impl GraphJob {
         limit: usize,
     ) -> Result<(), GraphError> {
         if !self.loans.returned(set, serial) {
+            self.end_repair_reads();
             return Ok(returned.repaired.remove().map_err(WriteError::from)?);
         }
         // A repair the stop ended while a volume's writer still holds
@@ -552,6 +567,7 @@ impl GraphJob {
         };
         if self.disk().is_some_and(|disk| !disk.quiet()) {
             self.pending().left_at_stop();
+            self.end_repair_reads();
             let _ = returned.repaired.remove();
             return Ok(false);
         }
@@ -573,7 +589,17 @@ impl GraphJob {
     pub(in crate::pipeline) fn leave_stopped_repair(&mut self) {
         if let Some(returned) = self.stopped_repair.take() {
             self.pending().left_at_stop();
+            self.end_repair_reads();
             let _ = returned.repaired.remove();
+        }
+    }
+
+    // A repair's return was taken back or given up: once no other repair is
+    // out or kept, no read is left to check, and the leaves let go of what
+    // they kept for one (`NamespaceWriter::end_repair_reads`).
+    fn end_repair_reads(&mut self) {
+        if !self.loans.repair_out() && self.stopped_repair.is_none() {
+            self.writer.end_repair_reads();
         }
     }
 
@@ -593,7 +619,11 @@ impl GraphJob {
             &objects,
             returned,
             &mut out,
-        )?;
+        );
+        // The return's read was checked, or never will be: before what it
+        // came to is applied and the next repair goes out.
+        self.end_repair_reads();
+        let tailed = tailed?;
         // The return is applied a slice at a time, from its staged output
         // read back off the loop (`Loans::apply`): its tail runs as the
         // reader is done (`Heard::RepairRead`).
@@ -675,11 +705,15 @@ impl GraphJob {
         }
         loop {
             let limit = self.run_limit(pipeline_limit);
+            self.invalidate_runs();
             let (engines, gone) = self.touched_engines();
             admitted.extend(self.runs.forget(gone, limit));
             for (&node, &facts) in &engines {
                 self.feed(node, facts)?;
                 let shelf = self.writer.shelf(node);
+                // What a candidate failed on before a repair behind the run
+                // proves nothing of it: the candidates are tried again.
+                self.passwords.rewind(node, shelf.repaired());
                 let asks = match self.runs.generation(node) {
                     Some(generation) if generation != shelf.generation() => {
                         self.retract_run(node)?;
@@ -709,8 +743,50 @@ impl GraphJob {
                 return Ok(());
             }
             for node in std::mem::take(&mut admitted) {
-                admitted.extend(self.start_run(node)?);
+                admitted.extend(self.start_run(node, limit)?);
             }
+        }
+    }
+
+    // An object that retracted, of its own accord, a member its run makes
+    // invalidates the node's run on record: its shelf starts over, as behind
+    // a repair, and the run is retracted and asked again once its node is
+    // brought up. The member is the run's when the tree's record said so as
+    // it went, which reaches one a replaced map dropped, or says so now: one
+    // the object said again under a map that has its run make it. A
+    // retracted record keeps whose member it was until it is announced
+    // again, so one that was the object's and is not said again is not the
+    // run's now.
+    fn invalidate_runs(&mut self) {
+        for (node, member, made) in self.writer.take_retracted() {
+            if !self.runs.has(node) {
+                continue;
+            }
+            let now = self.tree.is_live(node)
+                && self.tree.engine(node).is_some()
+                && self
+                    .tree
+                    .namespace(node)
+                    .and_then(|namespace| namespace.get(member))
+                    .is_some_and(|record| !record.own);
+            if made || now {
+                self.writer.restart_shelf(node);
+            }
+        }
+    }
+
+    // The job is quiet and the node's run still asks for a password no
+    // candidate answered. An engine's object refuses its whole set for it
+    // as it hears quiet; a run of an object that places members of its own
+    // fails only the members it makes, for the password, as a run's own
+    // refusal does, and the object and what it placed stand.
+    pub(super) fn refuse_unanswered(&mut self, node: NodeId) {
+        if !self.tree.run_asking(node) {
+            return;
+        }
+        if self.runs.has(node) && self.tree.places_own(node) {
+            self.writer
+                .refuse_made(&self.tree, node, Why::EncryptedHeader);
         }
     }
 
@@ -724,17 +800,21 @@ impl GraphJob {
     // Start the node's run once its memory is reserved. A run whose memory
     // can never fit is refused to the tree as a run's own refusal is; one
     // that does not fit now hands back the nodes its slot admitted.
-    fn start_run(&mut self, node: NodeId) -> Result<Vec<NodeId>, GraphError> {
-        let Some(engine) = self.tree.engine(node) else {
-            return Ok(Vec::new());
-        };
-        let Some(window) = engine.reserve() else {
-            return Ok(Vec::new());
+    fn start_run(&mut self, node: NodeId, limit: usize) -> Result<Vec<NodeId>, GraphError> {
+        // An object out on loan answers nothing, and one with nothing to
+        // run on declares no window: the run waits unstarted, holding no
+        // slot, and is asked again once the node is touched.
+        let Some((window, lends)) = self
+            .tree
+            .engine(node)
+            .and_then(|engine| Some((engine.reserve()?, engine.lends())))
+        else {
+            return Ok(self.runs.defer(node, limit));
         };
         // Whether the decoder borrows a window over its grant from a
         // scratch file as it asks for it, or is given it in RAM
         // (`Engine::lends`).
-        let refused = match self.runs.reserve_for(node, window, engine.lends()) {
+        let refused = match self.runs.reserve_for(node, window, lends) {
             Reservation::Granted => None,
             Reservation::Starved(admitted) => return Ok(admitted),
             Reservation::Refused { needed, allowed } => Some(Why::TooLarge {
@@ -744,6 +824,14 @@ impl GraphJob {
             Reservation::Beyond { needed, memory } => Some(Why::OverMachine { needed, memory }),
         };
         if let Some(why) = refused {
+            // As a run's own refusal: only what the run makes fails, and
+            // the run ends where it stands, under the shelf's generation,
+            // so it is not asked again until a repair or an offer moves it.
+            if self.tree.places_own(node) {
+                self.writer.refuse_made(&self.tree, node, why);
+                let generation = self.writer.shelf(node).generation();
+                return Ok(self.runs.ended(node, generation, limit));
+            }
             let mut effects = Vec::new();
             self.tree.emitted(
                 node,
@@ -754,6 +842,9 @@ impl GraphJob {
             self.settle(effects)?;
             return Ok(Vec::new());
         }
+        if self.tree.places_own(node) {
+            self.writer.unrefuse_made(&self.tree, node);
+        }
         if let Some(extraction) = self.tree.start(node) {
             let shelf = self.writer.shelf(node);
             self.runs.start(node, extraction, shelf);
@@ -761,28 +852,17 @@ impl GraphJob {
         Ok(Vec::new())
     }
 
-    // The archive the object at `node` reads, as the namespace it is bound
-    // in names its first volume.
-    fn archive_name(&self, node: NodeId) -> String {
-        self.tree
-            .volumes(node)
-            .and_then(|(parent, volumes)| {
-                let member = volumes.values().next()?;
-                let namespace = self.tree.namespace(parent)?;
-                Some(namespace.get(*member)?.name.clone())
-            })
-            .unwrap_or_default()
-    }
-
     // Everything the run built was built on bytes a repair replaced, at a
-    // window too narrow, or while the job waits for room. The members start
-    // over; the envelope keeps the repaired bytes in place. The run runs
-    // again from the start in every case, and writes them again: while the
-    // job waits for room, it wakes only once its disk has room for them.
+    // window too narrow, or while the job waits for room. The members it
+    // made start over; the envelope keeps the repaired bytes in place. The
+    // run runs again from the start in every case, and writes them again:
+    // while the job waits for room, it wakes only once its disk has room
+    // for them.
     fn retract_run(&mut self, node: NodeId) -> Result<(), GraphError> {
         let retracts = self.members(node).into_iter().map(Emit::Retract).collect();
         let mut effects = Vec::new();
         self.writer.rewriting(true);
+        self.writer.run_speaks(Some(node));
         self.tree.emitted(
             node,
             retracts,
@@ -790,15 +870,25 @@ impl GraphJob {
             &mut effects,
         );
         let settled = self.settle(effects);
+        self.writer.run_speaks(None);
         self.writer.rewriting(false);
         settled
     }
 
+    // The members the node's run made: those of its namespace the tree's
+    // record does not give its object, every one of an engine. None before
+    // a run is on record.
     fn members(&self, node: NodeId) -> Vec<MemberId> {
+        if !self.runs.has(node) {
+            return Vec::new();
+        }
         self.tree
             .namespace(node)
-            .map(|namespace| namespace.members().map(|member| member.id).collect())
-            .unwrap_or_default()
+            .into_iter()
+            .flat_map(|namespace| namespace.members())
+            .filter(|member| !member.own)
+            .map(|member| member.id)
+            .collect()
     }
 
     // The engines a step brings up, each with what its parent tells it, and
@@ -810,6 +900,8 @@ impl GraphJob {
     // node is marked from its first change on, so a job's first step
     // brings every engine up.
     fn touched_engines(&mut self) -> (BTreeMap<NodeId, Facts>, Vec<NodeId>) {
+        // The facts read what is to come.
+        self.refresh_coming();
         let at = self.fed.at.unwrap_or_default();
         self.fed.at = Some(FedAt {
             tree: self.tree.generation(),
@@ -851,7 +943,10 @@ impl GraphJob {
         let mut gone = Vec::new();
         for node in touched {
             let Some((parent, _)) = self.tree.volumes(node).filter(|_| self.is_engine(node)) else {
-                if self.runs.has(node) {
+                // An object out on loan for its work answers nothing while
+                // it is out, its engine face too: its run is not gone, and
+                // stands until the object is back.
+                if self.runs.has(node) && !self.tree.lent(node) {
                     gone.push(node);
                 }
                 continue;

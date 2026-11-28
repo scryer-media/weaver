@@ -332,6 +332,15 @@ pub enum Emit {
         member: MemberId,
         crc32: u32,
     },
+    // "My headers say member M's bytes have this CRC32, and my decoder
+    // checked every byte I said for M against it as it made them": the
+    // checksum of a member decoded whole without a mismatch, said in place
+    // of `Checksum`. The member's own check takes it as what its file
+    // holds, and hashes and reads nothing.
+    Checked {
+        member: MemberId,
+        crc32: u32,
+    },
     // "Member M ends at `length`, short of the length I announced it with:
     // its checksum proved its bytes whole there." Said just before its
     // close, which takes it as the member's length.
@@ -404,6 +413,12 @@ pub enum Emit {
     // mine": a sibling holding there a volume it may carry lets it go to
     // me, where I claim it at that place. Said once per place.
     Wants(VolumeIndex),
+    // "The headers of this volume I hold moved": what they say of its
+    // members, its number, whether a volume follows or where it ends is not
+    // what it was. A member given back beside me that no object took is
+    // asked of me again, by what was parsed of it. Said once per move, never
+    // per delivery that moves nothing.
+    HeadersMoved(VolumeIndex),
     // "I know more than I did when I was offered what no object holds": a
     // member offered by clean bytes past the hole where its front stopped,
     // and taken by no object then, is offered to me again. Said once per

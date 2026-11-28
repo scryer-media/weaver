@@ -1,0 +1,25 @@
+# Free space per storage role, storage read errors, and each volume's kind,
+# write rate and write buffer. No paths. Scope: READ.
+# Variables: none.
+query DiskState {
+  diskUsage {
+    label
+    totalBytes
+    usedBytes
+    freeBytes
+  }
+  systemInfo {
+    configuredStorage {
+      labels
+      error
+    }
+    volumes {
+      label
+      storageKind
+      writeRateBytesPerSecond
+      throughputBytesPerSecond
+      bufferedBytes
+      bufferLimitBytes
+    }
+  }
+}

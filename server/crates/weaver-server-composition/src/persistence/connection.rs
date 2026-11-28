@@ -1103,6 +1103,10 @@ impl Database {
         self.connection.set_encryption_key(key);
     }
 
+    pub fn set_torrent_port_pin(&mut self, pin: Option<u16>) {
+        self.connection.set_torrent_port_pin(pin);
+    }
+
     // Open (or create) the database at `path`.
     // Runs schema migrations and configures SQLite pragmas.
     pub fn open(path: &Path) -> Result<Self, StateError> {

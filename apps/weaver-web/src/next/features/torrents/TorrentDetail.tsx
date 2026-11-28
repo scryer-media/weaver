@@ -1,34 +1,35 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
-import { useEffect, useMemo, useState, type ReactNode } from "react";
-import { useMutation, useQuery, useSubscription } from "urql";
+import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { useClient, useMutation, useQuery, useSubscription } from "urql";
 import {
   ADD_TORRENT_TRACKERS_MUTATION,
   BAN_TORRENT_PEER_MUTATION,
   DHT_ANNOUNCE_TORRENT_MUTATION,
-  SET_TORRENT_DOWNLOAD_LIMIT_MUTATION,
   REANNOUNCE_TORRENT_MUTATION,
   REMOVE_TORRENT_TRACKERS_MUTATION,
   REPLACE_TORRENT_TRACKERS_MUTATION,
   SET_TORRENT_FILE_PRIORITIES_MUTATION,
   SET_TORRENT_FIRST_LAST_PIECE_FIRST_MUTATION,
+  SET_TORRENT_RATE_LIMITS_MUTATION,
   SET_TORRENT_SEEDING_MUTATION,
   SET_TORRENT_SEQUENTIAL_MUTATION,
-  SET_TORRENT_UPLOAD_LIMIT_MUTATION,
+  TORRENT_FILE_UPDATES_SUBSCRIPTION,
   TORRENT_PEERS_QUERY,
   TORRENT_UNPACKED_FILES_QUERY,
   TORRENT_UPDATES_SUBSCRIPTION,
 } from "@/graphql/queries";
 import { useTranslate, type Translate } from "@/lib/context/translate-context";
+import { usePageVisible } from "@/lib/page-visible";
 import {
   torrentErrorText,
   resolvedByKey,
   trackerSourceKey,
   type SettingLevel,
   type TorrentActionError,
-  type TorrentChangesData,
   type TorrentData,
+  type TorrentFilePageData,
   type TorrentFilePriority,
   type TorrentPeerData,
   type TorrentTrackerData,
@@ -72,6 +73,7 @@ import {
   type PeerSort,
   type PeerSortKey,
 } from "@/next/features/torrents/peers";
+import { rereadOnChange } from "@/next/features/torrents/reread";
 import { countLabel } from "@/next/i18n/labels";
 import { testIds, torrentIds } from "@/next/testids";
 import {
@@ -95,6 +97,10 @@ const FILE_COLUMNS = {
 };
 const LIMIT_COLUMNS = { base: "minmax(0,1fr) max-content" };
 const NO_PEERS: TorrentPeerData[] = [];
+/** The files the detail shows at once; the rest are a page away. */
+const FILE_PAGE_SIZE = 200;
+/** The unpacked files read at once; the rest come on asking. */
+const UNPACKED_PAGE_SIZE = 100;
 const PEER_COLUMNS = {
   // Each row is its own grid, so every column but the shared 1fr ones has a
   // fixed width: a max-content one sized by the Ban button would sit wider in
@@ -104,34 +110,26 @@ const PEER_COLUMNS = {
 };
 
 /**
- * A torrent job's torrent, followed while the page shows it. Following it
- * again reads it at once, as a change that pushes nothing still shows.
+ * A torrent job's torrent, followed while the page shows it and the tab is
+ * visible: sent at once and again each time it moves, a change made from
+ * this screen included. Shown again, the tab reads it afresh.
  */
 export function useTorrent(id: number, active: boolean) {
   const { connection } = useNextData("connection");
-  // A push carries the torrent only when it moved, and its id once gone.
-  const [{ data }, follow] = useSubscription<
-    { torrentUpdates: TorrentChangesData<TorrentData> },
+  const visible = usePageVisible();
+  // Each push is the whole torrent as it now is, and null once it is gone.
+  const [{ data }] = useSubscription<
+    { torrentUpdates: TorrentData | null },
     TorrentData | null
   >(
     {
       query: TORRENT_UPDATES_SUBSCRIPTION,
       variables: { id },
-      pause: !active || connection.isDisconnected,
+      pause: !active || !visible || connection.isDisconnected,
     },
-    (held, pushed) => {
-      const { fullUpdate, torrents, removedIds } = pushed.torrentUpdates;
-      if (removedIds.includes(id)) return null;
-      return (
-        torrents.find((torrent) => torrent.id === id) ??
-        (fullUpdate ? null : (held ?? null))
-      );
-    },
+    (_held, pushed) => pushed.torrentUpdates,
   );
-  return {
-    torrent: active ? (data ?? null) : null,
-    refresh: () => follow(),
-  };
+  return { torrent: active ? (data ?? null) : null };
 }
 
 const ACTION_KEYS = {
@@ -214,7 +212,7 @@ function levelText(
       return t("next.torrent.seedingFromTorrent");
     case "TRACKER_RULE":
       return t("next.torrent.seedingFromTrackerRule", {
-        name: torrent.trackerRule ?? "",
+        name: torrent.trackerRuleName ?? "",
       });
     case "CATEGORY":
       return t("next.torrent.seedingFromCategory", {
@@ -256,16 +254,25 @@ function PeersBlock({
   onReport: (message: string) => void;
 }) {
   const t = useTranslate();
-  const [{ data }, reread] = useQuery<{ torrentPeers: TorrentPeerData[] }>({
+  const [{ data }, reread] = useQuery<{
+    torrent: { id: number; peerConnections: TorrentPeerData[] } | null;
+  }>({
     query: TORRENT_PEERS_QUERY,
     variables: { id: torrent.id },
     requestPolicy: "network-only",
   });
   const [banState, banPeer] = useMutation(BAN_TORRENT_PEER_MUTATION);
+  // The query reads the peers at mount; each later push of the torrent
+  // reads them again, once.
+  const readFor = useRef(torrent);
   useEffect(() => {
+    if (readFor.current === torrent) {
+      return;
+    }
+    readFor.current = torrent;
     reread({ requestPolicy: "network-only" });
   }, [torrent, reread]);
-  const peers = data?.torrentPeers ?? NO_PEERS;
+  const peers = data?.torrent?.peerConnections ?? NO_PEERS;
   // Null until a heading is clicked: the order then follows the torrent, so
   // a download that finishes turns to its uploads by itself.
   const [chosen, setChosen] = useState<PeerSort | null>(null);
@@ -473,26 +480,52 @@ function LimitsBlock({
   onReport: (message: string) => void;
 }) {
   const t = useTranslate();
-  const [, setUpload] = useMutation(SET_TORRENT_UPLOAD_LIMIT_MUTATION);
-  const [, setDownload] = useMutation(SET_TORRENT_DOWNLOAD_LIMIT_MUTATION);
-  // Each control sends its own limit alone; the server keeps the other.
-  const report = (result: { error?: TorrentActionError }) => {
-    if (result.error) {
-      onReport(torrentErrorText(result.error));
-    }
+  const [, setLimits] = useMutation<{
+    setTorrentRateLimits: {
+      id: number;
+      uploadLimitBps: number | null;
+      downloadLimitBps: number | null;
+    };
+  }>(SET_TORRENT_RATE_LIMITS_MUTATION);
+  // Both limits go in every change, so the one not changed is sent as it
+  // last stood: as the torrent pushed it, as this page sent it, or as the
+  // server answered, whichever came last.
+  const latest = useRef({
+    uploadBps: torrent.uploadLimitBps,
+    downloadBps: torrent.downloadLimitBps,
+  });
+  useEffect(() => {
+    latest.current = {
+      uploadBps: torrent.uploadLimitBps,
+      downloadBps: torrent.downloadLimitBps,
+    };
+  }, [torrent.uploadLimitBps, torrent.downloadLimitBps]);
+  const send = (change: Partial<typeof latest.current>) => {
+    const limits = { ...latest.current, ...change };
+    latest.current = limits;
+    void setLimits({ id: torrent.id, ...limits }).then((result) => {
+      if (result.error) {
+        onReport(torrentErrorText(result.error));
+        return;
+      }
+      const answer = result.data?.setTorrentRateLimits;
+      if (answer)
+        latest.current = {
+          uploadBps: answer.uploadLimitBps,
+          downloadBps: answer.downloadLimitBps,
+        };
+    });
   };
   const rows = [
     {
       label: t("next.torrent.downloadLimit"),
-      value: torrent.downloadLimit,
-      set: (download: number | null) =>
-        void setDownload({ id: torrent.id, download }).then(report),
+      value: torrent.downloadLimitBps,
+      set: (downloadBps: number | null) => send({ downloadBps }),
     },
     {
       label: t("next.torrent.uploadLimit"),
-      value: torrent.uploadLimit,
-      set: (upload: number | null) =>
-        void setUpload({ id: torrent.id, upload }).then(report),
+      value: torrent.uploadLimitBps,
+      set: (uploadBps: number | null) => send({ uploadBps }),
     },
   ];
   return (
@@ -595,11 +628,9 @@ function TrackerSource({
 
 function TrackersBlock({
   torrent,
-  onChanged,
   onReport,
 }: {
   torrent: TorrentData;
-  onChanged: () => void;
   onReport: (message: string) => void;
 }) {
   const t = useTranslate();
@@ -623,6 +654,7 @@ function TrackersBlock({
     reannounceState.fetching ||
     dhtState.fetching;
 
+  // The torrent pushes the change; nothing is read again here.
   const settle = (
     result: { error?: TorrentActionError },
     report: (message: string) => void,
@@ -631,7 +663,6 @@ function TrackersBlock({
       report(torrentErrorText(result.error));
       return false;
     }
-    onChanged();
     return true;
   };
 
@@ -794,7 +825,7 @@ function TrackersBlock({
                 {count(tracker.leechers)}
               </span>
               <span className="hidden text-center font-wv-mono text-[12px] text-wv-muted sm:block">
-                {count(tracker.peers)}
+                {count(tracker.announcedPeers)}
               </span>
               <span
                 className="hidden min-w-0 truncate text-[12px] text-wv-tertiary sm:block"
@@ -882,18 +913,46 @@ const isPriority = (value: string): value is TorrentFilePriority =>
   Object.hasOwn(PRIORITY_KEYS, value);
 
 /**
- * How the torrent's pieces are picked, and its files, each with its level.
- * A level set on one row is sent for that file alone; a level set over the
- * ticked rows is one request naming every one of them. What is shown is what
- * the torrent pushes back, never the level just sent.
+ * One page of a torrent's files, followed while the page shows it and the tab
+ * is visible: sent at once and again each time its files move. Shown again,
+ * the tab reads the page afresh.
+ */
+function useTorrentFilePage(
+  id: number,
+  after: string | null,
+): TorrentFilePageData | null {
+  const { connection } = useNextData("connection");
+  const visible = usePageVisible();
+  const variables = useMemo(
+    () => ({ id, first: FILE_PAGE_SIZE, after }),
+    [id, after],
+  );
+  const [{ data }] = useSubscription<
+    { torrentFileUpdates: TorrentFilePageData },
+    TorrentFilePageData
+  >(
+    {
+      query: TORRENT_FILE_UPDATES_SUBSCRIPTION,
+      variables,
+      pause: !visible || connection.isDisconnected,
+    },
+    (_held, pushed) => pushed.torrentFileUpdates,
+  );
+  return data ?? null;
+}
+
+/**
+ * How the torrent's pieces are picked, and its files, each with its level,
+ * a page of 200 at a time. A level set on one row is sent for that file
+ * alone; a level set over the ticked rows is one request naming every one of
+ * them, on whichever page each is. What is shown is what the torrent pushes
+ * back, never the level just sent.
  */
 function FilesBlock({
   torrent,
-  onChanged,
   onReport,
 }: {
   torrent: TorrentData;
-  onChanged: () => void;
   onReport: (message: string) => void;
 }) {
   const t = useTranslate();
@@ -906,18 +965,24 @@ function FilesBlock({
   const [firstLastState, setFirstLast] = useMutation(
     SET_TORRENT_FIRST_LAST_PIECE_FIRST_MUTATION,
   );
+  // Where each page shown so far starts: the first at the top, each after it
+  // where the one before said the next begins. The last is the page shown.
+  const [starts, setStarts] = useState<readonly (string | null)[]>([null]);
+  const pageIndex = starts.length - 1;
+  const filePage = useTorrentFilePage(torrent.id, starts[pageIndex]);
+  const files = filePage?.items ?? [];
+  const total = filePage?.totalCount ?? 0;
   const [picked, setPicked] = useState<ReadonlySet<number>>(() => new Set());
-  // Only files the torrent still lists count as ticked.
-  const pickedFiles = torrent.files.filter((file) => picked.has(file.index));
-  const allPicked =
-    torrent.files.length > 0 && pickedFiles.length === torrent.files.length;
+  // Only files the torrent has count as ticked; a tick may be on any page.
+  const pickedIndexes = [...picked].filter((index) => index < total);
+  const allPicked = total > 0 && pickedIndexes.length === total;
 
+  // The torrent and its files push the change; nothing is read again here.
   const settle = (result: { error?: TorrentActionError }) => {
     if (result.error) {
       onReport(torrentErrorText(result.error));
       return false;
     }
-    onChanged();
     return true;
   };
 
@@ -932,10 +997,7 @@ function FilesBlock({
 
   const prioritizePicked = (value: string) => {
     if (!isPriority(value)) return;
-    void prioritize(
-      pickedFiles.map((file) => file.index),
-      value,
-    ).then((done) => {
+    void prioritize(pickedIndexes, value).then((done) => {
       if (done) setPicked(new Set());
     });
   };
@@ -977,13 +1039,17 @@ function FilesBlock({
 
   const heading =
     "truncate font-wv-mono text-[10.5px] uppercase tracking-[0.12em] text-wv-note";
-  const unpacked = useUnpackedFiles(torrent);
+  const unpacked = useUnpackedFiles(torrent, onReport);
+  const nextCursor = filePage?.nextCursor ?? null;
+  // The unpacked files follow the torrent's own, after its last page.
+  const lastPage = nextCursor === null;
+  const firstShown = pageIndex * FILE_PAGE_SIZE;
 
   return (
     <DetailBlock
       id="torrent-files"
       title={t("next.common.files")}
-      note={countLabel(t, "next.job.fileCount", torrent.files.length)}
+      note={countLabel(t, "next.job.fileCount", total)}
     >
       {toggles.map((toggle) => (
         <GridRow
@@ -1021,7 +1087,7 @@ function FilesBlock({
           </span>
         </GridRow>
       ) : null}
-      {torrent.files.length === 0 ? (
+      {files.length === 0 ? (
         <span className="border-t border-wv-hairline pt-3 text-[12.5px] text-wv-muted">
           {EM_DASH}
         </span>
@@ -1039,15 +1105,17 @@ function FilesBlock({
                 setPicked(
                   allPicked
                     ? new Set()
-                    : new Set(torrent.files.map((file) => file.index)),
+                    : new Set(
+                        Array.from({ length: total }, (_, index) => index),
+                      ),
                 )
               }
             />
-            {pickedFiles.length === 0 ? (
+            {pickedIndexes.length === 0 ? (
               <span className={heading}>{t("table.name")}</span>
             ) : (
               <BulkCluster
-                count={pickedFiles.length}
+                count={pickedIndexes.length}
                 onClear={() => setPicked(new Set())}
               >
                 <BulkMenu
@@ -1068,7 +1136,7 @@ function FilesBlock({
             </span>
             <span className={heading}>{t("table.priority")}</span>
           </GridRow>
-          {torrent.files.map((file) => (
+          {files.map((file) => (
             <GridRow
               key={file.index}
               testId={torrentIds.file}
@@ -1108,36 +1176,80 @@ function FilesBlock({
               />
             </GridRow>
           ))}
-          {unpacked.map((file) => (
-            <GridRow
-              key={`unpacked:${file.path}`}
-              testId={torrentIds.unpackedFile}
-              columns={FILE_COLUMNS}
-              gap={14}
-              className="h-[38px] border-t border-wv-hairline"
-              title={file.path}
-            >
-              <span />
+          {total > FILE_PAGE_SIZE ? (
+            <div className="flex items-center justify-end gap-3 border-t border-wv-hairline pt-3">
               <span
-                data-testid={torrentIds.filePath}
-                className="min-w-0 truncate font-wv-mono text-[12px] text-wv-fg"
+                data-testid={torrentIds.fileRange}
+                className="font-wv-mono text-[11.5px] whitespace-nowrap text-wv-muted"
               >
-                {file.path}
+                {t("next.pagination.range", {
+                  from: formatCount(firstShown + 1),
+                  to: formatCount(firstShown + files.length),
+                  total: formatCount(total),
+                })}
               </span>
-              <span className="hidden text-right font-wv-mono text-[12px] text-wv-muted sm:block">
-                {formatSize(file.length)}
-              </span>
-              <span
-                data-testid={torrentIds.fileProgress}
-                className="text-right font-wv-mono text-[12px] text-wv-muted"
+              <SecondaryButton
+                size="compact"
+                testId={torrentIds.filePrevious}
+                disabled={pageIndex === 0}
+                onClick={() => setStarts(starts.slice(0, -1))}
               >
-                100.0%
-              </span>
-              <span className="truncate text-[12.5px] text-wv-muted">
-                {t("next.torrent.unpacked")}
-              </span>
-            </GridRow>
-          ))}
+                {t("action.previous")}
+              </SecondaryButton>
+              <SecondaryButton
+                size="compact"
+                testId={torrentIds.fileNext}
+                disabled={nextCursor === null}
+                onClick={() => setStarts([...starts, nextCursor])}
+              >
+                {t("action.next")}
+              </SecondaryButton>
+            </div>
+          ) : null}
+          {lastPage
+            ? unpacked.files.map((file) => (
+                <GridRow
+                  key={`unpacked:${file.path}`}
+                  testId={torrentIds.unpackedFile}
+                  columns={FILE_COLUMNS}
+                  gap={14}
+                  className="h-[38px] border-t border-wv-hairline"
+                  title={file.path}
+                >
+                  <span />
+                  <span
+                    data-testid={torrentIds.filePath}
+                    className="min-w-0 truncate font-wv-mono text-[12px] text-wv-fg"
+                  >
+                    {file.path}
+                  </span>
+                  <span className="hidden text-right font-wv-mono text-[12px] text-wv-muted sm:block">
+                    {formatSize(file.length)}
+                  </span>
+                  <span
+                    data-testid={torrentIds.fileProgress}
+                    className="text-right font-wv-mono text-[12px] text-wv-muted"
+                  >
+                    100.0%
+                  </span>
+                  <span className="truncate text-[12.5px] text-wv-muted">
+                    {t("next.torrent.unpacked")}
+                  </span>
+                </GridRow>
+              ))
+            : null}
+          {lastPage && unpacked.more !== null ? (
+            <div className="flex justify-center border-t border-wv-hairline pt-[9px]">
+              <SecondaryButton
+                size="compact"
+                testId={torrentIds.unpackedMore}
+                disabled={unpacked.loading}
+                onClick={unpacked.more}
+              >
+                {t("next.job.showMore")}
+              </SecondaryButton>
+            </div>
+          ) : null}
         </>
       )}
     </DetailBlock>
@@ -1151,38 +1263,105 @@ const UNPACK_KEYS: Record<TorrentUnpackResult, string> = {
   REFUSED: "next.torrent.unpackRefused",
 };
 
+/** A page of the files a torrent's unpacking placed beside its own. */
+interface UnpackedFilePage {
+  items: TorrentUnpackedFileData[];
+  nextCursor: string | null;
+}
+
+interface UnpackedFilesAnswer {
+  torrent: {
+    id: number;
+    unpacking: { files: UnpackedFilePage } | null;
+  } | null;
+}
+
 /**
  * The files a torrent's unpacking placed beside its own, read only once its
- * unpacking is over and again when how it came out changes.
+ * unpacking is over and again when how it came out changes: the first 100,
+ * and each further 100 on asking. Pages asked for belong to the first page
+ * they continue, so a fresh read of it drops them.
  */
-function useUnpackedFiles(torrent: TorrentData): TorrentUnpackedFileData[] {
+function useUnpackedFiles(
+  torrent: TorrentData,
+  onReport: (message: string) => void,
+): {
+  files: TorrentUnpackedFileData[];
+  /** Reads the next page; null when there is none. */
+  more: (() => void) | null;
+  loading: boolean;
+} {
+  const client = useClient();
   const result = torrent.unpacking?.result ?? null;
-  const [{ data }, reread] = useQuery<{
-    torrent: {
-      id: number;
-      unpacking: { files: TorrentUnpackedFileData[] } | null;
-    } | null;
-  }>({
+  const [{ data }, reread] = useQuery<UnpackedFilesAnswer>({
     query: TORRENT_UNPACKED_FILES_QUERY,
-    variables: { id: torrent.id },
+    variables: { id: torrent.id, first: UNPACKED_PAGE_SIZE },
     pause: result === null,
     requestPolicy: "network-only",
   });
+  // The read that starts with the query covers the first result; only a
+  // change from one result to another is read again.
+  const readFor = useRef(result);
   useEffect(() => {
-    if (result !== null) reread({ requestPolicy: "network-only" });
+    const before = readFor.current;
+    readFor.current = result;
+    if (rereadOnChange(before, result)) {
+      reread({ requestPolicy: "network-only" });
+    }
   }, [result, reread]);
-  if (result === null) return [];
-  return data?.torrent?.unpacking?.files ?? [];
+  const first = data?.torrent?.unpacking?.files ?? null;
+  const [later, setLater] = useState<{
+    first: UnpackedFilePage;
+    files: TorrentUnpackedFileData[];
+    nextCursor: string | null;
+  } | null>(null);
+  const [loading, setLoading] = useState(false);
+  if (result === null || first === null) {
+    return { files: [], more: null, loading };
+  }
+  const held = later !== null && later.first === first ? later : null;
+  const nextCursor = held === null ? first.nextCursor : held.nextCursor;
+  const more = async () => {
+    if (nextCursor === null) return;
+    setLoading(true);
+    const answer = await client
+      .query<UnpackedFilesAnswer>(
+        TORRENT_UNPACKED_FILES_QUERY,
+        { id: torrent.id, first: UNPACKED_PAGE_SIZE, after: nextCursor },
+        { requestPolicy: "network-only" },
+      )
+      .toPromise();
+    setLoading(false);
+    if (answer.error) {
+      onReport(torrentErrorText(answer.error));
+      return;
+    }
+    const page = answer.data?.torrent?.unpacking?.files;
+    if (!page) return;
+    setLater((previous) => ({
+      first,
+      files: [
+        ...(previous !== null && previous.first === first
+          ? previous.files
+          : []),
+        ...page.items,
+      ],
+      nextCursor: page.nextCursor,
+    }));
+  };
+  return {
+    files: held === null ? first.items : [...first.items, ...held.files],
+    more: nextCursor === null ? null : () => void more(),
+    loading,
+  };
 }
 
 /** A torrent job's own blocks on the job's screen: its transfer, its limits, its information, how it seeds, its trackers, its peers and its files. */
 export function TorrentDetail({
   torrent,
-  onChanged,
   onReport,
 }: {
   torrent: TorrentData;
-  onChanged: () => void;
   onReport: (message: string) => void;
 }) {
   const t = useTranslate();
@@ -1201,7 +1380,6 @@ export function TorrentDetail({
         return;
       }
       setEditing(null);
-      onChanged();
     });
   };
 
@@ -1224,7 +1402,7 @@ export function TorrentDetail({
       <DetailBlock
         id="seeding"
         title={t("next.torrents.seeding")}
-        note={torrent.seedingLeft ?? undefined}
+        note={torrent.seedingGoalLeft ?? undefined}
         right={
           <SmallAction
             tone="accent"
@@ -1263,15 +1441,11 @@ export function TorrentDetail({
         </div>
       </DetailBlock>
 
-      <TrackersBlock
-        torrent={torrent}
-        onChanged={onChanged}
-        onReport={onReport}
-      />
+      <TrackersBlock torrent={torrent} onReport={onReport} />
 
       <PeersBlock torrent={torrent} onReport={onReport} />
 
-      <FilesBlock torrent={torrent} onChanged={onChanged} onReport={onReport} />
+      <FilesBlock torrent={torrent} onReport={onReport} />
 
       <RecordEditor
         open={editing !== null}

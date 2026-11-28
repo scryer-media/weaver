@@ -228,6 +228,13 @@ pub trait Recovery {
     // its members when it was made has nothing to match.
     fn bind(&mut self, _namespace: &mut Namespace, _renamed: &mut Vec<MemberId>) {}
 
+    // The members the last `bind` came to cover that it did not cover as it
+    // began, each with the name it had then, each once, taken: read right
+    // after `bind`. Each `bind` begins its report afresh, so a report not
+    // taken is never read after a later one. An object whose `bind` does
+    // not change what it covers reports none.
+    fn take_newly(&mut self, out: &mut Vec<(MemberId, String)>);
+
     // The files this object describes and can rebuild that no member of
     // the namespace carries, by name and length. The owner announces each
     // once the namespace has every member it will get, so the repair has
@@ -241,6 +248,33 @@ pub trait Recovery {
     // some member. An object that describes nothing checked nothing, so
     // its ruling vouches for no file.
     fn covers_some(&self) -> bool;
+
+    // Whether this object describes some member the namespace lists:
+    // `covers` holds for one of `namespace.members()`. A member it covers
+    // that the namespace no longer lists, gone or folded into another
+    // posting, answers no. An object that keeps what it covers reads that
+    // instead of the namespace.
+    fn covers_any_of(&self, namespace: &Namespace) -> bool {
+        namespace.members().any(|member| self.covers(member.id))
+    }
+
+    // The members `covers` holds for, each once, read off what `covers`
+    // reads. An object that covers nothing lists none.
+    fn covered_members(&self, _out: &mut Vec<MemberId>) {}
+
+    // A value that changes whenever `covers` may answer otherwise for some
+    // member: two reads that give the same value saw `covered_members` list
+    // the same members. An object that covers nothing keeps 0.
+    fn coverage_version(&self) -> u64 {
+        0
+    }
+
+    // Whether what the object took since its last bind leaves a bind
+    // something to do. An object that cannot tell says it does, and is
+    // bound after each of its volumes' bytes.
+    fn bind_due(&self) -> bool {
+        true
+    }
 
     // Whether the object has yet to learn what some set of it describes:
     // its own volumes may still say, once something asks for them. The
@@ -285,12 +319,26 @@ pub trait Recovery {
         self.feed(member, segments);
     }
 
-    // The block sizes at whose boundaries `feed`'s checksums have to be cut
-    // for this object to vouch for a block without reading it back. A
+    // Covered members whose evidence the object wants said again, each
+    // once: a set of it came to describe them after some of their bytes
+    // arrived, and holds nothing of those. The namespace asks after a
+    // bind, after it feeds the object and before it rules it, and feeds
+    // each what its source still keeps.
+    fn unfed(&mut self, _out: &mut Vec<MemberId>) {}
+
+    // Whether `unfed` may name a member.
+    fn moved(&self) -> bool {
+        false
+    }
+
+    // The block sizes at whose boundaries `feed`'s checksums of the member
+    // have to be cut for this object to vouch for a block of it without
+    // reading it back: those of what describes the member, not of all the
+    // object holds. A
     // source that cuts its checksums there, as the article decoder can,
     // gives the object its proof as the bytes pass. An object that folds
     // checksums of any alignment, or takes none, names none.
-    fn block_sizes(&self, _out: &mut Vec<u64>) {}
+    fn block_sizes(&self, _member: MemberId, _out: &mut Vec<u64>) {}
 
     // The parent's other answer to a seek: this range of a covered member
     // will never come. The object learns that and nothing else, no bytes
@@ -340,6 +388,29 @@ pub trait Recovery {
     // with no identifier when it holds no set at all. Asked once, when the
     // job is done. An object that binds what it is handed says nothing.
     fn unbound(&self, _out: &mut Vec<Unbound>) {}
+
+    // The members of the namespace whose source checksums this object
+    // asks for, as a listing does that checks nothing but wants a CRC. It
+    // need not cover them. `covered` says whether a set that stands covers
+    // a member. Each member asked is answered once, through `evidenced`,
+    // with what the source still keeps of it, which may be nothing.
+    fn evidence(
+        &self,
+        _namespace: &Namespace,
+        _covered: &dyn Fn(MemberId) -> bool,
+        _out: &mut Vec<MemberId>,
+    ) {
+    }
+
+    // The answer to `evidence` for one member: the source's checksums of
+    // its bytes, in order. A member the source keeps none of, or only
+    // some of, gets what is kept.
+    fn evidenced(&mut self, _namespace: &Namespace, _member: MemberId, _segments: &[Segment]) {}
+
+    // The members of the namespace whose bytes disagree with what this
+    // object states of them, for a note. Asked once, when the job is done.
+    // An object whose disagreements are its rulings says nothing.
+    fn disputed(&self, _namespace: &Namespace, _out: &mut Vec<MemberId>) {}
 
     // How this object's repair ranks against another's over the same
     // bytes. A returned repair rewrites bytes an earlier repair wrote only

@@ -52,6 +52,9 @@ impl Object for Proven {
 }
 
 impl Recovery for Proven {
+    // Its bind is the default, which changes nothing it covers.
+    fn take_newly(&mut self, _: &mut Vec<(MemberId, String)>) {}
+
     fn rebuilds(&self) -> bool {
         true
     }
@@ -220,6 +223,9 @@ impl Object for RefusingSet {
 }
 
 impl Recovery for RefusingSet {
+    // Its bind is the default, which changes nothing it covers.
+    fn take_newly(&mut self, _: &mut Vec<(MemberId, String)>) {}
+
     fn rebuilds(&self) -> bool {
         true
     }

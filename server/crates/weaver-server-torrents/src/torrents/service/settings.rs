@@ -433,10 +433,12 @@ impl Presence {
 
 impl TorrentService {
     /// Take the tracker rules as the database holds them now, and apply
-    /// what that changes to the torrents under them. A torrent keeps the
-    /// rule it was matched to when added or at start-up: one whose rule was
-    /// deleted follows no rule, and a rule's new hosts take the torrents
-    /// added from now on and every torrent after a restart.
+    /// what that changes to the torrents under them. Each torrent is
+    /// matched again against its trackers, as an add matches it: a new rule
+    /// or new hosts take the torrents already here, and one whose rule was
+    /// deleted follows the rule that matches it now, or none. A torrent
+    /// whose rule now names another client goes through its session again
+    /// on the tick this wakes.
     pub async fn reload_tracker_rules(&self) -> Result<(), String> {
         self.load_rules().await?;
         let rules = self.rules();
@@ -444,11 +446,9 @@ impl TorrentService {
             let mut live = self.inner.live.lock().await;
             for torrent in live.values_mut() {
                 let job_id = torrent.record.job_id;
-                // A torrent keeps the rule it matched; one whose rule was
-                // deleted falls under no rule.
-                if rules.of(torrent.rule_id).is_none() {
-                    torrent.rule_id = None;
-                }
+                torrent.rule_id = rules
+                    .rule_for(torrent.trackers.iter().map(|tracker| tracker.url.as_str()))
+                    .map(|rule| rule.id);
                 // An SSL torrent takes its rule's certificate as it stands:
                 // its new connections and announces present it.
                 let ssl = certificate_of(torrent.rule(&rules));
@@ -468,7 +468,14 @@ impl TorrentService {
         }
         self.apply_queue().await;
         self.publish().await;
+        // The tick follows what changed for each torrent's route and terms.
+        self.inner.settings_changed.notify_one();
         Ok(())
+    }
+
+    /// The tracker rule of id `id`, as the service holds it in memory.
+    pub fn tracker_rule(&self, id: u32) -> Option<crate::settings::model::TrackerRule> {
+        self.rules().of(Some(id)).cloned()
     }
 
     pub async fn load_rules(&self) -> Result<(), String> {

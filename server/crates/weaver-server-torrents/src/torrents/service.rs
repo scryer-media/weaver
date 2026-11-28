@@ -31,7 +31,7 @@ use crate::pipeline::ExtractionLimits;
 use crate::pipeline::graph::engine::{DecodePool, Outside, RunMail, Said};
 use crate::pipeline::graph::status::RepairSlots;
 use crate::settings::model::{TrackerCertificate, TrackerRule};
-use crate::settings::{Config, TorrentEncryption, TransportRule};
+use crate::settings::{Client, Config, TorrentEncryption, TransportRule};
 use crate::torrents::identity::TorrentIdentity;
 use crate::torrents::intake::Heard as IntakeHeard;
 use crate::torrents::layout::PieceLayout;
@@ -58,6 +58,9 @@ pub use scripts::ScriptDirs;
 pub mod batch;
 mod checkpoints;
 mod completion;
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub use completion::placing_end;
 pub mod disk_room;
 pub mod intake;
 pub mod live;
@@ -96,8 +99,8 @@ pub use settings::{
 };
 pub use tick::TorrentRoute;
 pub use views::{
-    ClockFields, PeerKinds, RowParts, TorrentLeg, TorrentPieces, TorrentSupport, TorrentView,
-    ViewClock,
+    ClockFields, FilesPage, PeerKinds, RowParts, TorrentLeg, TorrentPieces, TorrentSupport,
+    TorrentView, ViewClock,
 };
 
 // Why a magnet with no trackers is turned away on a route with no DHT.
@@ -148,8 +151,13 @@ pub const CHECKPOINT_PIECES: u32 = 16;
 // exchange, each switch on its own, and the encryption its connections are
 // made under and the transport order they are dialed in, each over the
 // session's. A change of any takes the torrent through its session again.
+// The client it names itself as is one of them: its peers and trackers see
+// its peer id, and a change of client stops the torrent and starts it
+// again, so each tracker hears `stopped` from the old id and `started` from
+// the new.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct PeerTerms {
+    client: Client,
     disable_dht: bool,
     disable_pex: bool,
     disable_lsd: bool,
@@ -164,6 +172,7 @@ impl PeerTerms {
         let off =
             |field: &Field<bool>| settings.levels(field, None, None, rule).resolve() == Some(false);
         Self {
+            client: rule.and_then(|rule| rule.client).unwrap_or_default(),
             disable_dht: off(&DHT),
             disable_pex: off(&PEX),
             disable_lsd: off(&LSD),
@@ -381,12 +390,18 @@ impl TorrentService {
     ) -> Result<Self, String> {
         let routes = NetworkRoutes::new(Arc::clone(proxies), ROUTE_TIMEOUT);
         let sessions = Sessions::new(Arc::new(routes), SessionEnv::of(config), db.clone());
+        // An e2e run may move the wall clock on by an offset; otherwise the
+        // system clock.
+        let clock: Arc<dyn Clock> = match weaver_server_base::e2e_clock::torrent_clock() {
+            Some(offset) => Arc::new(offset),
+            None => Arc::new(SystemClock),
+        };
         let service = Self::new(
             db,
             sessions,
             TorrentSettings::of(config),
             JobEnv::of_pipeline(pipeline, writers, buffers),
-            Arc::new(SystemClock),
+            clock,
         );
         service.wire_to(queue);
         service.park_crashed(crashed);
@@ -920,6 +935,9 @@ pub struct Inner {
     crash_marks: Mutex<weaver_server_base::runtime::panic_trap::CrashMarks>,
     pub signal: Arc<Signal>,
     ticks: watch::Sender<u64>,
+    // The clock as the last tick read it: a tick that reads an earlier one
+    // has found it stepped back.
+    tick_at_ms: AtomicI64,
     // Counts the waits for a route's session to open, begun off an add or
     // an action, that have ended.
     attaches: watch::Sender<u64>,
@@ -1072,6 +1090,7 @@ impl TorrentService {
                 crash_marks: Mutex::default(),
                 signal: Arc::new(Signal::default()),
                 ticks: watch::channel(0).0,
+                tick_at_ms: AtomicI64::new(i64::MIN),
                 attaches: watch::channel(0).0,
                 retired: watch::channel(0).0,
                 written: watch::channel(Written::default()).0,

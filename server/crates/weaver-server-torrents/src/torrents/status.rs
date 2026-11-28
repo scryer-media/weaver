@@ -286,6 +286,15 @@ impl Observed {
         seeding(self.complete, &self.engine)
     }
 
+    /// Whether every piece it wants is had where it is: complete as its
+    /// state reads it ([`seeding`]), with no check running, which lets go
+    /// of its pieces until it ends, and its files not missing. A complete
+    /// torrent keeps when it completed through both, until the check finds
+    /// a file it wants short.
+    pub fn has_wanted(&self) -> bool {
+        self.seeding() && !matches!(self.engine, Engine::Checking) && !self.files_missing
+    }
+
     // Why it waits for its disk: for room, or for a disk that holds it.
     fn disk_stated(&self) -> Stated {
         if self.disk_too_small {

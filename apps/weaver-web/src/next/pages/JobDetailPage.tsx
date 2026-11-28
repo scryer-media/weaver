@@ -22,7 +22,7 @@ import {
   REPROCESS_JOB_MUTATION,
   RERUN_POST_PROCESSING_MUTATION,
   RESUME_JOB_MUTATION,
-  SET_TORRENT_CATEGORY_MUTATION,
+  SET_QUEUE_ITEMS_CATEGORY_MUTATION,
   SET_TORRENT_FORCED_MUTATION,
   SET_TORRENT_LOCATION_MUTATION,
 } from "@/graphql/queries";
@@ -39,7 +39,9 @@ import {
   readDownloadErrorMessage,
   saveResponseAsDownload,
 } from "@/lib/download";
+import { refusalMessage } from "@/lib/refusal";
 import {
+  normalizeGraphqlTimestamp,
   normalizeJobData,
   type GraphqlJobData,
   type JobData,
@@ -154,7 +156,7 @@ const EVENT_COLUMNS = {
 
 const EVENT_TONE_CLASS = {
   bad: "text-wv-error",
-  good: "text-wv-accent",
+  good: "text-wv-ok",
   note: "text-wv-info",
   plain: "text-wv-muted",
 } as const;
@@ -393,7 +395,28 @@ function JobDetailContent() {
   const [, setTorrentForced] = useMutation(SET_TORRENT_FORCED_MUTATION);
   const [, recheckTorrent] = useMutation(RECHECK_TORRENT_MUTATION);
   const [, setTorrentLocation] = useMutation(SET_TORRENT_LOCATION_MUTATION);
-  const [, setTorrentCategory] = useMutation(SET_TORRENT_CATEGORY_MUTATION);
+  const [, setJobsCategory] = useMutation<{
+    setQueueItemsCategory: {
+      refused: { id: number; code: string; message: string }[];
+    };
+  }>(SET_QUEUE_ITEMS_CATEGORY_MUTATION);
+  // A torrent's category is its job's: the empty string takes it out of its
+  // own, and a refusal of the one job is the failure, by its code.
+  const setTorrentCategory = async (id: number, category: string) => {
+    const result = await setJobsCategory({ target: { ids: [id] }, category });
+    const refused = result.data?.setQueueItemsCategory.refused[0];
+    if (result.error || !refused) return result;
+    return {
+      error: {
+        message: refusalMessage(t, {
+          message: refused.message,
+          graphQLErrors: [
+            { message: refused.message, extensions: { code: refused.code } },
+          ],
+        }),
+      },
+    };
+  };
   const [removingTorrent, setRemovingTorrent] = useState(false);
   // The draft of the torrent's location or category while its editor is open.
   const [torrentEdit, setTorrentEdit] = useState<{
@@ -428,7 +451,7 @@ function JobDetailContent() {
   // Posts, articles, providers, PAR2 recovery and NZB duplicate identity
   // belong to a usenet job only; every other kind of job leaves them out.
   const usenet = job !== null && (job.protocol ?? "NZB") === "NZB";
-  const { torrent, refresh: refreshTorrent } = useTorrent(jobId, isTorrent);
+  const { torrent } = useTorrent(jobId, isTorrent);
   // Asked for once the job is known to be usenet: nothing else has one.
   const [{ data: duplicateData }, refetchDuplicate] = useQuery<{
     duplicateSnapshot: DuplicateSnapshot | null;
@@ -647,7 +670,10 @@ function JobDetailContent() {
         ? // A torrent finishes when its last piece checks out and then seeds
           // for days: its own completion date, with no pipeline after it.
           t("next.job.finished", {
-            time: formatDate(torrent?.completedAtMs ?? job.completedAt),
+            time: formatDate(
+              normalizeGraphqlTimestamp(torrent?.completedAt) ??
+                job.completedAt,
+            ),
           })
         : done
           ? [
@@ -882,7 +908,6 @@ function JobDetailContent() {
                           ? resumeJob({ id: job.id })
                           : pauseJob({ id: job.id }),
                     ).then(async () => {
-                      refreshTorrent();
                       if (
                         wasMissing &&
                         (await stillFilesMissing(client, job.id))
@@ -910,7 +935,7 @@ function JobDetailContent() {
                           : "next.torrent.unforced",
                       ),
                       () => setTorrentForced({ id: job.id, forced }),
-                    ).then(refreshTorrent);
+                    );
                   }}
                 >
                   {torrent?.forced
@@ -1264,7 +1289,7 @@ function JobDetailContent() {
                   ? "text-wv-muted"
                   : job.optionalRecoveryDownloadedBytes > 0
                     ? undefined
-                    : "text-wv-accent"
+                    : "text-wv-ok"
               }
               note={
                 job.optionalRecoveryBytes === 0
@@ -1280,11 +1305,7 @@ function JobDetailContent() {
         </MetricStrip>
 
         {torrent ? (
-          <TorrentDetail
-            torrent={torrent}
-            onChanged={refreshTorrent}
-            onReport={setReport}
-          />
+          <TorrentDetail torrent={torrent} onReport={setReport} />
         ) : null}
 
         {/* The stage waterfall and its wait for the first stage are the
@@ -1832,7 +1853,7 @@ function JobDetailContent() {
           setConfirm(null);
           void run(t("next.torrent.rechecking"), () =>
             recheckTorrent({ id: job.id }),
-          ).then(refreshTorrent);
+          );
         }}
         other={{
           label: t("next.torrent.move"),
@@ -1854,7 +1875,7 @@ function JobDetailContent() {
           setConfirm(null);
           void run(t("next.torrent.rechecking"), () =>
             recheckTorrent({ id: job.id }),
-          ).then(refreshTorrent);
+          );
         }}
       />
       <RecordEditor
@@ -1927,11 +1948,8 @@ function JobDetailContent() {
             () =>
               kind === "move"
                 ? setTorrentLocation({ id: job.id, path: value.trim() })
-                : setTorrentCategory({
-                    id: job.id,
-                    category: value === "" ? null : value,
-                  }),
-          ).then(refreshTorrent);
+                : setTorrentCategory(job.id, value),
+          );
         }}
       />
       <TorrentRemoveDialog

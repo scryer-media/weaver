@@ -66,6 +66,7 @@ async fn an_unwanted_member_found_while_unpacking_refuses_the_unpacking_and_the_
         .unpack_end
         .unwrap();
     assert_eq!(end.result, UnpackResult::Refused);
+    assert_eq!(end.cause, Some(UnpackCause::Refused));
     assert!(end.why.as_deref().unwrap().contains("txt"), "{end:?}");
     assert!(rig.db.get_job_history(job_id.0).unwrap().is_none());
     assert_eq!(
@@ -100,7 +101,7 @@ async fn an_archive_torrent_unpacks_beside_its_files_and_seeds_from_them() {
         std::env!("CARGO_MANIFEST_DIR"),
         "/../weaver-server-core/tests/fixtures/rar5/rar5_store.rar"
     ));
-    unpacks_beside_and_seeds("set.rar", archive).await;
+    unpacks_beside_and_seeds("set.rar", archive, 128, small_txt_beside).await;
 }
 
 // A torrent of a gzipped tar is an archive's too: its pieces feed the graph,
@@ -117,7 +118,36 @@ async fn a_tar_gz_torrent_unpacks_beside_its_file_and_seeds_from_it() {
         .unwrap();
     let mut gzip = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
     std::io::Write::write_all(&mut gzip, &tar.into_inner().unwrap()).unwrap();
-    unpacks_beside_and_seeds("set.tar.gz", &gzip.finish().unwrap()).await;
+    unpacks_beside_and_seeds("set.tar.gz", &gzip.finish().unwrap(), 128, small_txt_beside).await;
+}
+
+// A torrent of a compressed RAR that holds a file beside an `.xz` of
+// another unpacks both layers: the file, and what the `.xz` holds in place
+// of it, beside the archive. It completes and seeds on.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_compressed_rar_torrent_holding_an_xz_unpacks_both_layers_and_completes() {
+    let archive = std::fs::read(concat!(
+        std::env!("CARGO_MANIFEST_DIR"),
+        "/../../../e2e/testdata/nested-xz-rar/archive.rar"
+    ))
+    .unwrap();
+    unpacks_beside_and_seeds("archive.rar", &archive, 64 * 1024, |dir| {
+        assert!(dir.join("test-media.mkv").is_file());
+        assert!(
+            std::fs::read_to_string(dir.join("release.nfo"))
+                .unwrap()
+                .starts_with("Nested XZ sidecar beside ordinary media.")
+        );
+        assert!(!dir.join("release.nfo.xz").exists());
+        std::fs::remove_file(dir.join("test-media.mkv")).unwrap();
+    })
+    .await;
+}
+
+// `small.txt` lies beside the archive, as it came; it is taken away.
+fn small_txt_beside(dir: &Path) {
+    assert_eq!(std::fs::read(dir.join("small.txt")).unwrap(), SMALL_TXT);
+    std::fs::remove_file(dir.join("small.txt")).unwrap();
 }
 
 const SMALL_TXT: &[u8] = include_bytes!(concat!(
@@ -125,15 +155,20 @@ const SMALL_TXT: &[u8] = include_bytes!(concat!(
     "/../weaver-server-core/tests/fixtures/originals/small.txt"
 ));
 
-// Adds a torrent of one file, `name`, whose bytes are `archive` holding
-// `small.txt`, and downloads it whole: the torrent gets a tee, completes
-// without a history row, keeps `archive` as it came, unpacks `small.txt`
-// beside it, and with that file gone still reads every piece from `archive`.
-async fn unpacks_beside_and_seeds(name: &str, archive: &[u8]) {
-    let member = SMALL_TXT;
+// Adds a torrent of one file, `name`, whose bytes are `archive`, in pieces
+// of `piece` bytes, and downloads it whole: the torrent gets a tee,
+// completes without a history row, keeps `archive` as it came, and has what
+// `beside` checks unpacked beside it; with that taken away, it still reads
+// every piece from `archive`.
+async fn unpacks_beside_and_seeds(
+    name: &str,
+    archive: &[u8],
+    piece: usize,
+    beside: impl Fn(&Path),
+) {
     let rig = rig(set_clock());
     rig.service.open().await.unwrap();
-    let bytes = metainfo(name, &[(name, archive)], 128, false);
+    let bytes = metainfo(name, &[(name, archive)], piece, false);
     let job_id = rig
         .service
         .add_opened(request(AddSource::Metainfo(bytes)))
@@ -191,10 +226,9 @@ async fn unpacks_beside_and_seeds(name: &str, archive: &[u8]) {
     let view = rig.service.torrent(job_id).await.unwrap();
     let dir = PathBuf::from(view.storage_dir.unwrap());
     assert_eq!(std::fs::read(dir.join(name)).unwrap(), archive);
-    assert_eq!(std::fs::read(dir.join("small.txt")).unwrap(), member);
+    beside(&dir);
 
-    // The unpacked file gone, every piece still reads from the archive.
-    std::fs::remove_file(dir.join("small.txt")).unwrap();
+    // The unpacked files gone, every piece still reads from the archive.
     for piece in 0..layout.piece_count() {
         let range = layout.piece_range(piece);
         for span in layout.spans(piece) {
@@ -244,6 +278,7 @@ async fn a_finished_torrent_unpacking_refused_seeds_on_and_its_removal_is_comple
     assert_eq!(view.detail, None);
     let end = view.unpack_end.clone().unwrap();
     assert_eq!(end.result, UnpackResult::Refused);
+    assert_eq!(end.cause, Some(UnpackCause::Refused));
     assert!(end.why.as_deref().unwrap().contains("txt"), "{end:?}");
     assert!(rig.db.get_job_history(job_id.0).unwrap().is_none());
     assert_eq!(*rig.service.retired().borrow(), 0);
@@ -306,6 +341,7 @@ async fn an_unwanted_unpacked_file_is_deleted_under_the_delete_action_and_said_o
         view.unpack_end,
         Some(UnpackEnd::short(
             false,
+            UnpackCause::DeliveredInPart,
             "delivered in part; removed for an unwanted extension: small.txt".into()
         ))
     );
@@ -315,6 +351,79 @@ async fn an_unwanted_unpacked_file_is_deleted_under_the_delete_action_and_said_o
     assert!(!dir.join("small.txt").exists());
     assert!(!work.join("small.txt").exists());
     rig.service.stop().await;
+}
+
+// A placing that moved every file whole ends short when the policy removed
+// a file it made, under UNWANTED_REMOVED, and under UNWANTED_NOT_REMOVED
+// when the removal failed; the row keeps that cause and the torrent shows
+// it. A delivery in part or a file not placed wins over either.
+#[tokio::test]
+async fn a_placing_the_policy_left_a_file_out_of_ends_on_the_removal() {
+    use crate::torrents::service::placing_end;
+    let removed = placing_end(true, None, None, Ok(vec!["small.txt".to_owned()]));
+    assert_eq!(
+        removed,
+        UnpackEnd::short(
+            true,
+            UnpackCause::UnwantedRemoved,
+            "removed for an unwanted extension: small.txt".into()
+        )
+    );
+    let not_removed = placing_end(true, None, None, Err("could not remove small.txt".into()));
+    assert_eq!(
+        not_removed,
+        UnpackEnd::short(
+            true,
+            UnpackCause::UnwantedNotRemoved,
+            "could not remove small.txt".into()
+        )
+    );
+    assert_eq!(
+        placing_end(true, None, None, Ok(Vec::new())),
+        UnpackEnd::whole()
+    );
+    assert_eq!(
+        placing_end(true, None, Some("in part".into()), Ok(vec!["a.txt".into()])).cause,
+        Some(UnpackCause::DeliveredInPart)
+    );
+    assert_eq!(
+        placing_end(true, Some("not moved".into()), None, Err("x".into())).cause,
+        Some(UnpackCause::NotPlaced)
+    );
+
+    let rig = rig(set_clock());
+    rig.service.open().await.unwrap();
+    let job_id = rig
+        .service
+        .add_opened(request(AddSource::Metainfo(metainfo(
+            "set.rar",
+            &[("set.rar", b"rar")],
+            128,
+            false,
+        ))))
+        .await
+        .unwrap();
+    for end in [&removed, &not_removed] {
+        rig.db
+            .finish_torrent_unpack(job_id, &["notes.mkv".to_owned()], &[], &[], end)
+            .unwrap();
+        assert_eq!(
+            rig.db
+                .get_torrent(job_id)
+                .unwrap()
+                .unwrap()
+                .unpack_end
+                .as_ref(),
+            Some(end)
+        );
+    }
+    rig.service.stop().await;
+    rig.db.prune_orphan_active_state(JobId(u64::MAX)).unwrap();
+    let again = service_on(&rig.db, rig.dir.path(), &rig.routes, job_env(), set_clock());
+    again.open().await.unwrap();
+    let view = again.torrent(job_id).await.unwrap();
+    assert_eq!(view.unpack_end, Some(not_removed));
+    again.stop().await;
 }
 
 // Unpacked files that cannot be placed beside the torrent's are never
@@ -359,6 +468,7 @@ async fn unpacked_files_that_cannot_be_placed_are_kept_and_said_on_the_unpacking
         .unpack_end
         .unwrap();
     assert_eq!(end.result, UnpackResult::Failed);
+    assert_eq!(end.cause, Some(UnpackCause::NotPlaced));
     let error = end.why.unwrap();
     assert!(error.contains("could not be placed"), "{error}");
     assert!(error.contains(&work.display().to_string()), "{error}");
@@ -1111,6 +1221,7 @@ async fn reopened_for_a_plain_file(restart: bool) {
         ended,
         Some(UnpackEnd::short(
             true,
+            UnpackCause::DeliveredInPart,
             "delivered in part; damaged: extra.bin".into()
         ))
     );
@@ -1256,6 +1367,7 @@ async fn reopened_after_ending_short(restart: bool, mark_fails: bool) {
     assert_eq!(view.state, TorrentState::Seeding);
     let ended = view.unpack_end.clone().unwrap();
     assert_eq!(ended.result, UnpackResult::Refused);
+    assert_eq!(ended.cause, Some(UnpackCause::Refused));
     assert!(ended.why.as_deref().unwrap().contains("txt"), "{ended:?}");
     let dir = PathBuf::from(view.storage_dir.unwrap());
     let outputs = rig.db.torrent_outputs(job_id).unwrap();
@@ -1607,6 +1719,10 @@ async fn ignored_volume_fails(ignored: usize) {
     assert!(beside.is_empty(), "{beside:?}");
     assert!(rig.service.unpacked_files(job_id).await.unwrap().is_empty());
     let end = rig.service.torrent(job_id).await.unwrap().unpack_end;
+    assert_eq!(
+        end.as_ref().and_then(|end| end.cause),
+        Some(UnpackCause::NothingDelivered)
+    );
 
     rig.service.pause(job_id).await.unwrap();
     let view = rig.service.torrent(job_id).await.unwrap();

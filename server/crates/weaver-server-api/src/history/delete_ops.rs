@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
+use crate::observability::{spawn_blocking_with, state_error};
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::time::Duration;
@@ -157,10 +159,11 @@ impl HistoryDeleteManager {
 
     async fn requeue_operation(&self, operation_id: u64) -> Result<()> {
         let db = self.db.clone();
-        tokio::task::spawn_blocking(move || db.requeue_history_delete_operation(operation_id))
-            .await
-            .map_err(|error| graphql_error("INTERNAL", error.to_string()))?
-            .map_err(|error| graphql_error("INTERNAL", error.to_string()))
+        spawn_blocking_with(
+            move || db.requeue_history_delete_operation(operation_id),
+            state_error,
+        )
+        .await
     }
 
     async fn process_operation(&self, operation: HistoryDeleteOperationRow) -> Result<()> {
@@ -171,28 +174,29 @@ impl HistoryDeleteManager {
             const RESUBMIT_MESSAGE: &str =
                 "file deletion was not authorized; resubmit with integration (control) scope";
             let db = self.db.clone();
-            tokio::task::spawn_blocking(move || {
-                db.fail_pending_history_delete_operation_targets(operation.id, RESUBMIT_MESSAGE)
-            })
-            .await
-            .map_err(|error| graphql_error("INTERNAL", error.to_string()))?
-            .map_err(|error| graphql_error("INTERNAL", error.to_string()))?;
+            spawn_blocking_with(
+                move || {
+                    db.fail_pending_history_delete_operation_targets(operation.id, RESUBMIT_MESSAGE)
+                },
+                state_error,
+            )
+            .await?;
 
             let db = self.db.clone();
-            tokio::task::spawn_blocking(move || db.finalize_history_delete_operation(operation.id))
-                .await
-                .map_err(|error| graphql_error("INTERNAL", error.to_string()))?
-                .map_err(|error| graphql_error("INTERNAL", error.to_string()))?;
+            spawn_blocking_with(
+                move || db.finalize_history_delete_operation(operation.id),
+                state_error,
+            )
+            .await?;
             return Ok(());
         }
 
         let db = self.db.clone();
-        let targets = tokio::task::spawn_blocking(move || {
-            db.list_history_delete_operation_targets(operation.id, operation.delete_files)
-        })
-        .await
-        .map_err(|error| graphql_error("INTERNAL", error.to_string()))?
-        .map_err(|error| graphql_error("INTERNAL", error.to_string()))?;
+        let targets = spawn_blocking_with(
+            move || db.list_history_delete_operation_targets(operation.id, operation.delete_files),
+            state_error,
+        )
+        .await?;
 
         let target_ids = targets
             .iter()
@@ -212,10 +216,11 @@ impl HistoryDeleteManager {
         }
 
         let db = self.db.clone();
-        tokio::task::spawn_blocking(move || db.finalize_history_delete_operation(operation.id))
-            .await
-            .map_err(|error| graphql_error("INTERNAL", error.to_string()))?
-            .map_err(|error| graphql_error("INTERNAL", error.to_string()))?;
+        spawn_blocking_with(
+            move || db.finalize_history_delete_operation(operation.id),
+            state_error,
+        )
+        .await?;
 
         Ok(())
     }
@@ -225,12 +230,11 @@ impl HistoryDeleteManager {
     // the revision that release rings finds the result written.
     async fn process_archive_history(&self, operation_id: u64) -> Result<()> {
         let db = self.db.clone();
-        let targets = tokio::task::spawn_blocking(move || {
-            db.list_history_delete_operation_targets(operation_id, true)
-        })
-        .await
-        .map_err(|error| graphql_error("INTERNAL", error.to_string()))?
-        .map_err(|error| graphql_error("INTERNAL", error.to_string()))?;
+        let targets = spawn_blocking_with(
+            move || db.list_history_delete_operation_targets(operation_id, true),
+            state_error,
+        )
+        .await?;
         let target_ids = targets
             .iter()
             .map(|target| target.target_id)
@@ -267,20 +271,20 @@ impl HistoryDeleteManager {
                     })
                     .collect::<Vec<_>>();
                 let db = self.db.clone();
-                tokio::task::spawn_blocking(move || {
-                    db.settle_archive_history_targets(operation_id, &settled)
-                })
-                .await
-                .map_err(|error| graphql_error("INTERNAL", error.to_string()))?
-                .map_err(|error| graphql_error("INTERNAL", error.to_string()))?;
+                spawn_blocking_with(
+                    move || db.settle_archive_history_targets(operation_id, &settled),
+                    state_error,
+                )
+                .await?;
             }
         }
 
         let db = self.db.clone();
-        tokio::task::spawn_blocking(move || db.finalize_history_delete_operation(operation_id))
-            .await
-            .map_err(|error| graphql_error("INTERNAL", error.to_string()))?
-            .map_err(|error| graphql_error("INTERNAL", error.to_string()))?;
+        spawn_blocking_with(
+            move || db.finalize_history_delete_operation(operation_id),
+            state_error,
+        )
+        .await?;
         Ok(())
     }
 
@@ -378,17 +382,18 @@ impl HistoryDeleteManager {
         message: Option<String>,
     ) -> Result<()> {
         let db = self.db.clone();
-        tokio::task::spawn_blocking(move || {
-            db.mark_history_delete_targets_state(
-                operation_id,
-                &target_ids,
-                state,
-                message.as_deref(),
-            )
-        })
+        spawn_blocking_with(
+            move || {
+                db.mark_history_delete_targets_state(
+                    operation_id,
+                    &target_ids,
+                    state,
+                    message.as_deref(),
+                )
+            },
+            state_error,
+        )
         .await
-        .map_err(|error| graphql_error("INTERNAL", error.to_string()))?
-        .map_err(|error| graphql_error("INTERNAL", error.to_string()))
     }
 }
 
@@ -428,9 +433,10 @@ fn map_insert_error(error: HistoryDeleteOperationInsertError) -> async_graphql::
         | HistoryDeleteOperationInsertError::NoHistoryRows => {
             graphql_error("CONFLICT", error.to_string())
         }
-        HistoryDeleteOperationInsertError::State(state_error) => {
-            graphql_error("INTERNAL", state_error.to_string())
-        }
+        HistoryDeleteOperationInsertError::State(state_error) => graphql_error(
+            crate::observability::state_code(&state_error),
+            state_error.to_string(),
+        ),
     }
 }
 

@@ -1057,9 +1057,7 @@ export function HistoryPage() {
                     </div>
                     <div className="flex min-w-0 items-center gap-[7px]">
                       <Square
-                        color={
-                          pending ? WV.idle : failed ? WV.error : WV.accent
-                        }
+                        color={pending ? WV.idle : failed ? WV.error : WV.ok}
                       />
                       <span className="truncate text-[12.5px] text-wv-secondary">
                         {operation === "deleting"

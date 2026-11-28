@@ -363,12 +363,14 @@ function makeLocalId(): string {
   );
 }
 
-export function useUploadNzb(options?: {
+export function useUploadNzb(options: {
+  fileExtensions: readonly string[];
   resetOnOpen?: boolean;
   open?: boolean;
   onSubmitted?: () => void;
 }) {
   const t = useTranslate();
+  const { fileExtensions } = options;
   const fileInputRef = useRef<HTMLInputElement>(null);
   const controllerRef = useRef(new Map<string, AbortController>());
   const generationRef = useRef(0);
@@ -457,6 +459,10 @@ export function useUploadNzb(options?: {
       );
 
       try {
+        const filename = entry.file.name.toLowerCase();
+        if (!fileExtensions.some((extension) => filename.endsWith(extension))) {
+          throw new Error(t("next.addNzb.unsupportedFile"));
+        }
         const payload = await stageNzbUpload(entry.file, controller.signal);
         // A torrent is kept whole for submit, unless the server refused it
         // here (torrents off): that refusal fails the row below.
@@ -564,7 +570,7 @@ export function useUploadNzb(options?: {
         }
       }
     },
-    [discardKnownStageIds, isEntryCurrent, setEntriesState, t],
+    [discardKnownStageIds, fileExtensions, isEntryCurrent, setEntriesState, t],
   );
 
   const replaceEntries = useCallback(

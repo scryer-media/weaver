@@ -381,6 +381,25 @@ impl TorrentService {
 
     /// Read every torrent, keep their ledgers, follow their routes, and
     /// apply what that changes.
+    // The clock for a tick's readings. One that reads earlier than the
+    // tick before has been stepped back: every torrent's durations run
+    // from it, so the time from there on counts again. Nothing else moves
+    // a torrent's instant back, so a pass off the tick that read the clock
+    // before the tick and reached a torrent after it counts no time twice.
+    pub(super) async fn tick_clock(&self) -> i64 {
+        let now = self.inner.clock.unix_ms();
+        let last = self
+            .inner
+            .tick_at_ms
+            .swap(now, std::sync::atomic::Ordering::AcqRel);
+        if now < last {
+            for torrent in self.inner.live.lock().await.values_mut() {
+                torrent.clock_stepped_back(now);
+            }
+        }
+        now
+    }
+
     pub async fn tick(&self) {
         // A load of the stored torrents whose page failed reads it again.
         self.resume_load();
@@ -390,7 +409,7 @@ impl TorrentService {
         self.follow_routes().await;
         // Taken after the routes are followed, whose readings take their
         // own: no reading in the tick runs from before one already kept.
-        let now = self.inner.clock.unix_ms();
+        let now = self.tick_clock().await;
         // Each torrent read, its checkpoint written when it is behind, its
         // goals applied, then its queue turn, picking and limits.
         self.policy_pass(now).await;
@@ -495,7 +514,17 @@ impl TorrentService {
                                 .is_some_and(|open| Arc::ptr_eq(open, &attached.session))
                     })
                 {
-                    self.move_out(torrent).await;
+                    // A new client is a new peer to its trackers: they hear
+                    // the old one stop. Any other change is a move.
+                    let new_client = torrent
+                        .attached
+                        .as_ref()
+                        .is_some_and(|attached| attached.terms.client != terms.client);
+                    if new_client {
+                        self.detach(torrent).await;
+                    } else {
+                        self.move_out(torrent).await;
+                    }
                     // A torrent placed on another route reads as that route
                     // from here, opening, while the torrents before it take
                     // their turn. One whose route's session could not be

@@ -21,11 +21,6 @@ import { interpolate } from "@/lib/i18n/types";
 /**
  * The page the interface shows when it cannot show anything else.
  *
- * It draws its own palette rather than the theme tokens, because a crash can
- * land before any stylesheet has been applied at all. The server's startup holding
- * page draws the same design in plain HTML, so a Weaver that is failing looks
- * the same whether the browser or the server found out first.
- *
  * Retry asks Weaver whether it is answering before reloading, so a Weaver that
  * has stopped leaves the operator on this page, still checking, rather than on
  * the browser's own "cannot connect".
@@ -148,22 +143,22 @@ export function ErrorPage({
   const t = useErrorTranslate();
   const { state, retry } = useRetry();
   const focusRing =
-    "focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#3fb39c]";
+    "focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-wv-accent";
 
   return (
     <div
-      className="flex min-h-dvh items-center justify-center bg-[#1a1b1e] px-6 py-12 text-[#ecebe6]"
+      className="flex min-h-dvh items-center justify-center bg-wv-app px-6 py-12 text-wv-fg"
       style={UI_FONT}
     >
       <main className="flex w-full max-w-[460px] flex-col items-center text-center">
         <BrandLockup className="h-7 w-auto flex-none" />
         <h1
-          className="mt-9 text-[22px] leading-[1.3] font-semibold tracking-[-0.01em] text-[#ecebe6]"
+          className="mt-9 text-[22px] leading-[1.3] font-semibold tracking-[-0.01em] text-wv-fg"
           style={TITLE_FONT}
         >
           {title}
         </h1>
-        <p className="mt-2 text-[13px] leading-[1.6] break-words text-[#a09d96]">
+        <p className="mt-2 text-[13px] leading-[1.6] break-words text-wv-muted">
           {body}
         </p>
         <div className="mt-6 flex flex-wrap justify-center gap-[10px]">
@@ -171,7 +166,7 @@ export function ErrorPage({
             type="button"
             onClick={retry}
             disabled={state === "checking"}
-            className={`h-[34px] cursor-pointer bg-[#3fb39c] px-4 text-[13px] font-medium text-[#10201c] hover:bg-[#52c4ad] disabled:cursor-default disabled:bg-[#2f8a78] ${focusRing}`}
+            className={`h-[34px] cursor-pointer bg-wv-accent px-4 text-[13px] font-medium text-wv-on-accent hover:bg-wv-accent-hover disabled:cursor-default disabled:bg-wv-accent/70 ${focusRing}`}
           >
             {state === "checking"
               ? t("next.errorPage.checking")
@@ -181,7 +176,7 @@ export function ErrorPage({
             <button
               type="button"
               onClick={onBack}
-              className={`h-[34px] cursor-pointer border border-[#3a3b41] bg-[#23242a] px-[14px] text-[13px] font-medium text-[#ecebe6] hover:border-[#4a4b52] hover:bg-[#2a2b31] ${focusRing}`}
+              className={`h-[34px] cursor-pointer border border-wv-control bg-wv-button px-[14px] text-[13px] font-medium text-wv-fg hover:border-wv-control-hover hover:bg-wv-button-hover ${focusRing}`}
             >
               {t("next.errorPage.goBack")}
             </button>
@@ -190,18 +185,18 @@ export function ErrorPage({
         <p
           role="status"
           aria-live="polite"
-          className="mt-3 min-h-[1.6em] text-[12px] leading-[1.6] text-[#84817a]"
+          className="mt-3 min-h-[1.6em] text-[12px] leading-[1.6] text-wv-faint"
         >
           {state === "unreachable" ? t("next.errorPage.unreachable") : ""}
         </p>
         {detail ? (
           <details className="mt-5 w-full text-left">
             <summary
-              className={`cursor-pointer text-center text-[12px] text-[#84817a] hover:text-[#a09d96] ${focusRing}`}
+              className={`cursor-pointer text-center text-[12px] text-wv-faint hover:text-wv-muted ${focusRing}`}
             >
               {t("next.errorPage.details")}
             </summary>
-            <pre className="mt-3 max-h-[240px] overflow-auto border border-[#2a2b30] bg-[#1f2024] px-3 py-2 text-[11.5px] leading-[1.55] break-words whitespace-pre-wrap text-[#a09d96]">
+            <pre className="mt-3 max-h-[240px] overflow-auto border border-wv-line-strong bg-wv-chrome px-3 py-2 text-[11.5px] leading-[1.55] break-words whitespace-pre-wrap text-wv-muted">
               {detail}
             </pre>
           </details>

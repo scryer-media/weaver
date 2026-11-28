@@ -333,41 +333,88 @@ pub(super) mod refusal {
     // 403: a browser session came with the request but failed its origin or
     // CSRF binding.
     pub(in crate::http) const BROWSER_VERIFICATION_REQUIRED: &str = "BROWSER_VERIFICATION_REQUIRED";
+    // 403: the caller is known, and its scope does not allow the request.
+    // Sent by the `/api` handlers; the same code GraphQL's scope guards
+    // put in `extensions.code`.
+    pub(in crate::http) const FORBIDDEN: &str = "FORBIDDEN";
     // 413: an authenticated request's body is larger than the endpoint takes,
     // by its declared length or by the bytes that arrived.
     pub(in crate::http) const REQUEST_TOO_LARGE: &str = "REQUEST_TOO_LARGE";
+
+    // The MCP endpoint's codes. The first six are HTTP refusals sent as
+    // `code` beside `error`, before rmcp sees the request.
+    //
+    // 403: the endpoint is turned off, by the stored switch or by
+    // `WEAVER_MCP_ENABLED`. Sent before any other check.
+    pub(in crate::http) const MCP_DISABLED: &str = "MCP_DISABLED";
+    // 403: the request came from a browser page on an origin the GraphQL
+    // socket would refuse.
+    pub(in crate::http) const MCP_ORIGIN_NOT_ALLOWED: &str = "MCP_ORIGIN_NOT_ALLOWED";
+    // 401: no API key came with the request; a browser session or local
+    // access is not one.
+    pub(in crate::http) const MCP_API_KEY_REQUIRED: &str = "MCP_API_KEY_REQUIRED";
+    // 401: an API key was presented and refused.
+    pub(in crate::http) const MCP_API_KEY_INVALID: &str = "MCP_API_KEY_INVALID";
+    // 413: the body is larger than the endpoint takes.
+    pub(in crate::http) const MCP_REQUEST_TOO_LARGE: &str = "MCP_REQUEST_TOO_LARGE";
+    // 400: the body could not be read.
+    pub(in crate::http) const MCP_REQUEST_BODY_UNREADABLE: &str = "MCP_REQUEST_BODY_UNREADABLE";
+    // The rest are a tool error's `reason`, or a JSON-RPC error's
+    // `data.reason`. A tool name that is not served.
+    pub(in crate::http) const MCP_TOOL_UNKNOWN: &str = "MCP_TOOL_UNKNOWN";
+    // A tool argument that is missing, the wrong type or not taken.
+    pub(in crate::http) const MCP_ARGUMENTS_INVALID: &str = "MCP_ARGUMENTS_INVALID";
+    // A GraphQL error that carries no code of its own.
+    pub(in crate::http) const MCP_GRAPHQL_ERROR: &str = "MCP_GRAPHQL_ERROR";
+    // A run tool's result past its byte cap.
+    pub(in crate::http) const MCP_RESULT_TOO_LARGE: &str = "MCP_RESULT_TOO_LARGE";
+    // A confirmation token presented for a call other than its own.
+    pub(in crate::http) const MCP_CONFIRMATION_MISMATCH: &str = "MCP_CONFIRMATION_MISMATCH";
+    // A confirmation token that is unknown, expired or spent.
+    pub(in crate::http) const MCP_CONFIRMATION_UNKNOWN: &str = "MCP_CONFIRMATION_UNKNOWN";
+    // A query sent to the mutation tool, or the reverse.
+    pub(in crate::http) const MCP_OPERATION_KIND_MISMATCH: &str = "MCP_OPERATION_KIND_MISMATCH";
+    // No catalog operation has the name, or none in the named skill.
+    pub(in crate::http) const MCP_OPERATION_UNKNOWN: &str = "MCP_OPERATION_UNKNOWN";
+    // The name has differing texts in several skills and none was named.
+    pub(in crate::http) const MCP_OPERATION_AMBIGUOUS: &str = "MCP_OPERATION_AMBIGUOUS";
+    // No served operation is in the named skill.
+    pub(in crate::http) const MCP_SKILL_UNKNOWN: &str = "MCP_SKILL_UNKNOWN";
+    // The served schema could not be read.
+    pub(in crate::http) const MCP_SCHEMA_UNREADABLE: &str = "MCP_SCHEMA_UNREADABLE";
+    // A diagnostics tool called with a scope below ADMIN.
+    pub(in crate::http) const MCP_ADMIN_REQUIRED: &str = "MCP_ADMIN_REQUIRED";
+    // A log search pattern that is too long, not a regular expression, or
+    // too large once compiled.
+    pub(in crate::http) const MCP_LOG_PATTERN_INVALID: &str = "MCP_LOG_PATTERN_INVALID";
 
     #[cfg(test)]
     pub(in crate::http) const ALL: &[&str] = &[
         INVALID_API_KEY,
         AUTHENTICATION_REQUIRED,
         BROWSER_VERIFICATION_REQUIRED,
+        FORBIDDEN,
         REQUEST_TOO_LARGE,
+        MCP_DISABLED,
+        MCP_ORIGIN_NOT_ALLOWED,
+        MCP_API_KEY_REQUIRED,
+        MCP_API_KEY_INVALID,
+        MCP_REQUEST_TOO_LARGE,
+        MCP_REQUEST_BODY_UNREADABLE,
+        MCP_TOOL_UNKNOWN,
+        MCP_ARGUMENTS_INVALID,
+        MCP_GRAPHQL_ERROR,
+        MCP_RESULT_TOO_LARGE,
+        MCP_CONFIRMATION_MISMATCH,
+        MCP_CONFIRMATION_UNKNOWN,
+        MCP_OPERATION_KIND_MISMATCH,
+        MCP_OPERATION_UNKNOWN,
+        MCP_OPERATION_AMBIGUOUS,
+        MCP_SKILL_UNKNOWN,
+        MCP_SCHEMA_UNREADABLE,
+        MCP_ADMIN_REQUIRED,
+        MCP_LOG_PATTERN_INVALID,
     ];
-}
-
-// The body for an authentication or browser-binding refusal. Only the body
-// changes: the status is the one the auth check chose, and any status that is
-// not a refusal (a storage failure, say) keeps its bare response.
-fn auth_refusal_response(status: StatusCode, headers: &HeaderMap) -> axum::response::Response {
-    match status {
-        StatusCode::UNAUTHORIZED
-            if headers.contains_key(header::AUTHORIZATION) || headers.contains_key("x-api-key") =>
-        {
-            super::coded_error_response(status, refusal::INVALID_API_KEY, "invalid API key")
-        }
-        StatusCode::UNAUTHORIZED => super::coded_error_response(
-            status,
-            refusal::AUTHENTICATION_REQUIRED,
-            "authentication required",
-        ),
-        StatusCode::FORBIDDEN => super::coded_error_response(
-            status,
-            refusal::BROWSER_VERIFICATION_REQUIRED,
-            "browser verification required",
-        ),
-        other => other.into_response(),
-    }
 }
 
 // Room in a request body for the JSON or multipart framing around its largest
@@ -473,7 +520,7 @@ pub(super) async fn graphql_handler(
             &headers,
         )
         .await
-        .map_err(|status| auth_refusal_response(status, &headers))?,
+        .map_err(|status| super::refusal_response(super::Refused::Caller(status), &headers))?,
     };
     if !matches!(
         resolved.identity,
@@ -482,7 +529,7 @@ pub(super) async fn graphql_handler(
     ) {
         super::auth::validate_browser_csrf(&request_auth.db, &request_auth.security, &headers)
             .await
-            .map_err(|status| auth_refusal_response(status, &headers))?;
+            .map_err(|status| super::refusal_response(super::Refused::Caller(status), &headers))?;
     }
     let mut request = read_request(&headers, body, body_limit(&request_auth.security)).await?;
     request = request
@@ -496,8 +543,16 @@ pub(super) async fn graphql_handler(
 //
 // Browsers always send `Origin` on a socket upgrade and page scripts cannot
 // forge it; a request without one is a machine client, which carries its own
-// credential rather than riding on a browser's cookies.
-fn upgrade_origin_allowed(
+// credential rather than riding on a browser's cookies. The MCP endpoint
+// admits the same origins.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum OriginSurface {
+    GraphqlSocket,
+    Mcp,
+}
+
+pub(super) fn upgrade_origin_allowed(
+    surface: OriginSurface,
     auth: &super::RequestAuthContext,
     peer: Option<SocketAddr>,
     headers: &HeaderMap,
@@ -520,11 +575,18 @@ fn upgrade_origin_allowed(
         auth.security
             .is_websocket_origin_allowed(origin, request_host.as_ref(), peer, headers);
     if !allowed {
-        tracing::warn!(
-            origin,
-            "refused a GraphQL socket opened from another origin; name this \
-             server's public host in WEAVER_HTTP_ALLOWED_HOSTS if a proxy rewrites Host"
-        );
+        match surface {
+            OriginSurface::GraphqlSocket => tracing::warn!(
+                origin,
+                "refused a GraphQL socket opened from another origin; name this \
+                 server's public host in WEAVER_HTTP_ALLOWED_HOSTS if a proxy rewrites Host"
+            ),
+            OriginSurface::Mcp => tracing::warn!(
+                origin,
+                "refused an MCP request sent from another origin; name this \
+                 server's public host in WEAVER_HTTP_ALLOWED_HOSTS if a proxy rewrites Host"
+            ),
+        }
     }
     allowed
 }
@@ -567,7 +629,7 @@ pub(super) async fn ws_handler<E: Executor>(
     // Authenticated sessions bind an exact Origin and CSRF token at init.
     // Legacy browser sessions still need the upgrade Host/origin defense.
     if !request_auth.security.authenticated_access_mode()
-        && !upgrade_origin_allowed(&request_auth, peer, &headers)
+        && !upgrade_origin_allowed(OriginSurface::GraphqlSocket, &request_auth, peer, &headers)
     {
         return Err(StatusCode::FORBIDDEN);
     }

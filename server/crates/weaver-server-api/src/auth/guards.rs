@@ -156,6 +156,16 @@ pub fn graphql_error(code: &'static str, message: impl Into<String>) -> Error {
     })
 }
 
+// The caller's input was refused, worded as given.
+pub fn invalid_input(message: impl Into<String>) -> Error {
+    graphql_error("INVALID_INPUT", message)
+}
+
+// What the caller named does not exist, worded as given.
+pub fn not_found(message: impl Into<String>) -> Error {
+    graphql_error("NOT_FOUND", message)
+}
+
 pub fn internal_error(message: impl Into<String>) -> Error {
     graphql_error("INTERNAL", format!("internal: {}", message.into()))
 }

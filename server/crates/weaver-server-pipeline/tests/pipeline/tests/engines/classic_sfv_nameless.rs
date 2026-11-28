@@ -7,15 +7,15 @@
 // hex digits. A listing found that way checks the files it names as a named
 // one does.
 
-use super::harness::{ARTICLE, Claim, Post, Scenario, payload, run};
-use super::sfv::{crc, listing_text};
-use crate::history::HistoryFailureKind;
+use super::harness::{ARTICLE, Claim, Post, Scenario, kinds, payload, run};
+use super::sfv::{crc, listing_text, notes};
 use crate::jobs::model::JobStatus;
 
 // A listing posted under a name that says nothing, opening with a comment
-// and a blank line, is read as a listing: its entry that disagrees with a
-// file marks that file, so the job ends Partial as the repair's, as a named
-// listing does.
+// and a blank line, is read as a listing: it binds as an SFV, and stands
+// aside as every listing does. Its entry that disagrees with a file is
+// never taken for damage, so the job ends Complete with both files as
+// posted.
 #[tokio::test]
 async fn a_nameless_sfv_with_comments_and_blank_lines_is_used() {
     let lantern = payload(3 * ARTICLE, 73);
@@ -37,18 +37,24 @@ async fn a_nameless_sfv_with_comments_and_blank_lines_is_used() {
     let graph = run(&scenario).await;
     assert_eq!(
         graph.status,
-        Some(JobStatus::Partial),
+        Some(JobStatus::Complete),
         "{:?}",
         graph.failure
     );
-    assert_eq!(graph.failure_kind, Some(HistoryFailureKind::Repair));
+    assert_eq!(graph.failure_kind, None);
     let view = graph.graph();
+    assert!(view.rulings.is_empty());
+    assert_eq!(kinds(&graph), ["sfv"]);
     assert_eq!(view.claims["lantern.mkv"], Claim::Complete);
-    assert_eq!(view.claims["beacon.mkv"], Claim::Damaged);
+    assert_eq!(view.claims["beacon.mkv"], Claim::Complete);
+    assert_eq!(
+        notes(&graph),
+        ["beacon.mkv does not match its CRC32 in oBfU5CaTeD-0001"]
+    );
 }
 
-// Two nameless listings each naming one file are both read: the second's
-// entry, disagreeing with its file, marks it.
+// Two nameless listings each naming one file are both read as listings:
+// each notes the file it disagrees with.
 #[tokio::test]
 async fn two_nameless_sfv_listings_are_both_used() {
     let lantern = payload(3 * ARTICLE, 75);
@@ -58,7 +64,7 @@ async fn two_nameless_sfv_listings_are_both_used() {
         Post::plain("beacon.mkv", beacon.clone()),
         Post::plain(
             "5wXn1TLm",
-            listing_text("", &[("lantern.mkv", crc(&lantern))]),
+            listing_text("", &[("lantern.mkv", crc(&lantern) ^ 1)]),
         ),
         Post::plain(
             "aC3f9pQ2",
@@ -68,12 +74,23 @@ async fn two_nameless_sfv_listings_are_both_used() {
     let graph = run(&scenario).await;
     assert_eq!(
         graph.status,
-        Some(JobStatus::Partial),
+        Some(JobStatus::Complete),
         "{:?}",
         graph.failure
     );
-    assert_eq!(graph.failure_kind, Some(HistoryFailureKind::Repair));
+    assert_eq!(graph.failure_kind, None);
     let view = graph.graph();
+    assert!(view.rulings.is_empty());
+    assert_eq!(kinds(&graph), ["sfv"]);
     assert_eq!(view.claims["lantern.mkv"], Claim::Complete);
-    assert_eq!(view.claims["beacon.mkv"], Claim::Damaged);
+    assert_eq!(view.claims["beacon.mkv"], Claim::Complete);
+    let mut noted = notes(&graph);
+    noted.sort();
+    assert_eq!(
+        noted,
+        [
+            "beacon.mkv does not match its CRC32 in aC3f9pQ2",
+            "lantern.mkv does not match its CRC32 in 5wXn1TLm",
+        ]
+    );
 }

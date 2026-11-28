@@ -427,6 +427,12 @@ pub struct QueueItem {
     #[graphql(skip)]
     #[serde(skip)]
     pub disk_write: Option<Option<QueueDiskWrite>>,
+    /// The published torrent rows the list this item came in shares, read
+    /// once for the list when a row's `torrent` is asked for; none when no
+    /// list shared them, and `torrent` then reads this row's alone.
+    #[graphql(skip)]
+    #[serde(skip)]
+    pub torrent_rows: crate::torrents::QueueTorrentRows,
 }
 
 /// A job's write to its destination disk, while the disk is slow or the
@@ -474,6 +480,20 @@ pub(crate) fn attach_disk_writes(
 
 #[async_graphql::ComplexObject]
 impl QueueItem {
+    /// The job's torrent as the torrent list's rows show it; null for an
+    /// NZB job, for a torrent whose row is not yet published, and while the
+    /// torrent client is not running. Its
+    /// files, peer connections and unpacked files are read on
+    /// `torrent(id)`, and asking for them here is refused.
+    async fn torrent(
+        &self,
+        ctx: &async_graphql::Context<'_>,
+    ) -> async_graphql::Result<Option<crate::torrents::types::TorrentGql>> {
+        if self.protocol != ProtocolGql::Torrent {
+            return Ok(None);
+        }
+        crate::torrents::queue_torrent(ctx, &self.torrent_rows, self.id)
+    }
     /// The job's attributes. An RSS job's item link and id are among them
     /// for an admin only.
     async fn attributes(&self, ctx: &async_graphql::Context<'_>) -> Vec<Attribute> {
@@ -547,6 +567,32 @@ impl GlobalQueueState {
             secs => Some(secs.saturating_mul(1000)),
         }
     }
+
+    /// The paused classes whose pause lifts by itself, and when.
+    async fn class_resumes(&self, ctx: &async_graphql::Context<'_>) -> Vec<ClassResume> {
+        let Some(coordinator) = ctx.data_opt::<crate::ScheduledResumeCoordinator>() else {
+            return Vec::new();
+        };
+        let mut resumes = Vec::new();
+        for class in weaver_server_core::jobs::HeldClass::all() {
+            let secs = coordinator.class_resume_at(class).await;
+            if secs > 0 {
+                resumes.push(ClassResume {
+                    class: class.protocol().into(),
+                    resume_at_epoch_ms: secs.saturating_mul(1000),
+                });
+            }
+        }
+        resumes
+    }
+}
+
+/// A class pause that lifts by itself.
+#[derive(Debug, Clone, PartialEq, SimpleObject)]
+pub struct ClassResume {
+    pub class: ProtocolGql,
+    /// When the pause lifts, in epoch milliseconds.
+    pub resume_at_epoch_ms: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, SimpleObject)]
@@ -1700,6 +1746,7 @@ fn queue_item_from_display(
         attention: attention_for_live_job(info, state),
         duplicate_summary: None,
         disk_write: None,
+        torrent_rows: Default::default(),
     }
 }
 
@@ -1754,6 +1801,7 @@ pub fn queue_item_from_submission(
         attention: None,
         duplicate_summary: None,
         disk_write: None,
+        torrent_rows: Default::default(),
     }
 }
 
@@ -2058,7 +2106,7 @@ fn normalize_progress_percent(progress_ratio: f64) -> f64 {
     (progress_ratio * 100.0).clamp(0.0, 100.0)
 }
 
-fn ms_to_datetime(ms: i64) -> DateTime<Utc> {
+pub(crate) fn ms_to_datetime(ms: i64) -> DateTime<Utc> {
     DateTime::from_timestamp_millis(ms).unwrap_or(DateTime::<Utc>::UNIX_EPOCH)
 }
 

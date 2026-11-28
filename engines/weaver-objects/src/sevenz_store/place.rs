@@ -141,6 +141,12 @@ impl SevenZipStore {
             }
             let part = ByteRange::new(cursor, folder.pack.end.min(range.end));
             let local = part.shift(-(folder.pack.start as i64));
+            if folder.coded {
+                // Its packs are the run's to read, from the envelope.
+                out.push(Piece::Envelope(part));
+                cursor = part.end;
+                continue;
+            }
             match &self.folders[index] {
                 // The proof file is kept to try passwords against.
                 Lock::Locked | Lock::Sealed(..) => self.held_or_kept(part, out),
@@ -176,7 +182,7 @@ impl SevenZipStore {
         };
         let mut pieces = Vec::new();
         for (index, folder) in map.folders_in(range) {
-            let Some(part) = range.intersect(folder.pack) else {
+            let Some(part) = range.intersect(folder.pack).filter(|_| !folder.coded) else {
                 continue;
             };
             let local = part.shift(-(folder.pack.start as i64));
@@ -230,10 +236,24 @@ impl SevenZipStore {
         range: ByteRange,
         out: &mut Vec<Extent>,
     ) -> Located {
-        match &self.map {
-            Some(map) => self.extent_in(map, member, range, out),
-            None => Located::NotYet,
+        let Some(map) = &self.map else {
+            return Located::NotYet;
+        };
+        // A coded member's bytes are its folder's decode: every byte of the
+        // folder's packs is behind each of them.
+        let coded = map
+            .entry(member)
+            .and_then(|entry| entry.folder)
+            .map(|folder| &map.folders[folder])
+            .filter(|folder| folder.coded);
+        if let Some(folder) = coded {
+            out.push(Extent {
+                volume: FILE,
+                range: folder.pack,
+            });
+            return Located::Whole;
         }
+        self.extent_in(map, member, range, out)
     }
 
     // On a map in hand, for a caller that has taken it out to route by it.

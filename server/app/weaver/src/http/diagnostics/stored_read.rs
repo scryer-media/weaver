@@ -128,7 +128,7 @@ type QueueNames = Box<dyn Fn() -> Vec<(u64, JobNameRecord)> + Send + Sync>;
 
 // What the read has gathered so far, shared with the request that waits on
 // it.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub(super) struct ReadState {
     pub(super) stored: StoredNames,
     pub(super) steps: Vec<ManifestStep>,

@@ -624,3 +624,96 @@ async fn a_held_recovery_volume_reads_as_fetching_repair_data() {
         "not repaired"
     );
 }
+
+// What a run counted of the articles of a recovery volume past its front,
+// before the volume was whole: how many came, how many left their set a bind
+// to do, and how many bound.
+#[derive(Debug, PartialEq, Eq)]
+struct VolumeBinds {
+    articles: usize,
+    due: usize,
+    binds: usize,
+}
+
+async fn run_counting_volume_binds(
+    scenario: &Scenario,
+    open: bool,
+) -> (super::harness::Outcome, VolumeBinds) {
+    use weaver_server_pipeline::pipeline::graph::namespace::recovery::{
+        VOLUME_ARTICLES, VOLUME_BINDS, VOLUME_BINDS_DUE, VOLUME_BINDS_OPEN,
+    };
+    for count in [&VOLUME_ARTICLES, &VOLUME_BINDS_DUE, &VOLUME_BINDS] {
+        count.with(|count| count.set(0));
+    }
+    VOLUME_BINDS_OPEN.with(|cell| cell.set(open));
+    let graph = run(scenario).await;
+    VOLUME_BINDS_OPEN.with(|cell| cell.set(false));
+    let counted = VolumeBinds {
+        articles: VOLUME_ARTICLES.with(std::cell::Cell::get),
+        due: VOLUME_BINDS_DUE.with(std::cell::Cell::get),
+        binds: VOLUME_BINDS.with(std::cell::Cell::get),
+    };
+    (graph, counted)
+}
+
+// A recovery volume of some forty kilobytes, posted without its index, in
+// articles far past its front, over a damaged file and one posted under a
+// name of its own. An article of the volume binds the set only when what
+// the set took of it left a bind something to do, not once per article,
+// and the job binds, names, repairs and delivers every member as it does
+// when each such article binds.
+#[tokio::test]
+async fn a_recovery_volumes_articles_bind_only_when_their_take_left_a_bind_due() {
+    let named = payload(12 * 1024, 71);
+    let hidden = payload(12 * 1024, 72);
+    let described = [
+        ("lantern.bin", named.as_slice()),
+        ("beacon.bin", hidden.as_slice()),
+    ];
+    let volumes = par2_volumes("lantern", &described, 300, 1);
+    assert_eq!(volumes.len(), 2, "an index and one volume");
+    let volume = volumes.into_iter().nth(1).expect("the volume");
+    assert!(volume.bytes.len() > 2 * 16 * 1024, "{}", volume.bytes.len());
+    let posts = vec![
+        Post::plain("lantern.bin", named.clone()),
+        Post::plain("3f9a.bin", hidden.clone()),
+        volume,
+    ];
+    let mut scenario = Scenario::new(posts);
+    scenario.damage.push((0, 5));
+
+    let (gated, counted) = run_counting_volume_binds(&scenario, false).await;
+    let (open, before) = run_counting_volume_binds(&scenario, true).await;
+
+    assert!(before.articles > 100, "{before:?}");
+    assert_eq!(before.binds, before.articles, "every article bound before");
+    assert_eq!(counted.articles, before.articles);
+    assert_eq!(counted.due, before.due);
+    assert_eq!(
+        counted.binds, counted.due,
+        "a bind for each take that left one"
+    );
+    assert!(counted.binds < counted.articles, "{counted:?}");
+
+    assert!(gated.completed(), "{:?}", gated.failure);
+    assert_eq!(gated.status, open.status);
+    assert_eq!(gated.failure, open.failure);
+    assert_eq!(
+        gated.files.keys().collect::<Vec<_>>(),
+        open.files.keys().collect::<Vec<_>>()
+    );
+    for (name, bytes) in &open.files {
+        assert!(gated.files[name] == *bytes, "{name}");
+    }
+    assert!(gated.files["lantern beacon/lantern.bin"] == named);
+    assert!(gated.files["lantern beacon/beacon.bin"] == hidden);
+    let (gated, open) = (gated.graph(), open.graph());
+    for (name, claim) in &open.claims {
+        assert_eq!(gated.claims.get(name), Some(claim), "{name}");
+    }
+    assert_eq!(gated.claims.len(), open.claims.len());
+    assert_eq!(gated.names, open.names);
+    assert_eq!(gated.outcomes, open.outcomes);
+    assert_eq!(gated.rulings, open.rulings);
+    assert_eq!(gated.delivery, open.delivery);
+}

@@ -16,7 +16,7 @@ use super::instances::{
     InstanceInputDraft, InstanceSchedule, InstanceTrigger, ScriptInstance, ScriptInstanceDraft,
     ScriptInstanceError,
 };
-use super::listing::{DiscoveredScript, resolve_script};
+use super::listing::{DiscoveredScript, ListingError, resolve_script};
 use super::model::{OptionValue, ScriptKind, ScriptManifest, ScriptName, ScriptTaskTime};
 use super::runner::option_value_text;
 use weaver_server_db::persistence::StateError;
@@ -224,7 +224,7 @@ pub struct HeaderSetup {
 #[derive(Debug, thiserror::Error)]
 pub enum HeaderSetupError {
     #[error("{0}")]
-    Script(String),
+    Script(ListingError),
     #[error("the script's header declares nothing to set up")]
     NothingDeclared,
     #[error(transparent)]
@@ -240,7 +240,7 @@ trait PostProcessingPresetLocalQueries {
 impl<D: PostprocDatabase> PostProcessingPresetLocalQueries for D {
     fn discovered_script(&self, script: &ScriptName) -> Result<DiscoveredScript, HeaderSetupError> {
         resolve_script(&self.post_processing_script_directory()?, script)
-            .map_err(|error| HeaderSetupError::Script(error.to_string()))
+            .map_err(HeaderSetupError::Script)
     }
 }
 

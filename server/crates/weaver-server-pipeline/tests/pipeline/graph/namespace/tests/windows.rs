@@ -199,6 +199,9 @@ impl Recovery for Trail {
         self.tape.lock().unwrap().binds += 1;
     }
 
+    // It covers nothing, so its bind covers nothing newly.
+    fn take_newly(&mut self, _: &mut Vec<(MemberId, String)>) {}
+
     fn covers(&self, _: MemberId) -> bool {
         false
     }

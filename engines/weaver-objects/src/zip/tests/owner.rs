@@ -57,12 +57,22 @@ pub(super) struct Owner {
     pub refetched: Vec<(VolumeIndex, ByteRange)>,
     // Runs read back and delivered again.
     pub replays: usize,
+    // How deep ranges asked for again are being answered inside one
+    // another: a store that asks again for what it is being given again
+    // fails the test here instead of overflowing the stack.
+    again_depth: usize,
     // The object is not lent out for what it holds until `work` is called.
     pub lend_late: bool,
     working: bool,
     // Member bytes said, every time they were said.
     pub emitted: u64,
+    // Member bytes said without a CRC32 over every byte of them.
+    pub unproven: usize,
 }
+
+// The most ranges asked for again answered inside one another before a
+// test fails.
+const AGAIN_DEPTH: usize = 32;
 
 // What is held of `range` of `volume`, read the way the owner reads a held
 // placement back: every byte of it, or nothing.
@@ -136,8 +146,10 @@ impl Owner {
             fetched: BTreeMap::new(),
             refetched: Vec::new(),
             replays: 0,
+            again_depth: 0,
             lend_late: false,
             emitted: 0,
+            unproven: 0,
             working: false,
         };
         let name = owner.volumes[0].0.clone();
@@ -393,6 +405,15 @@ impl Owner {
             .expect("the facts restore");
     }
 
+    // The namespace's check of the member's file failed, as the tree tells
+    // the store.
+    pub fn refuted(&mut self, member: weaver_graph::MemberId) {
+        let mut out = Vec::new();
+        self.object.member_refuted(member, &mut out);
+        self.apply(out);
+        self.settle();
+    }
+
     pub fn held(&self) -> usize {
         self.held.len()
     }
@@ -444,6 +465,9 @@ impl Owner {
                     provenance,
                 } => {
                     self.emitted += bytes.len() as u64;
+                    if !bytes.proven(weaver_graph::Algorithm::Crc32) {
+                        self.unproven += 1;
+                    }
                     let got = self.members.get_mut(&member.0).expect("announced first");
                     let end = offset as usize + bytes.len();
                     if got.bytes.len() < end {
@@ -488,6 +512,11 @@ impl Owner {
     // member they reached is open again, and the bytes come again as they
     // came.
     pub(super) fn again(&mut self, ranges: &[(VolumeIndex, ByteRange)]) {
+        assert!(
+            self.again_depth < AGAIN_DEPTH,
+            "asked again {AGAIN_DEPTH} deep, inside answers to asking again"
+        );
+        self.again_depth += 1;
         let read_back = self.read_delivered(&self.forgets(ranges, false));
         for (volume, piece, _, _) in &read_back {
             self.uncover(*volume, *piece);
@@ -496,6 +525,7 @@ impl Owner {
             self.replays += 1;
             self.push(volume, piece, provenance, Some(&bytes));
         }
+        self.again_depth -= 1;
     }
 
     // An article sent back for another copy, as the job sends it back: what

@@ -216,8 +216,15 @@ impl TorrentService {
             QueueAction::Resume => self.resume(job_id).await,
             QueueAction::Cancel(origin) => {
                 let delete_files = origin != CancellationOrigin::UserKeepingFiles;
-                self.remove_as(job_id, delete_files, false, super::scripts::Ending::Asked)
-                    .await
+                // A cancel the caller asked for is never refused for a
+                // seeding goal still to meet; one Weaver decides on is.
+                self.remove_as(
+                    job_id,
+                    delete_files,
+                    origin.is_user(),
+                    super::scripts::Ending::Asked,
+                )
+                .await
             }
             QueueAction::Update(update) => self.update(job_id, update).await,
             QueueAction::Move(target) => self.reorder(&[job_id], target).await,

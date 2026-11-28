@@ -107,6 +107,9 @@ impl Tree {
             into.crc32 = record.crc32;
             into.fronted = record.fronted;
         }
+        if let Some(mut members) = self.nodes.members_mut(parent) {
+            members.refront(lifted);
+        }
         self.lifted.insert(
             (parent, lifted),
             Lift {

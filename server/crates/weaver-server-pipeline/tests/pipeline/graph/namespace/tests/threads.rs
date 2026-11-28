@@ -213,7 +213,9 @@ fn a_discarded_leaf_with_no_file_takes_no_newer_file_through_the_writer() {
         .discard(Leaf::at(&dir, &queued).through(to.as_ref()))
         .expect("discard");
     let mut newer = Leaf::at(&dir, &queued).through(to.as_ref());
-    newer.write(LoopSite::LeafWrite, 0, b"next", None).unwrap();
+    newer
+        .write(LoopSite::LeafWrite, 0, b"next", None, false)
+        .unwrap();
     job.commit();
     hold.wait_held();
     hold.open();
@@ -223,7 +225,9 @@ fn a_discarded_leaf_with_no_file_takes_no_newer_file_through_the_writer() {
     // The newer file is on disk first.
     let written = crate::pipeline::graph::envelope::envelope_name(NodeId(3), 1);
     let mut first = Leaf::at(&dir, &written).through(to.as_ref());
-    first.write(LoopSite::LeafWrite, 0, b"next", None).unwrap();
+    first
+        .write(LoopSite::LeafWrite, 0, b"next", None, false)
+        .unwrap();
     settle(&job);
     job.writer
         .discard(Leaf::at(&dir, &written).through(to.as_ref()))

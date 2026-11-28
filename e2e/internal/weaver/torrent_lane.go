@@ -306,20 +306,27 @@ func (lane *torrentLane) gql(query string, variables map[string]any, out any) er
 	return nil
 }
 
-const torrentFields = `id name infohash state stated detail category private forced progress totalBytes haveBytes
-uploadedBytes downloadedBytes ratio downloadBps uploadBps peers seeds leechers completedAtMs storageDir
-seedingLeft route seedingPolicy { ratioGoal seedTimeGoalMinutes inactiveGoalMinutes mode action uploadCap levels { ratioGoal } }
+// torrentListFields are what a torrent list may select: no detail-only
+// field.
+const torrentListFields = `id name infohashV1 state stateReason stateDetail category private forced progress totalBytes haveBytes
+uploadedBytes downloadedBytes ratio downloadBps uploadBps connectedPeers connectedSeeds connectedLeechers completedAt storageDir
+seedingGoalLeft route seedingPolicy { ratioGoal seedTimeGoalMinutes inactiveGoalMinutes mode action uploadCap levels { ratioGoal } }
 seedingOverride { ratioGoal { state value } action { state value } }
-files { index path length selected progress }
-trackers { tier url status message seeders leechers lastAnnounceMs }`
+trackers { tier url status message seeders leechers lastAnnounceAt }
+unpacking { result reason }`
+
+// torrentFields are one torrent's fields, its files with them: the lane's
+// fixtures hold far fewer than one page of files.
+const torrentFields = torrentListFields + `
+files(first: 1000) { items { index path length selected progress } totalCount }`
 
 type torrentView struct {
 	ID              int     `json:"id"`
 	Name            string  `json:"name"`
-	Infohash        string  `json:"infohash"`
+	Infohash        string  `json:"infohashV1"`
 	State           string  `json:"state"`
-	Stated          *string `json:"stated"` // HELD_MANUAL under the torrents' hold
-	Detail          *string `json:"detail"`
+	Stated          *string `json:"stateReason"` // HELD_MANUAL under the torrents' hold
+	Detail          *string `json:"stateDetail"`
 	Category        *string `json:"category"`
 	Private         bool    `json:"private"`
 	Forced          bool    `json:"forced"`
@@ -331,14 +338,19 @@ type torrentView struct {
 	Ratio           float64 `json:"ratio"`
 	DownloadBps     int64   `json:"downloadBps"`
 	UploadBps       int64   `json:"uploadBps"`
-	Peers           int     `json:"peers"`
-	Seeds           int     `json:"seeds"`
-	Leechers        int     `json:"leechers"`
-	CompletedAtMs   *int64  `json:"completedAtMs"`
+	Peers           int     `json:"connectedPeers"`
+	Seeds           int     `json:"connectedSeeds"`
+	Leechers        int     `json:"connectedLeechers"`
+	CompletedAt     *string `json:"completedAt"`
 	StorageDir      *string `json:"storageDir"`
-	SeedingLeft     *string `json:"seedingLeft"`
-	Route           *string `json:"route"`
-	SeedingPolicy   struct {
+	// How its unpacking came out, once over; absent while it runs.
+	Unpacking *struct {
+		Result string  `json:"result"`
+		Reason *string `json:"reason"`
+	} `json:"unpacking"`
+	SeedingLeft   *string `json:"seedingGoalLeft"`
+	Route         *string `json:"route"`
+	SeedingPolicy struct {
 		RatioGoal *float64 `json:"ratioGoal"`
 		Action    string   `json:"action"`
 		// The level each term comes from.
@@ -350,12 +362,16 @@ type torrentView struct {
 		RatioGoal leaf[float64] `json:"ratioGoal"`
 		Action    leaf[string]  `json:"action"`
 	} `json:"seedingOverride"`
-	Files []struct {
-		Index    int     `json:"index"`
-		Path     string  `json:"path"`
-		Length   int64   `json:"length"`
-		Selected bool    `json:"selected"`
-		Progress float64 `json:"progress"`
+	// Absent from a list, which may not select it.
+	Files struct {
+		Items []struct {
+			Index    int     `json:"index"`
+			Path     string  `json:"path"`
+			Length   int64   `json:"length"`
+			Selected bool    `json:"selected"`
+			Progress float64 `json:"progress"`
+		} `json:"items"`
+		TotalCount int `json:"totalCount"`
 	} `json:"files"`
 	Trackers []struct {
 		URL    string  `json:"url"`
@@ -388,24 +404,30 @@ type submitOptions struct {
 	Paused   bool
 	Forced   bool
 	Seeding  map[string]any
+	// Unpack asks for this torrent's archives to be extracted; unpacking is
+	// off by default.
+	Unpack bool
 }
 
 func (lane *torrentLane) submit(fixture *torrentFixture, options submitOptions) (*torrentView, error) {
 	input := map[string]any{"paused": options.Paused, "forced": options.Forced}
 	if options.Magnet {
-		input["magnet"] = fixture.Magnet
+		input["source"] = map[string]any{"magnet": fixture.Magnet}
 	} else {
 		data, err := os.ReadFile(fixture.TorrentFile)
 		if err != nil {
 			return nil, err
 		}
-		input["metainfoBase64"] = base64.StdEncoding.EncodeToString(data)
+		input["source"] = map[string]any{"metainfoBase64": base64.StdEncoding.EncodeToString(data)}
 	}
 	if options.Category != "" {
 		input["category"] = options.Category
 	}
 	if options.Seeding != nil {
 		input["seeding"] = options.Seeding
+	}
+	if options.Unpack {
+		input["unpack"] = true
 	}
 	var out struct {
 		SubmitTorrent torrentView `json:"submitTorrent"`
@@ -428,18 +450,82 @@ func (lane *torrentLane) torrent(id int) (*torrentView, error) {
 	return out.Torrent, nil
 }
 
+// torrents lists every torrent, page by page through `nextCursor`.
 func (lane *torrentLane) torrents() ([]torrentView, error) {
-	var out struct {
-		Torrents []torrentView `json:"torrents"`
+	var all []torrentView
+	var after *string
+	for {
+		var out struct {
+			Torrents struct {
+				Items      []torrentView `json:"items"`
+				NextCursor *string       `json:"nextCursor"`
+			} `json:"torrents"`
+		}
+		err := lane.gql(`query($after: String) { torrents(after: $after) { items { `+torrentListFields+` } nextCursor } }`,
+			map[string]any{"after": after}, &out)
+		if err != nil {
+			return all, err
+		}
+		all = append(all, out.Torrents.Items...)
+		if out.Torrents.NextCursor == nil {
+			return all, nil
+		}
+		after = out.Torrents.NextCursor
 	}
-	err := lane.gql(`{ torrents { `+torrentFields+` } }`, nil, &out)
-	return out.Torrents, err
 }
 
+// mutateBool runs a mutation whose answer is a scalar.
 func (lane *torrentLane) mutateBool(name string, args string, variables map[string]any) error {
+	return lane.mutateSelect(name, args, "", variables)
+}
+
+// mutateSelect runs a mutation whose answer is an object, selecting
+// `selection` from it.
+func (lane *torrentLane) mutateSelect(name string, args string, selection string, variables map[string]any) error {
+	if selection != "" {
+		selection = " { " + selection + " }"
+	}
 	var out map[string]any
-	if err := lane.gql(fmt.Sprintf("mutation%s { %s }", argDecl(variables), name+args), variables, &out); err != nil {
+	if err := lane.gql(fmt.Sprintf("mutation%s { %s%s }", argDecl(variables), name+args, selection), variables, &out); err != nil {
 		return err
+	}
+	return nil
+}
+
+// queueCommand runs a queue mutation on one job and fails when the queue
+// did not take it.
+func (lane *torrentLane) queueCommand(name string, id int) error {
+	var out map[string]struct {
+		Success bool    `json:"success"`
+		Message *string `json:"message"`
+	}
+	if err := lane.gql(`mutation($id: Int!) { `+name+`(id: $id) { success message } }`, map[string]any{"id": id}, &out); err != nil {
+		return err
+	}
+	if result := out[name]; !result.Success {
+		return fmt.Errorf("%s %d: %s", name, id, deref(result.Message))
+	}
+	return nil
+}
+
+// setCategory moves the torrent's job into category; the empty string
+// takes it out of its category. A refusal is the failure.
+func (lane *torrentLane) setCategory(id int, category string) error {
+	var out struct {
+		SetQueueItemsCategory struct {
+			Refused []struct {
+				Code    string `json:"code"`
+				Message string `json:"message"`
+			} `json:"refused"`
+		} `json:"setQueueItemsCategory"`
+	}
+	err := lane.gql(`mutation($ids: [Int!], $category: String!) { setQueueItemsCategory(target: {ids: $ids}, category: $category) { refused { code message } } }`,
+		map[string]any{"ids": []int{id}, "category": category}, &out)
+	if err != nil {
+		return err
+	}
+	if refused := out.SetQueueItemsCategory.Refused; len(refused) > 0 {
+		return fmt.Errorf("category refused: %s (%s)", refused[0].Code, refused[0].Message)
 	}
 	return nil
 }
@@ -466,10 +552,10 @@ func argDecl(variables map[string]any) string {
 	}
 	types := map[string]string{
 		"id": "Int!", "deleteFiles": "Boolean!", "forced": "Boolean!",
-		"category": "String", "seeding": "SeedingPolicyInput",
+		"seeding": "SeedingPolicyInput",
 	}
 	var parts []string
-	for _, key := range []string{"id", "deleteFiles", "forced", "category", "seeding"} {
+	for _, key := range []string{"id", "deleteFiles", "forced", "seeding"} {
 		if _, ok := variables[key]; ok {
 			parts = append(parts, "$"+key+": "+types[key])
 		}
@@ -478,15 +564,15 @@ func argDecl(variables map[string]any) string {
 }
 
 func (lane *torrentLane) pause(id int) error {
-	return lane.mutateBool("pauseTorrent", "(id: $id)", map[string]any{"id": id})
+	return lane.queueCommand("pauseQueueItem", id)
 }
 
 func (lane *torrentLane) resume(id int) error {
-	return lane.mutateBool("resumeTorrent", "(id: $id)", map[string]any{"id": id})
+	return lane.queueCommand("resumeQueueItem", id)
 }
 
 func (lane *torrentLane) setForced(id int, forced bool) error {
-	return lane.mutateBool("setTorrentForced", "(id: $id, forced: $forced)", map[string]any{"id": id, "forced": forced})
+	return lane.mutateSelect("setTorrentForced", "(id: $id, forced: $forced)", "id forced", map[string]any{"id": id, "forced": forced})
 }
 
 func (lane *torrentLane) remove(id int, deleteFiles bool) error {
@@ -514,7 +600,7 @@ func (lane *torrentLane) waitTorrent(id int, describe string, want func(*torrent
 }
 
 func seeding(view *torrentView) bool {
-	return view != nil && view.State == "SEEDING" && view.HaveBytes == view.TotalBytes && view.CompletedAtMs != nil
+	return view != nil && view.State == "SEEDING" && view.HaveBytes == view.TotalBytes && view.CompletedAt != nil
 }
 
 // ---- tracker ----
@@ -787,11 +873,6 @@ func verifyTorrentOutput(fixture *torrentFixture, dir string) (map[string]any, e
 		}
 		if got != want {
 			problems = append(problems, fmt.Sprintf("%s BLAKE3 %s, want %s", rel, got, want))
-		}
-	}
-	for _, rel := range fixture.Absent {
-		if _, ok := listing[rel]; ok {
-			problems = append(problems, "unpacking left "+rel)
 		}
 	}
 	retainedAt := map[string]string{}

@@ -4,6 +4,7 @@
 import assert from "node:assert/strict";
 import { after, before, test } from "node:test";
 import { createServer } from "vite";
+import { torrentIds } from "../../src/next/testids/torrents.ts";
 const { chromium } = await import(
   process.env.PLAYWRIGHT_MODULE_PATH ?? "playwright"
 );
@@ -40,6 +41,7 @@ async function open(screen) {
 const sent = (page) =>
   page.evaluate(() => structuredClone(window.torrentsFixture.sent));
 const METAINFO = "d4:infod4:name7:fixturee";
+const COMPRESSIONS = ["gz", "xz", "zst"];
 
 test("only a torrent carries a protocol chip", async () => {
   const { page, errors } = await open("tag");
@@ -127,29 +129,42 @@ test("a tracker row says who named the tracker", async () => {
   await page.close();
 });
 
-test("the add dialog sends a torrent file and a magnet link through submit, read for what they are", async () => {
+test("the Add dialog submits torrent and magnet files and accepts pasted links", async () => {
   const { page, errors } = await open("add");
   const dialog = page.getByRole("dialog", { name: "Add", exact: true });
   await dialog.waitFor();
-  // The name says nothing: the daemon reads the bytes, and a torrent is not staged.
-  await page.locator("input[type=file]").setInputFiles({
-    name: "fixture.bin",
-    mimeType: "application/octet-stream",
-    buffer: Buffer.from(METAINFO),
-  });
-  await dialog.getByText("fixture.bin", { exact: true }).waitFor();
-  await dialog.getByText("staged", { exact: true }).waitFor();
-  await dialog.getByRole("switch", { name: "Add paused", exact: true }).click();
+  const opened = page.waitForEvent("filechooser");
+  await page.getByTestId(torrentIds.addDrop).click();
+  const picker = await opened;
+  await picker.setFiles([
+    {
+      name: "fixture.TORRENT",
+      mimeType: "application/octet-stream",
+      buffer: Buffer.from(METAINFO),
+    },
+    {
+      name: "saved.magnet",
+      mimeType: "text/plain",
+      buffer: Buffer.from(`magnet:?xt=urn:btih:${"1".repeat(40)}\n`),
+    },
+  ]);
+  await dialog.getByTestId(torrentIds.addPaused).click();
 
-  const link = dialog.getByRole("textbox", { name: "Link", exact: true });
+  const link = dialog.getByTestId(torrentIds.addLink);
   await link.fill("magnet:?xt=urn:btih:duplicate");
-  const submit = dialog.getByRole("button", { name: /^Add/ });
+  const submit = dialog.getByTestId(torrentIds.addSubmit);
   await submit.click();
 
   // The daemon's refusal is shown as it gave it, and the dialog stays open for it.
   await dialog
     .getByText("This torrent is already in the queue.", { exact: true })
     .waitFor();
+  await page.waitForFunction(() =>
+    window.torrentsFixture.sent.some(
+      ({ name, variables }) =>
+        name === "Submit" && variables.file === "saved.magnet",
+    ),
+  );
   // No tags were given, so none are sent.
   const input = {
     upload: null,
@@ -164,12 +179,14 @@ test("the add dialog sends a torrent file and a magnet link through submit, read
     .map((entry) => entry.variables);
   assert.deepEqual(submitted, [
     { input: { ...input, text: "magnet:?xt=urn:btih:duplicate" } },
-    { input: { ...input, text: null }, file: "fixture.bin" },
+    { input: { ...input, text: null }, file: "fixture.TORRENT" },
+    { input: { ...input, text: null }, file: "saved.magnet" },
   ]);
   assert.equal(await page.locator("#status").innerText(), "");
 
-  // Sent again, the file already in is not sent twice, and the dialog closes once nothing is refused.
-  await link.fill("magnet:?xt=urn:btih:fresh");
+  // The files are already in. A successful pasted NZB URL closes the dialog.
+  const nzbUrl = "https://downloads.example/release.nzb";
+  await link.fill(nzbUrl);
   await submit.click();
   await page
     .locator("#status")
@@ -177,28 +194,188 @@ test("the add dialog sends a torrent file and a magnet link through submit, read
     .waitFor();
   const again = (await sent(page))
     .filter((entry) => entry.name === "Submit")
-    .slice(2)
+    .slice(3)
     .map((entry) => entry.variables);
-  assert.deepEqual(again, [
-    { input: { ...input, text: "magnet:?xt=urn:btih:fresh" } },
-  ]);
+  assert.deepEqual(again, [{ input: { ...input, text: nzbUrl } }]);
   assert.equal(errors.length, 0, errors.join("\n"));
   await page.close();
 });
 
-test("a file the daemon cannot read shows its refusal on its row", async () => {
+test("the Add picker offers only supported file extensions for its torrent capability", async () => {
+  for (const [screen, extensions] of [
+    ["add", [".nzb", ".torrent", ".magnet"]],
+    ["addOff", [".nzb"]],
+  ]) {
+    const accepted = extensions.flatMap((extension) => [
+      extension,
+      ...COMPRESSIONS.map((compression) => `${extension}.${compression}`),
+    ]);
+    const { page, errors } = await open(screen);
+    try {
+      const opened = page.waitForEvent("filechooser");
+      await page.getByTestId(torrentIds.addDrop).click();
+      const picker = await opened;
+      const advertised = await picker.element().getAttribute("accept");
+      assert.deepEqual(advertised.split(",").sort(), accepted.sort());
+      assert.equal(picker.isMultiple(), true);
+      assert.equal(errors.length, 0, errors.join("\n"));
+    } finally {
+      await page.close();
+    }
+  }
+});
+
+test("compound torrent and magnet suffixes reach staging and submit only when torrents are enabled", async () => {
+  // The fixture recognises the underlying documents. The daemon tests cover decoding.
+  const uploads = [
+    ["TORRENT", METAINFO],
+    ["magnet", `magnet:?xt=urn:btih:${"1".repeat(40)}\n`],
+  ].flatMap(([extension, content]) =>
+    COMPRESSIONS.map((compression) => ({
+      name: `fixture.${extension}.${compression}`,
+      content,
+    })),
+  );
+  const expected = uploads.map(({ name }) => name).sort();
   const { page, errors } = await open("add");
-  const dialog = page.getByRole("dialog", { name: "Add", exact: true });
+  try {
+    const dataTransfer = await page.evaluateHandle((files) => {
+      const transfer = new DataTransfer();
+      for (const { name, content } of files) {
+        transfer.items.add(new File([content], name));
+      }
+      return transfer;
+    }, uploads);
+    try {
+      await page.getByTestId(torrentIds.addDrop).dispatchEvent("drop", {
+        dataTransfer,
+      });
+    } finally {
+      await dataTransfer.dispose();
+    }
+    await page
+      .getByText("staged", { exact: true })
+      .nth(uploads.length - 1)
+      .waitFor();
+    await page.getByTestId(torrentIds.addSubmit).click();
+    await page
+      .locator("#status")
+      .filter({ hasText: /^closed$/ })
+      .waitFor();
+    const requests = await sent(page);
+    for (const operation of ["StageNzbUpload", "Submit"]) {
+      assert.deepEqual(
+        requests
+          .filter(({ name }) => name === operation)
+          .map(({ variables }) => variables.file)
+          .sort(),
+        expected,
+      );
+    }
+    assert.equal(errors.length, 0, errors.join("\n"));
+  } finally {
+    await page.close();
+  }
+
+  const disabled = await open("addOff");
+  try {
+    const opened = disabled.page.waitForEvent("filechooser");
+    await disabled.page.getByTestId(torrentIds.addDrop).click();
+    await (
+      await opened
+    ).setFiles(
+      uploads.map(({ name, content }) => ({
+        name,
+        mimeType: "application/octet-stream",
+        buffer: Buffer.from(content),
+      })),
+    );
+    await disabled.page
+      .getByText("Unsupported file extension.", { exact: true })
+      .nth(uploads.length - 1)
+      .waitFor();
+    assert.deepEqual(await sent(disabled.page), []);
+    assert.equal(
+      await disabled.page.getByTestId(torrentIds.addSubmit).isDisabled(),
+      true,
+    );
+    assert.equal(disabled.errors.length, 0, disabled.errors.join("\n"));
+  } finally {
+    await disabled.page.close();
+  }
+});
+
+test("overriding the Add picker cannot stage a file outside its allowlist", async () => {
+  for (const [screen, filename, content] of [
+    ["add", "disguised.bin", METAINFO],
+    ["add", "hidden.torrent.gzip", METAINFO],
+    ["add", "hidden.torrent.bz2", METAINFO],
+    ["add", "hidden.nzb.br", "<nzb></nzb>"],
+    ["add", "hidden.magnet.deflate", `magnet:?xt=urn:btih:${"1".repeat(40)}`],
+    ["addOff", "disabled.torrent", METAINFO],
+    ["addOff", "disabled.magnet", `magnet:?xt=urn:btih:${"1".repeat(40)}`],
+  ]) {
+    const { page, errors } = await open(screen);
+    try {
+      const opened = page.waitForEvent("filechooser");
+      await page.getByTestId(torrentIds.addDrop).click();
+      await (
+        await opened
+      ).setFiles({
+        name: filename,
+        mimeType: "application/octet-stream",
+        buffer: Buffer.from(content),
+      });
+      await page
+        .getByText("Unsupported file extension.", { exact: true })
+        .waitFor();
+      assert.deepEqual(await sent(page), []);
+      assert.equal(
+        await page.getByTestId(torrentIds.addSubmit).isDisabled(),
+        true,
+      );
+      assert.equal(errors.length, 0, errors.join("\n"));
+    } finally {
+      await page.close();
+    }
+  }
+});
+
+test("the Usenet-only drop zone stages compound NZB suffixes and refuses bare compression suffixes", async () => {
+  const { page, errors } = await open("addOff");
+  const dialog = page.getByRole("dialog");
   await dialog.waitFor();
-  await page.locator("input[type=file]").setInputFiles({
-    name: "notes.txt",
-    mimeType: "text/plain",
-    buffer: Buffer.from("x"),
+  const nzbs = ["broken.NZB.GZ", "broken.nzb.xz", "broken.nzb.zst"];
+  const filenames = [
+    ...nzbs,
+    ...COMPRESSIONS.map((suffix) => `notes.${suffix}`),
+  ];
+  const dataTransfer = await page.evaluateHandle((names) => {
+    const transfer = new DataTransfer();
+    for (const name of names) transfer.items.add(new File(["x"], name));
+    return transfer;
+  }, filenames);
+  await dialog.getByTestId(torrentIds.addDrop).dispatchEvent("drop", {
+    dataTransfer,
   });
-  await dialog.getByText("notes.txt", { exact: true }).waitFor();
-  await dialog.getByText("not an NZB", { exact: true }).waitFor();
+  await dataTransfer.dispose();
+  await dialog
+    .getByText("Unsupported file extension.", { exact: true })
+    .nth(COMPRESSIONS.length - 1)
+    .waitFor();
+  await dialog
+    .getByText("not an NZB", { exact: true })
+    .nth(nzbs.length - 1)
+    .waitFor();
+  assert.deepEqual(
+    (await sent(page))
+      .filter(({ name }) => name === "StageNzbUpload")
+      .map(({ variables }) => variables)
+      .sort((a, b) => a.file.localeCompare(b.file)),
+    nzbs.map((file) => ({ file, input: { filename: file, nzbUpload: null } })),
+  );
   assert.equal(
-    await dialog.getByRole("button", { name: /^Add/ }).isDisabled(),
+    await dialog.getByTestId(torrentIds.addSubmit).isDisabled(),
     true,
   );
   assert.equal(errors.length, 0, errors.join("\n"));
@@ -493,10 +670,8 @@ test("the override dialog starts from the override, and Use inherited clears onl
   await dialog
     .getByRole("button", { name: "Use inherited", exact: true })
     .click();
-  await page
-    .locator("#status")
-    .filter({ hasText: /^changed 1$/ })
-    .waitFor();
+  // The dialog closes once the change is accepted; the torrent pushes it.
+  await dialog.waitFor({ state: "detached" });
   assert.deepEqual(
     (await sent(page))
       .filter((entry) => entry.name === "SetTorrentSeeding")

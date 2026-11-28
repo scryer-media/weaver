@@ -82,7 +82,7 @@ impl ArticleMap {
                 if volume.articles[at].state != State::Waiting {
                     continue;
                 }
-                volume.set_class(at, class(*raised));
+                volume.set_class(&mut self.open, at, class(*raised));
                 self.moves.push(Move {
                     volume: VolumeIndex(index as u32),
                     ordinal: *ordinal,

@@ -14,8 +14,8 @@
 // place and never sees a first. The engine's run walks its volumes in order
 // and writes every body into one member, `whole.bin`.
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
 use weaver_graph::holds::{HoldBudgets, HoldsAccountant};
@@ -57,7 +57,12 @@ fn volume(index: u32) -> Vec<u8> {
 struct Family {
     stores: u32,
     starts: Arc<AtomicUsize>,
+    quiets: Quiets,
 }
+
+// Each time the engine hears the job is quiet: how many volumes it holds,
+// and how many runs it had started by then.
+type Quiets = Arc<Mutex<Vec<(usize, usize)>>>;
 
 impl Builder for Family {
     fn build(&mut self, kind: Kind, _: ObjectId) -> Option<Box<dyn Object>> {
@@ -72,6 +77,8 @@ impl Builder for Family {
             }
             Kind::RarEngine => Some(Box::new(Walker {
                 starts: Arc::clone(&self.starts),
+                quiets: Arc::clone(&self.quiets),
+                held: 0,
             })),
             _ => None,
         }
@@ -197,15 +204,25 @@ impl Object for Headless {
 
 // The engine: by its name it claims its set's second volume and nothing
 // else; a volume given back with its parse it takes at the place that parse
-// says, the second. It counts the runs it starts.
+// says, the second. It counts the runs it starts and the volumes bound to
+// it, and notes both each time it hears the job is quiet.
 struct Walker {
     starts: Arc<AtomicUsize>,
+    quiets: Quiets,
+    held: usize,
 }
 
 impl Object for Walker {
     fn unposted(&mut self, _: VolumeIndex, _: ByteRange) {}
     fn kind(&self) -> Kind {
         Kind::RarEngine
+    }
+    fn bound(&mut self, _: VolumeIndex, _: &str, _: &[u8], _: Option<u64>) {
+        self.held += 1;
+    }
+    fn quiet(&mut self, _: &dyn Standing, _: &mut Vec<Emit>) {
+        let starts = self.starts.load(Ordering::SeqCst);
+        self.quiets.lock().unwrap().push((self.held, starts));
     }
     fn deliver(
         &mut self,
@@ -329,6 +346,7 @@ struct Late {
     job: GraphJob,
     mail: RunMail,
     starts: Arc<AtomicUsize>,
+    quiets: Quiets,
     dir: tempfile::TempDir,
 }
 
@@ -364,11 +382,13 @@ fn late(second: &str) -> Late {
     );
     let family = Family::default();
     let starts = Arc::clone(&family.starts);
+    let quiets = Arc::clone(&family.quiets);
     let job = GraphJob::new(&files, Box::new(family), writer, runs, u32::MAX);
     Late {
         job,
         mail,
         starts,
+        quiets,
         dir,
     }
 }
@@ -547,4 +567,37 @@ async fn a_volume_joining_while_more_can_join_restarts_no_run() {
     assert_eq!(late.starts(), 1, "the run reading waited for the volume");
     assert_eq!(late.run_generation(), Some(first));
     assert_eq!(late.written(), whole(), "dir {:?}", late.dir.path());
+}
+
+// The engine takes the later volume from the headless store's give-up on
+// the quiet's own pass. It is not told the job is quiet on that pass: its
+// run has not read the volume yet. It hears quiet again only once the run
+// that starts over on both volumes has ended.
+#[tokio::test]
+async fn an_engine_that_takes_a_given_up_volume_hears_no_quiet_before_its_run_reads_it() {
+    let mut late = late(LATER);
+    late.deliver(0);
+    late.deliver(1);
+    late.until_ended().await;
+    while late.job.giving_up() {
+        late.give_up_turn();
+    }
+    assert_eq!(
+        late.engine_volumes(),
+        vec![VolumeIndex(0), VolumeIndex(1)],
+        "the engine took the later volume"
+    );
+    let heard = late.quiets.lock().unwrap().clone();
+    assert!(
+        heard.iter().all(|&(held, _)| held < 2),
+        "the engine heard quiet holding a volume its run had not read: {heard:?}"
+    );
+    late.until_settled().await;
+    assert_eq!(late.starts(), 2, "the run started over on both volumes");
+    assert_eq!(late.written(), whole(), "dir {:?}", late.dir.path());
+    let heard = late.quiets.lock().unwrap().clone();
+    assert!(
+        heard.iter().all(|&(held, starts)| held < 2 || starts == 2),
+        "{heard:?}"
+    );
 }

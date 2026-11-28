@@ -545,7 +545,7 @@ query Torrents($range: UsageRange!) {
   torrentHistory(range: $range) {
     total { kind range { bytes bytesUploaded durationMs } }
     trackers { id range { bytes bytesUploaded durationMs } }
-    peers { torrents connected seeds }
+    live { torrents connectedPeers connectedSeeds }
   }
 }
 "#;
@@ -611,8 +611,75 @@ async fn torrents_read_the_total_and_each_tracker() {
     );
     // No torrent client in this server: no peers.
     assert_eq!(
-        torrents["peers"],
-        serde_json::json!({ "torrents": 0, "connected": 0, "seeds": 0 })
+        torrents["live"],
+        serde_json::json!({ "torrents": 0, "connectedPeers": 0, "connectedSeeds": 0 })
+    );
+}
+
+// Each part of the torrent ledger is read only for its own fields: one
+// selected alone answers as it does beside the others.
+#[tokio::test]
+async fn each_part_of_the_torrent_ledger_answers_alone() {
+    let harness = TestHarness::new().await;
+    harness
+        .db
+        .write_usage_flush(&UsageFlush {
+            rows: vec![
+                counted(
+                    day(2024, 5, 2),
+                    UsageConsumerKind::Torrent,
+                    "",
+                    UsageCounts {
+                        bytes: 30,
+                        ..UsageCounts::default()
+                    },
+                ),
+                counted(
+                    day(2024, 5, 2),
+                    UsageConsumerKind::Tracker,
+                    "a.test",
+                    UsageCounts {
+                        bytes: 20,
+                        ..UsageCounts::default()
+                    },
+                ),
+            ],
+            fold_before: None,
+            expire_removed_at: None,
+        })
+        .unwrap();
+    let ask = |fields: &'static str| {
+        let harness = &harness;
+        async move {
+            let response = harness
+                .execute_with_variables(
+                    &format!(
+                        "query Torrents($range: UsageRange!) {{ torrentHistory(range: $range) {{ {fields} }} }}"
+                    ),
+                    variables(serde_json::json!({
+                        "range": { "period": "CUSTOM", "fromDay": "2024-05-01", "toDay": "2024-05-03" },
+                    })),
+                )
+                .await;
+            assert_no_errors(&response);
+            response_data(&response)["torrentHistory"].clone()
+        }
+    };
+    assert_eq!(
+        ask("rangeStart rangeEnd").await,
+        serde_json::json!({ "rangeStart": "2024-05-01", "rangeEnd": "2024-05-03" })
+    );
+    assert_eq!(
+        ask("total { range { bytes } }").await,
+        serde_json::json!({ "total": { "range": { "bytes": 30 } } })
+    );
+    assert_eq!(
+        ask("trackers { id range { bytes } }").await,
+        serde_json::json!({ "trackers": [{ "id": "a.test", "range": { "bytes": 20 } }] })
+    );
+    assert_eq!(
+        ask("live { torrents }").await,
+        serde_json::json!({ "live": { "torrents": 0 } })
     );
 }
 

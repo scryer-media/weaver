@@ -81,6 +81,9 @@ pub(crate) struct Shown {
     pub(crate) refusals: BTreeMap<MemberId, Vec<ByteRange>>,
     own: BTreeSet<MemberId>,
     damaged: BTreeSet<MemberId>,
+    // The namespace's generation when it was last shown, from which a bind
+    // reads only the members changed since.
+    seen: Option<u64>,
 }
 
 // What a refusal adds to what the object was shown.
@@ -109,6 +112,41 @@ impl Shown {
             .collect();
         let newly = !damaged.is_subset(&self.damaged);
         self.damaged = damaged;
+        self.seen = Some(namespace.generation());
+        newly
+    }
+
+    // What `bind` comes to, read from the members changed since the
+    // namespace was last shown: the whole namespace when it has not been.
+    pub(crate) fn bind_changed(&mut self, namespace: &Namespace, id: ObjectId) -> bool {
+        let Some(seen) = self.seen else {
+            return self.bind(namespace, id);
+        };
+        let mut newly = false;
+        for changed in namespace.changed_since(seen) {
+            self.own.remove(&changed);
+            let damaged = self.damaged.remove(&changed);
+            let Some(member) = namespace
+                .get(changed)
+                .filter(|_| namespace.copy_of(changed).is_none())
+            else {
+                continue;
+            };
+            if member.bound_to == Some(id) {
+                self.own.insert(changed);
+            } else if !member.coverage.is_clean() {
+                self.damaged.insert(changed);
+                newly |= !damaged;
+            }
+        }
+        self.seen = Some(namespace.generation());
+        #[cfg(test)]
+        {
+            let mut whole = Self::default();
+            whole.bind(namespace, id);
+            assert_eq!(self.own, whole.own, "own members shown");
+            assert_eq!(self.damaged, whole.damaged, "damaged members shown");
+        }
         newly
     }
 

@@ -37,6 +37,7 @@ import {
   type HardwareProfileName,
   type HardwareProfileSettings,
 } from "../../../data/hardware-profiles";
+import { AppearancePicker } from "../../../components/AppearancePicker";
 import { ConfirmDialog } from "../../../components/ConfirmDialog";
 import {
   SecondaryButton,
@@ -475,6 +476,16 @@ export function GeneralPanel() {
     );
 
   const interfaceFields: FieldSpec[] = [
+    {
+      id: "appearance",
+      label: t("next.appearance.title"),
+      keywords: "appearance palette theme mode accent progress colours",
+      wide: true,
+      control: {
+        kind: "custom",
+        control: <AppearancePicker editable={Boolean(settings)} />,
+      },
+    },
     {
       id: "language",
       label: t("next.general.language"),

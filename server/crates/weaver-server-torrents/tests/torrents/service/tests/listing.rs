@@ -571,6 +571,107 @@ async fn the_tables_pick_is_the_walk_of_every_record_on_postgres() {
     .unwrap();
 }
 
+// A page of a torrent's unpacked names, taken in SQL, is that window of the
+// names its row keeps, in their order, on SQLite and on PostgreSQL (in a
+// schema of its own on the server `WEAVER_TEST_POSTGRES_URL` names; skipped
+// when it names none).
+#[test]
+fn an_outputs_page_is_the_window_of_the_rows_names() {
+    outputs_page_is_the_window(&Database::open_in_memory().unwrap());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_outputs_page_is_the_window_of_the_rows_names_on_postgres() {
+    use crate::persistence::database_target::DatabaseTarget;
+    let Some((admin, schema, url)) =
+        crate::tests::test_schema::create_postgres_test_schema("torrent_outputs_page").await
+    else {
+        return;
+    };
+    tokio::task::spawn_blocking(move || {
+        let db = Database::open_target(DatabaseTarget::PostgresUrl(url)).unwrap();
+        outputs_page_is_the_window(&db);
+    })
+    .await
+    .unwrap();
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "DROP SCHEMA IF EXISTS {schema} CASCADE"
+    )))
+    .execute(&admin)
+    .await
+    .unwrap();
+}
+
+fn outputs_page_is_the_window(db: &Database) {
+    use crate::torrents::persistence::TorrentsPersistenceInsertTorrentQueries;
+    let job_id = JobId(1);
+    let record = TorrentRecord {
+        unpack_in_force: None,
+        unpack_over: false,
+        unpack_end: None,
+        download_ends: 0,
+        job_id,
+        infohash_v1: Some([1; 20]),
+        infohash_v2: None,
+        name: "unpacked".to_owned(),
+        source: TorrentSource::Magnet,
+        metainfo: None,
+        category_id: None,
+        added_at_ms: EPOCH_MS,
+        kept: KeptIntent::Intent(TorrentIntent::Paused),
+        forced: false,
+        completed_at_ms: None,
+        storage_dir: None,
+        policy_override: None,
+        unpack: None,
+        metadata: Vec::new(),
+        upload_limit: None,
+        download_limit: None,
+        sequential: false,
+        first_last_piece_first: false,
+        save_path: None,
+        content_layout: None,
+        files_dir: None,
+        seed_mode: false,
+        move_to: None,
+        queue_position: 1,
+        pool_member: None,
+        private: false,
+    };
+    db.insert_torrent(&record, &[]).unwrap();
+    // No names kept yet: every page is empty.
+    assert!(db.torrent_outputs_page(job_id, 0, 10).unwrap().is_empty());
+    // Out of name order, with a quote and a name past the ASCII range.
+    let names: Vec<String> = [
+        "e.mkv",
+        "b \"quoted\".nfo",
+        "d/é.srt",
+        "a.txt",
+        "c.txt",
+        "f.bin",
+    ]
+    .iter()
+    .map(|name| (*name).to_owned())
+    .collect();
+    db.finish_torrent_unpack(job_id, &names, &[], &[], &UnpackEnd::whole())
+        .unwrap();
+    let every = db.torrent_outputs(job_id).unwrap();
+    assert_eq!(every, names);
+    for offset in 0..=every.len() + 1 {
+        for limit in 0..=every.len() + 1 {
+            let end = (offset + limit).min(every.len());
+            let window = every.get(offset.min(every.len())..end).unwrap_or(&[]);
+            assert_eq!(
+                db.torrent_outputs_page(job_id, offset, limit).unwrap(),
+                window,
+                "{offset} {limit}"
+            );
+        }
+    }
+    // Another torrent's page is its own.
+    assert!(db.torrent_outputs_page(JobId(2), 0, 10).unwrap().is_empty());
+}
+
 fn picks_are_the_walk_of_every_record(db: &Database) {
     use crate::schema_migrations::torrent_private_v126::tiny_metainfo;
     use crate::torrents::service::metainfo_is_private;

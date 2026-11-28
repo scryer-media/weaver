@@ -1,0 +1,10 @@
+basePath: /weaver
+ingress:
+  enabled: true
+  className: nginx
+  hosts:
+    - weaver.example.test
+  tls:
+    - secretName: weaver-tls
+      hosts:
+        - weaver.example.test

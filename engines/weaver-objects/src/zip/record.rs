@@ -4,9 +4,15 @@
 // Member bytes out. A delivery is routed through the map: a stored entry's
 // data is its member's bytes. Each member closes once its whole extent is
 // covered, and its CRC32 is folded as its bytes pass, so a checksum that
-// fails marks the member's extent damaged for the recovery beside it. Data
-// that arrived before its header placed it, in a range the object kept to
-// read the directory, is said from what was kept.
+// fails marks the member's extent damaged for the recovery beside it. A
+// member whose fold the grid threw away, past its budget, closes on its
+// coverage while the fold is missing, encrypted or not, and is asked for
+// nothing again: its checksum is judged where the member closes, against
+// the one the directory said, and a failure there is ruled here as a failed
+// fold would be. Its bytes said again in order fold once more and are
+// judged as any member's are.
+// Data that arrived before its header placed it, in a range the object kept
+// to read the directory, is said from what was kept.
 
 use weaver_graph::{
     Algorithm, ByteRange, Emit, Evidenced, MemberId, Placement, Provenance, Segment, SliceVerdict,
@@ -174,6 +180,7 @@ impl Zip {
             verified: provenance.is_verified(),
         };
         self.grid.offer(member, WHOLE, &segment);
+        let dropped = self.grid.dropped(member, WHOLE);
         out.push(Emit::Bytes {
             member,
             offset,
@@ -222,7 +229,7 @@ impl Zip {
         };
         said.coverage.write(range, provenance);
         if !retry
-            && (!encrypted || verdict == SliceVerdict::Intact)
+            && (!encrypted || verdict == SliceVerdict::Intact || (dropped && folded.is_none()))
             && !said.closed
             && said.coverage.covered(whole)
         {
@@ -246,6 +253,7 @@ impl Zip {
             || (encrypted
                 && crc_known
                 && folded.is_none()
+                && !dropped
                 && self.members[member.0 as usize].coverage.covered(whole))
         {
             let mut extents = Vec::new();
@@ -261,7 +269,8 @@ impl Zip {
     }
 
     // A member whose whole CRC fails over verified bytes under a candidate
-    // nothing proved, kept for want of another: a new password retries it.
+    // nothing proved, kept for want of another: a new password retries it,
+    // whether its fold failed or the namespace's check did.
     pub(super) fn retry_doubted(&mut self, out: &mut Vec<Emit>) {
         let Some(map) = &mut self.map else {
             return;
@@ -281,8 +290,16 @@ impl Zip {
             }
             let whole = ByteRange::new(0, entry.length);
             let folded = self.grid.fold(member, WHOLE, 0, whole);
-            if grid::verdict(folded, entry.length, 0, entry.crc) != SliceVerdict::Damaged
-                || !folded.is_some_and(|folded| folded.verified)
+            // A member with no fold, its CRC failed by the namespace's check
+            // over verified bytes and said damaged for it, is retried as one
+            // whose fold failed.
+            let refuted = folded.is_none()
+                && self.members.get(member.0 as usize).is_some_and(|said| {
+                    said.closed && said.damaged && said.coverage.verified(whole)
+                });
+            if !refuted
+                && (grid::verdict(folded, entry.length, 0, entry.crc) != SliceVerdict::Damaged
+                    || !folded.is_some_and(|folded| folded.verified))
             {
                 continue;
             }
@@ -297,5 +314,76 @@ impl Zip {
                 range: extent.range,
             }));
         }
+    }
+
+    // The member's file failed the check of the namespace above it. Only a
+    // member closed with no ruling of the store's own is touched: one that
+    // states its CRC, was not said damaged, and has no fold, which was
+    // dropped past its budget. It is ruled as `record` rules a failed fold
+    // over the same bytes: a candidate nothing proved, over verified bytes,
+    // gives way to another that passes the header's check and the member is
+    // read again under it; otherwise its extent is damaged for the recovery
+    // beside it, once, and with no other candidate a password is asked for.
+    pub(super) fn refuted(&mut self, member: MemberId, out: &mut Vec<Emit>) {
+        if self.gone {
+            return;
+        }
+        let Some((length, crc_known)) = self
+            .map
+            .as_ref()
+            .and_then(|map| map.entry(member))
+            .map(|entry| (entry.length, entry.crc_known))
+        else {
+            return;
+        };
+        let Some(said) = self.members.get(member.0 as usize) else {
+            return;
+        };
+        let whole = ByteRange::new(0, length);
+        if !crc_known
+            || !said.closed
+            || said.damaged
+            || self.grid.fold(member, WHOLE, 0, whole).is_some()
+        {
+            return;
+        }
+        // The bytes the fold would have called verified, from what the
+        // member was written with.
+        let verified = said.coverage.verified(whole);
+        let mut retry = false;
+        let mut doubted = false;
+        if let Some(map) = &mut self.map {
+            let index = map.members[member.0 as usize];
+            if let Some(cipher) = &mut map.entries[index].cipher
+                && !cipher.proven
+                && verified
+            {
+                if cipher.alternative(&self.candidates) {
+                    cipher.retry = true;
+                    retry = true;
+                } else {
+                    doubted = true;
+                }
+            }
+        }
+        if doubted && !self.asked {
+            self.asked = true;
+            out.push(Emit::NeedsPassword);
+        }
+        let mut extents = Vec::new();
+        self.member_extent(member, whole, &mut extents);
+        if retry {
+            out.extend(extents.into_iter().map(|extent| Emit::Again {
+                volume: extent.volume,
+                range: extent.range,
+            }));
+            self.asked = false;
+            return;
+        }
+        self.members[member.0 as usize].damaged = true;
+        out.extend(extents.into_iter().map(|extent| Emit::Damaged {
+            volume: extent.volume,
+            range: extent.range,
+        }));
     }
 }

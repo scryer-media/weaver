@@ -5220,6 +5220,7 @@ async fn archive_server_with(spawn_history_delete_worker: bool) -> ArchiveServer
             &weaver_server_core::auth::SigningKeys::for_database(&db).unwrap(),
         ),
         api_key_cache: ApiKeyCache::default(),
+        appearance: Default::default(),
         security: weaver_server_core::security::RuntimeSecurityConfig::default(),
         rss: weaver_server_api::RssService::new(handle.clone(), config.clone(), db.clone()),
         watch_folder: weaver_server_core::watch_folder::WatchFolderService::new(

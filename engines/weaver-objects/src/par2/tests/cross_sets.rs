@@ -9,7 +9,7 @@
 use super::*;
 
 // Everything binding decides, per set in order and per member.
-fn decided(job: &Job<Par2>, members: &[MemberId]) -> String {
+pub(super) fn decided(job: &Job<Par2>, members: &[MemberId]) -> String {
     let mut out = String::new();
     for key in job.object.ordered() {
         let state = &job.object.sets[key];
@@ -21,7 +21,11 @@ fn decided(job: &Job<Par2>, members: &[MemberId]) -> String {
         ));
     }
     for member in members {
-        let record = job.namespace.get(*member).unwrap();
+        // A posting removed has no record to say.
+        let Some(record) = job.namespace.get(*member) else {
+            out.push_str(&format!("{member:?} removed\n"));
+            continue;
+        };
         out.push_str(&format!(
             "{member:?} {} {:?} {} {:?}\n",
             record.name,
@@ -36,31 +40,83 @@ fn decided(job: &Job<Par2>, members: &[MemberId]) -> String {
     out
 }
 
-// Two jobs alike, one binding by the catalogue and one by the scan: after
-// every step they have decided the same, in the same order, and renamed the
-// same members.
-struct Twins {
-    jobs: [Job<Par2>; 2],
-    members: Vec<MemberId>,
+// Everything binding keeps beside what it decides: each set's verdict, the
+// sets covering each member and those still to be said again, the unmatched
+// members, the lengths, the sets binding and holding members, the members
+// given up and whether a binding is due; and every record of the namespace.
+// Not how often coverage changed: the scan gives every usable set an entry,
+// so it binds them in another order and counts other moves.
+pub(super) fn kept(job: &Job<Par2>) -> String {
+    let object = &job.object;
+    let mut out = String::new();
+    for key in object.ordered() {
+        out.push_str(&format!("{key:?} {:?}\n", object.sets[key].concluded()));
+    }
+    out.push_str(&format!(
+        "{:?}\n{:?}\n{:?}\n{:?}\n{:?}\n{:?}\n{:?}\n{}\n",
+        object.covered.by,
+        object.covered.unfed,
+        object.unmatched,
+        object.lengths,
+        object.binding,
+        object.holding,
+        object.given_up,
+        object.bind_due(),
+    ));
+    for record in job.namespace.records() {
+        out.push_str(&format!("{record:?}\n"));
+    }
+    out
+}
+
+// The members the object covers, and how often coverage changed.
+pub(super) fn coverage(object: &Par2) -> (Vec<MemberId>, u64) {
+    let mut members = Vec::new();
+    object.covered_members(&mut members);
+    (members, object.coverage_version())
+}
+
+// Two jobs alike, one binding by the catalogue and what changed and one by
+// the scan and the whole: after every step they have decided and kept the
+// same, in the same order, renamed the same members and cover the same; and
+// each says coverage changed whenever what it covers did.
+//
+// Or, `whole`, the second binds by the catalogue too, its claims made stale
+// before each binding, so each binding is a whole pass: then they also say
+// coverage changed as often, the old binding's count beside the new one's.
+pub(super) struct Twins {
+    pub(super) jobs: [Job<Par2>; 2],
+    pub(super) members: Vec<MemberId>,
+    covered: [Option<(Vec<MemberId>, u64)>; 2],
+    whole: bool,
 }
 
 impl Twins {
-    fn new(files: &[(String, Vec<u8>)]) -> Self {
+    pub(super) fn new(files: &[(String, Vec<u8>)]) -> Self {
+        Self::of(files, false)
+    }
+
+    pub(super) fn of(files: &[(String, Vec<u8>)], whole: bool) -> Self {
         let mut jobs = [job(files), job(files)];
-        jobs[1].object.scanning = true;
+        jobs[1].object.scanning = !whole;
         Self {
             jobs,
             members: Vec::new(),
+            covered: [None, None],
+            whole,
         }
     }
 
-    fn each(&mut self, mut step: impl FnMut(&mut Job<Par2>) -> Option<MemberId>) {
+    pub(super) fn each(&mut self, mut step: impl FnMut(&mut Job<Par2>) -> Option<MemberId>) {
         let found: Vec<_> = self.jobs.iter_mut().map(&mut step).collect();
         assert_eq!(found[0], found[1]);
         self.members.extend(found[0]);
     }
 
-    fn bind(&mut self, step: &str) {
+    pub(super) fn bind(&mut self, step: &str) {
+        if self.whole {
+            self.jobs[1].object.claims.stale();
+        }
         let renamed: Vec<_> = self.jobs.iter_mut().map(bind).collect();
         assert_eq!(renamed[0], renamed[1], "{step}: renamed");
         let [catalogued, scanned] = &self.jobs;
@@ -69,13 +125,27 @@ impl Twins {
             decided(scanned, &self.members),
             "{step}"
         );
+        assert_eq!(kept(catalogued), kept(scanned), "{step}: kept");
+        let now = [coverage(&catalogued.object), coverage(&scanned.object)];
+        assert_eq!(now[0].0, now[1].0, "{step}: covered members");
+        if self.whole {
+            assert_eq!(now[0].1, now[1].1, "{step}: coverage version");
+        }
+        for (was, now) in self.covered.iter().zip(&now) {
+            if let Some((members, version)) = was
+                && *members != now.0
+            {
+                assert_ne!(*version, now.1, "{step}: coverage version");
+            }
+        }
+        self.covered = now.map(Some);
         assert_eq!(
             catalogued.object.digests, scanned.object.digests,
             "{step}: fronts hashed"
         );
     }
 
-    fn repair(&mut self, step: &str) {
+    pub(super) fn repair(&mut self, step: &str) {
         let outcomes: Vec<_> = self
             .jobs
             .iter_mut()
@@ -88,12 +158,14 @@ impl Twins {
         self.bind(step);
     }
 
-    fn restore(&mut self) {
+    pub(super) fn restore(&mut self) {
         for (at, job) in self.jobs.iter_mut().enumerate() {
             let facts = job.object.facts();
             job.object = crate::par2::facts::par2(&facts).unwrap();
-            job.object.scanning = at == 1;
+            job.object.scanning = at == 1 && !self.whole;
         }
+        // A restored object is a new one: its versions start again.
+        self.covered = [None, None];
     }
 }
 
@@ -265,9 +337,10 @@ fn binding_checks_grow_with_the_sets_that_describe_a_member() {
         // The first binding matches each posted part against its set and
         // binds every set once: the new ones are all to be bound.
         assert_eq!(catalogued[0], (3, count as usize), "{count} sets");
-        // After it, the one set the parts bind.
+        // After it, nothing. A bind with nothing new visits no posting, so
+        // it matches no member against a set, and binds no set again.
         for pass in &catalogued[1..] {
-            assert_eq!(*pass, (3, 1), "{count} sets");
+            assert_eq!(*pass, (0, 0), "{count} sets");
         }
         // The scan matches the nfo against every set and binds every set,
         // on every binding.

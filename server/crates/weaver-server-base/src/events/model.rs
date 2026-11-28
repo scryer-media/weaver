@@ -326,6 +326,16 @@ pub enum PipelineEvent {
         reason: String,
     },
 
+    // A file a checksum listing names whose bytes have another CRC32 than
+    // the listing states, said once when the job is done. It changes
+    // nothing of the job: a listing only notes. `file` is the file's name,
+    // `listing` the listing's.
+    SfvMismatch {
+        job_id: JobId,
+        file: String,
+        listing: String,
+    },
+
     // ---- File classification (discovered during download) ----
     // A file's role was identified or updated.
     FileClassified {
@@ -361,6 +371,12 @@ pub fn recovery_set_unused_message(set: &str, reason: &str) -> String {
         _ => "of an unnamed reason",
     };
     format!("recovery set {set} was not used: {why}")
+}
+
+// What a job's history and its log say of a file whose CRC32 disagrees
+// with a checksum listing's.
+pub fn sfv_mismatch_message(file: &str, listing: &str) -> String {
+    format!("{file} does not match its CRC32 in {listing}")
 }
 
 // Result of verifying a file against PAR2 checksums.

@@ -1,13 +1,18 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
-use unrar_rs::KdfCache;
-use weaver_graph::{Facts, Kind, RestoreError};
+use std::sync::Arc;
 
-use super::super::facts::{KeyTuple, StoreFacts};
+use unrar_rs::KdfCache;
+use weaver_graph::{ByteRange, Emit, Facts, Kind, Object, RestoreError};
+
+use super::super::Lock;
+use super::super::facts::{KeyTuple, StoreFacts, restored};
+use super::owner::Owner;
 use super::writer::{Options, Version, write};
-use super::{PASSWORD, encrypted, items, split, split_encrypted, store};
-use crate::testing::replay::{Step, contains, frames, restores_alike};
+use super::{PASSWORD, encrypted, items, split, split_encrypted, store, streamed};
+use crate::crypt::Padding;
+use crate::testing::replay::{Step, contains, frames, misfit_paddings, restores_alike};
 
 fn named(volumes: Vec<Vec<u8>>) -> Vec<(String, Vec<u8>)> {
     let count = volumes.len();
@@ -159,4 +164,88 @@ fn facts_of_the_previous_version_are_refused() {
             version: 2
         })
     ));
+}
+
+// A mixed set cut at every frame: the restored store knows which members
+// its run makes from its facts, goes on as the live one, and faces as it
+// does, run or no run.
+#[test]
+fn a_mixed_rar_restored_at_every_frame_makes_what_the_live_one_makes() {
+    for version in [Version::Rar5, Version::Rar4] {
+        let mut options = Options::new(version);
+        options.split = Some(6_000);
+        let volumes = named(write(&super::mixed::mixed_items(version), &options));
+        let steps = steps(&volumes, 4096, false);
+        for cut in 1..steps.len() {
+            let (_, live, restored) = restores_alike(Box::new(store()), &steps, cut, &[]);
+            let face = |object: &dyn weaver_graph::Object| {
+                object.engine().map(|face| {
+                    (
+                        (0..4)
+                            .map(|id| face.makes(weaver_graph::MemberId(id)))
+                            .collect::<Vec<_>>(),
+                        face.reserve(),
+                    )
+                })
+            };
+            assert_eq!(
+                face(live.as_ref()),
+                face(restored.as_ref()),
+                "{version:?} {cut}"
+            );
+            if cut == steps.len() - 1 {
+                assert_eq!(
+                    face(restored.as_ref()).map(|(makes, _)| makes),
+                    Some(vec![false, true, false, false])
+                );
+            }
+        }
+    }
+}
+
+// A member restored with a padding that does not fit its stream opens
+// afresh with none, whether it was sealed or never opened, and its bytes
+// said again come out whole.
+#[test]
+fn a_restored_padding_that_does_not_fit_opens_its_member_afresh() {
+    let volumes = write(&items(), &encrypted(Version::Rar5, false));
+    let length = volumes[0].len() as u64;
+    for sealed in [true, false] {
+        for padding in misfit_paddings() {
+            let mut owner = Owner::named(store(), volumes.clone());
+            if sealed {
+                owner.offer(PASSWORD);
+            }
+            // Into beta's stream, short of its end.
+            let mut start = 0;
+            while !owner.members.values().any(|got| got.name == "beta.bin") {
+                let end = (start + 512).min(length);
+                owner.deliver(0, ByteRange::new(start, end));
+                start = end;
+            }
+            let index = owner
+                .object
+                .entries
+                .iter()
+                .position(|entry| entry.name == "beta.bin")
+                .expect("beta is a member");
+            let entry = &mut owner.object.entries[index];
+            assert_eq!(matches!(entry.lock, Lock::Open(_)), sealed);
+            Arc::make_mut(&mut entry.out).padding = padding;
+            let facts = owner.object.facts();
+            let restored = restored(&facts).expect("the facts restore");
+            assert_eq!(
+                matches!(restored.entries[index].lock, Lock::Sealed(_)),
+                sealed
+            );
+            owner.object = restored;
+            owner.offer(PASSWORD);
+            let entry = &owner.object.entries[index];
+            assert!(matches!(entry.lock, Lock::Open(_)));
+            assert_eq!(entry.out.padding, Padding::default());
+            owner.whole(512);
+            owner.said.retain(|emit| *emit != Emit::NeedsPassword);
+            streamed(&owner);
+        }
+    }
 }

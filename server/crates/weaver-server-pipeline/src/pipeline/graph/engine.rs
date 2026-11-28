@@ -691,6 +691,19 @@ impl Runs {
             .map(|(node, _)| *node)
     }
 
+    // The node's object is out on loan, as the run is to start: a run that
+    // has not started gives back its slot and its memory and goes, to be
+    // asked again once the object is back, which marks the node
+    // (`Tree::take_back_worked`). A run that started stands. Returns the
+    // nodes that may start now.
+    pub fn defer(&mut self, node: NodeId, limit: usize) -> Vec<NodeId> {
+        let waits = self
+            .runs
+            .get(&node)
+            .is_some_and(|run| matches!(run.life, Life::Queued | Life::Starved { .. }));
+        self.forget(if waits { vec![node] } else { Vec::new() }, limit)
+    }
+
     // The generation the node's run started under, once it started.
     pub fn generation(&self, node: NodeId) -> Option<u64> {
         match self.runs.get(&node)?.life {

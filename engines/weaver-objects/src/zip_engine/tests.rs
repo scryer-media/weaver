@@ -221,7 +221,7 @@ fn said(emits: &[Emit]) -> Vec<Said> {
             Emit::NeedsPassword => out.push(Said::NeedsPassword),
             Emit::Refuse(why) => out.push(Said::Refuse(*why)),
             // Said beside the walk; `checksums` reads them.
-            Emit::Checksum { .. } => {}
+            Emit::Checked { .. } => {}
             // Text for the log, which changes nothing.
             Emit::Failed(_) => {}
             other => panic!("an engine run does not say {other:?}"),
@@ -1240,7 +1240,7 @@ fn checksums(emits: &[Emit]) -> Vec<(u32, u32)> {
     emits
         .iter()
         .filter_map(|emit| match emit {
-            Emit::Checksum { member, crc32 } => Some((member.0, *crc32)),
+            Emit::Checked { member, crc32 } => Some((member.0, *crc32)),
             _ => None,
         })
         .collect()
@@ -1265,6 +1265,50 @@ fn a_run_says_each_files_header_checksum_and_none_for_a_directory() {
     assert_eq!(
         checksums(&emits),
         vec![(1, crc(NOTES)), (2, crc(&second()))]
+    );
+    // The library checked each one as it read it: said after the member's
+    // bytes, just before its close, and none of its bytes hashed here.
+    assert!(emits.iter().all(|emit| match emit {
+        Emit::Bytes { bytes, .. } => bytes.evidence().is_empty(),
+        _ => true,
+    }));
+    for (at, emit) in emits.iter().enumerate() {
+        if let Emit::Checked { member, .. } = emit {
+            assert!(matches!(emits[at + 1], Emit::MemberClosed(closed) if closed == *member));
+            assert!(
+                !emits[at + 1..]
+                    .iter()
+                    .any(|later| matches!(later, Emit::Bytes { member: of, .. } if of == member))
+            );
+        }
+    }
+}
+
+// A member whose bytes fail the CRC32 its directory states is not said
+// checked: its read fails, and it is retracted.
+#[test]
+fn a_member_that_fails_its_crc_is_not_said_checked() {
+    let mut archive = plain();
+    let at = archive
+        .windows(NOTES.len())
+        .position(|window| window == NOTES)
+        .expect("the stored notes");
+    archive[at] ^= 0x20;
+    let mut emits = Vec::new();
+    let mut sink = |emit| {
+        emits.push(emit);
+        true
+    };
+    ZipEngine::new().start().run(
+        Gate::whole(vec![archive]),
+        &mut sink,
+        weaver_graph::Budget::default(),
+    );
+    assert!(!checksums(&emits).iter().any(|(member, _)| *member == 1));
+    assert!(
+        emits
+            .iter()
+            .any(|emit| matches!(emit, Emit::Retract(member) if member.0 == 1))
     );
 }
 

@@ -432,7 +432,7 @@ impl NamespaceWriter {
                     self.disk_under(&self.working_dir).as_ref(),
                     0,
                 );
-                self.files_mut(node).leaves.insert(member, leaf);
+                self.insert_leaf(node, member, leaf);
                 self.intend(node, member, output_name);
                 true
             }

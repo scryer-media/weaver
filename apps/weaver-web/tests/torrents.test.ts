@@ -17,7 +17,12 @@ import {
   type TorrentData,
   type TorrentSummaryData,
 } from "../src/lib/torrents.ts";
-import { EM_DASH, formatRate, formatSize } from "../src/next/data/format.ts";
+import {
+  EM_DASH,
+  formatDate,
+  formatRate,
+  formatSize,
+} from "../src/next/data/format.ts";
 import {
   informationFields,
   transferFields,
@@ -75,10 +80,10 @@ const torrent = (overrides: Partial<TorrentData> = {}): TorrentData => ({
   ratio: 0.5,
   uploadBps: 1024,
   name: "set",
-  infohash: "ab".repeat(20),
+  infohashV1: "ab".repeat(20),
   infohashV2: null,
-  stated: null,
-  detail: null,
+  stateReason: null,
+  stateDetail: null,
   routeReason: null,
   category: null,
   private: true,
@@ -89,9 +94,9 @@ const torrent = (overrides: Partial<TorrentData> = {}): TorrentData => ({
   downloadedBytes: 2 * 1024 * 1024,
   downloadBps: 2048,
   etaSeconds: 90,
-  peers: 5,
-  seeds: 2,
-  leechers: 3,
+  connectedPeers: 5,
+  connectedSeeds: 2,
+  connectedLeechers: 3,
   maxPeers: 500,
   swarmSeeds: 40,
   swarmLeechers: null,
@@ -100,17 +105,16 @@ const torrent = (overrides: Partial<TorrentData> = {}): TorrentData => ({
   downloadAvgBps: 512,
   uploadAvgBps: 256,
   wastedBytes: 16 * 1024,
-  lastSeenCompleteMs: null,
+  lastSeenCompleteAt: null,
   pieceCount: 16,
   pieceSize: 256 * 1024,
   piecesHave: 8,
   createdBy: "maker 1.0",
-  createdAtMs: null,
+  metainfoCreatedAt: null,
   comment: null,
-  addedAtMs: 1_700_000_000_000,
-  completedAtMs: null,
+  addedAt: "2023-11-14T22:13:20Z",
+  completedAt: null,
   savePath: "/complete/set",
-  seedingLeft: null,
   seedingGoalLeft: null,
   seedingOverride: null,
   seedingPolicy: {
@@ -129,12 +133,11 @@ const torrent = (overrides: Partial<TorrentData> = {}): TorrentData => ({
       uploadCap: "GLOBAL",
     },
   },
-  trackerRule: null,
+  trackerRuleName: null,
   unpack: true,
   unpackOverride: null,
   route: null,
   routeConsumer: "torrent:default",
-  files: [],
   trackers: [],
   ...overrides,
 });
@@ -202,6 +205,11 @@ test("the information section names the pieces, the maker and where the torrent 
   const values = byLabel(informationFields(t, torrent()));
   assert.equal(values["Pieces"], `8/16 × ${formatSize(256 * 1024)}`);
   assert.equal(values["Created by"], "maker 1.0");
+  // Dates come as ISO-8601 strings and read as every other date does.
+  assert.equal(
+    values["Added on"],
+    formatDate(Date.parse("2023-11-14T22:13:20Z")),
+  );
   assert.equal(values["Created on"], undefined);
   assert.equal(values["Comment"], undefined);
   assert.equal(values["Private"], "Yes");
@@ -233,7 +241,7 @@ test("a torrent route shows who resolves its names, and whether peers can reach 
   const exposure = {
     resolvedBy: "PROXY" as const,
     address: null,
-    announcedPort: 0,
+    announcedPort: null,
     inbound: false,
     udpTrackers: false,
     dht: false,
@@ -241,7 +249,7 @@ test("a torrent route shows who resolves its names, and whether peers can reach 
   };
   assert.equal(
     routeExposureText(t, { resolvedBy: "PROXY", exposure }),
-    "Resolved by Proxy · Tracker sees Unknown · Announced port 0 · Inbound No · UDP trackers No · DHT No · uTP No",
+    "Resolved by Proxy · Tracker sees Unknown · Announced port — · Inbound No · UDP trackers No · DHT No · uTP No",
   );
   assert.equal(
     routeExposureText(t, {
@@ -347,7 +355,10 @@ test("the transfer section notes its route's reason in each locale, else the ser
     for (const reason of TORRENT_STATED_REASONS) {
       const key = `next.torrents.stated.${reason}`;
       assert.equal(
-        transferNote(translate, torrent({ state: "STALLED", stated: reason })),
+        transferNote(
+          translate,
+          torrent({ state: "STALLED", stateReason: reason }),
+        ),
         dictionary[key],
         `${locale}: ${reason}`,
       );
@@ -378,24 +389,24 @@ test("the transfer section notes its route's reason in each locale, else the ser
     "Session limit reached",
   );
   assert.equal(
-    transferNote(t, torrent({ state: "STOPPED", detail: "disk gone" })),
+    transferNote(t, torrent({ state: "STOPPED", stateDetail: "disk gone" })),
     "disk gone",
   );
   assert.equal(
-    transferNote(t, torrent({ state: "STALLED", stated: "DISK_SPACE" })),
+    transferNote(t, torrent({ state: "STALLED", stateReason: "DISK_SPACE" })),
     "Low disk space",
   );
   assert.equal(
-    transferNote(t, torrent({ state: "STALLED", stated: "DISK_FULL" })),
+    transferNote(t, torrent({ state: "STALLED", stateReason: "DISK_FULL" })),
     "Disk full: seeding only",
   );
   assert.equal(
-    transferNote(t, torrent({ state: "STOPPED", stated: "GOAL_MET" })),
+    transferNote(t, torrent({ state: "STOPPED", stateReason: "GOAL_MET" })),
     "Seeding goal met",
   );
   // Free words that look like a code are shown as they came.
   assert.equal(
-    transferNote(t, torrent({ state: "STALLED", detail: "disk_space" })),
+    transferNote(t, torrent({ state: "STALLED", stateDetail: "disk_space" })),
     "disk_space",
   );
   assert.equal(transferNote(t, torrent()), undefined);

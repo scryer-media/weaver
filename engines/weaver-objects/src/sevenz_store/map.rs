@@ -25,6 +25,15 @@ pub(super) struct Folder {
     pub(super) aes: Option<AesProperties>,
     // Its streamed entries, by index, in offset order.
     pub(super) entries: Vec<usize>,
+    // Compressed: its packs are the envelope's, kept for a run that decodes
+    // the coded folders alone, and its entries take no bytes from here.
+    #[serde(default)]
+    pub(super) coded: bool,
+    // A coded folder's coders, in the order they decode, each its method
+    // and properties: what the run decodes it by. Empty for a stored one,
+    // which `aes` describes whole.
+    #[serde(default)]
+    pub(super) coders: Vec<(Vec<u8>, Vec<u8>)>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -117,14 +126,72 @@ fn coder_refusal(block: &Block) -> Why {
     }
 }
 
+// The methods a run decodes besides AES: the compressors and filters
+// sevenz-turbo reads as it is built here.
+const DECODES: &[&[u8]] = &[
+    COPY,
+    EncoderMethod::ID_LZMA,
+    EncoderMethod::ID_LZMA2,
+    EncoderMethod::ID_PPMD,
+    EncoderMethod::ID_BZIP2,
+    EncoderMethod::ID_DEFLATE,
+    EncoderMethod::ID_ZSTD,
+    EncoderMethod::ID_BROTLI,
+    EncoderMethod::ID_LZ4,
+    EncoderMethod::ID_DELTA,
+    EncoderMethod::ID_BCJ_X86,
+    EncoderMethod::ID_BCJ2,
+    EncoderMethod::ID_BCJ_PPC,
+    EncoderMethod::ID_BCJ_IA64,
+    EncoderMethod::ID_BCJ_ARM,
+    EncoderMethod::ID_BCJ_ARM64,
+    EncoderMethod::ID_BCJ_ARM_THUMB,
+    EncoderMethod::ID_BCJ_SPARC,
+    EncoderMethod::ID_BCJ_RISCV,
+];
+
+// A folder that does not stream, coded for the store's run: one without
+// AES, as ever, or a compression chain under AES, which the run deciphers
+// with the store's password as the 7z engine would. AES alone, or over a
+// copy only, or beside a method the run cannot decode, is not.
+fn is_coded(block: &Block) -> bool {
+    let methods: Vec<&[u8]> = block
+        .coders
+        .iter()
+        .map(|coder| coder.encoder_method_id())
+        .collect();
+    coded_by(&methods)
+}
+
+// As `is_coded`, by the folder's methods.
+pub(super) fn coded_by(methods: &[&[u8]]) -> bool {
+    !methods.contains(&AES)
+        || (methods
+            .iter()
+            .all(|method| *method == AES || DECODES.contains(method))
+            && methods
+                .iter()
+                .any(|method| *method != AES && *method != COPY))
+}
+
 fn align(len: u64) -> Result<u64, Why> {
     len.checked_next_multiple_of(BLOCK).ok_or(Why::Unsupported)
 }
 
-// The whole decision is taken over the set: folders are the unit of coding
-// and several entries share one, so a container with anything but stored
-// folders goes to an engine whole, with its bytes still in hand.
+// Folders are the unit of coding and several entries share one. A folder
+// that codes its bytes, plain or under AES, is kept whole in the envelope
+// for a run that decodes the coded folders alone, and the stored folders
+// beside it stream as ever. AES over anything else refuses the set, as does
+// a set with no stored folder: an engine reads the whole set better. Once a
+// folder is coded, any refusal after it is the first coded folder's own,
+// as it was before a set could be mixed, so what cannot be mapped goes to
+// an engine whole for the reason it always went.
 pub(super) fn build(archive: &Archive) -> Result<Map, Why> {
+    let mut coded = None;
+    mixed(archive, &mut coded).map_err(|why| coded.unwrap_or(why))
+}
+
+fn mixed(archive: &Archive, seen_coded: &mut Option<Why>) -> Result<Map, Why> {
     let firsts = archive.stream_map.block_first_pack_stream_index();
     let offsets = archive.stream_map.pack_stream_offsets();
     let sizes = archive.pack_sizes();
@@ -142,17 +209,24 @@ pub(super) fn build(archive: &Archive) -> Result<Map, Why> {
     }
     let mut folders = Vec::with_capacity(archive.blocks.len());
     for (index, block) in archive.blocks.iter().enumerate() {
-        if block
-            .coders
-            .iter()
-            .any(|coder| coder.num_input_streams() != 1 || coder.num_output_streams() != 1)
-        {
-            return Err(coder_refusal(block));
-        }
         let methods: Vec<_> = block
             .ordered_coder_iter()
             .map(|(_, coder)| coder.encoder_method_id())
             .collect();
+        let simple = block
+            .coders
+            .iter()
+            .all(|coder| coder.num_input_streams() == 1 && coder.num_output_streams() == 1);
+        let streams =
+            simple && (methods == [COPY] || methods == [AES, COPY] || methods == [COPY, AES]);
+        if !streams {
+            if is_coded(block) {
+                seen_coded.get_or_insert(coder_refusal(block));
+                folders.push(coded(archive, index, block)?);
+                continue;
+            }
+            return Err(coder_refusal(block));
+        }
         let aes = if methods == [COPY] {
             None
         } else if methods == [AES, COPY] || methods == [COPY, AES] {
@@ -213,6 +287,8 @@ pub(super) fn build(archive: &Archive) -> Result<Map, Why> {
             plain_len,
             aes,
             entries: Vec::new(),
+            coded: false,
+            coders: Vec::new(),
         });
     }
     // Each folder's running cursor: the entries sharing one are laid out end
@@ -285,6 +361,11 @@ pub(super) fn build(archive: &Archive) -> Result<Map, Why> {
     if entries.iter().all(|entry| entry.folder.is_none()) {
         return Err(Why::Unsupported);
     }
+    // Nothing stored: an engine reads the whole set better, for the first
+    // coded folder's reason (`build`).
+    if folders.iter().all(|folder| folder.coded) {
+        return Err(Why::Compressed);
+    }
     // Lookups by container offset walk the packs in order: they must follow
     // one another without overlap.
     if folders
@@ -296,7 +377,54 @@ pub(super) fn build(archive: &Archive) -> Result<Map, Why> {
     Ok(Map { folders, entries })
 }
 
+// A coded folder: its pack streams, end to end, are one range of the
+// container, and its size is what its coders say it unpacks to.
+fn coded(archive: &Archive, index: usize, block: &Block) -> Result<Folder, Why> {
+    let streams = archive.block_pack_streams(index);
+    let first = streams.first().ok_or(Why::Unsupported)?;
+    let mut end = first.offset;
+    for stream in &streams {
+        if stream.offset != end {
+            return Err(Why::Unsupported);
+        }
+        end = end.checked_add(stream.size).ok_or(Why::Unsupported)?;
+    }
+    Ok(Folder {
+        pack: ByteRange::new(first.offset, end),
+        plain_len: block.get_unpack_size(),
+        aes: None,
+        entries: Vec::new(),
+        coded: true,
+        coders: block
+            .ordered_coder_iter()
+            .map(|(_, coder)| {
+                (
+                    coder.encoder_method_id().to_vec(),
+                    coder.properties().to_vec(),
+                )
+            })
+            .collect(),
+    })
+}
+
 impl Map {
+    // The coded folders, by index, in order.
+    pub(super) fn coded(&self) -> impl Iterator<Item = usize> + '_ {
+        self.folders
+            .iter()
+            .enumerate()
+            .filter(|(_, folder)| folder.coded)
+            .map(|(index, _)| index)
+    }
+
+    // Whether a member's bytes are a coded folder's, a run's to make.
+    pub(super) fn is_coded(&self, member: MemberId) -> bool {
+        self.entry(member)
+            .and_then(|entry| entry.folder)
+            .and_then(|folder| self.folders.get(folder))
+            .is_some_and(|folder| folder.coded)
+    }
+
     pub(super) fn entry(&self, member: MemberId) -> Option<&Entry> {
         self.entries.get(member.0 as usize)
     }
@@ -337,7 +465,7 @@ impl Map {
         range: ByteRange,
     ) -> Option<(usize, ByteRange)> {
         let entry = self.entry(member)?;
-        let folder = entry.folder?;
+        let folder = entry.folder.filter(|folder| !self.folders[*folder].coded)?;
         let range = range.intersect(ByteRange::new(0, entry.length))?;
         let start = self.folders[folder].pack.start + entry.offset;
         Some((folder, range.shift(start as i64)))

@@ -11,8 +11,11 @@ use weaver_server_core::settings::service::SettingsServiceQueries;
 
 use async_graphql::{Context, MaybeUndefined, Object, Result};
 
-use crate::auth::AdminGuard;
-use crate::observability::{persist_then_update_config, spawn_blocking_db};
+use crate::auth::{AdminGuard, graphql_error, invalid_input, not_found};
+use crate::observability::{
+    persist_then_update_config, spawn_blocking_db, spawn_blocking_with, state_error,
+    watch_folder_error,
+};
 use crate::settings::types::{
     DuplicatePolicySettingsInput, GeneralSettings, GeneralSettingsInput, WatchFolderScanReport,
     WatchFolderSettingsInput,
@@ -21,6 +24,10 @@ use weaver_server_core::settings::SharedConfig;
 use weaver_server_core::settings::tracker_file;
 use weaver_server_core::watch_folder::{WatchFolderConfig, WatchFolderMode, WatchFolderService};
 use weaver_server_core::{Database, SchedulerHandle};
+
+// The refusal of another torrent listen port while the environment pins it.
+pub(crate) const TORRENT_PORT_PINNED: &str = "WEAVER_TORRENT_PORT is set in this deployment's \
+     environment and pins the torrent listen port; change it there instead";
 
 // Refuse a schedule rule this machine could never apply, judged against the
 // live probe as the hardware-profile choice is.
@@ -32,9 +39,9 @@ async fn validate_schedule_input(
     let probe = system
         .profile
         .read()
-        .map_err(|_| async_graphql::Error::new("system profile unavailable"))?
+        .map_err(|_| graphql_error("INTERNAL", "system profile unavailable"))?
         .clone();
-    input.validate(&probe).map_err(async_graphql::Error::new)?;
+    input.validate(&probe).map_err(invalid_input)?;
     Ok(())
 }
 
@@ -54,6 +61,22 @@ pub(crate) struct SettingsMutation;
 #[Object]
 impl SettingsMutation {
     #[graphql(guard = "AdminGuard")]
+    async fn update_web_appearance(
+        &self,
+        ctx: &Context<'_>,
+        input: crate::settings::appearance::WebAppearanceInput,
+    ) -> Result<crate::settings::appearance::WebAppearance> {
+        let store = ctx
+            .data::<crate::settings::appearance::AppearanceStore>()?
+            .clone();
+        let db = ctx.data::<Database>()?.clone();
+        spawn_blocking_db("settings.mutation.update_web_appearance", move || {
+            store.save(&db, input)
+        })
+        .await
+    }
+
+    #[graphql(guard = "AdminGuard")]
     async fn update_archive_password_settings(
         &self,
         ctx: &Context<'_>,
@@ -66,11 +89,14 @@ impl SettingsMutation {
             MaybeUndefined::Null => Some(None),
             MaybeUndefined::Value(file) => Some(Some(file)),
         };
-        let (has_passwords, password_file) = tokio::task::spawn_blocking(move || {
-            db.save_archive_password_settings(passwords, password_file)?;
-            db.archive_password_settings()
-        })
-        .await??;
+        let (has_passwords, password_file) = spawn_blocking_with(
+            move || {
+                db.save_archive_password_settings(passwords, password_file)?;
+                db.archive_password_settings()
+            },
+            state_error,
+        )
+        .await?;
         Ok(crate::settings::types::ArchivePasswordSettings {
             has_passwords,
             password_file,
@@ -100,11 +126,11 @@ impl SettingsMutation {
         let detected = system
             .profile
             .read()
-            .map_err(|_| async_graphql::Error::new("system profile unavailable"))?
+            .map_err(|_| graphql_error("INTERNAL", "system profile unavailable"))?
             .clone();
         let chosen: HardwareProfile = profile.into();
         if let Some(requirement) = chosen.unmet_requirement(&detected) {
-            return Err(async_graphql::Error::new(requirement));
+            return Err(invalid_input(requirement));
         }
 
         let persist = {
@@ -134,7 +160,10 @@ impl SettingsMutation {
         // the next download, decode and extraction that starts; work already
         // running finishes under the limits it started with. A schedule rule
         // with a profile in force keeps it until the schedule lets go.
-        handle.set_hardware_profile(chosen).await?;
+        handle
+            .set_hardware_profile(chosen)
+            .await
+            .map_err(crate::observability::scheduler_error)?;
 
         Ok(
             crate::settings::types::HardwareProfileSettings::resolve(Some(chosen), &detected)
@@ -194,7 +223,7 @@ impl SettingsMutation {
                 cfg.watch_folder.clone()
             };
             apply_watch_folder_update(&mut candidate, watch);
-            candidate.validate().map_err(async_graphql::Error::new)?;
+            candidate.validate().map_err(invalid_input)?;
         }
         let seeding_update = match input.seeding {
             MaybeUndefined::Undefined => None,
@@ -222,6 +251,15 @@ impl SettingsMutation {
                         })?;
                 }
                 let mut torrent = config.read().await.torrent.clone();
+                // A pinned port is refused rather than saved and ignored; the
+                // port it already is saves as an unchanged one.
+                if torrent.base_port_pinned
+                    && update
+                        .base_port
+                        .is_some_and(|port| port != torrent.base_port)
+                {
+                    return Err(graphql_error("ENV_PINNED", TORRENT_PORT_PINNED));
+                }
                 if update.enabled == Some(false)
                     && (torrent.enabled || update.when_disabled.is_some())
                 {
@@ -230,7 +268,7 @@ impl SettingsMutation {
                 update.apply(&mut torrent);
                 let torrent = torrent
                     .checked()
-                    .map_err(|errors| async_graphql::Error::new(errors.join("; ")))?;
+                    .map_err(|errors| invalid_input(errors.join("; ")))?;
                 Some(torrent)
             }
             None => None,
@@ -476,10 +514,16 @@ impl SettingsMutation {
         };
 
         if let Some(seconds) = propagation_delay_secs {
-            handle.set_propagation_delay(seconds).await?;
+            handle
+                .set_propagation_delay(seconds)
+                .await
+                .map_err(crate::observability::scheduler_error)?;
         }
         if let Some(limit) = max_concurrent_nzbs {
-            handle.set_max_concurrent_nzbs(limit).await?;
+            handle
+                .set_max_concurrent_nzbs(limit)
+                .await
+                .map_err(crate::observability::scheduler_error)?;
         }
 
         // Apply directory changes immediately so new jobs use them without restart.
@@ -493,7 +537,7 @@ impl SettingsMutation {
             watch_folder
                 .reconcile_from_config()
                 .await
-                .map_err(|error| async_graphql::Error::new(error.to_string()))?;
+                .map_err(watch_folder_error)?;
         }
         crate::torrents::reconcile(ctx).await?;
 
@@ -535,10 +579,7 @@ impl SettingsMutation {
     #[graphql(guard = "AdminGuard")]
     async fn scan_watch_folder(&self, ctx: &Context<'_>) -> Result<WatchFolderScanReport> {
         let watch_folder = ctx.data::<WatchFolderService>()?;
-        let report = watch_folder
-            .scan_now()
-            .await
-            .map_err(|error| async_graphql::Error::new(error.to_string()))?;
+        let report = watch_folder.scan_now().await.map_err(watch_folder_error)?;
         Ok(report.into())
     }
 
@@ -553,20 +594,26 @@ impl SettingsMutation {
             .data::<weaver_server_core::bandwidth::schedule::SharedSchedules>()?
             .clone();
         validate_schedule_input(ctx, &input).await?;
-        let entry = input.into_entry().map_err(async_graphql::Error::new)?;
+        let entry = input.into_entry().map_err(invalid_input)?;
         let mut schedules_guard = schedules_state.write().await;
-        let mut entries = tokio::task::spawn_blocking({
-            let db = db.clone();
-            move || db.list_schedules()
-        })
-        .await??;
+        let mut entries = spawn_blocking_with(
+            {
+                let db = db.clone();
+                move || db.list_schedules()
+            },
+            state_error,
+        )
+        .await?;
         entries.push(entry);
         let entries_for_save = entries.clone();
-        let entries = tokio::task::spawn_blocking(move || {
-            db.save_schedules(&entries_for_save)?;
-            db.list_schedules()
-        })
-        .await??;
+        let entries = spawn_blocking_with(
+            move || {
+                db.save_schedules(&entries_for_save)?;
+                db.list_schedules()
+            },
+            state_error,
+        )
+        .await?;
         *schedules_guard = entries.clone();
         drop(schedules_guard);
         schedule_response(ctx, entries).await
@@ -584,22 +631,28 @@ impl SettingsMutation {
             .clone();
         validate_schedule_input(ctx, &input).await?;
         let mut schedules_guard = schedules_state.write().await;
-        let mut entries = tokio::task::spawn_blocking({
-            let db = db.clone();
-            move || db.list_schedules()
-        })
-        .await??;
+        let mut entries = spawn_blocking_with(
+            {
+                let db = db.clone();
+                move || db.list_schedules()
+            },
+            state_error,
+        )
+        .await?;
         if let Some(existing) = entries.iter_mut().find(|e| e.id == id) {
-            let mut updated = input.into_entry().map_err(async_graphql::Error::new)?;
+            let mut updated = input.into_entry().map_err(invalid_input)?;
             updated.id = existing.id.clone();
             *existing = updated;
         }
         let entries_for_save = entries.clone();
-        let entries = tokio::task::spawn_blocking(move || {
-            db.save_schedules(&entries_for_save)?;
-            db.list_schedules()
-        })
-        .await??;
+        let entries = spawn_blocking_with(
+            move || {
+                db.save_schedules(&entries_for_save)?;
+                db.list_schedules()
+            },
+            state_error,
+        )
+        .await?;
         *schedules_guard = entries.clone();
         drop(schedules_guard);
         schedule_response(ctx, entries).await
@@ -615,18 +668,24 @@ impl SettingsMutation {
             .data::<weaver_server_core::bandwidth::schedule::SharedSchedules>()?
             .clone();
         let mut schedules_guard = schedules_state.write().await;
-        let mut entries = tokio::task::spawn_blocking({
-            let db = db.clone();
-            move || db.list_schedules()
-        })
-        .await??;
+        let mut entries = spawn_blocking_with(
+            {
+                let db = db.clone();
+                move || db.list_schedules()
+            },
+            state_error,
+        )
+        .await?;
         entries.retain(|e| e.id != id);
         let entries_for_save = entries.clone();
-        let entries = tokio::task::spawn_blocking(move || {
-            db.save_schedules(&entries_for_save)?;
-            db.list_schedules()
-        })
-        .await??;
+        let entries = spawn_blocking_with(
+            move || {
+                db.save_schedules(&entries_for_save)?;
+                db.list_schedules()
+            },
+            state_error,
+        )
+        .await?;
         *schedules_guard = entries.clone();
         drop(schedules_guard);
         schedule_response(ctx, entries).await
@@ -643,20 +702,26 @@ impl SettingsMutation {
             .data::<weaver_server_core::bandwidth::schedule::SharedSchedules>()?
             .clone();
         let mut schedules_guard = schedules_state.write().await;
-        let mut entries = tokio::task::spawn_blocking({
-            let db = db.clone();
-            move || db.list_schedules()
-        })
-        .await??;
+        let mut entries = spawn_blocking_with(
+            {
+                let db = db.clone();
+                move || db.list_schedules()
+            },
+            state_error,
+        )
+        .await?;
         if let Some(existing) = entries.iter_mut().find(|e| e.id == id) {
             existing.enabled = enabled;
         }
         let entries_for_save = entries.clone();
-        let entries = tokio::task::spawn_blocking(move || {
-            db.save_schedules(&entries_for_save)?;
-            db.list_schedules()
-        })
-        .await??;
+        let entries = spawn_blocking_with(
+            move || {
+                db.save_schedules(&entries_for_save)?;
+                db.list_schedules()
+            },
+            state_error,
+        )
+        .await?;
         *schedules_guard = entries.clone();
         drop(schedules_guard);
         schedule_response(ctx, entries).await
@@ -682,17 +747,18 @@ impl SettingsMutation {
         // The rule's transports, resolved over the global ones, leave one
         // on; its preferences are kept as set.
         let global = ctx.data::<SharedConfig>()?.read().await.torrent.transports;
-        rule.transports
-            .checked(global)
-            .map_err(async_graphql::Error::new)?;
-        let (routed, rules) = tokio::task::spawn_blocking(move || {
-            let routed = routed_rules(&db.list_tracker_rules()?);
-            let now = chrono::Utc::now().timestamp_millis();
-            let rules = db.save_tracker_rule(id, rule, keeps_ssl, keeps_passwords, now)?;
-            Ok::<_, weaver_server_core::StateError>(rules.map(|rules| (routed, rules)))
-        })
-        .await??
-        .map_err(async_graphql::Error::new)?;
+        rule.transports.checked(global).map_err(invalid_input)?;
+        let (routed, rules) = spawn_blocking_with(
+            move || {
+                let routed = routed_rules(&db.list_tracker_rules()?);
+                let now = chrono::Utc::now().timestamp_millis();
+                let rules = db.save_tracker_rule(id, rule, keeps_ssl, keeps_passwords, now)?;
+                Ok::<_, weaver_server_core::StateError>(rules.map(|rules| (routed, rules)))
+            },
+            state_error,
+        )
+        .await?
+        .map_err(tracker_rule_refusal)?;
         tracker_rules_saved(ctx, &routed, &rules).await?;
         Ok(rules.into_iter().map(Into::into).collect())
     }
@@ -707,12 +773,15 @@ impl SettingsMutation {
     ) -> Result<Vec<crate::settings::types::TrackerRule>> {
         let db = ctx.data::<Database>()?.clone();
         let _guard = SETTINGS_MUTATION_GUARD.lock().await;
-        let (routed, rules) = tokio::task::spawn_blocking(move || {
-            let routed = routed_rules(&db.list_tracker_rules()?);
-            db.delete_tracker_rule(id)?;
-            Ok::<_, weaver_server_core::StateError>((routed, db.list_tracker_rules()?))
-        })
-        .await??;
+        let (routed, rules) = spawn_blocking_with(
+            move || {
+                let routed = routed_rules(&db.list_tracker_rules()?);
+                db.delete_tracker_rule(id)?;
+                Ok::<_, weaver_server_core::StateError>((routed, db.list_tracker_rules()?))
+            },
+            state_error,
+        )
+        .await?;
         tracker_rules_saved(ctx, &routed, &rules).await?;
         Ok(rules.into_iter().map(Into::into).collect())
     }
@@ -727,22 +796,25 @@ impl SettingsMutation {
     ) -> Result<crate::settings::types::TrackerFilePreview> {
         let db = ctx.data::<Database>()?.clone();
         let bytes = decode_tracker_file(&file)?;
-        let preview = tokio::task::spawn_blocking(move || {
-            let read = tracker_file::read(&bytes, password.as_deref());
-            let file = match read {
-                Ok(file) => file,
-                Err(refusal) => return Ok(Err(refusal)),
-            };
-            let rules = db.list_tracker_rules()?;
-            let rule = match file.rule_in(&rules) {
-                Ok(rule) => rule,
-                Err(refusal) => return Ok(Err(refusal)),
-            };
-            let fingerprint = tracker_file::fingerprint(&bytes, rule);
-            Ok::<_, weaver_server_core::StateError>(Ok(file.preview(rule, fingerprint)))
-        })
-        .await??
-        .map_err(async_graphql::Error::new)?;
+        let preview = spawn_blocking_with(
+            move || {
+                let read = tracker_file::read(&bytes, password.as_deref());
+                let file = match read {
+                    Ok(file) => file,
+                    Err(refusal) => return Ok(Err(refusal)),
+                };
+                let rules = db.list_tracker_rules()?;
+                let rule = match file.rule_in(&rules) {
+                    Ok(rule) => rule,
+                    Err(refusal) => return Ok(Err(refusal)),
+                };
+                let fingerprint = tracker_file::fingerprint(&bytes, rule);
+                Ok::<_, weaver_server_core::StateError>(Ok(file.preview(rule, fingerprint)))
+            },
+            state_error,
+        )
+        .await?
+        .map_err(|refusal| graphql_error("CONFLICT", refusal))?;
         Ok(preview.into())
     }
 
@@ -759,29 +831,34 @@ impl SettingsMutation {
         let db = ctx.data::<Database>()?.clone();
         let bytes = decode_tracker_file(&file)?;
         let _guard = SETTINGS_MUTATION_GUARD.lock().await;
-        let rules = tokio::task::spawn_blocking(move || {
-            let file = match tracker_file::read(&bytes, password.as_deref()) {
-                Ok(file) => file,
-                Err(refusal) => return Ok(Err(refusal)),
-            };
-            let rules = db.list_tracker_rules()?;
-            let rule = match file.rule_in(&rules) {
-                Ok(rule) => rule,
-                Err(refusal) => return Ok(Err(refusal)),
-            };
-            if tracker_file::fingerprint(&bytes, rule) != fingerprint {
-                return Ok(Err("stale preview".to_owned()));
-            }
-            let routed = routed_rules(&rules);
-            let now = chrono::Utc::now().timestamp_millis();
-            match db.apply_tracker_file(&file, now) {
-                Err(weaver_server_core::StateError::Conflict(refusal)) => return Ok(Err(refusal)),
-                applied => applied?,
-            };
-            Ok::<_, weaver_server_core::StateError>(Ok((routed, db.list_tracker_rules()?)))
-        })
-        .await??
-        .map_err(async_graphql::Error::new)?;
+        let rules = spawn_blocking_with(
+            move || {
+                let file = match tracker_file::read(&bytes, password.as_deref()) {
+                    Ok(file) => file,
+                    Err(refusal) => return Ok(Err(refusal)),
+                };
+                let rules = db.list_tracker_rules()?;
+                let rule = match file.rule_in(&rules) {
+                    Ok(rule) => rule,
+                    Err(refusal) => return Ok(Err(refusal)),
+                };
+                if tracker_file::fingerprint(&bytes, rule) != fingerprint {
+                    return Ok(Err("stale preview".to_owned()));
+                }
+                let routed = routed_rules(&rules);
+                let now = chrono::Utc::now().timestamp_millis();
+                match db.apply_tracker_file(&file, now) {
+                    Err(weaver_server_core::StateError::Conflict(refusal)) => {
+                        return Ok(Err(refusal));
+                    }
+                    applied => applied?,
+                };
+                Ok::<_, weaver_server_core::StateError>(Ok((routed, db.list_tracker_rules()?)))
+            },
+            state_error,
+        )
+        .await?
+        .map_err(|refusal| graphql_error("CONFLICT", refusal))?;
         let (routed, rules) = rules;
         tracker_rules_saved(ctx, &routed, &rules).await?;
         Ok(rules.into_iter().map(Into::into).collect())
@@ -797,19 +874,37 @@ impl SettingsMutation {
     ) -> Result<Vec<crate::settings::types::TrackerRule>> {
         let db = ctx.data::<Database>()?.clone();
         let _guard = SETTINGS_MUTATION_GUARD.lock().await;
-        let (routed, rules) = tokio::task::spawn_blocking(move || {
-            let routed = routed_rules(&db.list_tracker_rules()?);
-            let now = chrono::Utc::now().timestamp_millis();
-            if !db.unbind_tracker_rule(id, now)? {
-                return Ok(Err(format!("no tracker rule {id}")));
-            }
-            Ok::<_, weaver_server_core::StateError>(Ok((routed, db.list_tracker_rules()?)))
-        })
-        .await??
-        .map_err(async_graphql::Error::new)?;
+        let (routed, rules) = spawn_blocking_with(
+            move || {
+                let routed = routed_rules(&db.list_tracker_rules()?);
+                let now = chrono::Utc::now().timestamp_millis();
+                if !db.unbind_tracker_rule(id, now)? {
+                    return Ok(Err(format!("no tracker rule {id}")));
+                }
+                Ok::<_, weaver_server_core::StateError>(Ok((routed, db.list_tracker_rules()?)))
+            },
+            state_error,
+        )
+        .await?
+        .map_err(not_found)?;
         tracker_rules_saved(ctx, &routed, &rules).await?;
         Ok(rules.into_iter().map(Into::into).collect())
     }
+}
+
+// A tracker rule not saved, worded as it stands: a locked field or a host
+// another rule covers is a conflict, a name in use is taken, and an id of no
+// rule is not found.
+fn tracker_rule_refusal(
+    refusal: weaver_server_core::settings::repository::TrackerRuleRefusal,
+) -> async_graphql::Error {
+    use weaver_server_core::settings::repository::TrackerRuleRefusal;
+    let code = match &refusal {
+        TrackerRuleRefusal::Locked(_) | TrackerRuleRefusal::Covered { .. } => "CONFLICT",
+        TrackerRuleRefusal::NameTaken(_) => "NAME_TAKEN",
+        TrackerRuleRefusal::NotFound(_) => "NOT_FOUND",
+    };
+    graphql_error(code, refusal.to_string())
 }
 
 // The tracker rules that route their torrents themselves: each is a route
@@ -846,14 +941,14 @@ fn decode_tracker_file(file: &str) -> Result<Vec<u8>> {
     use base64::Engine as _;
     let limit = tracker_file::MAX_UPLOAD_BYTES;
     if file.len() > limit.div_ceil(3) * 4 {
-        return Err(async_graphql::Error::new(format!(
-            "The tracker file is larger than {} KiB.",
-            limit / 1024
-        )));
+        return Err(graphql_error(
+            "UPLOAD_TOO_LARGE",
+            format!("The tracker file is larger than {} KiB.", limit / 1024),
+        ));
     }
     base64::engine::general_purpose::STANDARD
         .decode(file.trim())
-        .map_err(|_| async_graphql::Error::new("The tracker file is not base64."))
+        .map_err(|_| invalid_input("The tracker file is not base64."))
 }
 
 fn normalize_settings_path_update(input: &MaybeUndefined<String>) -> MaybeUndefined<String> {
@@ -890,13 +985,14 @@ fn normalize_watch_folder_update(
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(|value| {
-            WatchFolderMode::parse(value).ok_or_else(|| {
-                async_graphql::Error::new("watch_folder.mode must be off, polling, or realtime")
-            })
+            WatchFolderMode::parse(value)
+                .ok_or_else(|| invalid_input("watch_folder.mode must be off, polling, or realtime"))
         })
         .transpose()?;
     if input.poll_interval_secs == Some(0) {
-        return Err("watch_folder.poll_interval_secs must be greater than 0".into());
+        return Err(invalid_input(
+            "watch_folder.poll_interval_secs must be greater than 0",
+        ));
     }
     Ok(NormalizedWatchFolderSettingsInput {
         mode,
@@ -967,6 +1063,34 @@ mod tests {
     use crate::observability::{persist_then_update_config, with_timed_config_read};
 
     use super::*;
+
+    // A lock or an overlap is a conflict, a taken name is taken, and an
+    // unknown id is not found. Each keeps its sentence.
+    #[test]
+    fn each_tracker_rule_refusal_carries_the_code_of_its_kind() {
+        use weaver_server_core::settings::repository::TrackerRuleRefusal;
+        let cases = [
+            (TrackerRuleRefusal::Locked("locked".into()), "CONFLICT"),
+            (TrackerRuleRefusal::NameTaken("Linux".into()), "NAME_TAKEN"),
+            (
+                TrackerRuleRefusal::Covered {
+                    pattern: "*.example.org".into(),
+                    by: "Linux".into(),
+                },
+                "CONFLICT",
+            ),
+            (TrackerRuleRefusal::NotFound(7), "NOT_FOUND"),
+        ];
+        for (refusal, code) in cases {
+            let message = refusal.to_string();
+            let refused = tracker_rule_refusal(refusal);
+            assert_eq!(refused.message, message);
+            assert_eq!(
+                refused.extensions.as_ref().and_then(|ext| ext.get("code")),
+                Some(&async_graphql::Value::from(code))
+            );
+        }
+    }
 
     fn test_config() -> SharedConfig {
         Arc::new(RwLock::new(weaver_server_core::settings::Config {

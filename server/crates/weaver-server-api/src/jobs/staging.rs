@@ -2,7 +2,9 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 use std::collections::HashMap;
-use std::io::{Chain, Cursor, Error, ErrorKind, Read, Result as IoResult, Take};
+use std::io::{
+    BufRead, BufReader, Chain, Cursor, Error, ErrorKind, Read, Result as IoResult, Take,
+};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
@@ -10,10 +12,12 @@ use async_graphql::UploadValue;
 use weaver_nzb::Nzb;
 
 use crate::auth::CallerIdentity;
+use weaver_server_core::MAX_TORRENT_FILE_BYTES;
 use weaver_server_core::auth::generate_api_key;
+use weaver_server_core::ingest::classify::SUBMISSION_TEXT_LIMIT_BYTES;
 use weaver_server_core::ingest::{
-    PreparedPersistedNzb, StagedSubmissionPreparation, SubmitNzbError,
-    XZ_DECODER_MEMORY_LIMIT_BYTES, bzip2_multistream_decoder, nzb_to_submission_spec,
+    Kind, PreparedPersistedNzb, StagedSubmissionPreparation, SubmitNzbError,
+    XZ_DECODER_MEMORY_LIMIT_BYTES, bzip2_multistream_decoder, classify, nzb_to_submission_spec,
     parse_and_hash_persisted_nzb_bytes, persist_decoded_nzb_reader_to_zstd, xz_multistream_decoder,
 };
 use weaver_server_core::jobs::FingerprintEvidence;
@@ -415,6 +419,45 @@ fn detect_upload_encoding(upload: &UploadValue) -> UploadEncoding {
     }
 }
 
+// An upload past its size limit. It travels inside the I/O error it is read
+// through, so the answer can name it by type, not by its sentence.
+#[derive(Debug)]
+struct UploadTooLarge(String);
+
+impl std::fmt::Display for UploadTooLarge {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for UploadTooLarge {}
+
+fn too_large(message: String) -> Error {
+    Error::new(ErrorKind::InvalidData, UploadTooLarge(message))
+}
+
+// Whether an upload's read failed because the upload passed its limit.
+pub(crate) fn is_upload_too_large(error: &Error) -> bool {
+    error
+        .get_ref()
+        .is_some_and(|inner| inner.is::<UploadTooLarge>())
+}
+
+// An upload refused, worded as it stands: past its size limit it is too
+// large, a failure to keep it or a pipeline answer keeps its own code, and
+// anything else is bad input.
+pub(crate) fn upload_refusal(error: SubmitNzbError) -> async_graphql::Error {
+    let code = match &error {
+        SubmitNzbError::Upload(io) if is_upload_too_large(io) => "UPLOAD_TOO_LARGE",
+        SubmitNzbError::Save(_) => "INTERNAL",
+        SubmitNzbError::Fetch(_) => "FETCH_FAILED",
+        SubmitNzbError::State(state) => crate::observability::state_code(state),
+        SubmitNzbError::Scheduler(scheduler) => crate::observability::scheduler_code(scheduler),
+        _ => "INVALID_INPUT",
+    };
+    crate::auth::graphql_error(code, error.to_string())
+}
+
 struct LimitedReader<R> {
     inner: R,
     remaining: u64,
@@ -443,10 +486,10 @@ impl<R: Read> Read for LimitedReader<R> {
             .min(buf.len());
         let read = self.inner.read(&mut buf[..cap])?;
         if read as u64 > self.remaining {
-            return Err(Error::new(
-                ErrorKind::InvalidData,
-                format!("{} exceeds {} bytes", self.label, self.limit),
-            ));
+            return Err(too_large(format!(
+                "{} exceeds {} bytes",
+                self.label, self.limit
+            )));
         }
         self.remaining -= read as u64;
         Ok(read)
@@ -497,6 +540,73 @@ pub(crate) fn normalize_uploaded_nzb_reader(
     )))
 }
 
+/// Identify the uploaded content and keep NZBs on the streaming intake.
+/// Submit retains decoded torrent inputs, while staging only verifies them.
+pub(crate) async fn classify_upload(
+    upload: &UploadValue,
+    retain_decoded: bool,
+) -> Result<(Kind, Option<Vec<u8>>), SubmitNzbError> {
+    if detect_upload_encoding(upload) == UploadEncoding::Plain
+        && encoding_from_magic(&upload.content) == UploadEncoding::Plain
+    {
+        return Ok((classify(&upload.content), None));
+    }
+
+    let upload = UploadValue {
+        filename: upload.filename.clone(),
+        content_type: upload.content_type.clone(),
+        content: upload.content.clone(),
+    };
+    tokio::task::spawn_blocking(move || {
+        let reader = normalize_uploaded_nzb_reader(upload)?;
+        classify_decoded_upload(reader, MAX_TORRENT_FILE_BYTES as u64, retain_decoded)
+            .map_err(SubmitNzbError::Upload)
+    })
+    .await
+    .map_err(|error| SubmitNzbError::Upload(Error::other(error)))?
+}
+
+fn classify_decoded_upload(
+    reader: impl Read,
+    metainfo_limit: u64,
+    retain_decoded: bool,
+) -> IoResult<(Kind, Option<Vec<u8>>)> {
+    let mut reader = BufReader::with_capacity(
+        128,
+        LimitedReader::new(reader, metainfo_limit, "decompressed torrent metainfo"),
+    );
+    let mut bytes = Vec::new();
+    reader.by_ref().take(2).read_to_end(&mut bytes)?;
+    if classify(&bytes) == Kind::Metainfo {
+        let decoded = if retain_decoded {
+            reader.read_to_end(&mut bytes)?;
+            Some(bytes)
+        } else {
+            std::io::copy(&mut reader, &mut std::io::sink())?;
+            None
+        };
+        return Ok((Kind::Metainfo, decoded));
+    }
+
+    let peek = reader.fill_buf()?;
+    let bom = bytes == [0xef, 0xbb] && peek.starts_with(&[0xbf]);
+    let first = bytes
+        .iter()
+        .chain(peek)
+        .skip(if bom { 3 } else { 0 })
+        .find(|byte| !byte.is_ascii_whitespace());
+    if first == Some(&b'<') {
+        return Ok((Kind::Nzb, None));
+    }
+
+    let remaining = (SUBMISSION_TEXT_LIMIT_BYTES + 1 - bytes.len()) as u64;
+    reader.take(remaining).read_to_end(&mut bytes)?;
+    match classify(&bytes) {
+        kind @ Kind::Magnet(_) => Ok((kind, retain_decoded.then_some(bytes))),
+        _ => Ok((Kind::Nzb, None)),
+    }
+}
+
 // Whether base64 text of `encoded_len` characters can decode to an NZB within
 // the inline limit. Checked before decoding so an oversized string is refused
 // without first being decoded in full.
@@ -505,10 +615,9 @@ pub(crate) fn inline_nzb_base64_fits(encoded_len: usize) -> Result<(), SubmitNzb
     if base64_len_within(encoded_len, limit) {
         return Ok(());
     }
-    Err(SubmitNzbError::Upload(Error::new(
-        ErrorKind::InvalidData,
-        format!("NZB upload exceeds {limit} bytes"),
-    )))
+    Err(SubmitNzbError::Upload(too_large(format!(
+        "NZB upload exceeds {limit} bytes"
+    ))))
 }
 
 // Padded base64 spends four characters on every three bytes.
@@ -522,10 +631,10 @@ fn base64_len_within(encoded_len: usize, limit: u64) -> bool {
 pub(crate) fn read_inline_nzb_bytes(bytes: Vec<u8>) -> Result<Vec<u8>, SubmitNzbError> {
     let limits = RuntimeSecurityConfig::from_env_or_default_for_tests();
     if bytes.len() as u64 > limits.nzb_upload_limit_bytes {
-        return Err(SubmitNzbError::Upload(Error::new(
-            ErrorKind::InvalidData,
-            format!("NZB upload exceeds {} bytes", limits.nzb_upload_limit_bytes),
-        )));
+        return Err(SubmitNzbError::Upload(too_large(format!(
+            "NZB upload exceeds {} bytes",
+            limits.nzb_upload_limit_bytes
+        ))));
     }
     let encoding = encoding_from_magic(&bytes);
     let source = Cursor::new(bytes);
@@ -561,6 +670,51 @@ mod tests {
     use std::io::Write;
 
     use lzma_turbo::{LzmaEncProps, XzWriter};
+
+    fn code_of(error: &async_graphql::Error) -> Option<async_graphql::Value> {
+        error
+            .extensions
+            .as_ref()
+            .and_then(|ext| ext.get("code"))
+            .cloned()
+    }
+
+    // An upload past its limit is too large; a failure to keep it is a fault;
+    // anything else is bad input. Each keeps its sentence.
+    #[test]
+    fn each_upload_refusal_carries_the_code_of_its_kind() {
+        let too_large = inline_nzb_base64_fits(usize::MAX).unwrap_err();
+        let message = too_large.to_string();
+        let refused = upload_refusal(too_large);
+        assert_eq!(refused.message, message);
+        assert_eq!(
+            code_of(&refused),
+            Some(async_graphql::Value::from("UPLOAD_TOO_LARGE"))
+        );
+
+        let cases = [
+            (SubmitNzbError::Empty, "INVALID_INPUT"),
+            (SubmitNzbError::NotXml, "INVALID_INPUT"),
+            (
+                SubmitNzbError::Upload(std::io::Error::other("truncated")),
+                "INVALID_INPUT",
+            ),
+            (
+                SubmitNzbError::Save(std::io::Error::other("disk gone")),
+                "INTERNAL",
+            ),
+            (
+                SubmitNzbError::Fetch("connection refused".into()),
+                "FETCH_FAILED",
+            ),
+        ];
+        for (error, code) in cases {
+            let message = error.to_string();
+            let refused = upload_refusal(error);
+            assert_eq!(refused.message, message);
+            assert_eq!(code_of(&refused), Some(async_graphql::Value::from(code)));
+        }
+    }
 
     #[test]
     fn inline_base64_bound_matches_the_decoded_limit() {
@@ -640,6 +794,173 @@ mod tests {
         let error = reader.read_to_end(&mut buf).unwrap_err();
         assert_eq!(error.kind(), ErrorKind::InvalidData);
         assert!(error.to_string().contains("test payload exceeds 3 bytes"));
+    }
+
+    const METAINFO: &[u8] = b"d4:infod4:name7:fixtureee";
+    const MAGNET: &str = "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567";
+
+    fn gzip(payload: &[u8]) -> Vec<u8> {
+        let mut writer = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        writer.write_all(payload).unwrap();
+        writer.finish().unwrap()
+    }
+
+    fn brotli(payload: &[u8]) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        {
+            let mut writer = brotli::CompressorWriter::new(&mut bytes, 4096, 5, 22);
+            writer.write_all(payload).unwrap();
+        }
+        bytes
+    }
+
+    #[tokio::test]
+    async fn compressed_torrents_and_magnets_decode_with_every_upload_codec() {
+        use base64::Engine;
+
+        // bzip2-compressed payloads, encoded with Python's bz2.compress.
+        let bzip2_metainfo =
+            "QlpoOTFBWSZTWQBuQpIAAAOJgASQJyOWQCAAMUwAANRtEHomjiCR0pMJ5GUmk+u3+LuSKcKEgANyFJA=";
+        let bzip2_magnet = concat!(
+            "QlpoOTFBWSZTWWYd4TUAABmJgH/yv+MWQCAAVFGhoAAABlRoxPUaMTQ8iJUZlx0OpeYGJ2",
+            "CCzLlLkLUO7Fh4I+h6pJmvDD+++LuSKcKEgzDvCag=",
+        );
+        for (extension, payload, kind, bzip2) in [
+            ("torrent", METAINFO, Kind::Metainfo, bzip2_metainfo),
+            (
+                "magnet",
+                MAGNET.as_bytes(),
+                Kind::Magnet(MAGNET.to_owned()),
+                bzip2_magnet,
+            ),
+        ] {
+            let props = LzmaEncProps::xz_preset(0, false).unwrap();
+            let mut xz = XzWriter::new(Vec::new(), &props).unwrap();
+            xz.write_all(payload).unwrap();
+            let mut deflate =
+                flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::fast());
+            deflate.write_all(payload).unwrap();
+
+            for (suffix, encoded) in [
+                ("gz", gzip(payload)),
+                ("gzip", gzip(payload)),
+                ("xz", xz.finish().unwrap()),
+                (
+                    "bz2",
+                    base64::engine::general_purpose::STANDARD
+                        .decode(bzip2)
+                        .unwrap(),
+                ),
+                ("zst", zstd::stream::encode_all(payload, 1).unwrap()),
+                ("br", brotli(payload)),
+                ("deflate", deflate.finish().unwrap()),
+            ] {
+                let upload = UploadValue {
+                    filename: format!("sample.{extension}.{suffix}"),
+                    content_type: None,
+                    content: encoded.into(),
+                };
+                let (actual_kind, decoded) = classify_upload(&upload, true).await.unwrap();
+                assert_eq!(actual_kind, kind, "{}", upload.filename);
+                assert_eq!(decoded.as_deref(), Some(payload), "{}", upload.filename);
+                assert_eq!(
+                    classify_upload(&upload, false).await.unwrap(),
+                    (kind.clone(), None),
+                    "{}",
+                    upload.filename,
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn compressed_torrents_decode_by_mime_type_or_magic() {
+        for (content_type, encoded) in [
+            (Some("application/brotli".to_owned()), brotli(METAINFO)),
+            (None, gzip(METAINFO)),
+        ] {
+            let upload = UploadValue {
+                filename: "attachment.bin".to_owned(),
+                content_type,
+                content: encoded.into(),
+            };
+            assert_eq!(
+                classify_upload(&upload, true).await.unwrap(),
+                (Kind::Metainfo, Some(METAINFO.to_vec())),
+            );
+        }
+
+        let upload = UploadValue {
+            filename: "attachment.bin".to_owned(),
+            content_type: None,
+            content: METAINFO.to_vec().into(),
+        };
+        assert_eq!(
+            classify_upload(&upload, true).await.unwrap(),
+            (Kind::Metainfo, None)
+        );
+    }
+
+    #[test]
+    fn decoded_nzb_classifies_without_buffering_the_document() {
+        let mut xml = b"\xef\xbb\xbf \n<nzb>".to_vec();
+        xml.resize(SUBMISSION_TEXT_LIMIT_BYTES * 2, b' ');
+        let mut reader = Cursor::new(xml);
+        assert_eq!(
+            classify_decoded_upload(&mut reader, MAX_TORRENT_FILE_BYTES as u64, false).unwrap(),
+            (Kind::Nzb, None),
+        );
+        assert!(reader.position() <= 128);
+    }
+
+    #[test]
+    fn decoded_torrent_limit_includes_classification_bytes() {
+        let size = METAINFO.len() as u64;
+        assert_eq!(
+            classify_decoded_upload(METAINFO, size, true).unwrap(),
+            (Kind::Metainfo, Some(METAINFO.to_vec())),
+        );
+        let limit = size - 1;
+        for retain_decoded in [true, false] {
+            let error = classify_decoded_upload(METAINFO, limit, retain_decoded).unwrap_err();
+            assert!(is_upload_too_large(&error));
+            assert_eq!(
+                error.to_string(),
+                format!("decompressed torrent metainfo exceeds {limit} bytes"),
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn stage_checks_compression_integrity_without_retaining_metainfo() {
+        let mut encoded = gzip(METAINFO);
+        encoded.pop();
+        let upload = UploadValue {
+            filename: "sample.torrent.gz".to_owned(),
+            content_type: None,
+            content: encoded.into(),
+        };
+        assert!(matches!(
+            classify_upload(&upload, false).await,
+            Err(SubmitNzbError::Upload(_)),
+        ));
+    }
+
+    #[test]
+    fn decoded_magnets_keep_the_submission_text_limit() {
+        let mut payload = MAGNET.as_bytes().to_vec();
+        payload.resize(SUBMISSION_TEXT_LIMIT_BYTES + 1, b' ');
+        let limit = MAX_TORRENT_FILE_BYTES as u64;
+        assert_eq!(
+            classify_decoded_upload(&payload[..SUBMISSION_TEXT_LIMIT_BYTES], limit, true)
+                .unwrap()
+                .0,
+            Kind::Magnet(MAGNET.to_owned()),
+        );
+        assert_eq!(
+            classify_decoded_upload(payload.as_slice(), limit, true).unwrap(),
+            (Kind::Nzb, None),
+        );
     }
 
     #[tokio::test]

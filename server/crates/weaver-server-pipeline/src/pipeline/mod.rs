@@ -390,6 +390,32 @@ pub(super) struct DownloadLaneOwner {
     outstanding_bytes: u64,
 }
 
+// The cut plan of each file a lease holds articles of. A file's articles
+// are cut at the slices of the sets that describe it, so a job of many
+// sets cuts each article for its own file's alone.
+#[derive(Debug, Clone, Default)]
+pub struct CheckpointPlans(Vec<(u32, weaver_yenc::CheckpointPlan)>);
+
+impl CheckpointPlans {
+    // The file's plan, or none for a file the lease holds nothing of.
+    pub fn of(&self, file_index: u32) -> &weaver_yenc::CheckpointPlan {
+        self.0
+            .iter()
+            .find(|(file, _)| *file == file_index)
+            .map_or(&weaver_yenc::CheckpointPlan::None, |(_, plan)| plan)
+    }
+
+    pub fn holds(&self, file_index: u32) -> bool {
+        self.0.iter().any(|(file, _)| *file == file_index)
+    }
+
+    pub fn insert(&mut self, file_index: u32, plan: weaver_yenc::CheckpointPlan) {
+        if !self.holds(file_index) {
+            self.0.push((file_index, plan));
+        }
+    }
+}
+
 pub struct DownloadBatchLease {
     pub body_activity: Arc<std::sync::atomic::AtomicU64>,
     pub lane_id: u64,
@@ -412,10 +438,10 @@ pub struct DownloadBatchLease {
     // the scheduler's answer was for. Kept apart from the excludes above,
     // which reach the failure ledger — a pin is not a failure.
     pub dial_exclude_servers: weaver_nntp::ServerSet,
-    // Immutable common-refinement geometry captured when this batch was
-    // leased. Each response carries this same snapshot through durable commit
-    // so grids admitted later cannot reinterpret old decoder output.
-    pub checkpoint_plan: weaver_yenc::CheckpointPlan,
+    // Immutable geometry of each file in the batch, captured when it was
+    // leased. Each response carries its file's snapshot through durable
+    // commit so grids admitted later cannot reinterpret old decoder output.
+    pub checkpoint_plans: CheckpointPlans,
     // Byte pressure at lease time. Carried onto every observation this lease
     // produces so the depth explorer can discard distorted samples.
     pub pressure_clear: bool,

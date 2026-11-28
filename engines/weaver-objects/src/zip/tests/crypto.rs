@@ -2089,3 +2089,350 @@ fn ciphertext_kept_before_the_password_is_deciphered_by_the_loan() {
         assert_eq!(owner.refetched, refetched, "frame {frame}");
     }
 }
+
+// One-byte stored members, as many as the job's pending run budget, and an
+// encrypted member after them: it closes with its bytes, nothing is asked
+// for again and nothing is replayed.
+#[test]
+fn an_encrypted_member_past_the_job_run_budget_closes_without_asking_again() {
+    const MEMBERS: usize = 16_384;
+    let names: Vec<String> = (0..MEMBERS).map(|at| format!("m{at:05}.bin")).collect();
+    let bytes: Vec<[u8; 1]> = (0..MEMBERS).map(|at| [at as u8]).collect();
+    let last = payload(90, 70_003);
+    let options = stored()
+        .with_deprecated_encryption(PASSWORD.as_bytes())
+        .unwrap();
+    let mut entries: Vec<Entry<'_>> = names
+        .iter()
+        .zip(&bytes)
+        .map(|(name, bytes)| Entry::File(name, bytes, stored()))
+        .collect();
+    entries.push(Entry::File("last.bin", &last, options));
+    let archive = write(&entries);
+    let mut owner = Owner::single(Zip::new(), archive.clone());
+    offer(&mut owner, PASSWORD);
+    owner.whole(65_536);
+    let got = owner.member("last.bin");
+    assert!(got.closed);
+    assert!(got.bytes == last);
+    assert!(
+        !owner
+            .said
+            .iter()
+            .any(|emit| matches!(emit, Emit::Again { .. }))
+    );
+    assert_eq!(owner.replays, 0);
+}
+
+// An encrypted member whose grid went past the bound one member's grid
+// holds: it closes on its coverage, asks for nothing again, and every byte
+// it says carries its CRC32. Its deciphered bytes come in order, with the
+// chain's provenance, so they fold into one run: the grid is taken past its
+// bound by runs apart offered to it first.
+#[test]
+fn an_encrypted_member_past_its_run_bound_closes_on_coverage() {
+    let plain = payload(91, 9_000);
+    let archive = encrypted(&plain);
+    let mut owner = Owner::single(Zip::new(), archive.clone());
+    for at in 0..=4096 {
+        owner.object.grid.offer(
+            MemberId(0),
+            crate::grid::WHOLE,
+            &weaver_graph::Segment {
+                range: ByteRange::at(at * 2, 1),
+                crc32: 0,
+                verified: true,
+            },
+        );
+    }
+    assert!(owner.object.grid.dropped(MemberId(0), crate::grid::WHOLE));
+    offer(&mut owner, PASSWORD);
+    owner.whole(4096);
+    assert!(owner.object.grid.dropped(MemberId(0), crate::grid::WHOLE));
+    let got = owner.member("alpha.bin");
+    assert!(got.closed);
+    assert!(got.bytes == plain);
+    assert!(
+        !owner
+            .said
+            .iter()
+            .any(|emit| matches!(emit, Emit::Again { .. }))
+    );
+    assert_eq!(owner.replays, 0);
+    assert!(owner.emitted >= plain.len() as u64);
+    assert_eq!(owner.unproven, 0);
+}
+
+// An encrypted member whose fold is thrown away past the job's run budget,
+// each piece of it over the budget once a damaged frame splits its runs,
+// closes on its coverage and asks for nothing again. Said again in order
+// with the budget free and a byte of its ciphertext changed, it folds once
+// more and is judged on its checksum: damaged.
+#[test]
+fn an_encrypted_member_dropped_then_said_again_in_order_is_judged_on_its_checksum() {
+    use weaver_graph::{Object, Provenance, Segment, VolumeIndex};
+    let plain = payload(94, 9_000);
+    let archive = encrypted(&plain);
+    let length = archive.len() as u64;
+    let mut owner = Owner::single(Zip::new(), archive.clone());
+    // Only what is delivered here arrives.
+    owner.pull = Pull::Moved(0);
+    // Other members' runs apart, as many as the job's pending budget holds.
+    for other in 1..=4 {
+        for at in 0..4096 {
+            owner.object.grid.offer(
+                MemberId(other),
+                crate::grid::WHOLE,
+                &Segment {
+                    range: ByteRange::at(at * 2, 1),
+                    crc32: 0,
+                    verified: true,
+                },
+            );
+        }
+    }
+    assert!(!owner.object.grid.dropped(MemberId(4), crate::grid::WHOLE));
+    offer(&mut owner, PASSWORD);
+    owner.deliver(0, ByteRange::new(0, 4096));
+    owner.deliver_as(0, ByteRange::new(4096, 8192), Provenance::Damaged, None);
+    owner.deliver(0, ByteRange::new(8192, length));
+    assert!(owner.object.grid.dropped(MemberId(0), crate::grid::WHOLE));
+    let whole = ByteRange::new(0, plain.len() as u64);
+    assert_eq!(
+        owner
+            .object
+            .grid
+            .fold(MemberId(0), crate::grid::WHOLE, 0, whole),
+        None
+    );
+    let got = owner.member("alpha.bin");
+    assert!(got.closed);
+    assert!(got.bytes == plain);
+    let again = |owner: &Owner| {
+        owner
+            .said
+            .iter()
+            .any(|emit| matches!(emit, Emit::Again { .. }))
+    };
+    assert!(!again(&owner));
+    // The budget freed, the volume said again in order with one byte of the
+    // member's ciphertext changed.
+    for other in 1..=4 {
+        owner.object.grid.forget(MemberId(other));
+    }
+    let mut changed = archive.clone();
+    changed[5000] ^= 0x5a;
+    owner.said.clear();
+    owner
+        .object
+        .unposted(VolumeIndex(0), ByteRange::new(0, length));
+    owner.deliver_as(
+        0,
+        ByteRange::new(0, length),
+        Provenance::Fresh,
+        Some(&changed),
+    );
+    assert!(owner.object.grid.dropped(MemberId(0), crate::grid::WHOLE));
+    assert!(
+        owner
+            .said
+            .iter()
+            .any(|emit| matches!(emit, Emit::Damaged { .. })),
+        "{:?}",
+        owner.said
+    );
+    // One password offered: no other candidate to retry, so the damage
+    // stands and a password is asked for, a failed check over verified
+    // bytes doubting the one in use; nothing closes on damage, as for any
+    // encrypted member.
+    assert_eq!(owner.said.len(), 2, "{:?}", owner.said);
+    assert_eq!(owner.said[0], Emit::NeedsPassword);
+    assert!(!again(&owner));
+}
+
+// An encrypted member under a candidate that passes the header's check but
+// is wrong, its fold thrown away past the job's run budget once unchanged
+// bytes said again as repaired split its one run: it closes on its coverage
+// with no ruling of its own. The namespace's failed check gives the candidate up for the next one
+// that passes, the member is read again under it in order, folds once more
+// and closes clean; a second word changes nothing.
+#[test]
+fn an_encrypted_member_refuted_with_its_fold_dropped_tries_the_next_password() {
+    use crate::grid::WHOLE;
+    let plain = payload(95, 9_000);
+    let archive = encrypted(&plain);
+    let wrong = false_password(&archive);
+    let start = records::local_len(&archive).unwrap() + 12;
+    let end = start + plain.len() as u64;
+    let whole = ByteRange::new(0, plain.len() as u64);
+    let mut owner = Owner::single(Zip::new(), archive.clone());
+    owner.pull = Pull::Unseekable;
+    // Other members' runs apart, as many as the job's pending budget holds.
+    for other in 1..=4 {
+        for at in 0..4096 {
+            owner.object.grid.offer(
+                MemberId(other),
+                WHOLE,
+                &weaver_graph::Segment {
+                    range: ByteRange::at(at * 2, 1),
+                    crc32: 0,
+                    verified: true,
+                },
+            );
+        }
+    }
+    offer(&mut owner, &wrong);
+    offer(&mut owner, PASSWORD);
+    owner.deliver(0, ByteRange::new(0, end - 1));
+    assert!(!owner.object.grid.dropped(MemberId(0), WHOLE));
+    owner.deliver_as(
+        0,
+        ByteRange::at(start + 4000, 1),
+        Provenance::Repaired,
+        None,
+    );
+    owner.deliver(0, ByteRange::new(end - 1, archive.len() as u64));
+    owner.close(0);
+    let member = member_id(&owner, "alpha.bin");
+    let got = owner.member("alpha.bin");
+    assert!(got.closed);
+    assert!(got.bytes != plain, "opened under the wrong candidate");
+    assert!(got.coverage.verified(whole));
+    assert!(owner.object.grid.dropped(member, WHOLE));
+    assert_eq!(owner.object.grid.fold(member, WHOLE, 0, whole), None);
+    let again = |owner: &Owner| {
+        owner
+            .said
+            .iter()
+            .filter(|emit| matches!(emit, Emit::Again { .. }))
+            .count()
+    };
+    assert_eq!(again(&owner), 0, "nothing ruled the member");
+    assert_eq!(owner.replays, 0);
+
+    owner.refuted(member);
+    no_trouble_but_retract(&owner);
+    let retracted = |owner: &Owner| {
+        owner
+            .said
+            .iter()
+            .filter(|emit| matches!(emit, Emit::Retract(_)))
+            .count()
+    };
+    assert_eq!(retracted(&owner), 1, "read again once: {:?}", owner.said);
+    assert_eq!(again(&owner), 1, "{:?}", owner.said);
+    assert!(owner.replays > 0);
+    let got = owner.member("alpha.bin");
+    assert!(got.closed);
+    assert!(got.bytes == plain);
+    assert!(got.coverage.verified(whole));
+    // Read again in order, it folds into one run the full budget does not
+    // count: it cannot be thrown away again.
+    assert!(owner.object.grid.fold(member, WHOLE, 0, whole).is_some());
+    assert!(owner.posted(0) == Some(archive));
+    // The right candidate's fold rules now: a second word changes nothing.
+    let (said, replays) = (owner.said.len(), owner.replays);
+    owner.refuted(member);
+    assert_eq!((owner.said.len(), owner.replays), (said, replays));
+}
+
+// The same member under the false candidate alone: the namespace's failed
+// check finds no other candidate, so a password is asked for and the
+// member's extent is said damaged. The right password offered later gives
+// the false one up as a failed fold's doubt is given up: the member is read
+// again once, folds, and closes clean, and the store no longer holds it
+// damaged. A password given up already, offered again, changes nothing.
+#[test]
+fn a_member_refuted_with_its_fold_dropped_is_retried_by_a_password_offered_later() {
+    use crate::grid::WHOLE;
+    let plain = payload(96, 9_000);
+    let archive = encrypted(&plain);
+    let wrong = false_password(&archive);
+    let start = records::local_len(&archive).unwrap() + 12;
+    let end = start + plain.len() as u64;
+    let whole = ByteRange::new(0, plain.len() as u64);
+    let mut owner = Owner::single(Zip::new(), archive.clone());
+    owner.pull = Pull::Unseekable;
+    for other in 1..=4 {
+        for at in 0..4096 {
+            owner.object.grid.offer(
+                MemberId(other),
+                WHOLE,
+                &weaver_graph::Segment {
+                    range: ByteRange::at(at * 2, 1),
+                    crc32: 0,
+                    verified: true,
+                },
+            );
+        }
+    }
+    offer(&mut owner, &wrong);
+    owner.deliver(0, ByteRange::new(0, end - 1));
+    owner.deliver_as(
+        0,
+        ByteRange::at(start + 4000, 1),
+        Provenance::Repaired,
+        None,
+    );
+    owner.deliver(0, ByteRange::new(end - 1, archive.len() as u64));
+    owner.close(0);
+    let member = member_id(&owner, "alpha.bin");
+    assert!(owner.member("alpha.bin").closed);
+    assert!(owner.object.grid.dropped(member, WHOLE));
+    assert_eq!(owner.object.grid.fold(member, WHOLE, 0, whole), None);
+    let count = |owner: &Owner, of: fn(&Emit) -> bool| owner.said.iter().filter(|e| of(e)).count();
+    let damaged = |emit: &Emit| matches!(emit, Emit::Damaged { .. });
+    let again = |emit: &Emit| matches!(emit, Emit::Again { .. });
+    let retract = |emit: &Emit| matches!(emit, Emit::Retract(_));
+    let asked = |emit: &Emit| *emit == Emit::NeedsPassword;
+    assert_eq!(count(&owner, damaged), 0, "{:?}", owner.said);
+
+    owner.refuted(member);
+    assert_eq!(count(&owner, asked), 1, "{:?}", owner.said);
+    assert!(count(&owner, damaged) > 0, "{:?}", owner.said);
+    assert_eq!(count(&owner, again), 0, "{:?}", owner.said);
+    assert!(owner.object.members[member.0 as usize].damaged);
+    let said_damage = count(&owner, damaged);
+
+    offer(&mut owner, PASSWORD);
+    assert_eq!(
+        count(&owner, retract),
+        1,
+        "read again once: {:?}",
+        owner.said
+    );
+    assert_eq!(count(&owner, again), 1, "{:?}", owner.said);
+    assert_eq!(count(&owner, asked), 1, "{:?}", owner.said);
+    assert_eq!(count(&owner, damaged), said_damage, "{:?}", owner.said);
+    assert!(owner.replays > 0);
+    let got = owner.member("alpha.bin");
+    assert!(got.closed);
+    assert!(got.bytes == plain);
+    assert!(owner.object.grid.fold(member, WHOLE, 0, whole).is_some());
+    // The damage the store said is no longer its own: the member started
+    // over, and nothing held it damaged once the store ruled again.
+    assert!(!owner.object.members[member.0 as usize].damaged);
+    let mut out = Vec::new();
+    owner
+        .object
+        .quiet(&crate::testing::Quiet(Vec::new()), &mut out);
+    assert!(out.is_empty(), "{out:?}");
+    assert!(owner.posted(0) == Some(archive));
+
+    let (said, replays) = (owner.said.len(), owner.replays);
+    offer(&mut owner, &wrong);
+    owner.refuted(member);
+    assert_eq!((owner.said.len(), owner.replays), (said, replays));
+}
+
+fn no_trouble_but_retract(owner: &Owner) {
+    for emit in &owner.said {
+        assert!(
+            !matches!(
+                emit,
+                Emit::Damaged { .. } | Emit::NeedsEngine(_) | Emit::Refuse(_) | Emit::NeedsPassword
+            ),
+            "unexpected {emit:?}"
+        );
+    }
+}

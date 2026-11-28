@@ -3,12 +3,11 @@
 
 mod facts;
 
-use weaver_graph::recovery::RepairOutcome;
-use weaver_graph::{ObjectId, Provenance, Recovery, SliceVerdict};
+use weaver_graph::{ByteRange, MemberId, ObjectId, Recovery, Segment};
 
 use super::*;
 use crate::grid::crc32;
-use crate::testing::{Job, payload, segments};
+use crate::testing::{Job, payload};
 
 const OWN: ObjectId = ObjectId(9);
 
@@ -33,7 +32,8 @@ fn bind(job: &mut Job<Sfv>) {
 }
 
 // Comments, junk, a BOM, DOS and Unix paths, a short CRC, a size column,
-// a listing repeated verbatim and one that contradicts itself.
+// a listing repeated verbatim and one that contradicts itself. Each entry
+// keeps its basename in the listing's own case, the first spelling of it.
 #[test]
 fn entries_are_keyed_by_lower_cased_basename() {
     let parsed = entries(
@@ -42,286 +42,231 @@ fn entries_are_keyed_by_lower_cased_basename() {
          twice.bin 00000002\nTWICE.bin 00000002\nclash.bin 00000003\nclash.bin 00000004\n"
             .as_bytes(),
     );
+    let entry = |name: &str, crc32| {
+        let key = name.to_ascii_lowercase();
+        let name = name.to_owned();
+        (key, Entry { name, crc32 })
+    };
     assert_eq!(
         parsed,
         BTreeMap::from([
-            ("alpha.bin".to_owned(), 0xABCD),
-            ("dos.bin".to_owned(), 0xABC),
-            ("name with spaces.bin".to_owned(), 0xDEAD_BEEF),
-            ("twice.bin".to_owned(), 2),
-            ("unix.bin".to_owned(), 1),
+            entry("Alpha.bin", 0xABCD),
+            entry("Dos.bin", 0xABC),
+            entry("name with spaces.bin", 0xDEAD_BEEF),
+            entry("twice.bin", 2),
+            entry("unix.bin", 1),
         ])
     );
 }
 
+// A listing stands aside: whatever it names, it covers nothing, so it is
+// never fed, never rules and never vouches.
 #[test]
-fn members_whose_names_differ_only_by_case_bind_to_nothing() {
+fn a_listing_covers_nothing_it_names() {
     let one = payload(6, 2000);
     let mut job = job(&sfv_text(&[("one.bin", crc32(&one))]));
-    let lower = job.member("one.bin", &one);
-    let upper = job.member("ONE.bin", &one);
+    let member = job.member("one.bin", &one);
     bind(&mut job);
-    assert!(!job.object.covers(lower) && !job.object.covers(upper));
-}
-
-#[test]
-fn changed_accepted_bytes_invalidate_sfv_ruling() {
-    let original = payload(13, 5000);
-    let mut job = job(&sfv_text(&[("one.bin", crc32(&original))]));
-    let member = job.member("one.bin", &original);
-    bind(&mut job);
-    let unchanged = segments(0, &original, 700, 700, true);
-    job.object.feed(member, &unchanged);
-    assert_eq!(
-        job.object
-            .repair(&mut job.store, weaver_graph::Budget::default()),
-        RepairOutcome::Clean
-    );
-    job.object.feed(member, &unchanged);
-    assert_eq!(
-        job.object.outcome(),
-        Some(RepairOutcome::Clean),
-        "proven unchanged replay retains the ruling"
-    );
-    job.object
-        .feed(weaver_graph::MemberId(u32::MAX), &unchanged);
-    assert_eq!(
-        job.object.outcome(),
-        Some(RepairOutcome::Clean),
-        "unbound input cannot invalidate this listing"
-    );
-    let mut replacement = original;
-    replacement[2000] ^= 0x5a;
-    job.store.members.insert(member, replacement.clone());
-    job.object
-        .feed(member, &segments(0, &replacement, 700, 700, true));
-    assert_eq!(
-        job.object.outcome(),
-        None,
-        "changed accepted bytes must become due again"
-    );
-    let mut verdicts = Vec::new();
-    job.object.verdicts(member, &mut verdicts);
-    assert_eq!(verdicts, [SliceVerdict::Damaged]);
-    assert_eq!(
-        job.object
-            .repair(&mut job.store, weaver_graph::Budget::default()),
-        RepairOutcome::Impossible {
-            damaged: 1,
-            reachable: 0
-        }
-    );
-}
-
-#[test]
-fn acknowledged_sfv_proof_retains_its_ruling() {
-    let original = payload(14, 5000);
-    let mut job = job(&sfv_text(&[("one.bin", crc32(&original))]));
-    let member = job.member("one.bin", &original);
-    bind(&mut job);
-    job.object
-        .feed(member, &segments(0, &original, 700, 700, false));
-    assert_eq!(
-        job.object
-            .repair(&mut job.store, weaver_graph::Budget::default()),
-        RepairOutcome::Clean
-    );
-    assert!(
-        job.store.reads > 0,
-        "readback establishes the unverified source proof"
-    );
-    job.object
-        .feed_proven(member, &segments(0, &original, 700, 700, true));
-    assert_eq!(job.object.outcome(), Some(RepairOutcome::Clean));
-}
-
-#[test]
-fn damaged_source_invalidates_restored_sfv_proof() {
-    let original = payload(15, 5000);
-    let mut job = job(&sfv_text(&[("one.bin", crc32(&original))]));
-    let member = job.member("one.bin", &original);
-    bind(&mut job);
-    job.object
-        .feed(member, &segments(0, &original, 700, 700, true));
-    assert_eq!(
-        job.object
-            .repair(&mut job.store, weaver_graph::Budget::default()),
-        RepairOutcome::Clean
-    );
-    let mut restored: Sfv = job.object.facts().read(Kind::Sfv).unwrap();
-    assert_eq!(restored.outcome(), Some(RepairOutcome::Clean));
-    restored.feed(member, &segments(0, &original, 700, 700, false));
-    assert_eq!(restored.outcome(), None);
-    job.store
-        .holes
-        .insert(member, vec![ByteRange::new(0, original.len() as u64)]);
-    assert_eq!(
-        restored.repair(&mut job.store, weaver_graph::Budget::default()),
-        RepairOutcome::Impossible {
-            damaged: 1,
-            reachable: 0
-        }
-    );
-}
-
-#[test]
-fn changed_complete_length_invalidates_sfv_ruling() {
-    let original = payload(16, 5000);
-    let mut job = job(&sfv_text(&[("one.bin", crc32(&original))]));
-    let member = job.member("one.bin", &original);
-    bind(&mut job);
-    job.object
-        .feed(member, &segments(0, &original, 700, 700, true));
-    assert_eq!(
-        job.object
-            .repair(&mut job.store, weaver_graph::Budget::default()),
-        RepairOutcome::Clean
-    );
-    job.store.members.get_mut(&member).unwrap().push(1);
-    let record = job.namespace.get_mut(member).unwrap();
-    record.length = Some(original.len() as u64 + 1);
-    record
-        .coverage
-        .write(ByteRange::at(original.len() as u64, 1), Provenance::Fresh);
-    bind(&mut job);
+    assert!(!job.object.covers(member));
+    assert!(!job.object.covers_some());
+    assert!(!job.object.rebuilds());
     assert_eq!(job.object.outcome(), None);
-    assert_eq!(
-        job.object
-            .repair(&mut job.store, weaver_graph::Budget::default()),
-        RepairOutcome::Impossible {
-            damaged: 1,
-            reachable: 0
-        }
-    );
 }
 
 #[test]
-fn sfv_verifies_fed_members_without_reading_them() {
-    let one = payload(1, 5000);
-    let two = payload(2, 3000);
-    let text = sfv_text(&[("one.bin", crc32(&one)), ("two.bin", crc32(&two))]);
-    let mut job = job(&text);
-    let first = job.member("one.bin", &one);
-    let second = job.member("two.bin", &two);
-    bind(&mut job);
-    assert!(job.object.covers(first) && job.object.covers(second));
-    job.object.feed(first, &segments(0, &one, 700, 700, true));
-    job.object.feed(second, &segments(0, &two, 700, 700, true));
-    let mut verdicts = Vec::new();
-    job.object.verdicts(first, &mut verdicts);
-    assert_eq!(verdicts, vec![SliceVerdict::Intact]);
-    assert_eq!(
-        job.object
-            .repair(&mut job.store, weaver_graph::Budget::default()),
-        RepairOutcome::Clean
-    );
-    assert_eq!(job.store.reads, 0);
-}
-
-// The text's pieces arrive last first: each waits for the text to reach
-// it, and every entry binds.
-#[test]
-fn sfv_text_delivered_out_of_order_binds_every_entry() {
+fn sfv_text_delivered_out_of_order_is_read_whole() {
     let one = payload(7, 2000);
     let two = payload(8, 3000);
     let text = sfv_text(&[("one.bin", crc32(&one)), ("two.bin", crc32(&two))]);
     let mut job = Job::new(Sfv::new(OWN), OWN);
     job.volume("check.sfv", &text, 7, true);
-    let first = job.member("one.bin", &one);
-    let second = job.member("two.bin", &two);
-    bind(&mut job);
-    assert!(job.object.covers(first) && job.object.covers(second));
     assert!(job.object.text == text);
+    assert_eq!(entries(&job.object.text).len(), 2);
 }
 
-#[test]
-fn sfv_reads_back_what_the_feed_missed() {
-    let one = payload(3, 9000);
-    let mut job = job(&sfv_text(&[("one.bin", crc32(&one))]));
-    let member = job.member("one.bin", &one);
-    bind(&mut job);
-    assert_eq!(
-        job.object
-            .repair(&mut job.store, weaver_graph::Budget::default()),
-        RepairOutcome::Clean
-    );
-    assert!(job.store.reads > 0);
-    assert!(job.store.members[&member] == one);
+// A member as the namespace holds it once nothing more will arrive.
+fn whole(job: &mut Job<Sfv>, name: &str, bytes: &[u8]) -> MemberId {
+    let member = job.member(name, bytes);
+    job.namespace.get_mut(member).unwrap().closed = true;
+    member
 }
 
+fn asked(job: &Job<Sfv>) -> Vec<MemberId> {
+    let mut out = Vec::new();
+    job.object.evidence(&job.namespace, &|_| false, &mut out);
+    out
+}
+
+// The source's checksums of `bytes`, cut every `cut` bytes, as verified.
+fn checksums(bytes: &[u8], cut: usize) -> Vec<Segment> {
+    bytes
+        .chunks(cut)
+        .enumerate()
+        .map(|(index, chunk)| Segment {
+            range: ByteRange::at((index * cut) as u64, chunk.len() as u64),
+            crc32: crc32(chunk),
+            verified: true,
+        })
+        .collect()
+}
+
+fn disputed(job: &Job<Sfv>) -> Vec<MemberId> {
+    let mut out = Vec::new();
+    job.object.disputed(&job.namespace, &mut out);
+    out
+}
+
+// The listing asks once for each whole file it names, in any case, and
+// disputes the one whose checksums fold to another CRC32. A file it does not
+// name, and one still arriving, are not asked for.
 #[test]
-fn sfv_with_unknown_names_passes() {
-    let one = payload(4, 2000);
-    let text = sfv_text(&[
+fn a_listing_asks_once_for_each_whole_file_it_names_and_disputes_one_that_disagrees() {
+    let one = payload(10, 2000);
+    let two = payload(11, 3000);
+    let three = payload(12, 1000);
+    let four = payload(13, 1000);
+    let mut job = job(&sfv_text(&[
         ("one.bin", crc32(&one)),
-        ("absent.bin", 0x1234_5678),
-        ("also-absent.bin", 0),
-    ]);
-    let mut job = job(&text);
-    let member = job.member("ONE.BIN", &one);
-    bind(&mut job);
-    assert!(job.object.covers(member));
-    assert_eq!(
-        job.object
-            .repair(&mut job.store, weaver_graph::Budget::default()),
-        RepairOutcome::Clean
-    );
+        ("TWO.bin", crc32(&two) ^ 1),
+        ("four.bin", crc32(&four)),
+    ]));
+    let one_id = whole(&mut job, "one.bin", &one);
+    let two_id = whole(&mut job, "two.bin", &two);
+    whole(&mut job, "three.bin", &three);
+    job.member("four.bin", &four);
+    assert_eq!(asked(&job), vec![one_id, two_id]);
+    job.object
+        .evidenced(&job.namespace, one_id, &checksums(&one, 700));
+    job.object
+        .evidenced(&job.namespace, two_id, &checksums(&two, 700));
+    assert_eq!(asked(&job), Vec::<MemberId>::new());
+    assert_eq!(disputed(&job), vec![two_id]);
 }
 
+// A file it names that a standing set covers is not asked for: that set
+// says what became of it, and the listing notes nothing.
 #[test]
-fn sfv_reports_a_damaged_member_and_never_repairs() {
-    let one = payload(5, 2000);
-    let mut job = job(&sfv_text(&[("one.bin", crc32(&one))]));
-    let mut damaged = one.clone();
-    damaged[100] ^= 0xFF;
-    let member = job.member("one.bin", &damaged);
-    job.arrive(member, 0, &damaged[..700], Provenance::Damaged);
-    bind(&mut job);
+fn a_listing_asks_for_no_file_a_standing_set_covers() {
+    let one = payload(15, 2000);
+    let two = payload(16, 2000);
+    let mut job = job(&sfv_text(&[
+        ("one.bin", crc32(&one) ^ 1),
+        ("two.bin", crc32(&two)),
+    ]));
+    let one_id = whole(&mut job, "one.bin", &one);
+    let two_id = whole(&mut job, "two.bin", &two);
+    let mut out = Vec::new();
     job.object
-        .feed(member, &segments(0, &damaged, 700, 700, true));
-    assert_eq!(
-        job.object
-            .repair(&mut job.store, weaver_graph::Budget::default()),
-        RepairOutcome::Impossible {
-            damaged: 1,
-            reachable: 0
-        }
-    );
-    assert_eq!(job.store.writes, 0);
+        .evidence(&job.namespace, &|member| member == one_id, &mut out);
+    assert_eq!(out, vec![two_id]);
+    job.object
+        .evidenced(&job.namespace, two_id, &checksums(&two, 700));
+    assert_eq!(disputed(&job), Vec::<MemberId>::new());
 }
 
-// A member past READ_CHUNK, its segments unproven, is read back in
-// several pieces whose CRC32s combine; one changed byte in its last piece
-// is found.
+// Checksums that do not reach every byte, or one the source did not
+// verify, say nothing: a file whose bytes were never checked whole is not
+// disputed.
 #[test]
-fn sfv_readback_of_a_member_past_one_read_chunk() {
-    let original = payload(141, 2 * READ_CHUNK as usize + 4097);
-    let mut job = job(&sfv_text(&[("one.bin", crc32(&original))]));
-    let member = job.member("one.bin", &original);
-    bind(&mut job);
-    job.object
-        .feed(member, &segments(0, &original, 1 << 16, 1 << 16, false));
-    assert_eq!(
-        job.object
-            .repair(&mut job.store, weaver_graph::Budget::default()),
-        RepairOutcome::Clean
-    );
-    assert!(job.store.reads >= 3, "{} reads", job.store.reads);
+fn a_file_not_checked_whole_is_not_disputed() {
+    let bytes = payload(14, 3000);
+    for spoil in [
+        |segments: &mut Vec<Segment>| segments.clear(),
+        |segments: &mut Vec<Segment>| {
+            segments.pop();
+        },
+        |segments: &mut Vec<Segment>| {
+            segments.remove(1);
+        },
+        |segments: &mut Vec<Segment>| segments[0].verified = false,
+    ] {
+        let mut job = job(&sfv_text(&[("one.bin", crc32(&bytes) ^ 1)]));
+        let member = whole(&mut job, "one.bin", &bytes);
+        let mut segments = checksums(&bytes, 1000);
+        spoil(&mut segments);
+        job.object.evidenced(&job.namespace, member, &segments);
+        assert_eq!(asked(&job), Vec::<MemberId>::new());
+        assert_eq!(disputed(&job), Vec::<MemberId>::new());
+    }
+}
 
-    let mut job = self::job(&sfv_text(&[("one.bin", crc32(&original))]));
-    let mut changed = original;
-    let last = changed.len() - 9;
-    changed[last] ^= 0x10;
-    let member = job.member("one.bin", &changed);
-    bind(&mut job);
-    job.object
-        .feed(member, &segments(0, &changed, 1 << 16, 1 << 16, false));
-    assert_eq!(
+fn renamed(job: &mut Job<Sfv>) -> Vec<MemberId> {
+    let mut renamed = Vec::new();
+    job.object.bind(&mut job.namespace, &mut renamed);
+    renamed
+}
+
+// Each member asked for answered with the source's checksums of `bytes`.
+fn answer(job: &mut Job<Sfv>, members: &[(MemberId, &[u8])]) {
+    for (member, bytes) in members {
         job.object
-            .repair(&mut job.store, weaver_graph::Budget::default()),
-        RepairOutcome::Impossible {
-            damaged: 1,
-            reachable: 0
-        }
-    );
+            .evidenced(&job.namespace, *member, &checksums(bytes, 700));
+    }
+}
+
+// A whole member under a name no entry gives, whose CRC32 one entry no
+// member answers states, takes that entry's name in the listing's case.
+// The entry another member answers names nothing again.
+#[test]
+fn an_entry_no_member_answers_names_the_one_member_with_its_crc() {
+    let one = payload(20, 2000);
+    let two = payload(21, 2500);
+    let mut job = job(&sfv_text(&[
+        ("Sub\\Lantern.MKV", crc32(&one)),
+        ("beacon.mkv", crc32(&two)),
+    ]));
+    let hidden = whole(&mut job, "a8f3k2", &one);
+    let beacon = whole(&mut job, "beacon.mkv", &two);
+    assert_eq!(asked(&job), vec![beacon, hidden]);
+    answer(&mut job, &[(hidden, &one), (beacon, &two)]);
+    assert_eq!(renamed(&mut job), vec![hidden]);
+    assert_eq!(job.namespace.get(hidden).unwrap().name, "Lantern.MKV");
+    assert_eq!(renamed(&mut job), Vec::<MemberId>::new());
+    assert_eq!(disputed(&job), Vec::<MemberId>::new());
+}
+
+// Two candidates with one CRC32, or two entries stating it, name nothing.
+#[test]
+fn a_crc_two_candidates_or_two_entries_share_names_nothing() {
+    let one = payload(22, 2000);
+    let mut job = job(&sfv_text(&[("lantern.mkv", crc32(&one))]));
+    let first = whole(&mut job, "a8f3k2", &one);
+    let second = whole(&mut job, "b9g4l3", &one);
+    assert_eq!(asked(&job), vec![first, second]);
+    answer(&mut job, &[(first, &one), (second, &one)]);
+    assert_eq!(renamed(&mut job), Vec::<MemberId>::new());
+
+    let mut job = self::job(&sfv_text(&[
+        ("lantern.mkv", crc32(&one)),
+        ("beacon.mkv", crc32(&one)),
+    ]));
+    let only = whole(&mut job, "a8f3k2", &one);
+    answer(&mut job, &[(only, &one)]);
+    assert_eq!(renamed(&mut job), Vec::<MemberId>::new());
+}
+
+// A member still arriving, one a standing set covers, and one no checksums
+// reach whole are not named; nor is one renamed since it was asked for,
+// as a set that recognises it renames it: its name stands.
+#[test]
+fn a_member_not_whole_covered_unchecked_or_renamed_since_is_not_named() {
+    let one = payload(23, 2000);
+    let mut job = job(&sfv_text(&[("lantern.mkv", crc32(&one))]));
+    let arriving = job.member("a8f3k2", &one);
+    assert_eq!(asked(&job), Vec::<MemberId>::new());
+    job.namespace.get_mut(arriving).unwrap().closed = true;
+    let mut out = Vec::new();
+    job.object
+        .evidence(&job.namespace, &|member| member == arriving, &mut out);
+    assert_eq!(out, Vec::<MemberId>::new());
+
+    job.object.evidenced(&job.namespace, arriving, &[]);
+    assert_eq!(renamed(&mut job), Vec::<MemberId>::new());
+
+    let mut job = self::job(&sfv_text(&[("lantern.mkv", crc32(&one))]));
+    let member = whole(&mut job, "a8f3k2", &one);
+    answer(&mut job, &[(member, &one)]);
+    job.namespace.rename(member, "described.mkv");
+    assert_eq!(renamed(&mut job), Vec::<MemberId>::new());
+    assert_eq!(job.namespace.get(member).unwrap().name, "described.mkv");
 }

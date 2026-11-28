@@ -489,8 +489,9 @@ impl TorrentRates {
 /// Whether torrents are on, and the torrents there are.
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, SimpleObject)]
 pub struct TorrentPresence {
-    /// This run of the server has torrents at all: it was started with the
-    /// environment variable `WEAVER_TORRENTS` set to `1` or `true`. While
+    /// This run of the server has torrents at all: it was started without
+    /// the environment variable `WEAVER_TORRENTS`, or with it set to `1` or
+    /// `true`. While
     /// false no torrent runs, none is listed, turning torrents on is
     /// refused, and every other field here is false or null whatever the
     /// settings say.
@@ -968,6 +969,16 @@ impl From<&weaver_server_core::events::model::PipelineEvent> for PipelineEventGq
                 message: weaver_server_core::events::model::recovery_set_unused_message(
                     set, reason,
                 ),
+            },
+            PipelineEvent::SfvMismatch {
+                job_id,
+                file,
+                listing,
+            } => Self {
+                kind: EventKind::SfvMismatch,
+                job_id: Some(job_id.0),
+                file_id: None,
+                message: weaver_server_core::events::model::sfv_mismatch_message(file, listing),
             },
             PipelineEvent::MoveToCompleteStarted { job_id } => Self {
                 kind: EventKind::MoveToCompleteStarted,

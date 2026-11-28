@@ -35,6 +35,78 @@ pub fn ratio_base(downloaded_bytes: u64, held: u64) -> u64 {
     }
 }
 
+/// Which seeding goal a [`GoalProgress`] measures.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum GoalKind {
+    Ratio,
+    SeedTime,
+    InactiveTime,
+}
+
+/// One configured seeding goal and how far the torrent is toward it: a
+/// ratio as a ratio, the times in whole minutes.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct GoalProgress {
+    pub kind: GoalKind,
+    pub met: bool,
+    pub current: f64,
+    pub target: f64,
+}
+
+/// The goals the policy sets, in the order ratio, seed time, inactive time;
+/// empty when it sets none. The inactive time is 0 while there has been no
+/// activity, and that goal is not met then.
+pub fn goals(
+    policy: &Seeding,
+    counters: &TorrentCounters,
+    held_bytes: u64,
+    now_ms: i64,
+) -> Vec<GoalProgress> {
+    let mut goals = Vec::with_capacity(3);
+    if let Some(goal) = policy.ratio_goal {
+        let ratio = ratio(counters, held_bytes);
+        goals.push(GoalProgress {
+            kind: GoalKind::Ratio,
+            met: ratio >= goal,
+            current: ratio,
+            target: goal,
+        });
+    }
+    if let Some(minutes) = policy.seed_time_goal_minutes {
+        let seeded = policy.seeded_seconds(counters) / 60;
+        goals.push(GoalProgress {
+            kind: GoalKind::SeedTime,
+            met: seeded >= u64::from(minutes),
+            current: seeded as f64,
+            target: f64::from(minutes),
+        });
+    }
+    if let Some(minutes) = policy.inactive_goal_minutes {
+        let idle = counters
+            .last_activity_ms
+            .map(|at| (now_ms - at).max(0) as u64 / 60_000);
+        goals.push(GoalProgress {
+            kind: GoalKind::InactiveTime,
+            met: idle.is_some_and(|idle| idle >= u64::from(minutes)),
+            current: idle.unwrap_or(0) as f64,
+            target: f64::from(minutes),
+        });
+    }
+    goals
+}
+
+/// Whether `goals` are met by the policy's mode: any of them, or all of
+/// them. Terms with no goal are never met.
+pub fn goals_met(policy: &Seeding, goals: &[GoalProgress]) -> bool {
+    if goals.is_empty() {
+        return false;
+    }
+    match policy.mode {
+        SeedingGoalMode::Any => goals.iter().any(|goal| goal.met),
+        SeedingGoalMode::All => goals.iter().all(|goal| goal.met),
+    }
+}
+
 /// The goal still to meet, named, or `None` once it is met. Terms with no
 /// goal are never met.
 pub fn goal_left(
@@ -43,39 +115,26 @@ pub fn goal_left(
     held_bytes: u64,
     now_ms: i64,
 ) -> Option<String> {
-    let mut goals: Vec<(bool, String)> = Vec::new();
-    if let Some(goal) = policy.ratio_goal {
-        let ratio = ratio(counters, held_bytes);
-        goals.push((ratio >= goal, format!("ratio {ratio:.2} of {goal:.2}")));
-    }
-    if let Some(minutes) = policy.seed_time_goal_minutes {
-        let seeded = policy.seeded_seconds(counters) / 60;
-        goals.push((
-            seeded >= u64::from(minutes),
-            format!("seeded {seeded} of {minutes} minutes"),
-        ));
-    }
-    if let Some(minutes) = policy.inactive_goal_minutes {
-        let idle = counters
-            .last_activity_ms
-            .map(|at| (now_ms - at).max(0) as u64 / 60_000);
-        goals.push((
-            idle.is_some_and(|idle| idle >= u64::from(minutes)),
-            format!("inactive {} of {minutes} minutes", idle.unwrap_or(0)),
-        ));
-    }
+    let goals = goals(policy, counters, held_bytes, now_ms);
     if goals.is_empty() {
         return Some("no seeding goal".to_owned());
     }
-    let met = match policy.mode {
-        SeedingGoalMode::Any => goals.iter().any(|(met, _)| *met),
-        SeedingGoalMode::All => goals.iter().all(|(met, _)| *met),
-    };
-    (!met).then(|| {
+    (!goals_met(policy, &goals)).then(|| {
         goals
-            .into_iter()
-            .filter(|(met, _)| !met)
-            .map(|(_, goal)| goal)
+            .iter()
+            .filter(|goal| !goal.met)
+            .map(|goal| {
+                let (current, target) = (goal.current, goal.target);
+                match goal.kind {
+                    GoalKind::Ratio => format!("ratio {current:.2} of {target:.2}"),
+                    GoalKind::SeedTime => {
+                        format!("seeded {} of {} minutes", current as u64, target as u32)
+                    }
+                    GoalKind::InactiveTime => {
+                        format!("inactive {} of {} minutes", current as u64, target as u32)
+                    }
+                }
+            })
             .collect::<Vec<_>>()
             .join(", ")
     })
@@ -337,6 +396,249 @@ mod tests {
         };
         assert!(goal_left(&inactive, &idle, 100, 9 * 60_000).is_some());
         assert_eq!(goal_left(&inactive, &idle, 100, 10 * 60_000), None);
+    }
+
+    fn terms(
+        ratio: Option<f64>,
+        seed: Option<u32>,
+        inactive: Option<u32>,
+        mode: SeedingGoalMode,
+    ) -> Seeding {
+        Seeding {
+            inactive_goal_minutes: inactive,
+            ..policy(ratio, seed, mode)
+        }
+    }
+
+    // The text names each goal left, and the structured goals say the same:
+    // ratio 1.50 of 2.00, seeded 30 of 60 minutes, inactive 4 of 10 minutes.
+    #[test]
+    fn the_goal_left_text_is_pinned_for_each_goal_and_mode() {
+        use SeedingGoalMode::{All, Any};
+        let counters = TorrentCounters {
+            uploaded_bytes: 150,
+            downloaded_bytes: 100,
+            finished_duration_s: 30 * 60 + 59,
+            last_activity_ms: Some(0),
+            ..TorrentCounters::default()
+        };
+        let now = 4 * 60_000 + 59_999;
+        let quiet = TorrentCounters {
+            last_activity_ms: None,
+            ..counters
+        };
+        let cases: [(Seeding, &TorrentCounters, Option<&str>); 16] = [
+            (
+                terms(None, None, None, Any),
+                &counters,
+                Some("no seeding goal"),
+            ),
+            (
+                terms(None, None, None, All),
+                &counters,
+                Some("no seeding goal"),
+            ),
+            (terms(Some(1.5), None, None, Any), &counters, None),
+            (
+                terms(Some(2.0), None, None, Any),
+                &counters,
+                Some("ratio 1.50 of 2.00"),
+            ),
+            (terms(None, Some(30), None, Any), &counters, None),
+            (
+                terms(None, Some(60), None, Any),
+                &counters,
+                Some("seeded 30 of 60 minutes"),
+            ),
+            (terms(None, None, Some(4), Any), &counters, None),
+            (
+                terms(None, None, Some(10), Any),
+                &counters,
+                Some("inactive 4 of 10 minutes"),
+            ),
+            // No activity yet: no time inactive, and the goal is not met.
+            (
+                terms(None, None, Some(0), Any),
+                &quiet,
+                Some("inactive 0 of 0 minutes"),
+            ),
+            (terms(Some(1.0), Some(60), Some(10), Any), &counters, None),
+            (
+                terms(Some(2.0), Some(60), Some(10), Any),
+                &counters,
+                Some("ratio 1.50 of 2.00, seeded 30 of 60 minutes, inactive 4 of 10 minutes"),
+            ),
+            (
+                terms(Some(1.0), Some(60), Some(10), All),
+                &counters,
+                Some("seeded 30 of 60 minutes, inactive 4 of 10 minutes"),
+            ),
+            (
+                terms(Some(2.0), Some(30), Some(4), All),
+                &counters,
+                Some("ratio 1.50 of 2.00"),
+            ),
+            (terms(Some(1.0), Some(30), Some(4), All), &counters, None),
+            (
+                terms(Some(0.333), None, Some(10), All),
+                &counters,
+                Some("inactive 4 of 10 minutes"),
+            ),
+            (
+                terms(Some(2.0), Some(60), None, All),
+                &counters,
+                Some("ratio 1.50 of 2.00, seeded 30 of 60 minutes"),
+            ),
+        ];
+        for (index, (terms, counters, text)) in cases.iter().enumerate() {
+            let left = goal_left(terms, counters, 0, now);
+            assert_eq!(left.as_deref(), *text, "case {index}");
+            let goals = goals(terms, counters, 0, now);
+            assert_eq!(goals_met(terms, &goals), text.is_none(), "case {index}");
+        }
+    }
+
+    #[test]
+    fn the_goals_are_the_configured_ones_in_order() {
+        let counters = TorrentCounters {
+            uploaded_bytes: 150,
+            downloaded_bytes: 100,
+            finished_duration_s: 30 * 60,
+            ..TorrentCounters::default()
+        };
+        let none = terms(None, None, None, SeedingGoalMode::Any);
+        assert!(goals(&none, &counters, 0, 0).is_empty());
+        assert!(!goals_met(&none, &[]));
+        let all = terms(Some(1.0), Some(60), Some(10), SeedingGoalMode::All);
+        assert_eq!(
+            goals(&all, &counters, 0, 0),
+            [
+                GoalProgress {
+                    kind: GoalKind::Ratio,
+                    met: true,
+                    current: 1.5,
+                    target: 1.0,
+                },
+                GoalProgress {
+                    kind: GoalKind::SeedTime,
+                    met: false,
+                    current: 30.0,
+                    target: 60.0,
+                },
+                GoalProgress {
+                    kind: GoalKind::InactiveTime,
+                    met: false,
+                    current: 0.0,
+                    target: 10.0,
+                },
+            ]
+        );
+        let seed_only = terms(None, Some(60), None, SeedingGoalMode::Any);
+        let kinds: Vec<GoalKind> = goals(&seed_only, &counters, 0, 0)
+            .iter()
+            .map(|goal| goal.kind)
+            .collect();
+        assert_eq!(kinds, [GoalKind::SeedTime]);
+    }
+
+    // The text as it was built before the structured goals, kept to show
+    // the rewrite reads the same for every term, counter and mode.
+    fn goal_left_before(
+        policy: &Seeding,
+        counters: &TorrentCounters,
+        held_bytes: u64,
+        now_ms: i64,
+    ) -> Option<String> {
+        let mut goals: Vec<(bool, String)> = Vec::new();
+        if let Some(goal) = policy.ratio_goal {
+            let ratio = ratio(counters, held_bytes);
+            goals.push((ratio >= goal, format!("ratio {ratio:.2} of {goal:.2}")));
+        }
+        if let Some(minutes) = policy.seed_time_goal_minutes {
+            let seeded = policy.seeded_seconds(counters) / 60;
+            goals.push((
+                seeded >= u64::from(minutes),
+                format!("seeded {seeded} of {minutes} minutes"),
+            ));
+        }
+        if let Some(minutes) = policy.inactive_goal_minutes {
+            let idle = counters
+                .last_activity_ms
+                .map(|at| (now_ms - at).max(0) as u64 / 60_000);
+            goals.push((
+                idle.is_some_and(|idle| idle >= u64::from(minutes)),
+                format!("inactive {} of {minutes} minutes", idle.unwrap_or(0)),
+            ));
+        }
+        if goals.is_empty() {
+            return Some("no seeding goal".to_owned());
+        }
+        let met = match policy.mode {
+            SeedingGoalMode::Any => goals.iter().any(|(met, _)| *met),
+            SeedingGoalMode::All => goals.iter().all(|(met, _)| *met),
+        };
+        (!met).then(|| {
+            goals
+                .into_iter()
+                .filter(|(met, _)| !met)
+                .map(|(_, goal)| goal)
+                .collect::<Vec<_>>()
+                .join(", ")
+        })
+    }
+
+    #[test]
+    fn the_goal_left_text_reads_as_it_did_before_the_structured_goals() {
+        let ratios = [
+            None,
+            Some(0.0),
+            Some(0.5),
+            Some(1.0),
+            Some(1.005),
+            Some(2.0),
+        ];
+        let minutes = [None, Some(0), Some(1), Some(30), Some(60), Some(u32::MAX)];
+        let uploads = [0u64, 50, 100, 150, 100_501];
+        // Up to a century of seeding, and activity before, at and after now.
+        let seconds = [0u64, 59, 60, 30 * 60, 60 * 60 + 1, 100 * 365 * 86_400];
+        let activity = [None, Some(0i64), Some(60_000), Some(700_000)];
+        let nows = [0i64, 59_999, 600_000, 1 << 40];
+        for ratio_goal in ratios {
+            for seed in minutes {
+                for inactive in minutes {
+                    for mode in [SeedingGoalMode::Any, SeedingGoalMode::All] {
+                        for counting in
+                            [SeedTimeCounting::Cumulative, SeedTimeCounting::Consecutive]
+                        {
+                            let terms = Seeding {
+                                seed_time_counting: counting,
+                                ..terms(ratio_goal, seed, inactive, mode)
+                            };
+                            for uploaded_bytes in uploads {
+                                for seconds in seconds {
+                                    for last_activity_ms in activity {
+                                        for now in nows {
+                                            let counters = TorrentCounters {
+                                                uploaded_bytes,
+                                                downloaded_bytes: 100,
+                                                finished_duration_s: seconds,
+                                                consecutive_seeding_s: seconds / 2,
+                                                last_activity_ms,
+                                                ..TorrentCounters::default()
+                                            };
+                                            assert_eq!(
+                                                goal_left(&terms, &counters, 100, now),
+                                                goal_left_before(&terms, &counters, 100, now),
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 
     // The seed-time goal reads the counter its counting mode names: all the

@@ -1,0 +1,16 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "weaver.fullname" . }}
+  labels:
+    {{- include "weaver.labels" . | nindent 4 }}
+  {{- with include "weaver.annotations" (dict "root" . "extra" .Values.service.annotations) }}{{ . | nindent 2 }}{{- end }}
+spec:
+  type: {{ .Values.service.type }}
+  selector:
+    {{- include "weaver.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: http
+      port: {{ .Values.service.port }}
+      targetPort: http
+      protocol: TCP

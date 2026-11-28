@@ -13,6 +13,7 @@
 // The object is pure: no I/O, no threads, no files. Bytes it cannot place yet
 // are held by its owner, who hands them back once the map places them.
 
+mod coded;
 mod header;
 mod map;
 mod open;
@@ -29,19 +30,21 @@ use std::sync::atomic::AtomicBool;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use sevenz_turbo::Password;
 use weaver_graph::{
-    Budget, ByteRange, Claim, Coverage, Delivery, Durable, Emit, Extent, Facts, Give, Handed, Kind,
-    Located, MemberId, Object, Placement, Posting, Pull, Seek, Standing, Take, VolumeIndex, Weight,
-    Why,
+    Budget, ByteRange, Claim, Coverage, Delivery, Durable, Emit, Engine, Extent, Extraction, Facts,
+    Give, Handed, Kind, Located, MemberId, Object, Placement, Posting, Pull, Seek, Standing, Take,
+    VolumeIndex, Weight, Why,
 };
 use zeroize::Zeroizing;
 
 use crate::RECOVERY;
 use crate::crypt::{Cbc, Chain, Padding};
+use crate::engine::Format;
 use crate::grid::{Grid, crc32};
 use crate::kept::Kept;
 use crate::keys::Keys;
 use crate::lost::minus;
 use crate::placed::Placed;
+use crate::sevenz_engine::SevenZip;
 use header::{SIGNATURE, Signature, Start};
 use map::Map;
 
@@ -236,9 +239,16 @@ pub struct SevenZipStore {
     grid: Grid,
     #[serde(skip)]
     candidates: Vec<Candidate>,
+    // The candidate the job offered last, by index: offered again after the
+    // job's cursor went back, it is already among `candidates`.
+    #[serde(skip)]
+    latest: Option<usize>,
     // The candidate that opened the header or the folders.
     #[serde(skip)]
     opened: Option<usize>,
+    // The candidate the coded run last started under, by index.
+    #[serde(skip)]
+    ran: Option<usize>,
     // Whether the header or a proof file proved it. A candidate opened
     // unproven is on trial: a checksum it fails on verified bytes condemns
     // it. Kept: the candidate a restart offers again is the one that proved
@@ -363,7 +373,9 @@ impl SevenZipStore {
             members: Arc::default(),
             grid: Grid::default(),
             candidates: Vec::new(),
+            latest: None,
             opened: None,
+            ran: None,
             proven: false,
             wrong_key: false,
             condemned: BTreeSet::new(),
@@ -553,6 +565,9 @@ impl SevenZipStore {
     }
 
     fn build(&mut self, archive: &sevenz_turbo::Archive, read: &[ByteRange], out: &mut Vec<Emit>) {
+        // What a run holds is the widest folder's decode, whether the run
+        // is an engine's over the whole set or the store's over its coded
+        // folders.
         let map = match map::build(archive) {
             Ok(map) => map,
             Err(why) => {
@@ -560,6 +575,9 @@ impl SevenZipStore {
                 return self.give_up(Emit::NeedsEngine(why), out);
             }
         };
+        if map.coded().next().is_some() {
+            self.window = window(archive);
+        }
         self.basis = read
             .iter()
             .filter_map(|range| self.kept.read(*range).map(|bytes| (*range, crc32(bytes))))
@@ -762,10 +780,13 @@ fn moved(old: &Map, new: &Map) -> Vec<usize> {
         .collect()
 }
 
-// One folder in both maps: the same pack, plaintext and cipher.
+// One folder in both maps: the same pack, plaintext and cipher, coded or
+// stored alike, and a coded one by the same coders.
 fn same_folder(a: &map::Folder, b: &map::Folder) -> bool {
     a.pack == b.pack
         && a.plain_len == b.plain_len
+        && a.coded == b.coded
+        && a.coders == b.coders
         && match (&a.aes, &b.aes) {
             (None, None) => true,
             (Some(a), Some(b)) => {
@@ -794,7 +815,7 @@ impl Object for SevenZipStore {
                 .get(member.0 as usize)
                 .and_then(|entry| entry.folder)
                 .and_then(|folder| map.folders.get(folder))
-                .is_some_and(|folder| folder.aes.is_none())
+                .is_some_and(|folder| folder.aes.is_none() && !folder.coded)
         })
     }
 
@@ -839,11 +860,10 @@ impl Object for SevenZipStore {
                 break;
             }
         }
-        let pieces: Vec<ByteRange> = match proof {
-            Some(proof) => minus(range, proof).collect(),
-            None => vec![range],
-        };
-        for piece in pieces {
+        // With no proof pending, the cut is empty at the range's end, and
+        // the one piece is the whole range.
+        let cut = proof.unwrap_or(ByteRange::new(range.end, range.end));
+        for piece in minus(range, cut) {
             let at = (piece.start - range.start) as usize;
             let slice = bytes.slice(at..at + piece.len() as usize);
             self.route(piece, &slice, delivery.provenance, read, out);
@@ -893,6 +913,11 @@ impl Object for SevenZipStore {
             self.stale = true;
             self.settle(out);
         }
+    }
+
+    fn member_refuted(&mut self, member: MemberId, out: &mut Vec<Emit>) {
+        self.install(out);
+        self.refuted(member, out);
     }
 
     fn wants(&self, out: &mut Vec<Seek>) {
@@ -975,11 +1000,12 @@ impl Object for SevenZipStore {
         // opens nothing leaves it free to ask for the next one.
         self.install(out);
         self.asked = false;
-        if !self
+        let held = self
             .candidates
             .iter()
-            .any(|candidate| candidate.secret.as_str() == secret)
-        {
+            .position(|candidate| candidate.secret.as_str() == secret);
+        self.latest = Some(held.unwrap_or(self.candidates.len()));
+        if held.is_none() {
             self.candidates.push(Candidate {
                 secret: Zeroizing::new(secret.to_owned()),
                 password: Password::new(secret),
@@ -1013,6 +1039,7 @@ impl Object for SevenZipStore {
     fn engine_volume(&self, _volume: VolumeIndex) -> Option<weaver_graph::Carried> {
         Some(Box::new(crate::engine::CarriedVolume {
             front: self.measured,
+            ended: false,
             length: self.length,
             window: self.window,
         }))
@@ -1020,6 +1047,16 @@ impl Object for SevenZipStore {
 
     fn refused(&mut self) {
         self.gone = true;
+    }
+
+    // A set that codes some folders runs for them: the run is the store's
+    // engine face, once the map that says which folders they are is in.
+    fn engine(&self) -> Option<&dyn Engine> {
+        self.runs().then_some(self as &dyn Engine)
+    }
+
+    fn engine_mut(&mut self) -> Option<&mut dyn Engine> {
+        self.runs().then_some(self as &mut dyn Engine)
     }
 
     // A 7z is one file: no name or length makes another member a volume of
@@ -1058,5 +1095,59 @@ impl Object for SevenZipStore {
         if self.derive_due(stop) {
             self.settle(out);
         }
+    }
+}
+
+// The run over a mixed set's coded folders: the 7z engine's run, reading the
+// store's envelope as the container. It reserves and borrows as the 7z
+// engine does for the same set, from the same window the store hands an
+// engine; nothing is bid, since the envelope holds what the run reads, and
+// every place is the store's own and settled.
+impl Engine for SevenZipStore {
+    fn start(&mut self) -> Box<dyn Extraction> {
+        self.ran = self.opened.or(self.latest);
+        // The password is proven only when the candidate that opened the
+        // store and proved itself is the one the run decodes under.
+        let proven = self.proven && self.opened.is_some();
+        coded::run(self.map.as_deref(), self.password(), proven)
+    }
+
+    // A proof still to rule on a candidate holds the run: it declares no
+    // window until the proof has proved the candidate or ruled it wrong, so
+    // the run decodes under a candidate the store has ruled on. The ruling
+    // lands as the store is touched (bytes delivered, or a key the pool
+    // derived taken back), which asks the run again.
+    fn reserve(&self) -> Option<u64> {
+        if self.proving() {
+            return None;
+        }
+        crate::engine::reserve::<SevenZip>(self.window)
+    }
+
+    fn lends(&self) -> bool {
+        SevenZip::lends()
+    }
+
+    // Only the coded folders' members are the run's.
+    fn makes(&self, member: MemberId) -> bool {
+        self.map.as_ref().is_some_and(|map| map.is_coded(member))
+    }
+}
+
+impl SevenZipStore {
+    // Whether the map in hand codes any folder.
+    fn runs(&self) -> bool {
+        self.map
+            .as_ref()
+            .is_some_and(|map| map.coded().next().is_some())
+    }
+
+    // The password the run decodes under: the one that opened the store,
+    // or the latest the job offered, which answers what a run asked.
+    fn password(&self) -> Option<String> {
+        self.opened
+            .or(self.latest)
+            .and_then(|index| self.candidates.get(index))
+            .map(|candidate| candidate.secret.as_str().to_owned())
     }
 }

@@ -8,6 +8,7 @@ mod diagnostics;
 mod graphql;
 mod health;
 mod jobs;
+mod mcp;
 mod metrics;
 mod nzbget;
 mod request_metrics;
@@ -20,7 +21,7 @@ mod upgrade_splash;
 use std::sync::Arc;
 
 use axum::Json;
-use axum::http::{HeaderValue, Method, Response as HttpResponse, StatusCode, header};
+use axum::http::{HeaderMap, HeaderValue, Method, Response as HttpResponse, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use tower_http::compression::{
     CompressionLayer,
@@ -87,6 +88,9 @@ pub struct ServerRuntime {
     // Per-route HTTP request counters and latency, written by the
     // `request_metrics` middleware and read by the exporter.
     pub(crate) http_metrics: HttpMetricsHandle,
+    // The in-memory service log the schema serves, which the MCP log search
+    // reads with each line's number.
+    pub log_buffer: weaver_server_core::runtime::log_buffer::LogRingBuffer,
 }
 
 impl ServerRuntime {
@@ -123,6 +127,84 @@ fn coded_error_response(status: StatusCode, code: &str, message: &str) -> Respon
         Json(serde_json::json!({ "code": code, "error": message })),
     )
         .into_response()
+}
+
+// The code a refusal's status means, for a refusal that names no code of its
+// own: not found, bad input, a conflict, an upload past its limit, too many
+// attempts, a password check that is due, or a fault. Any other status has
+// none.
+fn status_code_name(status: StatusCode) -> Option<&'static str> {
+    match status {
+        StatusCode::NOT_FOUND => Some("NOT_FOUND"),
+        StatusCode::BAD_REQUEST => Some("INVALID_INPUT"),
+        StatusCode::CONFLICT => Some("CONFLICT"),
+        StatusCode::PAYLOAD_TOO_LARGE => Some("UPLOAD_TOO_LARGE"),
+        StatusCode::TOO_MANY_REQUESTS => Some("RATE_LIMITED"),
+        StatusCode::PRECONDITION_REQUIRED => Some("REAUTH_REQUIRED"),
+        StatusCode::INTERNAL_SERVER_ERROR => Some("INTERNAL"),
+        _ => None,
+    }
+}
+
+// A refusal that had no sentence, with the code its status means. The body
+// carries only the code; no sentence is added to a refusal that never had
+// one.
+fn coded_status_response(status: StatusCode) -> Response {
+    match status_code_name(status) {
+        Some(code) => (status, Json(serde_json::json!({ "code": code }))).into_response(),
+        None => status.into_response(),
+    }
+}
+
+// `error_response` with the code its status means beside the sentence.
+fn status_error_response(status: StatusCode, message: &str) -> Response {
+    match status_code_name(status) {
+        Some(code) => coded_error_response(status, code, message),
+        None => error_response(status, message),
+    }
+}
+
+// Why a request was refused before its handler did any work.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Refused {
+    // The caller check's answer: 401, or 403 for a browser session that
+    // failed its origin or CSRF binding. Any other status (a storage
+    // failure, a password check that is due) is no refusal of the caller.
+    Caller(StatusCode),
+    // The caller is known, and its scope does not allow the request.
+    Scope,
+}
+
+// A refusal with the coded body, its status unchanged: `INVALID_API_KEY` for
+// a 401 when an API key came with the request, `AUTHENTICATION_REQUIRED` for
+// any other 401, `BROWSER_VERIFICATION_REQUIRED` for a caller's 403, and
+// `FORBIDDEN` for a scope. A status that is no refusal keeps its bare
+// response.
+fn refusal_response(refused: Refused, headers: &HeaderMap) -> Response {
+    use graphql::refusal;
+    match refused {
+        Refused::Caller(status @ StatusCode::UNAUTHORIZED)
+            if headers.contains_key(header::AUTHORIZATION) || headers.contains_key("x-api-key") =>
+        {
+            coded_error_response(status, refusal::INVALID_API_KEY, "invalid API key")
+        }
+        Refused::Caller(status @ StatusCode::UNAUTHORIZED) => coded_error_response(
+            status,
+            refusal::AUTHENTICATION_REQUIRED,
+            "authentication required",
+        ),
+        Refused::Caller(status @ StatusCode::FORBIDDEN) => coded_error_response(
+            status,
+            refusal::BROWSER_VERIFICATION_REQUIRED,
+            "browser verification required",
+        ),
+        Refused::Caller(other) => other.into_response(),
+        Refused::Scope => coded_error_response(
+            StatusCode::FORBIDDEN,
+            refusal::FORBIDDEN,
+            "this API key's scope does not allow this request",
+        ),
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default)]

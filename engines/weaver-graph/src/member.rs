@@ -44,6 +44,10 @@ pub struct Member {
     pub closed: bool,
     // The CRC32 its object's headers state for its bytes, when they do.
     pub crc32: Option<u32>,
+    // Its producer checked the bytes it said against `crc32` as it decoded
+    // them. Not kept: a restore folds a closed member's stated CRC32, and
+    // one restored open checks its file as any other does.
+    pub checked: bool,
     // Its front came: clean bytes from offset zero were once in hand, so
     // more than its name placed it, whether or not the front is kept now.
     // Only a retraction, which starts the member over, takes it back.
@@ -54,6 +58,14 @@ pub struct Member {
     // no answer to who owns it, now or after a restart: its bytes say
     // (`said`). Only a retraction takes it back.
     pub refuted: Option<Kind>,
+    // Its object places it itself, and no run of that object makes it, as
+    // the object said when it was in its node and announced it
+    // (`Tree::own_word`). False for every member of an engine that makes
+    // every member, and for one a run named while its object was out. Not
+    // kept: a restore asks the rebuilt object again. A retraction keeps it:
+    // the record says whose member it was until its producer announces it
+    // again, when the tree sets it from the object's word then.
+    pub own: bool,
     // How far its own articles reached, when their producer said so: past
     // what arrived where it lost bytes, short of its length where they
     // declared more than they held. Its coverage cannot tell the two apart,
@@ -459,8 +471,10 @@ impl Namespace {
                 coverage: Coverage::new(),
                 closed: false,
                 crc32: None,
+                checked: false,
                 fronted: false,
                 refuted: None,
+                own: false,
                 reached: None,
             },
         );
@@ -509,6 +523,12 @@ impl Namespace {
     // The members marked since generation `at`, one gone since among them.
     pub fn changed_since(&self, at: u64) -> impl Iterator<Item = MemberId> + '_ {
         self.members.marks().since(at)
+    }
+
+    // Whether `members` lists the member: it is here, and is no further
+    // posting of another.
+    pub fn lists(&self, member: MemberId) -> bool {
+        self.members.get(&member).is_some() && !self.copies.contains_key(&member)
     }
 
     // The members, each once: a further posting of one is not listed.
@@ -1074,7 +1094,9 @@ impl Namespace {
 
     // The member starts over: its bytes are forgotten and it is unbound. Its
     // output name is kept, so what comes back lands where it was, until its
-    // producer announces it again under another name.
+    // producer announces it again under another name. Whose member it was,
+    // the object's or its run's (`own`), is kept too until that announce
+    // says so again.
     pub fn retract(&mut self, member: MemberId) {
         if let Some(found) = self.members.get_mut(&member) {
             found.coverage.clear();
@@ -1082,6 +1104,7 @@ impl Namespace {
             found.length = None;
             let was = std::mem::replace(&mut found.closed, false);
             found.crc32 = None;
+            found.checked = false;
             found.fronted = false;
             found.refuted = None;
             found.reached = None;
@@ -1225,7 +1248,7 @@ impl Namespace {
             .first_bytes
             .get(&member)
             .map_or((0, &[][..]), Front::clean);
-        Clean { at, bytes }
+        Clean::run(at, bytes)
     }
 
     // The member's front with the stamp of the write that left it so: the

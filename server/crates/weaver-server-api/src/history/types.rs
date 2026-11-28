@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
+use crate::observability::{spawn_blocking_with, state_error};
+
 use async_graphql::{ComplexObject, Enum, InputObject, SimpleObject};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -441,10 +443,7 @@ impl JobDetailSnapshot {
     ) -> async_graphql::Result<u64> {
         let db = ctx.data::<weaver_server_core::Database>()?.clone();
         let job_id = self.job_id;
-        tokio::task::spawn_blocking(move || db.count_job_events(job_id))
-            .await
-            .map_err(|e| async_graphql::Error::new(e.to_string()))?
-            .map_err(|e| async_graphql::Error::new(e.to_string()))
+        spawn_blocking_with(move || db.count_job_events(job_id), state_error).await
     }
 
     /// How the download went: its archive tree, recovery and post. Null
@@ -459,10 +458,8 @@ impl JobDetailSnapshot {
         }
         let db = ctx.data::<weaver_server_core::Database>()?.clone();
         let job_id = weaver_server_core::JobId(self.job_id);
-        let summary = tokio::task::spawn_blocking(move || db.history_download_summary(job_id))
-            .await
-            .map_err(|e| async_graphql::Error::new(e.to_string()))?
-            .map_err(|e| async_graphql::Error::new(e.to_string()))?;
+        let summary =
+            spawn_blocking_with(move || db.history_download_summary(job_id), state_error).await?;
         Ok(summary.map(Into::into))
     }
 }
@@ -538,6 +535,8 @@ pub enum EventKind {
     ArchiveDemoted,
     // A recovery set the job ended with that bound no file.
     RecoverySetUnused,
+    // A file whose CRC32 disagrees with a checksum listing's.
+    SfvMismatch,
     MoveToCompleteStarted,
     MoveToCompleteFinished,
     SegmentRetryScheduled,
@@ -596,6 +595,7 @@ impl std::str::FromStr for EventKind {
             "ExtractionFailed" => Ok(Self::ExtractionFailed),
             "ArchiveDemoted" => Ok(Self::ArchiveDemoted),
             "RecoverySetUnused" => Ok(Self::RecoverySetUnused),
+            "SfvMismatch" => Ok(Self::SfvMismatch),
             "MoveToCompleteStarted" => Ok(Self::MoveToCompleteStarted),
             "MoveToCompleteFinished" => Ok(Self::MoveToCompleteFinished),
             "SegmentRetryScheduled" => Ok(Self::SegmentRetryScheduled),

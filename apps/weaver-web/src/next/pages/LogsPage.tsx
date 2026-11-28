@@ -35,7 +35,7 @@ import {
 import { NextShell } from "../shell/NextShell";
 import { AttentionBlock, UptimeBlock } from "../shell/rail-blocks";
 
-const CHIP_OFF = "#3a414f";
+const CHIP_OFF = "var(--color-wv-chip-off)";
 
 /** How close to the bottom still counts as following the tail. */
 const TAIL_SLACK_PX = 24;

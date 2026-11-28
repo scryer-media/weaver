@@ -374,6 +374,12 @@
         "size": 25,
         "sha256": "eaef64337c0a7c6820e36a35538d35af10f984e45634df25a0d75343a783a200"
       }
+    },
+    "rar5_stored_sixtyfour": {
+      "stored64.bin": {
+        "size": 252000,
+        "sha256": "8c0c38bfdc7559368ebcaceaddb47a03b2ea221d1ab765875554ab6f78876544"
+      }
     }
   }
 }

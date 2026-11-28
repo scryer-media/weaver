@@ -4,8 +4,9 @@
 /** Whether torrents are on, and the torrents there are, as the server says. */
 export interface TorrentPresence {
   /**
-   * The server has torrents at all: it was started with `WEAVER_TORRENTS`
-   * set. While false nothing else here is true, whatever the settings say.
+   * The server has torrents at all: it was not started with
+   * `WEAVER_TORRENTS` turned off. While false nothing else here is true,
+   * whatever the settings say.
    */
   available: boolean;
   /** Torrents are available and the settings turn them on. */
@@ -31,7 +32,7 @@ export interface TorrentPresence {
  * read fails, they stay hidden and torrent-only routes wait: nothing shows
  * and then goes, and a failed read is never taken for off.
  *
- * "unavailable" is a server started without torrents: it has none to show
+ * "unavailable" is a server started with torrents turned off: it has none to show
  * and no way to turn them on, so nothing of theirs shows at all, the
  * Torrents settings and their switch included.
  */

@@ -830,14 +830,15 @@ pub async fn hear_rewalks(pipeline: &mut Pipeline, job_id: JobId) {
     }
 }
 
-// The checkpoint plan a download lane hands the decoder for `job_id`: the
-// block sizes its graph job's recovery declares.
-fn checkpoint_plan(pipeline: &Pipeline, job_id: JobId) -> weaver_yenc::CheckpointPlan {
+// The checkpoint plan a download lane hands the decoder for a file: the
+// block sizes its graph job's recovery declares for it.
+fn checkpoint_plan(pipeline: &Pipeline, file_id: NzbFileId) -> weaver_yenc::CheckpointPlan {
     pipeline
         .graph_jobs
-        .get(&job_id)
+        .get(&file_id.job_id)
         .map_or(weaver_yenc::CheckpointPlan::None, |graph| {
-            weaver_yenc::CheckpointPlan::from_slice_sizes(graph.block_sizes()).plan
+            weaver_yenc::CheckpointPlan::from_slice_sizes(graph.block_sizes(file_id.file_index))
+                .plan
         })
 }
 
@@ -2195,7 +2196,7 @@ async fn submit_decoded_segment_declaring(
                 expected_file_crc,
                 data: DecodedChunk::from(data.to_vec()),
                 yenc_name: filename.to_string(),
-                checkpoint_plan: checkpoint_plan(pipeline, file_id.job_id),
+                checkpoint_plan: checkpoint_plan(pipeline, file_id),
                 segments,
             },
             SegmentSource {

@@ -349,12 +349,15 @@ async fn every_kind_in_every_order_ends_under_tight_holds_as_under_unlimited_one
 
 // The cells whose holds run past memory and scratch. What arrives before
 // the headers that place it is held until they come: every kind spills
-// backwards, and all but the compressed rar and the split spill with their
-// first volume last too. In order, nothing waits long enough to.
+// backwards, and all but the split spill with their first volume last too:
+// the store keeps a compressed set as it does a stored one, and a volume's
+// packed data is held until the volume is linked. In order, nothing waits
+// long enough to.
 const SPILLS: &[&str] = &[
     "stored rar with par2 Backwards",
     "compressed rar Backwards",
     "stored rar with par2 FirstVolumeLast",
+    "compressed rar FirstVolumeLast",
     "7z Backwards",
     "7z FirstVolumeLast",
     "zip Backwards",

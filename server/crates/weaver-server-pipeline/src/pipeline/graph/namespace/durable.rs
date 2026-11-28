@@ -163,6 +163,7 @@ impl NamespaceWriter {
                     page_out.scratch_offset,
                     &page_out.bytes,
                     None,
+                    false,
                 )?;
             }
             for spill in &spills {
@@ -309,6 +310,9 @@ impl NamespaceWriter {
             if adopted || written > 0 {
                 self.files_mut(node).scratch = Some(scratch);
             }
+            // Every hold adopted is asked by the next pass.
+            self.unsettle_all(node);
+            self.file_holding(node);
         }
         Ok(())
     }
@@ -447,7 +451,7 @@ impl NamespaceWriter {
                     }
                 }
             }
-            self.files_mut(node).leaves.insert(member, leaf);
+            self.insert_leaf(node, member, leaf);
             self.caps.restore(tree, node, member, self.kept_device());
         }
         if let Some(why) = state.refused {

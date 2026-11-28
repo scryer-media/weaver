@@ -557,8 +557,9 @@ func TestWeaverComposeAllowsPrivateRSSByDefault(t *testing.T) {
 	}
 }
 
-// Torrents are off unless the server is started with WEAVER_TORRENTS; the
-// torrent lanes run on this Compose service, so it gives the variable.
+// Torrents are available unless WEAVER_TORRENTS turns them off; the torrent
+// lanes run on this Compose service, so it keeps them available unless
+// E2E_WEAVER_TORRENTS says otherwise.
 func TestWeaverComposeMakesTorrentsAvailable(t *testing.T) {
 	body, err := os.ReadFile(filepath.Join(weaverE2ETestRoot(t), "docker-compose.yml"))
 	if err != nil {

@@ -1,0 +1,28 @@
+# Every configured news server: endpoint, tier, limits and quota.
+# No username or password. Scope: ADMIN.
+# Variables: none.
+query ListServers {
+  servers {
+    id
+    host
+    port
+    tls
+    connections
+    active
+    priority
+    backfill
+    retentionDays
+    maxDownloadSpeed
+    downloadQuota {
+      enabled
+      limitBytes
+      period
+      resetTimeMinutesLocal
+      weeklyResetWeekday
+      monthlyResetDay
+      blocked
+    }
+    tlsCaCert
+    tlsNameMismatchCertificateFingerprint
+  }
+}

@@ -4,9 +4,15 @@
 import { createRoot } from "react-dom/client";
 import { MemoryRouter } from "react-router";
 import { Client, CombinedError, Provider } from "urql";
-import { fromValue, mergeMap, pipe } from "wonka";
+import { fromPromise, fromValue, mergeMap, pipe } from "wonka";
+import {
+  applyAppearance,
+  readEntryAppearance,
+  type Appearance,
+} from "@/lib/appearance";
 import { TranslateContext } from "@/lib/context/translate-context";
 import en from "@/lib/i18n/locales/en";
+import { PhaseBars } from "@/next/components/PhaseBars";
 import { nextEn } from "@/next/i18n/en";
 import {
   SettingsShellProvider,
@@ -56,6 +62,14 @@ let extensions = [
   "vbs",
 ];
 let extensionAction = "FAIL_JOB";
+// Keep the fixture daemon's stored appearance across a reload of this tab.
+const appearanceKey = "general-panel-fixture-appearance";
+const savedAppearance = sessionStorage.getItem(appearanceKey);
+let appearance = savedAppearance
+  ? (JSON.parse(savedAppearance) as Appearance)
+  : readEntryAppearance();
+applyAppearance(appearance);
+
 // A machine that can run more than one hardware profile, so the panel offers the choice.
 const option = (profile: string, threads: number) => ({
   profile,
@@ -83,10 +97,25 @@ const sent: { name: string; variables: Record<string, unknown> }[] = [];
 const flags: PanelFlags[] = [];
 // A mutation named here is refused with that message instead of stored.
 const refuse: Record<string, string> = {};
+const appearanceSave = {
+  pending: Promise.resolve(),
+  resume: () => {},
+  pause() {
+    this.pending = new Promise<void>((resolve) => {
+      this.resume = resolve;
+    });
+  },
+};
 const actionsRef: { current: { save: () => void; revert: () => void } | null } =
   { current: null };
 Object.assign(window, {
-  generalPanelFixture: { sent, flags, refuse, actions: actionsRef },
+  generalPanelFixture: {
+    sent,
+    flags,
+    refuse,
+    appearanceSave,
+    actions: actionsRef,
+  },
 });
 
 // What each save stores, applied as the daemon applies it, and what it answers with.
@@ -133,10 +162,16 @@ function store(name: string, variables: Record<string, unknown>): unknown {
     extensionAction = (variables as { action: string }).action;
     return { setUnwantedExtensionAction: extensionAction };
   }
+  if (name === "UpdateWebAppearance") {
+    const { input } = variables as { input: Partial<Appearance> };
+    appearance = { ...appearance, ...input };
+    sessionStorage.setItem(appearanceKey, JSON.stringify(appearance));
+    return { updateWebAppearance: appearance };
+  }
   return {};
 }
 
-// The General panel's reads and saves, answered at once from the fixture.
+// Appearance saves can wait for the test to release the fixture's answer.
 const client = new Client({
   url: "http://fixture.invalid/graphql",
   exchanges: [
@@ -154,17 +189,6 @@ const client = new Client({
           if (operation.kind === "mutation") {
             const variables = operation.variables as Record<string, unknown>;
             sent.push({ name, variables });
-            if (refuse[name] !== undefined) {
-              return fromValue({
-                operation,
-                data: undefined,
-                error: new CombinedError({
-                  graphQLErrors: [{ message: refuse[name] }],
-                }),
-                stale: false,
-                hasNext: false,
-              });
-            }
             const argumentsForStore = { ...variables };
             if (
               name === "UpdateArchivePasswordSettings" &&
@@ -187,12 +211,27 @@ const client = new Client({
                 argumentsForStore.passwordFile = null;
               }
             }
-            return fromValue({
-              operation,
-              data: store(name, argumentsForStore),
-              stale: false,
-              hasNext: false,
-            });
+            const answer = () => {
+              const refusal = refuse[name];
+              return {
+                operation,
+                data:
+                  refusal === undefined
+                    ? store(name, argumentsForStore)
+                    : undefined,
+                error:
+                  refusal === undefined
+                    ? undefined
+                    : new CombinedError({
+                        graphQLErrors: [{ message: refusal }],
+                      }),
+                stale: false,
+                hasNext: false,
+              };
+            };
+            return name === "UpdateWebAppearance"
+              ? fromPromise(appearanceSave.pending.then(answer))
+              : fromValue(answer());
           }
           const answer =
             name === "Settings"
@@ -253,6 +292,17 @@ createRoot(document.getElementById("root")!).render(
         <SettingsShellProvider {...shell}>
           <main className="mx-auto max-w-[1400px] p-8">
             <GeneralPanel />
+            <div
+              data-testid="appearance-list-sample"
+              className="bg-wv-list text-wv-fg"
+            >
+              <PhaseBars
+                job={{ progress: 1 }}
+                view={{ status: "DOWNLOADING", bars: [] }}
+                height={11}
+                barClassName="w-24"
+              />
+            </div>
           </main>
         </SettingsShellProvider>
       </MemoryRouter>

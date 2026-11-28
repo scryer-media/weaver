@@ -1064,6 +1064,10 @@ export const LIVE_METRICS_QUERY = gql`
       pausedClasses
       speedLimitBytesPerSec
       resumeAtEpochMs
+      classResumes {
+        class
+        resumeAtEpochMs
+      }
       downloadBlock {
         ...DownloadBlockFields
         diskVolumes {
@@ -1309,7 +1313,7 @@ export const TORRENT_HISTORY_QUERY = gql`
         days { day bytes bytesUploaded }
       }
       trackers { kind id range { ${USAGE_TOTALS_FIELDS} } }
-      peers { torrents connected seeds }
+      live { torrents connectedPeers connectedSeeds }
     }
   }
 `;
@@ -1422,8 +1426,8 @@ export const RESUME_ALL_MUTATION = gql`
 `;
 
 export const PAUSE_CLASS_MUTATION = gql`
-  mutation PauseClass($class: Protocol!) {
-    pauseClass(class: $class)
+  mutation PauseClass($class: Protocol!, $resumeAfterSecs: Int) {
+    pauseClass(class: $class, resumeAfterSecs: $resumeAfterSecs)
   }
 `;
 
@@ -1484,6 +1488,10 @@ export const LIVE_METRICS_SUBSCRIPTION = gql`
         pausedClasses
         speedLimitBytesPerSec
         resumeAtEpochMs
+        classResumes {
+          class
+          resumeAtEpochMs
+        }
         downloadBlock {
           ...DownloadBlockFields
           diskVolumes {
@@ -1757,6 +1765,21 @@ export const SETTINGS_QUERY = gql`
   ${DOWNLOAD_BLOCK_FIELDS}
 `;
 
+export const UPDATE_WEB_APPEARANCE_MUTATION = gql`
+  mutation UpdateWebAppearance($input: WebAppearanceInput!) {
+    updateWebAppearance(input: $input) {
+      palette
+      mode
+      accent
+      progressColors {
+        palette
+        stage
+        color
+      }
+    }
+  }
+`;
+
 export const UPDATE_SETTINGS_MUTATION = gql`
   mutation UpdateSettings($input: GeneralSettingsInput!) {
     updateSettings(input: $input) {
@@ -1775,6 +1798,7 @@ const TORRENT_SETTINGS_FIELDS = `
     torrent {
       enabled
       basePort
+      basePortPinned
       announcePort
       upnp
       encryption
@@ -1884,7 +1908,6 @@ export const TORRENT_ROUTES_QUERY = gql`
       key
       scopes {
         scope
-        id
         name
       }
       open
@@ -1984,8 +2007,8 @@ export const UNBIND_TRACKER_RULE_MUTATION = gql`
 
 /** The torrents the schedule's pause leaves seeding, by tracker rule. */
 export const SCHEDULE_SEEDING_QUERY = gql`
-  query ScheduleSeeding {
-    scheduleSeeding {
+  query TorrentScheduleSeeding {
+    torrentScheduleSeeding {
       ruleId
       name
       torrents
@@ -2001,7 +2024,7 @@ export const SCHEDULE_SEEDING_QUERY = gql`
  */
 export const TORRENT_SUMMARY_UPDATES_SUBSCRIPTION = gql`
   subscription TorrentSummaryUpdates($ids: [Int!]!) {
-    torrentUpdates(ids: $ids) {
+    torrentRowUpdates(ids: $ids) {
       fullUpdate
       removedIds
       torrents {
@@ -2023,64 +2046,68 @@ export const TORRENT_SUMMARY_UPDATES_SUBSCRIPTION = gql`
   }
 `;
 
-/** A torrent, pushed as it moves; its id under `removedIds` once it is gone. */
+/** A torrent, pushed as it is and again each time it moves; null once it is gone. */
 export const TORRENT_UPDATES_SUBSCRIPTION = gql`
   subscription TorrentUpdates($id: Int!) {
     torrentUpdates(id: $id) {
-      fullUpdate
-      removedIds
-      torrents {
-        id
-        name
-        infohash
-        infohashV2
-        state
-        stated
-        detail
-        routeReason
-        category
-        private
-        forced
-        progress
-        totalBytes
-        haveBytes
-        uploadedBytes
-        downloadedBytes
-        ratio
-        downloadBps
-        uploadBps
-        uploadLimit
-        downloadLimit
-        etaSeconds
-        peers
-        seeds
-        leechers
-        maxPeers
-        swarmSeeds
-        swarmLeechers
-        reannounceSeconds
-        activeSeconds
-        seedingSeconds
-        consecutiveSeedingSeconds
-        downloadAvgBps
-        uploadAvgBps
-        wastedBytes
-        lastSeenCompleteMs
-        pieceCount
-        pieceSize
-        piecesHave
-        createdBy
-        createdAtMs
-        comment
-        addedAtMs
-        completedAtMs
-        savePath
-        seedingLeft
-        seedingGoalLeft
-        seedingOverride {
-          ...SeedingPolicyFields
-        }
-        seedingPolicy {
+      id
+      name
+      infohashV1
+      infohashV2
+      state
+      stateReason
+      stateDetail
+      routeReason
+      category
+      private
+      forced
+      progress
+      totalBytes
+      haveBytes
+      uploadedBytes
+      downloadedBytes
+      ratio
+      downloadBps
+      uploadBps
+      uploadLimitBps
+      downloadLimitBps
+      etaSeconds
+      connectedPeers
+      connectedSeeds
+      connectedLeechers
+      maxPeers
+      swarmSeeds
+      swarmLeechers
+      reannounceSeconds
+      activeSeconds
+      seedingSeconds
+      consecutiveSeedingSeconds
+      downloadAvgBps
+      uploadAvgBps
+      wastedBytes
+      lastSeenCompleteAt
+      pieceCount
+      pieceSize
+      piecesHave
+      createdBy
+      metainfoCreatedAt
+      comment
+      addedAt
+      completedAt
+      savePath
+      seedingGoalLeft
+      seedingOverride {
+        ...SeedingPolicyFields
+      }
+      seedingPolicy {
+        ratioGoal
+        seedTimeGoalMinutes
+        inactiveGoalMinutes
+        mode
+        action
+        seedTimeCounting
+        uploadCap
+        levels {
           ratioGoal
           seedTimeGoalMinutes
           inactiveGoalMinutes
@@ -2088,51 +2115,52 @@ export const TORRENT_UPDATES_SUBSCRIPTION = gql`
           action
           seedTimeCounting
           uploadCap
-          levels {
-            ratioGoal
-            seedTimeGoalMinutes
-            inactiveGoalMinutes
-            mode
-            action
-            seedTimeCounting
-            uploadCap
-          }
         }
-        trackerRule
-        unpack
-        unpackOverride
-        unpacking {
-          result
-          reason
-        }
-        route
-        routeConsumer
-        files {
-          index
-          path
-          length
-          selected
-          priority
-          progress
-        }
-        sequential
-        firstLastPieceFirst
-        trackers {
-          tier
-          url
-          source
-          resolvedBy
-          status
-          updating
-          message
-          seeders
-          leechers
-          peers
-        }
+      }
+      trackerRuleName
+      unpack
+      unpackOverride
+      unpacking {
+        result
+        reason
+      }
+      routeKey
+      routeConsumer
+      sequential
+      firstLastPieceFirst
+      trackers {
+        tier
+        url
+        source
+        resolvedBy
+        status
+        updating
+        message
+        seeders
+        leechers
+        announcedPeers
       }
     }
   }
   ${SEEDING_POLICY_FIELDS}
+`;
+
+/** The files a torrent's detail shows: one page of them, sent at once and again when they move. */
+export const TORRENT_FILE_UPDATES_SUBSCRIPTION = gql`
+  subscription TorrentFileUpdates($id: Int!, $first: Int, $after: String) {
+    torrentFileUpdates(id: $id, first: $first, after: $after) {
+      items {
+        index
+        path
+        length
+        selected
+        priority
+        progress
+      }
+      totalCount
+      nextCursor
+    }
+  }
 `;
 
 export const REMOVE_TORRENT_MUTATION = gql`
@@ -2143,26 +2171,31 @@ export const REMOVE_TORRENT_MUTATION = gql`
 
 export const SET_TORRENT_FORCED_MUTATION = gql`
   mutation SetTorrentForced($id: Int!, $forced: Boolean!) {
-    setTorrentForced(id: $id, forced: $forced)
+    setTorrentForced(id: $id, forced: $forced) {
+      id
+      forced
+    }
   }
 `;
 
-/** The files a torrent's unpacking placed beside its own, read once its unpacking is over. */
+/** A page of the files a torrent's unpacking placed beside its own, read once its unpacking is over. */
 export const TORRENT_UNPACKED_FILES_QUERY = gql`
-  query TorrentUnpackedFiles($id: Int!) {
+  query TorrentUnpackedFiles($id: Int!, $first: Int, $after: String) {
     torrent(id: $id) {
       id
       unpacking {
-        files {
-          path
-          length
+        files(first: $first, after: $after) {
+          items {
+            path
+            length
+          }
+          nextCursor
         }
       }
     }
   }
 `;
 
-/** A torrent's live peer connections, by address. */
 /** A torrent's state alone, read once after an action that may change it. */
 export const TORRENT_STATE_QUERY = gql`
   query TorrentState($id: Int!) {
@@ -2173,43 +2206,52 @@ export const TORRENT_STATE_QUERY = gql`
   }
 `;
 
+/** A torrent's live peer connections, by address. */
 export const TORRENT_PEERS_QUERY = gql`
   query TorrentPeers($id: Int!) {
-    torrentPeers(id: $id) {
-      address
-      client
-      connection
-      progress
-      downloadBps
-      uploadBps
+    torrent(id: $id) {
+      id
+      peerConnections {
+        address
+        client
+        connection
+        progress
+        downloadBps
+        uploadBps
+      }
     }
   }
 `;
 
 export const BAN_TORRENT_PEER_MUTATION = gql`
   mutation BanTorrentPeer($id: Int!, $address: String!) {
-    banTorrentPeer(id: $id, address: $address)
+    banTorrentPeer(id: $id, address: $address) {
+      id
+    }
   }
 `;
 
-/** A torrent's own upload limit in bytes per second; null is unlimited. Its download limit is kept. */
-export const SET_TORRENT_UPLOAD_LIMIT_MUTATION = gql`
-  mutation SetTorrentUploadLimit($id: Int!, $upload: Int) {
-    setTorrentRateLimits(id: $id, upload: $upload)
-  }
-`;
-
-/** A torrent's own download limit in bytes per second; null is unlimited. Its upload limit is kept. */
-export const SET_TORRENT_DOWNLOAD_LIMIT_MUTATION = gql`
-  mutation SetTorrentDownloadLimit($id: Int!, $download: Int) {
-    setTorrentRateLimits(id: $id, download: $download)
+/** A torrent's own upload and download limits in bytes per second, both at once; null is unlimited. */
+export const SET_TORRENT_RATE_LIMITS_MUTATION = gql`
+  mutation SetTorrentRateLimits($id: Int!, $uploadBps: Int, $downloadBps: Int) {
+    setTorrentRateLimits(
+      id: $id
+      uploadBps: $uploadBps
+      downloadBps: $downloadBps
+    ) {
+      id
+      uploadLimitBps
+      downloadLimitBps
+    }
   }
 `;
 
 /** Add trackers as one tier after the torrent's last. */
 export const ADD_TORRENT_TRACKERS_MUTATION = gql`
   mutation AddTorrentTrackers($id: Int!, $urls: [String!]!) {
-    addTorrentTrackers(id: $id, urls: $urls)
+    addTorrentTrackers(id: $id, urls: $urls) {
+      id
+    }
   }
 `;
 
@@ -2218,26 +2260,34 @@ export const REPLACE_TORRENT_TRACKERS_MUTATION = gql`
     $id: Int!
     $trackers: [TorrentTrackerInput!]!
   ) {
-    replaceTorrentTrackers(id: $id, trackers: $trackers)
+    replaceTorrentTrackers(id: $id, trackers: $trackers) {
+      id
+    }
   }
 `;
 
 export const REMOVE_TORRENT_TRACKERS_MUTATION = gql`
   mutation RemoveTorrentTrackers($id: Int!, $urls: [String!]!) {
-    removeTorrentTrackers(id: $id, urls: $urls)
+    removeTorrentTrackers(id: $id, urls: $urls) {
+      id
+    }
   }
 `;
 
 /** Announce now, to every tracker or to the one named. */
 export const REANNOUNCE_TORRENT_MUTATION = gql`
   mutation ReannounceTorrent($id: Int!, $tracker: String) {
-    reannounceTorrent(id: $id, tracker: $tracker)
+    reannounceTorrent(id: $id, tracker: $tracker) {
+      id
+    }
   }
 `;
 
 export const SET_TORRENT_SEEDING_MUTATION = gql`
   mutation SetTorrentSeeding($id: Int!, $seeding: SeedingPolicyInput) {
-    setTorrentSeeding(id: $id, seeding: $seeding)
+    setTorrentSeeding(id: $id, seeding: $seeding) {
+      id
+    }
   }
 `;
 
@@ -2247,13 +2297,18 @@ export const SET_TORRENT_FILE_PRIORITIES_MUTATION = gql`
     $id: Int!
     $priorities: [TorrentFilePriorityInput!]!
   ) {
-    setTorrentFilePriorities(id: $id, priorities: $priorities)
+    setTorrentFilePriorities(id: $id, priorities: $priorities) {
+      id
+    }
   }
 `;
 
 export const SET_TORRENT_SEQUENTIAL_MUTATION = gql`
   mutation SetTorrentSequential($id: Int!, $sequential: Boolean!) {
-    setTorrentSequential(id: $id, sequential: $sequential)
+    setTorrentSequential(id: $id, sequential: $sequential) {
+      id
+      sequential
+    }
   }
 `;
 
@@ -2265,35 +2320,39 @@ export const SET_TORRENT_FIRST_LAST_PIECE_FIRST_MUTATION = gql`
     setTorrentFirstLastPieceFirst(
       id: $id
       firstLastPieceFirst: $firstLastPieceFirst
-    )
+    ) {
+      id
+      firstLastPieceFirst
+    }
   }
 `;
 
 /** Check every piece of the torrent again. */
 export const RECHECK_TORRENT_MUTATION = gql`
   mutation RecheckTorrent($id: Int!) {
-    recheckTorrent(id: $id)
+    recheckTorrent(id: $id) {
+      id
+      state
+    }
   }
 `;
 
 /** Move the torrent's directory under `path`. */
 export const SET_TORRENT_LOCATION_MUTATION = gql`
   mutation SetTorrentLocation($id: Int!, $path: String!) {
-    setTorrentLocation(id: $id, path: $path)
-  }
-`;
-
-/** Put the torrent in a category; null takes it out of its own. */
-export const SET_TORRENT_CATEGORY_MUTATION = gql`
-  mutation SetTorrentCategory($id: Int!, $category: String) {
-    setTorrentCategory(id: $id, category: $category)
+    setTorrentLocation(id: $id, path: $path) {
+      id
+      savePath
+    }
   }
 `;
 
 /** Look the torrent up on the DHT now. */
 export const DHT_ANNOUNCE_TORRENT_MUTATION = gql`
   mutation DhtAnnounceTorrent($id: Int!) {
-    dhtAnnounceTorrent(id: $id)
+    dhtAnnounceTorrent(id: $id) {
+      id
+    }
   }
 `;
 
@@ -2462,6 +2521,26 @@ export const ACCESS_POLICY_QUERY = gql`
 export const SET_ACCESS_POLICY_MUTATION = gql`
   mutation SetAccessPolicy($mode: String!, $trustedNetworks: [String!]) {
     setAccessPolicy(mode: $mode, trustedNetworks: $trustedNetworks)
+  }
+`;
+
+export const MCP_SERVER_QUERY = gql`
+  query McpServer {
+    mcpServer {
+      enabled
+      storedEnabled
+      editable
+    }
+  }
+`;
+
+export const SET_MCP_ENABLED_MUTATION = gql`
+  mutation SetMcpEnabled($enabled: Boolean!) {
+    setMcpEnabled(enabled: $enabled) {
+      enabled
+      storedEnabled
+      editable
+    }
   }
 `;
 
@@ -3432,12 +3511,6 @@ export const SET_UNACCEPTABLE_EXTENSIONS_MUTATION = gql`
 export const SET_UNWANTED_EXTENSION_ACTION_MUTATION = gql`
   mutation SetUnwantedExtensionAction($action: UnwantedExtensionAction!) {
     setUnwantedExtensionAction(action: $action)
-  }
-`;
-
-export const VALIDATED_ARCHIVE_PASSWORD_QUERY = gql`
-  query ValidatedArchivePassword($id: Int!) {
-    validatedArchivePassword(id: $id)
   }
 `;
 

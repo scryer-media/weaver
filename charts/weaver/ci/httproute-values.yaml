@@ -1,0 +1,9 @@
+httpRoute:
+  enabled: true
+  parentRefs:
+    - name: gateway
+      namespace: gateway-system
+  hostnames:
+    - weaver.example.test
+extraAllowedHosts:
+  - downloads.example.test

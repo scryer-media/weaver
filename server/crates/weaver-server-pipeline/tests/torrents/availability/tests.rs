@@ -6,12 +6,11 @@ use crate::ingest::Kind;
 use crate::jobs::class::{JobClasses, Route};
 
 #[test]
-fn only_one_or_true_makes_torrents_available() {
-    for value in [Some("1"), Some("true")] {
+fn torrents_are_available_unset_or_for_one_or_true() {
+    for value in [None, Some("1"), Some("true")] {
         assert!(TorrentAvailability::of_env_value(value).available());
     }
     for value in [
-        None,
         Some(""),
         Some("0"),
         Some("false"),

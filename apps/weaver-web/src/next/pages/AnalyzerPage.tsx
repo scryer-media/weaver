@@ -128,7 +128,7 @@ export function AnalyzerPage() {
       const bytes = new Uint8Array(await file.arrayBuffer());
       if (kind === "torrent") {
         const result = await analyzeTorrent({
-          input: { torrentBase64: toBase64(bytes) },
+          input: { source: { metainfoBase64: toBase64(bytes) } },
         });
         return outcomeOf(
           { error: result.error, data: result.data?.analyzeTorrent },
@@ -149,7 +149,9 @@ export function AnalyzerPage() {
     setSource(null);
     const failed = t("next.analyzer.magnetFailed");
     await run(async () => {
-      const result = await analyzeTorrent({ input: { magnet: link.trim() } });
+      const result = await analyzeTorrent({
+        input: { source: { magnet: link.trim() } },
+      });
       return outcomeOf(
         { error: result.error, data: result.data?.analyzeTorrent },
         failed,

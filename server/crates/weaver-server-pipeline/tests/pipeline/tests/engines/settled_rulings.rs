@@ -17,7 +17,7 @@ use weaver_graph::recovery::RepairOutcome;
 use super::harness::{
     Outcome, Post, Scenario, par2_volumes_sliced, par3_set_sized, payload, try_run,
 };
-use super::sfv::{crc, listing};
+use super::sfv::{assert_twin, crc, listing};
 use crate::jobs::model::JobStatus;
 
 // Articles larger than a read back's piece of a slice, as a real post's are.
@@ -430,50 +430,54 @@ async fn archive_volumes_under_a_short_set_settle() {
     assert!(repairs >= 1);
 }
 
-// A PAR2 index that never arrives describes nothing: the listing beside it
-// is all that can rule, and it does.
+// A PAR2 index that never arrives describes nothing, and the listing
+// beside it stands aside all the same: nothing rules, and the job ends as
+// the same posts without the listing.
 #[tokio::test]
-async fn a_listing_rules_when_the_par2_index_never_arrives() {
+async fn a_listing_beside_a_par2_index_that_never_arrives_rules_nothing() {
     let release = body(6, 147);
-    let mut posts = vec![
-        Post::plain("fixture.release.mkv", release.clone()),
-        listing(
-            "fixture.release.sfv",
-            &[("fixture.release.mkv", crc(&release))],
-        ),
-    ];
-    let mut par2 = par2_volumes_sliced(
-        "fixture.release",
-        &[("fixture.release.mkv", &release)],
-        SLICE,
-        1,
-        1,
-    );
-    // The index alone: its volume is not posted.
-    par2.truncate(1);
-    let index_articles = par2[0].bytes.len().div_ceil(FRAME) as u32;
-    posts.extend(par2);
-    let mut scenario = Scenario::new(posts).damaged(0, 2);
-    for article in 0..index_articles {
-        scenario = scenario.lost(2, article);
-    }
-    let (outcome, _) = settled(scenario, 2).await;
+    let posts = |listed: bool| {
+        let mut posts = vec![Post::plain("fixture.release.mkv", release.clone())];
+        if listed {
+            posts.push(listing(
+                "fixture.release.sfv",
+                &[("fixture.release.mkv", crc(&release))],
+            ));
+        }
+        let mut par2 = par2_volumes_sliced(
+            "fixture.release",
+            &[("fixture.release.mkv", &release)],
+            SLICE,
+            1,
+            1,
+        );
+        // The index alone: its volume is not posted.
+        par2.truncate(1);
+        let index_articles = par2[0].bytes.len().div_ceil(FRAME) as u32;
+        let index = posts.len() as u32;
+        posts.extend(par2);
+        let mut scenario = Scenario::new(posts).damaged(0, 2);
+        for article in 0..index_articles {
+            scenario = scenario.lost(index, article);
+        }
+        scenario
+    };
+    let (outcome, _) = settled(posts(true), 2).await;
     assert!(failed(&outcome), "{:?}", outcome.status);
-    assert!(
-        outcome
-            .graph()
-            .rulings
-            .iter()
-            .any(|(kind, ruling)| kind == "sfv" && impossible(ruling)),
-        "{:?}",
-        outcome.graph().rulings
-    );
+    assert!(outcome.graph().rulings.is_empty());
+    let (twin, _) = settled(posts(false), 2).await;
+    assert_twin(&outcome, &twin);
 }
 
 // RAR volumes beside a listing over them, the RAR volumes carrying the
 // recovery the case gives them: `.rev` files beside them, or a record
 // inside each. `damaged` are (volume, article) pairs.
 fn listed_rar(revs: bool, damaged: &[(u32, u32)]) -> Scenario {
+    listed_rar_of(revs, true, damaged)
+}
+
+// The same, with the listing posted or not as `listed` says.
+fn listed_rar_of(revs: bool, listed: bool, damaged: &[(u32, u32)]) -> Scenario {
     let volumes = match revs {
         true => crate::pipeline::tests::direct_store::single_member_store_set(
             "beacon.bin",
@@ -496,7 +500,9 @@ fn listed_rar(revs: bool, damaged: &[(u32, u32)]) -> Scenario {
         .map(|(name, crc)| (name.as_str(), *crc))
         .collect();
     let mut posts = super::rar::posts(volumes.clone());
-    posts.push(listing("silver.horizon.sfv", &entries));
+    if listed {
+        posts.push(listing("silver.horizon.sfv", &entries));
+    }
     if revs {
         let bytes: Vec<&[u8]> = volumes.iter().map(|(_, bytes)| bytes.as_slice()).collect();
         posts.extend(super::rar_rev::rar5_revs("silver.horizon", &bytes, 1));
@@ -541,35 +547,28 @@ const REV_SHORT: &str = "RAR_RECOVERY recovery failed for 1 set(s): silver.horiz
      (silver.horizon.part02.rar, silver.horizon.part03.rar): not repairable: 2 damaged slices, \
      only 1 recovery blocks reachable";
 
-// A listing beside volumes that each carry their own record still rules:
-// a record repairs only the volume it sits in, so a volume whose record is
-// lost is judged by the listing alone, as before.
+// A listing beside volumes that each carry their own record stands aside
+// as it does everywhere: the records rule alone. A volume whose record is
+// lost is not marked by the listing: the job ends as the same posts
+// without it.
 #[tokio::test]
-async fn a_listing_beside_rar_records_still_rules() {
+async fn a_listing_beside_rar_records_stands_aside() {
     let outcome = try_run(&listed_rar(false, &[(1, 1)]))
         .await
         .unwrap_or_else(|stall| panic!("the job stalled at {:?}", stall.status));
     assert!(outcome.completed(), "{:?}", outcome.status);
     assert_eq!(
         kinds(&outcome),
-        [
-            "sfv",
-            "rar_record",
-            "rar_record",
-            "rar_record",
-            "rar_record"
-        ]
+        ["rar_record", "rar_record", "rar_record", "rar_record"]
     );
 
-    let outcome = try_run(&listed_rar(false, &[(1, 1), (1, 2), (1, 3), (1, 4)]))
+    let lost = [(1, 1), (1, 2), (1, 3), (1, 4)];
+    let outcome = try_run(&listed_rar(false, &lost))
         .await
         .unwrap_or_else(|stall| panic!("the job stalled at {:?}", stall.status));
     assert!(failed(&outcome), "{:?}", outcome.status);
-    assert_eq!(
-        outcome.failure.as_deref(),
-        Some(
-            "SFV recovery failed for 1 set(s): silver.horizon.sfv (silver.horizon.part02.rar): \
-             not repairable: 1 damaged slices, only 0 recovery blocks reachable"
-        )
-    );
+    let twin = try_run(&listed_rar_of(false, false, &lost))
+        .await
+        .unwrap_or_else(|stall| panic!("the twin stalled at {:?}", stall.status));
+    assert_twin(&outcome, &twin);
 }

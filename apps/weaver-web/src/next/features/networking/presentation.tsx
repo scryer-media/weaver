@@ -23,7 +23,7 @@ import { WV } from "../../data/palette";
 export type NetworkTone = "ok" | "busy" | "warn" | "bad" | "idle";
 
 export const TONE_COLOR: Record<NetworkTone, string> = {
-  ok: WV.accent,
+  ok: WV.ok,
   busy: WV.info,
   warn: WV.warn,
   bad: WV.error,

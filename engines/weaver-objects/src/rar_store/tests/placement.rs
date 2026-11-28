@@ -473,6 +473,8 @@ fn a_compressed_set_renamed_from_swapped_posted_numbers_is_one_engine() {
         let mut options = super::split(Version::Rar4);
         options.split = Some(10_000);
         options.compressed = Some(0);
+        // Solid: a compressed set that goes to the engine whole.
+        options.solid = true;
         let set = write(&[Item::File("track.flac", payload(9, 57_000))], &options);
         assert_eq!(set.len(), 6);
         let mut run = Run::new();
@@ -538,6 +540,8 @@ fn another_sets_volume_held_by_its_posted_name_leaves_when_renamed_first() {
         let mut options = super::split(Version::Rar4);
         options.split = Some(10_000);
         options.compressed = Some(0);
+        // Solid: a compressed set that goes to the engine whole.
+        options.solid = true;
         write(&[Item::File(name, payload(seed, 37_000))], &options)
     };
     let a = set("track.flac", 9);
@@ -638,6 +642,8 @@ fn a_volume_renamed_before_its_neighbours_come_rejoins_its_engine() {
             let mut options = super::split(Version::Rar4);
             options.split = Some(10_000);
             options.compressed = Some(0);
+            // Solid: a compressed set that goes to the engine whole.
+            options.solid = true;
             let set = write(
                 &[Item::File("track.flac", payload(9, count * 10_000 - 3_000))],
                 &options,
@@ -717,6 +723,8 @@ fn a_long_compressed_set_renamed_one_at_a_time_looks_volumes_up() {
     let mut options = super::split(Version::Rar4);
     options.split = Some(5_000);
     options.compressed = Some(0);
+    // Solid: a compressed set that goes to the engine whole.
+    options.solid = true;
     let set = write(
         &[Item::File("track.flac", payload(9, VOLUMES * 5_000 - 700))],
         &options,
@@ -1389,6 +1397,8 @@ fn a_long_nameless_compressed_set_walks_its_volumes_a_bounded_number_of_times() 
         let mut options = super::split(Version::Rar4);
         options.split = Some(5_000);
         options.compressed = Some(0);
+        // Solid: a compressed set that goes to the engine whole.
+        options.solid = true;
         let set = write(
             &[Item::File("track.flac", payload(9, volumes * 5_000 - 700))],
             &options,
@@ -1505,6 +1515,7 @@ impl<'a> Filed<'a> {
         let held = claim::Held {
             facts: Some(facts),
             successor: None,
+            ended: false,
         };
         self.held.insert(at, held);
         self.beside.file(at, true);
@@ -1593,6 +1604,7 @@ fn place_both_ways<'a>(
         claim::Held {
             facts: Some(facts),
             successor: None,
+            ended: false,
         },
     );
     filed.hold(placed.0, facts);
@@ -1641,6 +1653,118 @@ fn placing_by_the_places_filed_beside_held_volumes_matches_the_walk_over_them() 
             assert_eq!(at, (0..12).map(Some).collect::<Vec<_>>());
         }
     }
+}
+
+// A nameless volume given back while its walk had read only the member it
+// continues, offered again with a front that holds its later headers: it is
+// judged by the front, which read further, and takes its true place between
+// the held volume it continues and the one that continues its last member.
+// The front places it nowhere a reading of its own headers rules out, and a
+// front that reads no further than the walk answers as the walk does.
+#[test]
+fn a_volume_given_back_short_is_judged_by_the_front_that_read_further() {
+    let mut options = Options::new(Version::Rar4);
+    options.split = Some(6_000);
+    options.numbered = true;
+    let set = write(
+        &[
+            Item::File("alpha.bin", payload(1, 10_000)),
+            Item::File("notes.txt", payload(2, 300)),
+            Item::File("omega.bin", payload(3, 16_000)),
+        ],
+        &options,
+    );
+    assert_eq!(set.len(), 5);
+
+    let name = "1d4f5f";
+    // What the walk had read when the volume went back: the header of the
+    // member it continues, no further.
+    let short = &set[1][..512];
+    // The front as it stands later: every header but the end record.
+    let later = &set[1][..set[1].len() - 7];
+    let read = |front: &[u8]| {
+        claim::front_facts(front, None, std::sync::Arc::new(unrar_rs::KdfCache::new()))
+            .expect("a volume's front")
+    };
+    let walked = read(short);
+    let fronted = read(later);
+    assert_eq!(walked.members.len(), 1, "the walk read one member");
+    assert!(fronted.members.len() > 1, "the front read further");
+
+    let mut donor = Owner::new(store(), vec![(name.to_owned(), set[1].clone())]);
+    donor.deliver(0, ByteRange::new(0, short.len() as u64));
+    let given = donor
+        .object
+        .give_back(VolumeIndex(0))
+        .expect("a short volume");
+    let receiving = |held: &[(u32, &[u8])]| {
+        let mut receiver = store();
+        for &(index, bytes) in held {
+            receiver.bound(VolumeIndex(index), &format!("bbf{index:08x}"), bytes, None);
+        }
+        receiver
+    };
+    let reclaim = |held: &[(u32, &[u8])], front: &[u8]| {
+        receiving(held).reclaim(name, front, None, &*given).to_vec()
+    };
+
+    let neighbours = [(0u32, set[0].as_slice()), (2, set[2].as_slice())];
+    let complete = [0, 2, 3, 4].map(|index| (index as u32, set[index].as_slice()));
+    assert_eq!(reclaim(&neighbours, later), vec![VolumeIndex(1)]);
+    assert_eq!(reclaim(&complete, later), vec![VolumeIndex(1)]);
+
+    // A front that reads no further than the walk answers as the walk does.
+    assert_eq!(reclaim(&neighbours, short), Vec::<VolumeIndex>::new());
+    assert_eq!(reclaim(&complete, short), Vec::<VolumeIndex>::new());
+
+    // A different member before the gap rules the place out.
+    let mut wrong_left = set[0].clone();
+    rewrite_rar4_part(&mut wrong_left, |body| {
+        let other = b"other.bin";
+        let start = body.len() - other.len();
+        body[start..].copy_from_slice(other);
+    });
+    assert_eq!(
+        reclaim(&[(0, &wrong_left), (2, &set[2])], later),
+        Vec::<VolumeIndex>::new(),
+        "a different preceding member"
+    );
+
+    // A store that holds another format takes it nowhere.
+    let mut other_options = Options::new(Version::Rar5);
+    other_options.split = Some(6_000);
+    let other = write(
+        &[Item::File("other.bin", payload(4, 25_000))],
+        &other_options,
+    );
+    let mut mixed = receiving(&complete);
+    let index = VolumeIndex(3);
+    mixed.volume(index).walk.restore(Some(facts(&other[3])));
+    mixed.file(index);
+    assert_eq!(
+        mixed.reclaim(name, later, None, &*given).to_vec(),
+        Vec::<VolumeIndex>::new(),
+        "another format held"
+    );
+
+    // A name that puts it elsewhere in the set's numbering takes it nowhere
+    // the front places it.
+    let mut named = store();
+    for (index, bytes) in complete {
+        named.bound(
+            VolumeIndex(index),
+            &format!("sample.part{}.rar", index + 1),
+            bytes,
+            None,
+        );
+    }
+    assert_eq!(
+        named
+            .reclaim("sample.part4.rar", later, None, &*given)
+            .to_vec(),
+        Vec::<VolumeIndex>::new(),
+        "a name that puts it elsewhere"
+    );
 }
 
 // Every order of `0..n`, each once.

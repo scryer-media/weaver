@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
+use crate::observability::{spawn_blocking_with, state_error};
+
 use std::collections::HashMap;
 use std::sync::Arc;
 use weaver_server_core::tags::TagsQueries;
@@ -73,6 +75,7 @@ impl JobsSubscription {
             .clone();
         let prepared_filter = PreparedQueueFilter::new(filter.as_ref());
         let wants_disk_write = ctx.look_ahead().field("items").field("diskWrite").exists();
+        let wants_torrent = ctx.look_ahead().field("items").field("torrent").exists();
         let throttled = Box::pin(snapshot_triggers(&handle, &db, FULL_SNAPSHOT_PERIOD));
 
         let memo = Arc::new(std::sync::Mutex::new(QueueSnapshotMemo::default()));
@@ -109,6 +112,9 @@ impl JobsSubscription {
                     .collect();
                     if wants_disk_write {
                         crate::jobs::types::attach_disk_writes(&state_handle, &mut items);
+                    }
+                    if wants_torrent {
+                        crate::torrents::QueueTorrentRows::share(&mut items);
                     }
                     let cached = {
                         let memo = memo.lock().expect("queue snapshot memo poisoned");
@@ -176,6 +182,7 @@ impl JobsSubscription {
         let replay = ctx.data::<crate::jobs::replay::QueueEventReplay>()?.clone();
         let db = ctx.data::<Database>()?.clone();
         let wants = crate::jobs::query::page_wants(ctx);
+        let wants_torrent = ctx.look_ahead().field("items").field("torrent").exists();
         let mut triggers = Box::pin(snapshot_triggers(&handle, &db, PAGE_UPDATE_PERIOD));
         Ok(async_stream::stream! {
             // What a page shows beyond its rows' revision: the live speed in
@@ -198,9 +205,13 @@ impl JobsSubscription {
                     continue;
                 }
                 last = Some(captured);
-                yield crate::jobs::query::build_queue_page(
+                let mut page = crate::jobs::query::build_queue_page(
                     &handle, &state, &replay, db.clone(), &input, wants, &mut duplicates,
                 ).await;
+                if wants_torrent && let Ok(page) = &mut page {
+                    crate::torrents::QueueTorrentRows::share(&mut page.items);
+                }
+                yield page;
             }
         })
     }
@@ -307,11 +318,11 @@ async fn load_duplicate_summary_infos(
         .iter()
         .map(|item| weaver_server_core::jobs::ids::JobId(item.id))
         .collect::<Vec<_>>();
-    let summaries =
-        tokio::task::spawn_blocking(move || load_duplicate_summaries_chunked(&db, job_ids))
-            .await
-            .map_err(|error| graphql_error("INTERNAL", error.to_string()))?
-            .map_err(|error| graphql_error("INTERNAL", error.to_string()))?;
+    let summaries = spawn_blocking_with(
+        move || load_duplicate_summaries_chunked(&db, job_ids),
+        state_error,
+    )
+    .await?;
     Ok(summaries
         .iter()
         .map(|(job_id, summary)| (job_id.0, DuplicateSummaryInfo::from_summary(summary)))

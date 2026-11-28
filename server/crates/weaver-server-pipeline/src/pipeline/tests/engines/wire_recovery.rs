@@ -199,6 +199,7 @@ pub async fn drive_stream(
         in_memory: Default::default(),
         restarts: usize::from(after.is_some()),
         order: articles.to_vec(),
+        events: Vec::new(),
     }
 }
 
@@ -300,7 +301,7 @@ async fn explicit_article_body(
     }
     raw.extend_from_slice(b".\r\n");
     let mut decoder = weaver_nntp::fused_yenc::FusedYencArticleDecoder::new();
-    decoder.set_checkpoint_plan(super::super::checkpoint_plan(pipeline, JOB));
+    decoder.set_checkpoint_plan(super::super::checkpoint_plan(pipeline, id.file_id));
     let decoded = decoder
         .decode_available(&mut bytes::BytesMut::from(raw.as_slice()))
         .unwrap()
@@ -342,7 +343,7 @@ pub(super) async fn decode_wire_article(
     use crate::pipeline::{DecodeDone, DownloadPayload, Pipeline, SegmentSource};
     use weaver_nntp::client::{DecodedBody, DecodedBodyTrace};
     let mut decoder = weaver_nntp::fused_yenc::FusedYencArticleDecoder::new();
-    decoder.set_checkpoint_plan(checkpoint_plan(pipeline, id.file_id.job_id));
+    decoder.set_checkpoint_plan(checkpoint_plan(pipeline, id.file_id));
     let decoded = decoder
         .decode_available(&mut bytes::BytesMut::from(raw))
         .unwrap()

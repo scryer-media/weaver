@@ -1444,6 +1444,8 @@ var canonicalFixtureSlugs = []string{
 	"par2-insufficient",
 	"par2-multi-grid-late-discovery",
 	"par2-multi-grid-overlap-clean",
+	"par2-multi-grid-overlap-repair",
+	"par2-many-grids-clean",
 	"par2-multi-set-archives",
 	"par2-multi-set-archives-clean",
 	"par2-multi-set-archives-insufficient",

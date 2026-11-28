@@ -30,6 +30,7 @@ const ENCRYPTED_LZ: &[u8] = include_bytes!(
 );
 const ENCRYPTED_LZ_MEMBER_LEN: u64 = 226_943;
 
+mod sealed;
 mod tails;
 
 // RAR5 store volumes, written here the way the format lays them out.
@@ -334,7 +335,7 @@ fn said(emits: &[Emit]) -> Vec<Said> {
                 out.push(Said::Damaged(volume.0, range.start, range.end))
             }
             // Said beside the walk; `checksums` reads them.
-            Emit::Checksum { .. } => {}
+            Emit::Checksum { .. } | Emit::Checked { .. } => {}
             // Text for the log, which changes nothing.
             Emit::Failed(_) => {}
             other => panic!("an engine run does not say {other:?}"),
@@ -619,6 +620,64 @@ fn a_stated_volume_is_placed_beside_a_bound_volume_whose_front_is_unread() {
     );
 }
 
+// The second volume ends on a whole member. Its front read to the end
+// record says the next volume opens on a new member, so a volume that
+// states the next number and opens on a member begun before it is no
+// volume of this set. A front cut short after that member says nothing
+// against it, and it is placed on its number.
+#[test]
+fn a_stated_volume_does_not_follow_a_front_read_to_its_end_on_a_whole_member() {
+    let spanning = spanning();
+    let (head, rest) = spanning.split_at(16);
+    let first = [
+        rar5::start(Some(0)),
+        rar5::file(
+            "lead.bin",
+            rar5::SPLIT_AFTER,
+            head,
+            spanning.len() as u64,
+            None,
+        ),
+        rar5::end(true),
+    ]
+    .concat();
+    let lead = [
+        rar5::start(Some(1)),
+        rar5::file(
+            "lead.bin",
+            rar5::SPLIT_BEFORE,
+            rest,
+            spanning.len() as u64,
+            Some(crc32(&spanning)),
+        ),
+        rar5::file(
+            "notes.txt",
+            0,
+            NOTES,
+            NOTES.len() as u64,
+            Some(crc32(NOTES)),
+        ),
+    ]
+    .concat();
+    let whole = [lead.as_slice(), &rar5::end(true)].concat();
+    let stranger = [
+        rar5::start(Some(2)),
+        rar5::file("other.bin", rar5::SPLIT_BEFORE, NOTES, 99, None),
+    ]
+    .concat();
+    for (second, placed) in [(&whole, Vec::new()), (&lead, vec![VolumeIndex(2)])] {
+        let mut engine = RarEngine::new();
+        engine.bound(VolumeIndex(0), "a1b2.101", &first, None);
+        engine.bound(VolumeIndex(1), "a1b2.102", second, None);
+        assert_eq!(
+            engine.claim("a1b2.103", (&stranger).into(), None),
+            placed,
+            "second volume of {} bytes",
+            second.len()
+        );
+    }
+}
+
 #[test]
 fn the_engine_bids_for_the_volumes_after_the_one_the_run_reached() {
     let mut engine = named(&["set.part1.rar", "set.part2.rar", "set.part3.rar"]);
@@ -859,12 +918,13 @@ fn a_sink_that_says_stop_hears_nothing_more() {
     assert!(matches!(said[1], Said::Bytes(0, _)));
 }
 
-// Each member's checksum as the run said it, in the order it was said.
+// Each member's checksum as the run said it, in the order it was said. A
+// run's decodes all verify, so it says every one checked.
 fn checksums(emits: &[Emit]) -> Vec<(u32, u32)> {
     emits
         .iter()
         .filter_map(|emit| match emit {
-            Emit::Checksum { member, crc32 } => Some((member.0, *crc32)),
+            Emit::Checked { member, crc32 } => Some((member.0, *crc32)),
             _ => None,
         })
         .collect()
@@ -932,8 +992,13 @@ fn a_split_compressed_member_states_its_own_checksum_once_decoded() {
     assert_eq!(bytes.len() as u64, SPLIT_LZ_MEMBER_LEN);
     assert_eq!(crc32(&bytes), SPLIT_LZ_MEMBER_CRC);
     assert_eq!(checksums(&emits), vec![(0, crc32(&bytes))]);
+    // The decoder checked them: the run hashes none of them itself.
+    assert!(emits.iter().all(|emit| match emit {
+        Emit::Bytes { bytes, .. } => bytes.evidence().is_empty(),
+        _ => true,
+    }));
     let at = |wanted: fn(&Emit) -> bool| emits.iter().rposition(wanted).unwrap();
-    let stated = at(|emit| matches!(emit, Emit::Checksum { .. }));
+    let stated = at(|emit| matches!(emit, Emit::Checked { .. }));
     assert!(at(|emit| matches!(emit, Emit::Bytes { .. })) < stated);
     assert_eq!(stated + 1, at(|emit| matches!(emit, Emit::MemberClosed(_))));
 }
@@ -2386,7 +2451,7 @@ fn a_lone_archive_states_its_window() {
         ("rar4_solid_ppmd_plain.rar", 1 << 20),
     ] {
         let bytes = fixture(path);
-        assert!(<Rar as Format>::front(&bytes).is_none(), "{path}");
+        assert!(<Rar as Format>::front(&bytes, None).is_none(), "{path}");
         assert_eq!(<Rar as Format>::window(&bytes), Some(window), "{path}");
     }
 }

@@ -23,6 +23,7 @@ use weaver_server_core::SchedulerHandle;
 use weaver_server_core::auth::ApiKeyCache;
 use weaver_server_core::jobs::handle::SharedPipelineState;
 use weaver_server_core::operations::metrics::PipelineMetrics;
+use weaver_server_core::settings::service::SettingsServiceQueries;
 use weaver_server_core::settings::{Config, SharedConfig};
 use weaver_server_core::{Database, JobHistoryRow};
 
@@ -96,7 +97,20 @@ impl TestHarness {
     pub async fn new_with_security(
         security: weaver_server_core::security::RuntimeSecurityConfig,
     ) -> Self {
-        Self::new_with_options_and_security(true, security, None).await
+        Self::new_with_options_and_security(true, security, None, None).await
+    }
+
+    // Like [`TestHarness::new`] but with the torrent listen port pinned to
+    // `pin`, as `WEAVER_TORRENT_PORT` pins it: the database is handed the pin
+    // and the shared torrent settings are the ones it loads.
+    pub async fn new_with_torrent_port_pin(pin: u16) -> Self {
+        Self::new_with_options_and_security(
+            true,
+            weaver_server_core::security::RuntimeSecurityConfig::default(),
+            None,
+            Some(pin),
+        )
+        .await
     }
 
     // Like [`TestHarness::new`] but with a data used recorder in the schema,
@@ -108,6 +122,7 @@ impl TestHarness {
             Some(Arc::new(
                 weaver_server_core::operations::UsageRecorder::new(),
             )),
+            None,
         )
         .await
     }
@@ -118,6 +133,7 @@ impl TestHarness {
             // Loopback, no environment override: the shape a fresh install has.
             weaver_server_core::security::RuntimeSecurityConfig::default(),
             None,
+            None,
         )
         .await
     }
@@ -126,17 +142,25 @@ impl TestHarness {
         spawn_history_delete_worker: bool,
         security: weaver_server_core::security::RuntimeSecurityConfig,
         usage_recorder: Option<Arc<weaver_server_core::operations::UsageRecorder>>,
+        torrent_port_pin: Option<u16>,
     ) -> Self {
         let tempdir = tempfile::TempDir::new().expect("failed to create tempdir");
         let mut db = Database::open_in_memory().expect("failed to open in-memory DB");
         db.set_encryption_key(
             weaver_server_core::persistence::encryption::EncryptionKey::generate(),
         );
+        let torrent = match torrent_port_pin {
+            Some(pin) => {
+                db.set_torrent_port_pin(Some(pin));
+                db.load_config().expect("load pinned settings").torrent
+            }
+            None => Default::default(),
+        };
 
         let config = Config {
             upload_cap: None,
             seeding: None,
-            torrent: Default::default(),
+            torrent,
             data_dir: tempdir.path().to_string_lossy().to_string(),
             intermediate_dir: None,
             complete_dir: None,
@@ -225,6 +249,7 @@ impl TestHarness {
             server_transfer_policy: Arc::clone(&server_transfer_policy),
             auth_cache: auth_cache.clone(),
             api_key_cache,
+            appearance: Default::default(),
             security: security.clone(),
             rss,
             watch_folder,

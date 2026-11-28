@@ -13,7 +13,7 @@
 
 use std::cmp::Reverse;
 use std::collections::binary_heap::{BinaryHeap, PeekMut};
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use weaver_server_disk::operations::disk::volume::LoopSite;
 
 use bytes::Bytes;
@@ -23,6 +23,7 @@ use weaver_graph::{
     RecoveryKind, Restore, Segment, Tree, VolumeIndex,
 };
 
+use super::super::root::source::ArticleMap;
 use super::{
     Acknowledging, Apply, Applying, Arrival, HeldWant, LeafError, Loan, NamespaceWriter, READ_BACK,
     ReturnTail, Returned, Segments, TailStep, Tailed, Write, WriteError, absent_from_posts,
@@ -49,6 +50,19 @@ pub trait Lender {
 #[cfg(any(test, feature = "pipeline-test-fixtures"))]
 thread_local! {
     pub static NAMES_KEPT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+// For the tests that count the binds a recovery volume's bytes make: past
+// its front, of a volume not yet whole, how many articles there were, how
+// many of them left their object a bind to do, and how many bound. Set,
+// `VOLUME_BINDS_OPEN` binds after every such article, as each did before
+// its object could say whether a bind was due.
+#[cfg(any(test, feature = "pipeline-test-fixtures"))]
+thread_local! {
+    pub static VOLUME_ARTICLES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    pub static VOLUME_BINDS_DUE: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    pub static VOLUME_BINDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    pub static VOLUME_BINDS_OPEN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 // What one set says of the members it covers.
@@ -81,24 +95,320 @@ fn own_set(tree: &Tree, member: MemberId) -> Option<NodeId> {
         .filter(|set| tree.recovers(*set))
 }
 
+// What is still to come, kept between reads: each volume the root still
+// fetches unasked, as its member is, and the payload and per-set counts
+// those make, as of the map's generation of volumes to come and the root
+// namespace's generation of member marks. The job brings it up to date on
+// its mutable paths (`refresh`); a read answers from it only when both
+// generations are the ones it was brought up to, and otherwise the caller
+// walks as before, so a read the job did not bring it up to date for is
+// never wrong, only as slow as the walk. A member's owner is in its row
+// (`MembersMut::own`), so a change of owner marks it. Whether the owner
+// recovers is not: an object out for its work answers no recovery face, and
+// no member is marked as it goes or comes back, so the job names the node
+// (`owner_moved`) and its volumes are classified again.
+#[derive(Debug, Default)]
+pub struct ComingKept {
+    // The two generations it was brought up to; `None` before the first.
+    read: Option<(u64, u64)>,
+    volumes: BTreeMap<VolumeIndex, Is>,
+    payload: usize,
+    sets: BTreeMap<NodeId, usize>,
+    // The volumes to come by the node that owns their member.
+    by_owner: BTreeMap<NodeId, BTreeSet<VolumeIndex>>,
+    // The owners that went out for their work or came back since the last
+    // refresh: the answer is not up to date until their volumes are
+    // classified again.
+    moved: BTreeSet<NodeId>,
+    // For the tests: the volumes a refresh classified, and the reads that
+    // found it behind and walked, by what was read.
+    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
+    classified: u64,
+    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
+    walked: [std::sync::atomic::AtomicU64; 2],
+}
+
+// What a volume to come is: a member the root does not hold, payload under
+// the node that owns it if one does, or an own volume of a set.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Is {
+    Absent,
+    Payload(Option<NodeId>),
+    Own(NodeId),
+}
+
+impl Is {
+    fn owner(self) -> Option<NodeId> {
+        match self {
+            Is::Absent => None,
+            Is::Payload(owner) => owner,
+            Is::Own(set) => Some(set),
+        }
+    }
+}
+
+// Root members are numbered as the volumes they are.
+fn member_of(volume: VolumeIndex) -> MemberId {
+    MemberId(volume.0)
+}
+
+fn classify(tree: &Tree, root: &Namespace, volume: VolumeIndex) -> Is {
+    let member = member_of(volume);
+    if root.get(member).is_none() {
+        return Is::Absent;
+    }
+    let owner = tree.child_of(NodeId::ROOT, member).map(|(owner, _)| owner);
+    match owner {
+        Some(set) if tree.recovers(set) => Is::Own(set),
+        owner => Is::Payload(owner),
+    }
+}
+
+// Which read found the kept answer behind.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum ComingRead {
+    Coming = 0,
+    Payload = 1,
+}
+
+impl ComingKept {
+    // The generations the answer would be brought up to now.
+    fn now(tree: &Tree, map: &ArticleMap) -> Option<(u64, u64)> {
+        let root = tree.namespace(NodeId::ROOT)?;
+        Some((map.come_generation(), root.generation()))
+    }
+
+    // Bring the answer up to date with the map and the tree, from the
+    // volumes that entered or left the map's volumes to come and the root
+    // members marked since, of those only the ones to come. A generation
+    // below the one last read is another map or namespace, and the answer is
+    // made again from every volume to come.
+    pub(crate) fn refresh(&mut self, tree: &Tree, map: &ArticleMap) {
+        let Some(root) = tree.namespace(NodeId::ROOT) else {
+            self.clear();
+            self.read = None;
+            return;
+        };
+        let now = (map.come_generation(), root.generation());
+        match self.read {
+            Some(read) if read == now => {}
+            Some((flips, marks)) if now.0 >= flips && now.1 >= marks => {
+                // Each volume is asked once whether it is still to come: a
+                // marked member that is not, and was not, files nothing.
+                let mut again: BTreeSet<VolumeIndex> = map.come_flips_since(flips).collect();
+                again.extend(
+                    root.changed_since(marks)
+                        .map(|member| VolumeIndex(member.0)),
+                );
+                for volume in again {
+                    let is = map
+                        .volume_to_come(volume)
+                        .then(|| self.classify(tree, root, volume));
+                    self.put(volume, is);
+                }
+            }
+            _ => {
+                self.clear();
+                for volume in map.coming() {
+                    let is = self.classify(tree, root, volume);
+                    self.put(volume, Some(is));
+                }
+            }
+        }
+        for node in std::mem::take(&mut self.moved) {
+            let again: Vec<VolumeIndex> = self
+                .by_owner
+                .get(&node)
+                .into_iter()
+                .flatten()
+                .copied()
+                .collect();
+            for volume in again {
+                let is = self.classify(tree, root, volume);
+                self.put(volume, Some(is));
+            }
+        }
+        self.read = Some(now);
+    }
+
+    // The object at `node` went out for its work or came back: whether it
+    // recovers changed with no member marked.
+    pub(crate) fn owner_moved(&mut self, node: NodeId) {
+        if self.read.is_some() {
+            self.moved.insert(node);
+        }
+    }
+
+    fn classify(&mut self, tree: &Tree, root: &Namespace, volume: VolumeIndex) -> Is {
+        #[cfg(any(test, feature = "pipeline-test-fixtures"))]
+        {
+            self.classified += 1;
+        }
+        classify(tree, root, volume)
+    }
+
+    fn clear(&mut self) {
+        self.volumes.clear();
+        self.payload = 0;
+        self.sets.clear();
+        self.by_owner.clear();
+        self.moved.clear();
+    }
+
+    // File the volume as `is`, or out when it is no longer to come.
+    fn put(&mut self, volume: VolumeIndex, is: Option<Is>) {
+        let was = match is {
+            Some(is) => self.volumes.insert(volume, is),
+            None => self.volumes.remove(&volume),
+        };
+        if was == is {
+            return;
+        }
+        self.count(was, false);
+        self.count(is, true);
+        if let Some(owner) = was.and_then(Is::owner)
+            && let Some(volumes) = self.by_owner.get_mut(&owner)
+        {
+            volumes.remove(&volume);
+            if volumes.is_empty() {
+                self.by_owner.remove(&owner);
+            }
+        }
+        if let Some(owner) = is.and_then(Is::owner) {
+            self.by_owner.entry(owner).or_default().insert(volume);
+        }
+    }
+
+    fn count(&mut self, is: Option<Is>, add: bool) {
+        match is {
+            Some(Is::Payload(_)) if add => self.payload += 1,
+            Some(Is::Payload(_)) => self.payload -= 1,
+            Some(Is::Own(set)) if add => *self.sets.entry(set).or_default() += 1,
+            Some(Is::Own(set)) => {
+                if let Some(count) = self.sets.get_mut(&set) {
+                    *count -= 1;
+                    if *count == 0 {
+                        self.sets.remove(&set);
+                    }
+                }
+            }
+            Some(Is::Absent) | None => {}
+        }
+    }
+
+    // Whether the answer is up to date with the map and the tree; a read
+    // that finds it behind is counted for the tests.
+    fn fresh(&self, tree: &Tree, map: &ArticleMap, read: ComingRead) -> bool {
+        let fresh =
+            self.moved.is_empty() && self.read.is_some() && self.read == Self::now(tree, map);
+        #[cfg(any(test, feature = "pipeline-test-fixtures"))]
+        if !fresh {
+            self.walked[read as usize].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        #[cfg(not(any(test, feature = "pipeline-test-fixtures")))]
+        let _ = read;
+        fresh
+    }
+
+    // What is still to come, when the answer is up to date.
+    pub(crate) fn coming(&self, tree: &Tree, map: &ArticleMap) -> Option<Coming> {
+        if !self.fresh(tree, map, ComingRead::Coming) {
+            return None;
+        }
+        #[cfg(any(test, feature = "pipeline-test-fixtures"))]
+        self.check(tree, map);
+        Some(Coming {
+            payload: self.payload > 0,
+            sets: self.sets.keys().copied().collect(),
+        })
+    }
+
+    // Whether payload is still to come, when the answer is up to date.
+    pub(crate) fn payload_coming(&self, tree: &Tree, map: &ArticleMap) -> Option<bool> {
+        if !self.fresh(tree, map, ComingRead::Payload) {
+            return None;
+        }
+        #[cfg(any(test, feature = "pipeline-test-fixtures"))]
+        self.check(tree, map);
+        Some(self.payload > 0)
+    }
+
+    // The volumes refreshes classified, and the reads that walked for
+    // `coming` and for payload, for the tests.
+    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
+    pub fn counts(&self) -> (u64, u64, u64) {
+        let walked = |read: ComingRead| {
+            self.walked[read as usize].load(std::sync::atomic::Ordering::Relaxed)
+        };
+        (
+            self.classified,
+            walked(ComingRead::Coming),
+            walked(ComingRead::Payload),
+        )
+    }
+
+    // Under the test fixtures, every read answered from the kept answer is
+    // held to the walk it replaced: the map's volumes to come, and each
+    // member's owner read again from the tree.
+    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
+    fn check(&self, tree: &Tree, map: &ArticleMap) {
+        let walked = map.coming_by_walk();
+        let Some(root) = tree.namespace(NodeId::ROOT) else {
+            assert!(self.volumes.is_empty(), "kept volumes to come with no root");
+            return;
+        };
+        let expected: BTreeMap<VolumeIndex, Is> = walked
+            .iter()
+            .map(|volume| (*volume, classify(tree, root, *volume)))
+            .collect();
+        for volume in expected.keys().chain(self.volumes.keys()) {
+            let (kept, is) = (self.volumes.get(volume), expected.get(volume));
+            let member = member_of(*volume);
+            let owner = tree.child_of(NodeId::ROOT, member).map(|(set, _)| set);
+            assert!(
+                kept == is,
+                "volume {volume:?} (member {member:?}) kept as {kept:?}, walked as {is:?}: \
+                 owner set {owner:?}, which recovers: {:?}",
+                owner.map(|set| tree.recovers(set)),
+            );
+        }
+        let walk = walk_coming(tree, walked.iter().map(|volume| member_of(*volume)));
+        assert_eq!(
+            Coming {
+                payload: self.payload > 0,
+                sets: self.sets.keys().copied().collect(),
+            },
+            walk,
+            "the kept payload and set counts against the walk"
+        );
+    }
+}
+
+// What is still to come, from the root members with an article the queue
+// fetches unasked: a member that is a set's own volume names its set, and
+// any other is payload.
+fn walk_coming(tree: &Tree, members: impl Iterator<Item = MemberId>) -> Coming {
+    let mut coming = Coming::default();
+    let Some(root) = tree.namespace(NodeId::ROOT) else {
+        return coming;
+    };
+    for member in members.filter(|member| root.get(*member).is_some()) {
+        match own_set(tree, member) {
+            Some(set) => {
+                coming.sets.insert(set);
+            }
+            None => coming.payload = true,
+        }
+    }
+    coming
+}
+
 impl NamespaceWriter {
     // What is still to come, from the root members with an article the
     // queue fetches unasked: a member that is a set's own volume names its
     // set, and any other is payload.
     pub fn coming(&self, tree: &Tree, members: impl Iterator<Item = MemberId>) -> Coming {
-        let mut coming = Coming::default();
-        let Some(root) = tree.namespace(NodeId::ROOT) else {
-            return coming;
-        };
-        for member in members.filter(|member| root.get(*member).is_some()) {
-            match own_set(tree, member) {
-                Some(set) => {
-                    coming.sets.insert(set);
-                }
-                None => coming.payload = true,
-            }
-        }
-        coming
+        walk_coming(tree, members)
     }
 
     // Whether `coming` would say payload is still to come, stopping at the
@@ -120,11 +430,10 @@ impl NamespaceWriter {
             .into_iter()
             .flat_map(|namespace| {
                 let sets = tree.recovery_nodes(namespace);
-                let aside = Aside::of(tree, &sets);
                 let standing: Vec<NodeId> = sets
                     .iter()
                     .copied()
-                    .filter(|set| !aside.yields(*set))
+                    .filter(|set| !aside(tree, *set))
                     .collect();
                 standing.into_iter().map(move |set| (namespace, set))
             })
@@ -140,10 +449,9 @@ impl NamespaceWriter {
         sets: &'t [NodeId],
         member: MemberId,
     ) -> impl Iterator<Item = NodeId> + 't {
-        let aside = Aside::of(tree, sets);
         sets.iter()
             .copied()
-            .filter(move |set| self.covers(tree, *set, member) && !aside.yields(*set))
+            .filter(move |set| self.covers(tree, *set, member) && !aside(tree, *set))
     }
 
     // Whether the set covers the member: the one place a member is matched
@@ -187,10 +495,9 @@ impl NamespaceWriter {
     // volumes are settled would read the bytes still to land as lost.
     pub fn ruled(&self, tree: &Tree, node: NodeId, coming: &Coming) -> bool {
         let sets = tree.recovery_nodes(node);
-        let aside = Aside::of(tree, &sets);
         sets.iter().copied().all(|set| {
             !self.returning(set)
-                && (aside.yields(set)
+                && (aside(tree, set)
                     || (!tree.lent(set)
                         && !coming.sets.contains(&set)
                         && tree.recovery(set).is_none_or(|recovery| {
@@ -315,10 +622,9 @@ impl NamespaceWriter {
             return false;
         };
         let sets = tree.recovery_nodes(node);
-        let aside = Aside::of(tree, &sets);
         let due = self.due(tree, node, reading);
         sets.iter().copied().all(|set| {
-            if aside.yields(set) {
+            if aside(tree, set) {
                 return true;
             }
             if tree.lent(set) || coming.sets.contains(&set) || due.contains(&set) {
@@ -405,6 +711,28 @@ impl NamespaceWriter {
         found
     }
 
+    // Every member a set disputes, as its object says once the job is
+    // done: the set, and the member's namespace. Sets that stand aside
+    // are asked too; a set's rulings say what it disputes otherwise.
+    pub(crate) fn disputed(&self, tree: &Tree) -> Vec<(NodeId, NodeId, MemberId)> {
+        let mut found = Vec::new();
+        let mut said = Vec::new();
+        for node in tree.live() {
+            let Some(namespace) = tree.namespace(node) else {
+                continue;
+            };
+            for set in tree.recovery_nodes(node) {
+                let Some(recovery) = tree.recovery(set) else {
+                    continue;
+                };
+                said.clear();
+                recovery.disputed(namespace, &mut said);
+                found.extend(said.drain(..).map(|member| (set, node, member)));
+            }
+        }
+        found
+    }
+
     // What a set is called: what the file that carries it is.
     pub fn set_name<'t>(&self, tree: &'t Tree, set: NodeId) -> Option<&'t str> {
         tree.volumes(set)
@@ -412,14 +740,14 @@ impl NamespaceWriter {
             .map(|record| record.output_name.as_str())
     }
 
-    // The block sizes the namespace's sets fold their evidence at. Bytes its
-    // source cuts at their boundaries prove a slice as they pass, rather
-    // than be read back.
-    pub(crate) fn block_sizes(&self, tree: &Tree, node: NodeId) -> Vec<u64> {
+    // The block sizes the namespace's sets fold the member's evidence at.
+    // Bytes its source cuts at their boundaries prove a slice as they
+    // pass, rather than be read back.
+    pub(crate) fn block_sizes(&self, tree: &Tree, node: NodeId, member: MemberId) -> Vec<u64> {
         let mut sizes = Vec::new();
         for set in tree.recovery_nodes(node) {
             if let Some(recovery) = tree.recovery(set) {
-                recovery.block_sizes(&mut sizes);
+                recovery.block_sizes(member, &mut sizes);
             }
         }
         sizes
@@ -441,6 +769,9 @@ impl NamespaceWriter {
     ) -> Result<(), WriteError> {
         self.announce_absent(tree, builder, segments, (node, reading), out)?;
         let due = self.due(tree, node, reading(node));
+        for &set in &due {
+            self.feed_moved(tree, segments, node, set);
+        }
         self.repair(tree, node, &due, lender)
     }
 
@@ -600,7 +931,6 @@ impl NamespaceWriter {
         // and only once a set is otherwise due, for its own ruling and for
         // every wider set beside it.
         let mut pending: Option<Vec<(NodeId, BTreeSet<MemberId>)>> = None;
-        let aside = Aside::of(tree, &sets);
         sets.iter()
             .copied()
             .filter(|&set| {
@@ -610,7 +940,7 @@ impl NamespaceWriter {
                 else {
                     return false;
                 };
-                if aside.yields(set) {
+                if aside(tree, set) {
                     return false;
                 }
                 if !known
@@ -1142,14 +1472,6 @@ impl NamespaceWriter {
             self.acknowledging = None;
             return Err(error);
         }
-        // An SFV below the root whose namespace came out of volumes a
-        // recovery set above proved makes no claim of damage: every byte of
-        // what it lists is what was posted.
-        let found = if tree.kind(set) == Some(Kind::Sfv) && tree.vouched_above(node) {
-            Vec::new()
-        } else {
-            found
-        };
         self.tail = Some(ReturnTail {
             set,
             node,
@@ -1738,7 +2060,7 @@ impl NamespaceWriter {
             let mut sizes = Vec::new();
             for set in &covering {
                 if let Some(recovery) = tree.recovery(*set) {
-                    recovery.block_sizes(&mut sizes);
+                    recovery.block_sizes(member, &mut sizes);
                 }
             }
             let cuts = block_cuts(range, &mut sizes);
@@ -1780,7 +2102,7 @@ impl NamespaceWriter {
         // each set read, cut wherever the read back cut them, which a set's
         // fold cannot tell from a change. Only bytes the namespace did not
         // hold, a repair's among them, take a ruling back.
-        for set in covering {
+        for &set in &covering {
             if self
                 .acknowledging
                 .as_ref()
@@ -1788,6 +2110,30 @@ impl NamespaceWriter {
             {
                 tree.feed_proven(set, member, &self.segments);
             } else {
+                tree.feed(set, member, &self.segments);
+            }
+        }
+        for set in covering {
+            self.feed_moved(tree, segments, arrival.node, set);
+        }
+    }
+
+    // A member a set came to describe after some of its bytes arrived is
+    // said again for that set, as far as the source still keeps its
+    // checksums. A set learns what it describes as its own volumes arrive,
+    // so the namespace asks after a bind, after it feeds the set and before
+    // it rules it: the set reads back only what the source no longer
+    // vouches for.
+    // A set with nothing to ask for is only read, so its row is not marked.
+    fn feed_moved(&mut self, tree: &mut Tree, segments: &dyn Segments, node: NodeId, set: NodeId) {
+        if !tree.recovery(set).is_some_and(|recovery| recovery.moved()) {
+            return;
+        }
+        let mut unfed = Vec::new();
+        tree.with_recovery(set, |recovery, _| recovery.unfed(&mut unfed));
+        for member in unfed {
+            self.early_evidence(tree, segments, node, member);
+            if !self.segments.is_empty() {
                 tree.feed(set, member, &self.segments);
             }
         }
@@ -1835,6 +2181,30 @@ impl NamespaceWriter {
         }
     }
 
+    // The source's checksums of each member the set asks for, as it asks:
+    // whatever is kept of them, once. Nothing is read back for it.
+    fn answer_evidence(
+        &mut self,
+        tree: &mut Tree,
+        segments: &dyn Segments,
+        node: NodeId,
+        sets: &[NodeId],
+        set: NodeId,
+    ) {
+        let mut wanted = Vec::new();
+        if let (Some(recovery), Some(namespace)) = (tree.recovery(set), tree.namespace(node)) {
+            let covered = |member| self.covering(tree, sets, member).next().is_some();
+            recovery.evidence(namespace, &covered, &mut wanted);
+        }
+        for member in wanted {
+            self.early_evidence(tree, segments, node, member);
+            let evidence = &self.segments;
+            tree.with_recovery(set, |recovery, namespace| {
+                recovery.evidenced(namespace, member, evidence);
+            });
+        }
+    }
+
     // Let every set of the namespace match its members again, after the
     // members, their lengths or their first bytes changed. A set that names
     // a member just founded in a namespace bound here, or beside here, moves
@@ -1876,37 +2246,46 @@ impl NamespaceWriter {
         if sets.is_empty() {
             return Ok(());
         }
-        let members: Vec<MemberId> = tree
-            .namespace(node)
-            .map(|namespace| namespace.members().map(|member| member.id).collect())
-            .unwrap_or_default();
         let mut renamed = std::mem::take(&mut self.renamed);
         renamed.clear();
         for &set in sets {
+            self.answer_evidence(tree, segments, node, sets, set);
             let newly = tree
                 .with_recovery(set, |recovery, namespace| {
-                    // A member covered before the bind is not newly
-                    // covered by it, so only the others' names before the
-                    // bind are kept.
-                    let uncovered: Vec<(MemberId, String)> = members
-                        .iter()
-                        .filter(|member| !recovery.covers(**member))
-                        .map(|member| {
-                            #[cfg(any(test, feature = "pipeline-test-fixtures"))]
-                            NAMES_KEPT.with(|kept| kept.set(kept.get() + 1));
-                            let name = namespace
-                                .get(*member)
-                                .map(|record| record.name.clone())
-                                .unwrap_or_default();
-                            (*member, name)
-                        })
+                    // Under the fixtures, what the set newly covers found
+                    // as it was before sets reported it: every member not
+                    // covered before the bind and covered after it.
+                    #[cfg(feature = "pipeline-test-fixtures")]
+                    let walked: Vec<(MemberId, String)> = namespace
+                        .members()
+                        .filter(|member| !recovery.covers(member.id))
+                        .map(|member| (member.id, member.name.clone()))
                         .collect();
                     let earlier = renamed.len();
                     recovery.bind(namespace, &mut renamed);
+                    // What the set says its bind newly covered, by the
+                    // names before it, in member order and listed members
+                    // only, as the namespace's members are.
+                    let mut reported = Vec::new();
+                    recovery.take_newly(&mut reported);
+                    reported.retain(|(member, _)| namespace.lists(*member));
+                    reported.sort_by_key(|(member, _)| *member);
+                    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
+                    NAMES_KEPT.with(|kept| kept.set(kept.get() + reported.len()));
+                    #[cfg(feature = "pipeline-test-fixtures")]
+                    {
+                        let walked: Vec<(MemberId, String)> = walked
+                            .into_iter()
+                            .filter(|(member, _)| recovery.covers(*member))
+                            .collect();
+                        assert_eq!(
+                            reported, walked,
+                            "a set reports what its bind newly covered"
+                        );
+                    }
                     let by_content = &renamed[earlier..];
-                    uncovered
+                    reported
                         .into_iter()
-                        .filter(|(member, _)| recovery.covers(*member))
                         .map(|(member, name)| {
                             let described = namespace
                                 .get(member)
@@ -1944,6 +2323,7 @@ impl NamespaceWriter {
                     tree.with_recovery(set, |recovery, _| recovery.feed(member, evidence));
                 }
             }
+            self.feed_moved(tree, segments, node, set);
         }
         // A member a set renamed in its namespace wants that name now; the
         // tree's ledger places it, and the claims the name makes again,
@@ -1985,12 +2365,13 @@ impl NamespaceWriter {
                 .is_some_and(|files| files.leaves.contains_key(member));
             if let Some(length) = length.filter(|_| has_file) {
                 self.admit_file(tree, node, *member, length, 0)?;
+                let keeps = self.keeps_changes(node, *member);
                 if let Some(leaf) = self
                     .files
                     .get_mut(&node)
                     .and_then(|files| files.leaves.get_mut(member))
                 {
-                    leaf.close(LoopSite::BindSets, length)?;
+                    leaf.close(LoopSite::BindSets, length, keeps)?;
                 }
             }
         }
@@ -2083,9 +2464,8 @@ fn pending_covers(
     namespace: &weaver_graph::Namespace,
     sets: &[NodeId],
 ) -> Vec<(NodeId, BTreeSet<MemberId>)> {
-    let aside = Aside::of(tree, sets);
     sets.iter()
-        .filter(|&&set| !aside.yields(set))
+        .filter(|&&set| !aside(tree, set))
         .filter_map(|&set| {
             let covers: BTreeSet<MemberId> = match tree.recovery(set) {
                 Some(recovery) if recovery.outcome().is_none() => namespace
@@ -2105,49 +2485,12 @@ fn pending_covers(
         .collect()
 }
 
-// A set that only checks, as an SFV listing does, stands aside while a set
-// beside it that rebuilds can rule: one among the namespace's `sets` that
-// knows what each of its sets describes, or, out on a repair, covered a
-// member when it left. Each set says for itself whether it rebuilds. A set
-// carried inside the one member it covers, as a RAR volume's own record
-// is, repairs that member alone, and the listing still rules the others.
-// The listing does not rule, is never lent, and no byte reaches it, so it
-// takes back no ruling and makes no other set rule again. With no such
-// set, as when its index never came or does not read, the listing rules as
-// before.
-//
-// Whether such parity is there is one answer for the whole namespace: it is
-// found the first time a listing asks, and never again in the same pass,
-// however many listings the namespace holds. A namespace with no listing
-// never looks.
-struct Aside<'t> {
-    tree: &'t Tree,
-    sets: &'t [NodeId],
-    parity: std::cell::OnceCell<bool>,
-}
-
-impl<'t> Aside<'t> {
-    fn of(tree: &'t Tree, sets: &'t [NodeId]) -> Self {
-        Self {
-            tree,
-            sets,
-            parity: std::cell::OnceCell::new(),
-        }
-    }
-
-    fn yields(&self, set: NodeId) -> bool {
-        !self.tree.rebuilds(set)
-            && *self.parity.get_or_init(|| {
-                self.sets.iter().any(|&other| {
-                    self.tree.rebuilds(other)
-                        && !self.tree.carried_inside(other)
-                        && match self.tree.recovery(other) {
-                            Some(recovery) => !recovery.undescribed(),
-                            None => self.tree.lent_covers_any(other),
-                        }
-                })
-            })
-    }
+// A set that only checks, as an SFV listing does, always stands aside: it
+// binds, and may name what it lists, but it is never fed, never repairs,
+// never rules, vouches or proves, and never waits a job. Each set says for
+// itself whether it rebuilds.
+fn aside(tree: &Tree, set: NodeId) -> bool {
+    !tree.rebuilds(set)
 }
 
 // How many of the set's own volumes are closed.
@@ -2192,10 +2535,19 @@ fn proven_open(tree: &Tree, node: NodeId, member: MemberId) -> bool {
         })
 }
 
-// Whether the recovery object covers some member of the namespace.
+// Whether the recovery object covers some member of the namespace, as it
+// keeps what it covers.
 fn covers_any(tree: &Tree, node: NodeId, recovery: &dyn Recovery) -> bool {
-    tree.namespace(node)
-        .is_some_and(|namespace| namespace.members().any(|member| recovery.covers(member.id)))
+    tree.namespace(node).is_some_and(|namespace| {
+        let covers = recovery.covers_any_of(namespace);
+        #[cfg(any(test, feature = "pipeline-test-fixtures"))]
+        assert_eq!(
+            covers,
+            namespace.members().any(|member| recovery.covers(member.id)),
+            "covers any"
+        );
+        covers
+    })
 }
 
 // A recovery object is bound in the namespace of the member it names. One

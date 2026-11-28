@@ -76,22 +76,22 @@ export type FlowTarget =
 
 /** The flow's colours: the theme's own tokens, as literal values. The accent stays a variable. */
 const INK = {
-  ground: "#1a1b1e",
-  card: "#1f2024",
-  row: "#191a1d",
-  rowActive: "#1f2b29",
-  line: "#2a2b30",
-  control: "#3a3b41",
-  fg: "#ecebe6",
-  secondary: "#d6d3cc",
-  muted: "#a09d96",
-  faint: "#84817a",
+  ground: "var(--color-wv-app)",
+  card: "var(--color-wv-chrome)",
+  row: "var(--color-wv-input)",
+  rowActive: "var(--color-wv-ok-bg)",
+  line: "var(--color-wv-line-strong)",
+  control: "var(--color-wv-control)",
+  fg: "var(--color-wv-fg)",
+  secondary: "var(--color-wv-secondary)",
+  muted: "var(--color-wv-muted)",
+  faint: "var(--color-wv-faint)",
   accent: "var(--wv-accent)",
-  warn: "#d3a43e",
-  track: "#3d3e45",
+  warn: "var(--color-wv-warn)",
+  track: "var(--color-wv-track-dash)",
   /** DNS: the lookups, the boxes they leave from and the servers that answer them. */
-  dns: "#5aa2ec",
-  dnsFill: "#1b2633",
+  dns: "var(--color-wv-dns)",
+  dnsFill: "var(--color-wv-dns-fill)",
 } as const;
 const FONT =
   '"Fira Code Variable", ui-monospace, "SFMono-Regular", Menlo, monospace';

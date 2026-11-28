@@ -18,6 +18,15 @@ export const EGRESS_QUOTAS_QUERY = gql`
     }
   }
 `;
+/** Every egress's own limits and caps, and what each update of it sends back. */
+export const EGRESS_LIMITS_QUERY = gql`
+  query EgressLimits {
+    egressInterfaces {
+      id name bindingKind interfaceName sourceAddress enabled downloadBps uploadBps
+      ${QUOTA_FIELDS}
+    }
+  }
+`;
 /** The limits over every egress together. */
 export const BANDWIDTH_QUERY = gql`
   query Bandwidth {

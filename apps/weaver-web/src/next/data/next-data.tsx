@@ -128,6 +128,7 @@ interface LiveMetricsSnapshot {
     pausedClasses?: string[];
     speedLimitBytesPerSec: number | null;
     resumeAtEpochMs?: number | null;
+    classResumes?: { class: string; resumeAtEpochMs: number }[];
     downloadBlock: DownloadBlockState & { diskVolumes?: DiskVolume[] };
   };
   providerHoldoffs?: ProviderHoldoff[];
@@ -174,6 +175,8 @@ export interface NextData {
   torrentPresence: TorrentPresence | undefined;
   /** When a timed pause resumes on its own, in epoch milliseconds; null when none is set. */
   resumeAt: number | null;
+  /** When the timed pause of every torrent lifts, in epoch milliseconds; null when none is set. */
+  torrentsResumeAt: number | null;
   /** The configured download limit in bytes per second; null is no limit, and 0 lets nothing through. */
   speedLimit: number | null;
   downloadBlock: DownloadBlockState;
@@ -594,6 +597,9 @@ export function NextDataProvider({ children }: { children: ReactNode }) {
     sameClasses,
   );
   const resumeAt = globalState?.resumeAtEpochMs ?? null;
+  const torrentsResumeAt =
+    globalState?.classResumes?.find((resume) => resume.class === "TORRENT")
+      ?.resumeAtEpochMs ?? null;
   const speedLimit = globalState?.speedLimitBytesPerSec ?? null;
   const categories = categoryData?.categories ?? EMPTY_CATEGORIES;
   const refreshCategories = useCallback(
@@ -653,6 +659,7 @@ export function NextDataProvider({ children }: { children: ReactNode }) {
       torrents,
       torrentPresence,
       resumeAt,
+      torrentsResumeAt,
       speedLimit,
       downloadBlock,
       diskVolumes,
@@ -687,6 +694,7 @@ export function NextDataProvider({ children }: { children: ReactNode }) {
       refreshCategories,
       refreshDnsProfiles,
       resumeAt,
+      torrentsResumeAt,
       refreshHistoryCount,
       speed,
       speedLimit,

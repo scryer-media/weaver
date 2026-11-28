@@ -102,7 +102,7 @@ pub(super) fn test_lease(
         completion_critical: false,
         effective_exclude_servers: exclude_servers,
         dial_exclude_servers: exclude_servers,
-        checkpoint_plan: weaver_yenc::CheckpointPlan::None,
+        checkpoint_plans: Default::default(),
         pressure_clear: true,
         repeated: None,
         works,

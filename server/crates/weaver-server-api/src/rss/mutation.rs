@@ -6,8 +6,9 @@ use regex::Regex;
 use weaver_server_core::rss::RssPersistenceQueries;
 use weaver_server_core::rss::RssQueries;
 
-use crate::auth::AdminGuard;
+use crate::auth::{AdminGuard, graphql_error, invalid_input, not_found};
 use crate::jobs::types::MetadataInput;
+use crate::observability::{spawn_blocking_with, state_error};
 use crate::rss::RssService;
 use crate::rss::types::{
     RssFeed, RssFeedInput, RssRule, RssRuleActionGql, RssRuleInput, RssSyncReport,
@@ -29,7 +30,7 @@ impl RssMutation {
             .data::<RssService>()?
             .preview_feed(id)
             .await
-            .map_err(|error| async_graphql::Error::new(error.to_string()))?;
+            .map_err(rss_service_error)?;
         Ok(rows
             .iter()
             .map(crate::rss::types::RssSeenItem::from_row)
@@ -55,24 +56,25 @@ impl RssMutation {
         )?;
 
         let db = ctx.data::<Database>()?.clone();
-        let feed = tokio::task::spawn_blocking(move || {
-            weaver_server_core::post_processing::feed::validate_feed_script_selection(
-                &db,
-                input.scripts.as_deref().unwrap_or_default(),
-            )?;
-            let id = db.next_rss_feed_id()?;
-            let row = rss_feed_row_from_create(id, input);
-            db.insert_rss_feed_with_routing(&row, routing.as_ref())?;
-            let rules = db
-                .list_rss_rules(row.id)?
-                .iter()
-                .map(RssRule::from_row)
-                .collect();
-            Ok::<_, weaver_server_core::StateError>(RssFeed::from_row(&row, rules))
-        })
-        .await
-        .map_err(|e| async_graphql::Error::new(e.to_string()))?
-        .map_err(crate::observability::state_error)?;
+        let feed = spawn_blocking_with(
+            move || {
+                weaver_server_core::post_processing::feed::validate_feed_script_selection(
+                    &db,
+                    input.scripts.as_deref().unwrap_or_default(),
+                )?;
+                let id = db.next_rss_feed_id()?;
+                let row = rss_feed_row_from_create(id, input);
+                db.insert_rss_feed_with_routing(&row, routing.as_ref())?;
+                let rules = db
+                    .list_rss_rules(row.id)?
+                    .iter()
+                    .map(RssRule::from_row)
+                    .collect();
+                Ok::<_, weaver_server_core::StateError>(RssFeed::from_row(&row, rules))
+            },
+            state_error,
+        )
+        .await?;
 
         crate::proxies::refresh(ctx).await?;
         Ok(feed)
@@ -102,28 +104,32 @@ impl RssMutation {
         )?;
 
         let db = ctx.data::<Database>()?.clone();
-        let feed = tokio::task::spawn_blocking(move || {
-            let Some(existing) = db.get_rss_feed(id)? else {
-                return Err(weaver_server_core::StateError::Database(format!(
-                    "RSS feed {id} not found"
-                )));
-            };
-            let row = rss_feed_row_from_update(existing, input);
-            weaver_server_core::post_processing::feed::validate_feed_script_selection(
-                &db,
-                &row.scripts,
-            )?;
-            db.update_rss_feed_with_routing(&row, routing.as_ref())?;
-            let rules = db
-                .list_rss_rules(row.id)?
-                .iter()
-                .map(RssRule::from_row)
-                .collect();
-            Ok::<_, weaver_server_core::StateError>(RssFeed::from_row(&row, rules))
-        })
-        .await
-        .map_err(|e| async_graphql::Error::new(e.to_string()))?
-        .map_err(crate::observability::state_error)?;
+        let feed = spawn_blocking_with(
+            move || {
+                let Some(existing) = db.get_rss_feed(id).map_err(state_error)? else {
+                    return Err(not_found(format!(
+                        "database error: RSS feed {id} not found"
+                    )));
+                };
+                let row = rss_feed_row_from_update(existing, input);
+                weaver_server_core::post_processing::feed::validate_feed_script_selection(
+                    &db,
+                    &row.scripts,
+                )
+                .map_err(state_error)?;
+                db.update_rss_feed_with_routing(&row, routing.as_ref())
+                    .map_err(state_error)?;
+                let rules = db
+                    .list_rss_rules(row.id)
+                    .map_err(state_error)?
+                    .iter()
+                    .map(RssRule::from_row)
+                    .collect();
+                Ok(RssFeed::from_row(&row, rules))
+            },
+            |error| error,
+        )
+        .await?;
 
         crate::proxies::refresh(ctx).await?;
         Ok(feed)
@@ -139,10 +145,7 @@ impl RssMutation {
             None => None,
         };
         let db = ctx.data::<Database>()?.clone();
-        let deleted = tokio::task::spawn_blocking(move || db.delete_rss_feed(id))
-            .await
-            .map_err(|e| async_graphql::Error::new(e.to_string()))?
-            .map_err(|e| async_graphql::Error::new(e.to_string()))?;
+        let deleted = spawn_blocking_with(move || db.delete_rss_feed(id), state_error).await?;
         crate::proxies::refresh(ctx).await?;
         Ok(deleted)
     }
@@ -157,20 +160,21 @@ impl RssMutation {
         validate_rule_input(&input)?;
 
         let db = ctx.data::<Database>()?.clone();
-        tokio::task::spawn_blocking(move || {
-            if db.get_rss_feed(feed_id)?.is_none() {
-                return Err(weaver_server_core::StateError::Database(format!(
-                    "RSS feed {feed_id} not found"
-                )));
-            }
-            let id = db.next_rss_rule_id()?;
-            let row = rss_rule_row_from_input(id, feed_id, input);
-            db.insert_rss_rule(&row)?;
-            Ok::<_, weaver_server_core::StateError>(RssRule::from_row(&row))
-        })
+        spawn_blocking_with(
+            move || {
+                if db.get_rss_feed(feed_id).map_err(state_error)?.is_none() {
+                    return Err(not_found(format!(
+                        "database error: RSS feed {feed_id} not found"
+                    )));
+                }
+                let id = db.next_rss_rule_id().map_err(state_error)?;
+                let row = rss_rule_row_from_input(id, feed_id, input);
+                db.insert_rss_rule(&row).map_err(state_error)?;
+                Ok(RssRule::from_row(&row))
+            },
+            |error| error,
+        )
         .await
-        .map_err(|e| async_graphql::Error::new(e.to_string()))?
-        .map_err(|e| async_graphql::Error::new(e.to_string()))
     }
     /// Update an RSS rule.
     #[graphql(guard = "AdminGuard")]
@@ -183,28 +187,26 @@ impl RssMutation {
         validate_rule_input(&input)?;
 
         let db = ctx.data::<Database>()?.clone();
-        tokio::task::spawn_blocking(move || {
-            let Some(existing) = db.get_rss_rule(id)? else {
-                return Err(weaver_server_core::StateError::Database(format!(
-                    "RSS rule {id} not found"
-                )));
-            };
-            let row = rss_rule_row_from_input(id, existing.feed_id, input);
-            db.update_rss_rule(&row)?;
-            Ok::<_, weaver_server_core::StateError>(RssRule::from_row(&row))
-        })
+        spawn_blocking_with(
+            move || {
+                let Some(existing) = db.get_rss_rule(id).map_err(state_error)? else {
+                    return Err(not_found(format!(
+                        "database error: RSS rule {id} not found"
+                    )));
+                };
+                let row = rss_rule_row_from_input(id, existing.feed_id, input);
+                db.update_rss_rule(&row).map_err(state_error)?;
+                Ok(RssRule::from_row(&row))
+            },
+            |error| error,
+        )
         .await
-        .map_err(|e| async_graphql::Error::new(e.to_string()))?
-        .map_err(|e| async_graphql::Error::new(e.to_string()))
     }
     /// Delete an RSS rule.
     #[graphql(guard = "AdminGuard")]
     async fn delete_rss_rule(&self, ctx: &Context<'_>, id: u32) -> Result<bool> {
         let db = ctx.data::<Database>()?.clone();
-        let deleted = tokio::task::spawn_blocking(move || db.delete_rss_rule(id))
-            .await
-            .map_err(|e| async_graphql::Error::new(e.to_string()))?
-            .map_err(|e| async_graphql::Error::new(e.to_string()))?;
+        let deleted = spawn_blocking_with(move || db.delete_rss_rule(id), state_error).await?;
         Ok(deleted)
     }
     /// Run RSS sync immediately for all enabled feeds or one specific feed.
@@ -215,7 +217,7 @@ impl RssMutation {
             Some(feed_id) => rss.run_feed_sync(feed_id).await,
             None => rss.run_all_sync().await,
         }
-        .map_err(|e| async_graphql::Error::new(e.to_string()))?;
+        .map_err(rss_service_error)?;
         Ok(RssSyncReport::from_domain(&report))
     }
     /// Forget one seen RSS item so it can be reconsidered on a future sync.
@@ -227,19 +229,18 @@ impl RssMutation {
         item_id: String,
     ) -> Result<bool> {
         let db = ctx.data::<Database>()?.clone();
-        tokio::task::spawn_blocking(move || db.delete_rss_seen_item(feed_id, &item_id))
-            .await
-            .map_err(|e| async_graphql::Error::new(e.to_string()))?
-            .map_err(|e| async_graphql::Error::new(e.to_string()))
+        spawn_blocking_with(
+            move || db.delete_rss_seen_item(feed_id, &item_id),
+            state_error,
+        )
+        .await
     }
     /// Clear seen RSS items, either globally or for one feed.
     #[graphql(guard = "AdminGuard")]
     async fn clear_rss_seen_items(&self, ctx: &Context<'_>, feed_id: Option<u32>) -> Result<u32> {
         let db = ctx.data::<Database>()?.clone();
-        let cleared = tokio::task::spawn_blocking(move || db.clear_rss_seen_items(feed_id))
-            .await
-            .map_err(|e| async_graphql::Error::new(e.to_string()))?
-            .map_err(|e| async_graphql::Error::new(e.to_string()))?;
+        let cleared =
+            spawn_blocking_with(move || db.clear_rss_seen_items(feed_id), state_error).await?;
         Ok(cleared as u32)
     }
 
@@ -248,11 +249,11 @@ impl RssMutation {
 
 fn validate_feed_input(input: &RssFeedInput) -> Result<()> {
     let url = reqwest::Url::parse(&input.url)
-        .map_err(|e| async_graphql::Error::new(format!("invalid RSS feed URL: {e}")))?;
+        .map_err(|e| invalid_input(format!("invalid RSS feed URL: {e}")))?;
     match url.scheme() {
         "http" | "https" => {}
         other => {
-            return Err(async_graphql::Error::new(format!(
+            return Err(invalid_input(format!(
                 "unsupported RSS feed URL scheme: {other}"
             )));
         }
@@ -260,22 +261,19 @@ fn validate_feed_input(input: &RssFeedInput) -> Result<()> {
     if let Some(interval) = input.poll_interval_secs
         && interval == 0
     {
-        return Err(async_graphql::Error::new(
-            "poll_interval_secs must be greater than 0",
-        ));
+        return Err(invalid_input("poll_interval_secs must be greater than 0"));
     }
     Ok(())
 }
 
 fn validate_rule_input(input: &RssRuleInput) -> Result<()> {
     if let Some(pattern) = &input.title_regex {
-        Regex::new(pattern)
-            .map_err(|e| async_graphql::Error::new(format!("invalid title_regex: {e}")))?;
+        Regex::new(pattern).map_err(|e| invalid_input(format!("invalid title_regex: {e}")))?;
     }
     if let (Some(min), Some(max)) = (input.min_size_bytes, input.max_size_bytes)
         && min > max
     {
-        return Err(async_graphql::Error::new(
+        return Err(invalid_input(
             "min_size_bytes cannot be greater than max_size_bytes",
         ));
     }
@@ -376,5 +374,52 @@ fn merge_optional_string(existing: Option<String>, incoming: Option<String>) -> 
     match incoming {
         Some(value) => normalize_optional_string(Some(value)),
         None => existing,
+    }
+}
+
+// A feed preview or sync that failed, worded as it stands: a feed that is
+// not there, one that could not be fetched or read, or routes mid-reload.
+fn rss_service_error(error: crate::rss::RssServiceError) -> async_graphql::Error {
+    use crate::rss::RssServiceError;
+    match error {
+        RssServiceError::FeedNotFound(_) => not_found(error.to_string()),
+        RssServiceError::Parse(_) | RssServiceError::Http(_) => {
+            graphql_error("FEED_UNREADABLE", error.to_string())
+        }
+        RssServiceError::RoutesChanging => graphql_error("CONFLICT", error.to_string()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::rss::RssServiceError;
+
+    // A feed that could not be fetched or read is unreadable, a reload of the
+    // routes is a conflict, and a missing feed is not found. Each keeps its
+    // sentence.
+    #[test]
+    fn each_feed_failure_carries_the_code_of_its_kind() {
+        let cases = [
+            (RssServiceError::FeedNotFound(4), "NOT_FOUND"),
+            (
+                RssServiceError::Parse("no channel".into()),
+                "FEED_UNREADABLE",
+            ),
+            (
+                RssServiceError::Http("status 503".into()),
+                "FEED_UNREADABLE",
+            ),
+            (RssServiceError::RoutesChanging, "CONFLICT"),
+        ];
+        for (error, code) in cases {
+            let message = error.to_string();
+            let refused = rss_service_error(error);
+            assert_eq!(refused.message, message);
+            assert_eq!(
+                refused.extensions.as_ref().and_then(|ext| ext.get("code")),
+                Some(&async_graphql::Value::from(code))
+            );
+        }
     }
 }

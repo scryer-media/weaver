@@ -378,7 +378,7 @@ test("a server with no torrent ever reads as no torrents", () => {
     rangeEnd: "2026-11-03",
     total: { ...ledger("torrent", "", {}), allTime: counted("", all) },
     trackers: [],
-    peers: { torrents, connected: 0, seeds: 0 },
+    live: { torrents, connectedPeers: 0, connectedSeeds: 0 },
   });
   assert.equal(noTorrents(history({})), true);
   assert.equal(noTorrents(history({}, 1)), false);

@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
+mod bind_due;
+mod bind_members;
 mod carriers;
 mod countless_names;
 mod cross_sets;
@@ -412,8 +414,11 @@ fn evidence_fed_piece_by_piece_says_what_one_fold_of_the_whole_does() {
         }
         let mut whole = job(&files);
         let other = whole.member("payload.bin", bytes);
-        feed(&mut whole, other, bytes, None);
         bind(&mut whole);
+        feed(&mut whole, other, bytes, None);
+        // Every verdict thrown away and folded afresh from the grid.
+        let key = whole.object.order[0];
+        whole.object.fold_set(key);
         let seen = verdicts(&piecewise, member);
         assert_eq!(seen, verdicts(&whole, other));
         assert_eq!(seen.contains(&SliceVerdict::Damaged), damaged);
@@ -541,6 +546,122 @@ fn two_sets_in_one_namespace_bind_and_repair_apart() {
     ));
     assert!(job.store.members[&second] == two);
     assert!(job.store.members[&first] == one);
+}
+
+// Each member's evidence is kept on the slices of the set that binds it,
+// and on no other set's: sets of other slice sizes cost it nothing.
+#[test]
+fn a_member_is_recorded_on_the_slices_of_its_own_set_alone() {
+    let one = payload(41, 5000);
+    let two = payload(42, 6000);
+    let mut files = par2_set("first", &[("one.bin", &one)], BLOCK, 2, 1);
+    files.extend(par2_set("second", &[("two.bin", &two)], 1024, 2, 1));
+    let mut job = job(&files);
+    let first = job.member("one.bin", &one);
+    let second = job.member("two.bin", &two);
+    bind(&mut job);
+    feed(&mut job, first, &one, None);
+    feed(&mut job, second, &two, None);
+    assert_eq!(
+        job.object.grid.sizes(first),
+        vec![BLOCK, crate::grid::WHOLE]
+    );
+    assert_eq!(
+        job.object.grid.sizes(second),
+        vec![1024, crate::grid::WHOLE]
+    );
+    for member in [first, second] {
+        assert!(
+            verdicts(&job, member)
+                .iter()
+                .all(|verdict| *verdict == SliceVerdict::Intact)
+        );
+    }
+    assert_eq!(
+        job.object
+            .repair(&mut job.store, weaver_graph::Budget::default()),
+        RepairOutcome::Clean
+    );
+    assert_eq!((job.store.reads, job.store.volume_reads), (0, 0));
+}
+
+// A member two sets describe is recorded on the slices of both, so the
+// set that cannot rebuild it gives it to one that already holds what
+// arrived: nothing is asked for again, and nothing is unknown to it.
+#[test]
+fn a_member_that_moves_to_a_set_of_other_slices_takes_its_evidence_along() {
+    let shared = payload(43, 5000);
+    let mut files = par2_set("first", &[("shared.bin", &shared)], BLOCK, 1, 1);
+    files.extend(par2_set("second", &[("shared.bin", &shared)], 1024, 4, 1));
+    let mut job = job(&files);
+    let member = job.member("shared.bin", &shared);
+    bind(&mut job);
+    let (first, second) = (job.object.order[0], job.object.order[1]);
+    assert!(job.object.sets[&first].bound(member).is_some());
+    // Two of the first set's slices, one of the second's.
+    let lost = ByteRange::new(400, 600);
+    let mut pieces = segments(0, &shared, ARTICLE, BLOCK, true);
+    for piece in &mut pieces {
+        piece.verified = piece.range.intersect(lost).is_none();
+    }
+    // Cut at the first set's slices, which the second's are made of.
+    job.object.feed(member, &pieces);
+    assert_eq!(
+        job.object.grid.sizes(member),
+        vec![BLOCK, 1024, crate::grid::WHOLE]
+    );
+    Recovery::refused(&mut job.object, member, lost);
+    assert!(job.object.sets[&first].bound(member).is_none());
+    assert!(job.object.sets[&second].bound(member).is_some());
+    let mut unfed = Vec::new();
+    job.object.unfed(&mut unfed);
+    assert!(unfed.is_empty(), "the second set holds what arrived");
+    let said = verdicts(&job, member);
+    assert_eq!(said.len(), 5);
+    assert!(
+        said[1..]
+            .iter()
+            .all(|verdict| *verdict == SliceVerdict::Intact)
+    );
+}
+
+// A set whose index comes after a member's bytes describes a member the
+// first set binds. What arrived was recorded on the first set's slices
+// alone, so the member is asked for again, once, and said again it is
+// recorded on the later set's slices too.
+#[test]
+fn a_set_that_comes_to_describe_a_member_asks_for_what_came_before() {
+    let shared = payload(44, 5000);
+    let first = par2_set("first", &[("shared.bin", &shared)], BLOCK, 1, 1);
+    let second = par2_set("second", &[("shared.bin", &shared)], 1024, 4, 1);
+    let mut job = job(&first);
+    let member = job.member("shared.bin", &shared);
+    bind(&mut job);
+    feed(&mut job, member, &shared, None);
+    assert_eq!(
+        job.object.grid.sizes(member),
+        vec![BLOCK, crate::grid::WHOLE]
+    );
+    let mut unfed = Vec::new();
+    job.object.unfed(&mut unfed);
+    assert!(unfed.is_empty(), "one set describes it");
+    for (name, bytes) in &second {
+        job.volume(name, bytes, ARTICLE as usize, false);
+    }
+    bind(&mut job);
+    assert!(job.object.moved());
+    job.object.unfed(&mut unfed);
+    assert_eq!(unfed, vec![member]);
+    job.object
+        .feed(member, &segments(0, &shared, ARTICLE, 1024, true));
+    assert_eq!(
+        job.object.grid.sizes(member),
+        vec![BLOCK, 1024, crate::grid::WHOLE]
+    );
+    unfed.clear();
+    job.object.unfed(&mut unfed);
+    assert!(unfed.is_empty(), "asked for once");
+    assert!(!job.object.moved());
 }
 
 #[test]
@@ -1187,6 +1308,93 @@ fn a_described_file_no_member_carries_is_named_and_rebuilt_whole() {
     );
     assert!(job.store.members[&rebuilt] == absent);
     assert!(job.store.members[&member] == carried);
+}
+
+// Naming what no member carries asks once per such file whether it was
+// listed, whatever the list already holds: of forty described files, one
+// carried and one listed by the caller, the thirty-nine others are each
+// asked once and the thirty-eight not listed are named, in set order.
+#[test]
+fn naming_absent_files_asks_once_per_file() {
+    let payloads: Vec<(String, Vec<u8>)> = (0..40u8)
+        .map(|at| {
+            (
+                format!("f{at:02}.bin"),
+                payload(40 + u64::from(at), 600 + usize::from(at)),
+            )
+        })
+        .collect();
+    let described: Vec<(&str, &[u8])> = payloads
+        .iter()
+        .map(|(name, bytes)| (name.as_str(), bytes.as_slice()))
+        .collect();
+    let files = par2_set("set", &described, BLOCK, 4, 1);
+    let mut job = job(&files);
+    let member = job.member("f00.bin", &payloads[0].1);
+    bind(&mut job);
+    feed(&mut job, member, &payloads[0].1, None);
+    let seeded = ("f01.bin".to_string(), payloads[1].1.len() as u64);
+    let mut named = vec![seeded.clone()];
+    super::ABSENT_PROBES.with(|probes| probes.set(0));
+    job.object.absent(&mut named);
+    assert_eq!(super::ABSENT_PROBES.with(std::cell::Cell::get), 39);
+    let mut expected = vec![seeded];
+    let mut rest: Vec<(String, u64)> = payloads[2..]
+        .iter()
+        .map(|(name, bytes)| (name.clone(), bytes.len() as u64))
+        .collect();
+    let mut order = Vec::new();
+    job.object.absent_by_scan(&mut order);
+    // The set's own order, which the walk it replaces keeps.
+    rest.sort_by_key(|entry| order.iter().position(|listed| listed == entry));
+    expected.extend(rest);
+    assert_eq!(named, expected);
+}
+
+// Whether a set covers a member the namespace lists asks only the members
+// it covers, up to the first one listed: of forty bound, one asks one; with
+// the first gone from the namespace, two; with all gone, forty, and none
+// answers, as asking every member listed answers.
+#[test]
+fn covering_a_listed_member_asks_the_covered_members_only() {
+    let payloads: Vec<(String, Vec<u8>)> = (0..40u8)
+        .map(|at| {
+            let bytes = payload(90 + u64::from(at), 600 + usize::from(at));
+            (format!("f{at:02}.bin"), bytes)
+        })
+        .collect();
+    let described: Vec<(&str, &[u8])> = payloads
+        .iter()
+        .map(|(name, bytes)| (name.as_str(), bytes.as_slice()))
+        .collect();
+    let files = par2_set("set", &described, BLOCK, 4, 1);
+    let mut job = job(&files);
+    let members: Vec<MemberId> = payloads
+        .iter()
+        .map(|(name, bytes)| job.member(name, bytes))
+        .collect();
+    bind(&mut job);
+    let walk = |job: &Job<Par2>| {
+        job.namespace
+            .members()
+            .any(|member| job.object.covers(member.id))
+    };
+    let probed = |job: &Job<Par2>| {
+        super::COVER_PROBES.with(|probes| probes.set(0));
+        let covers = job.object.covers_any_of(&job.namespace);
+        (covers, super::COVER_PROBES.with(std::cell::Cell::get))
+    };
+    assert!(members.iter().all(|member| job.object.covers(*member)));
+    assert_eq!(probed(&job), (true, 1));
+    assert!(walk(&job));
+    job.namespace.remove(members[0]);
+    assert_eq!(probed(&job), (true, 2));
+    assert!(walk(&job));
+    for member in &members[1..] {
+        job.namespace.remove(*member);
+    }
+    assert_eq!(probed(&job), (false, 40));
+    assert!(!walk(&job));
 }
 
 // A posted file under a name no description answers to, its first article
