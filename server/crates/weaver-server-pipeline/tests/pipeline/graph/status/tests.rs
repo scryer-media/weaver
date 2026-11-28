@@ -1303,3 +1303,67 @@ fn a_short_delivery_names_the_repair_when_a_recovery_object_ruled_though_it_boun
         PipelineFailureStage::Repair
     );
 }
+
+// A delivery files the summary's sets once by their namespace and hands
+// each member's reader the sets of its namespace only. Twelve sets across
+// four namespaces, three to each and the first of each failed, one hundred
+// members asked in each: the filing reads twelve, and each member reads
+// its three sets and its one failed one, 12 + 400 × 4 = 1,612, where
+// reading every set for each member read the twelve five times over. Each
+// answer is the one reading every set gives; a namespace with sets never
+// asks what the post carried, and the root without sets asks.
+#[test]
+fn a_delivery_reads_each_members_namespace_sets_only() {
+    use crate::pipeline::graph::status::seams::{NamespaceSets, SET_READS};
+    const NAMESPACES: u32 = 4;
+    const EACH: u32 = 3;
+    const MEMBERS: usize = 100;
+    let sets: Vec<SetSummary> = (0..NAMESPACES * EACH)
+        .map(|at| {
+            let mut set = set(Kind::Par2, &format!("set{at}"));
+            set.node = NodeId(100 + at);
+            set.namespace = NodeId(1 + at / EACH);
+            // The second namespace's sets read nothing: it went unruled.
+            if at / EACH == 1 {
+                set.outcome = Some(RepairOutcome::Unread);
+            } else if at % EACH == 1 {
+                set.outcome = Some(RepairOutcome::Clean);
+            }
+            set
+        })
+        .collect();
+    let failed = |set: &SetSummary| (set.node.0 - 100).is_multiple_of(EACH);
+    SET_READS.with(|reads| reads.set(0));
+    let filed = NamespaceSets::new(&sets, failed);
+    for namespace in (1..=NAMESPACES).map(NodeId) {
+        let walk: Vec<&SetSummary> = sets
+            .iter()
+            .filter(|set| set.namespace == namespace)
+            .collect();
+        let failed_walk: Vec<&SetSummary> =
+            walk.iter().copied().filter(|set| failed(set)).collect();
+        let ruled = walk.iter().any(|set| {
+            set.outcome
+                .is_some_and(|outcome| outcome != RepairOutcome::Unread)
+        });
+        assert_eq!(ruled, namespace != NodeId(2), "{namespace:?}");
+        for _ in 0..MEMBERS {
+            assert_eq!(filed.of(namespace), &walk[..]);
+            assert_eq!(filed.failed_of(namespace), &failed_walk[..]);
+            assert_eq!(
+                filed.unruled(namespace, || panic!("asked what the post carried")),
+                !ruled
+            );
+        }
+    }
+    let members = MEMBERS * NAMESPACES as usize;
+    assert_eq!(
+        SET_READS.with(std::cell::Cell::get),
+        sets.len() + members * (EACH as usize + 1)
+    );
+    assert_eq!(SET_READS.with(std::cell::Cell::get), 1_612);
+    assert!(filed.unruled(NodeId::ROOT, || true));
+    assert!(!filed.unruled(NodeId::ROOT, || false));
+    assert!(!filed.unruled(NodeId(9), || true));
+    assert!(filed.of(NodeId::ROOT).is_empty());
+}

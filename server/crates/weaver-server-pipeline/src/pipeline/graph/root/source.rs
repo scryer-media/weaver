@@ -108,6 +108,14 @@ struct Open {
     // The volumes that began or stopped being waited on since the bootstrap
     // last read them.
     reopened: BTreeSet<VolumeIndex>,
+    // The volumes with an article the queue fetches unasked still to come:
+    // one waits that is not parked. Filed at the end of the two paths that
+    // change a state or a class, as it reads both `waiting` and the
+    // volume's `parked`.
+    to_come: BTreeSet<VolumeIndex>,
+    // Each volume that entered or left `to_come`, under the generation of
+    // its latest flip, for a reader that keeps what it derived from them.
+    come_flips: Marks<VolumeIndex>,
     // The volumes whose first article began or stopped being waited on
     // since the feed last read them. `None` until the feed first reads
     // them, when every volume counts as changed, so nothing is filed.
@@ -177,6 +185,9 @@ fn file_in<K: Ord>(
     }
 }
 
+// The most lost-seek witnesses a volume keeps.
+const WITNESSES: usize = 8;
+
 // The articles a seek's mapping looked at, for the tests that hold a mapping
 // to the articles it can move.
 fn count_examined(_examined: usize) {
@@ -184,10 +195,36 @@ fn count_examined(_examined: usize) {
     super::hooks::SEEK_EXAMINED.with(|count| count.set(count.get() + _examined));
 }
 
+// The articles a kept front looked at.
+fn count_front(_examined: usize) {
+    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
+    super::hooks::FRONT_EXAMINED.with(|count| count.set(count.get() + _examined));
+}
+
+// A seek its witness answered lost without a walk.
+fn count_witnessed() {
+    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
+    super::hooks::LOST_WITNESSED.with(|count| count.set(count.get() + 1));
+}
+
+// The lost articles a walk looked at and found none surely in the range.
+fn count_not_lost(_walked: usize) {
+    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
+    super::hooks::LOST_NOT_FOUND.with(|count| {
+        let (walks, examined) = count.get();
+        count.set((walks + 1, examined + _walked));
+    });
+}
+
 // The classes `Volume::raised` files: every class but the two `parkable` and
 // `parked` hold.
 fn is_raised(class: Class) -> bool {
     !matches!(class, Class::Ordinary | Class::Parked)
+}
+
+// The classes a recovery's own ask raises to, which decide its volume.
+fn is_asked(class: Class) -> bool {
+    matches!(class, Class::Critical | Class::Recovery)
 }
 
 #[derive(Debug)]
@@ -225,9 +262,21 @@ struct Volume {
     // can still move. Filed beside `parkable`, and a class with none has
     // no entry.
     raised: BTreeMap<Class, BTreeSet<usize>>,
+    // How many articles a recovery asked for, waiting or not: of the
+    // critical or recovery class. Kept by the one path that changes a class.
+    asked: usize,
+    // How many articles past the first are no longer waited on. Kept by the
+    // one path that changes a state.
+    settled_past_first: usize,
     // The articles carry no position of their own, so the volume can only
     // be placed in order, from the front.
     ordered_only: bool,
+    // How far the volume is in hand without a gap from its start, and how
+    // many of its first articles reach that far. Kept by the one path that
+    // changes a state: an arrival at the first article past them raises it,
+    // and a change among them reads them again.
+    front: u64,
+    front_len: usize,
     // The ordinals of the articles arrived at each decoded start. The last
     // of them holds the segments from that start to the next one.
     starts: BTreeMap<u64, BTreeSet<u32>>,
@@ -248,6 +297,14 @@ struct Volume {
     changes: u64,
     // The seeks answered since the last change, and what each was told.
     answered: HashMap<(ByteRange, Option<Class>), Pull>,
+    // For each seek last answered lost, the lost article that proved it.
+    // Not cleared by a change: a seek asked again tests its witness first,
+    // which stands while the article is still lost and still surely in the
+    // range, and is dropped when it no longer does. An entry exists only
+    // for a seek that was answered lost, and the whole map goes once the
+    // volume has no lost article. Not kept: a restored map starts with none.
+    // At most `WITNESSES` entries: one more clears it first.
+    lost_witness: HashMap<(ByteRange, Option<Class>), usize>,
 }
 
 impl Volume {
@@ -281,7 +338,11 @@ impl Volume {
             parked: BTreeSet::new(),
             parked_bytes: 0,
             raised: BTreeMap::new(),
+            asked: 0,
+            settled_past_first: 0,
             ordered_only: false,
+            front: 0,
+            front_len: 0,
             starts: BTreeMap::new(),
             cut: BTreeMap::new(),
             cuts: Vec::new(),
@@ -289,6 +350,7 @@ impl Volume {
             marks: Marks::default(),
             changes: 0,
             answered: HashMap::new(),
+            lost_witness: HashMap::new(),
         }
     }
 
@@ -311,6 +373,12 @@ impl Volume {
                 State::Waiting => self.settled_bytes - size,
                 _ => self.settled_bytes + size,
             };
+            if index > 0 {
+                self.settled_past_first = match state {
+                    State::Waiting => self.settled_past_first - 1,
+                    _ => self.settled_past_first + 1,
+                };
+            }
             if ordinal == self.articles[0].ordinal
                 && let Some(firsts) = open.firsts.as_mut()
             {
@@ -325,8 +393,13 @@ impl Volume {
         self.arrived_decoded = self.arrived_decoded - decoded(was) + decoded(state);
         open.in_hand = open.in_hand - decoded(was) + decoded(state);
         self.articles[index].state = state;
+        self.keep_front(index);
         open.file(self.at, index, state);
+        if !self.lost_witness.is_empty() && !open.lost.contains_key(&self.at) {
+            self.lost_witness = HashMap::new();
+        }
         self.file_parkable(index, self.articles[index].class);
+        self.file_to_come(open);
         self.marks.mark(Chunk::Articles(of_ordinal(ordinal)));
         let (from, to) = (start_of(was), start_of(state));
         if from == to {
@@ -367,7 +440,7 @@ impl Volume {
             .map_or(0, |ordinal| of_ordinal(*ordinal))
     }
 
-    fn set_class(&mut self, index: usize, class: Class) {
+    fn set_class(&mut self, open: &mut Open, index: usize, class: Class) {
         let article = &mut self.articles[index];
         if article.class == class {
             return;
@@ -375,9 +448,35 @@ impl Volume {
         let was = article.class;
         article.class = class;
         let chunk = of_ordinal(article.ordinal);
+        if is_asked(was) != is_asked(class) {
+            self.asked = if is_asked(class) {
+                self.asked + 1
+            } else {
+                self.asked - 1
+            };
+        }
         self.changed();
         self.file_parkable(index, was);
+        self.file_to_come(open);
         self.marks.mark(Chunk::Articles(chunk));
+    }
+
+    // File the volume in or out of `to_come`: parked articles are waiting
+    // ones, so it has one to come unasked when it waits on more than it
+    // parked. A flip is marked.
+    fn file_to_come(&self, open: &mut Open) {
+        let to_come = open
+            .waiting
+            .get(&self.at)
+            .is_some_and(|waiting| waiting.len() > self.parked.len());
+        let flipped = if to_come {
+            open.to_come.insert(self.at)
+        } else {
+            open.to_come.remove(&self.at)
+        };
+        if flipped {
+            open.come_flips.mark(self.at);
+        }
     }
 
     // A recovery volume nothing has yet decided on: none of it parked,
@@ -386,12 +485,20 @@ impl Volume {
     // held back whole, as a job that never ran presumes. Its bytes still to
     // come and its bytes out to bring, both all of it.
     fn undecided(&self) -> Option<(u64, u64)> {
-        let decided = !self.parked.is_empty()
-            || self.articles.iter().enumerate().any(|(index, article)| {
-                matches!(article.class, Class::Critical | Class::Recovery)
-                    || (index > 0 && article.state != State::Waiting)
-            });
+        let decided = !self.parked.is_empty() || self.asked > 0 || self.settled_past_first > 0;
+        #[cfg(test)]
+        assert_eq!(decided, self.decided_by_walk(), "{:?}", self.at);
         (!decided).then(|| (self.encoded_len - self.settled_bytes, self.encoded_len))
+    }
+
+    // Whether the volume is decided, from every article: what `undecided`
+    // read before its counts were kept, for the tests that hold it to them.
+    #[cfg(test)]
+    fn decided_by_walk(&self) -> bool {
+        !self.parked.is_empty()
+            || self.articles.iter().enumerate().any(|(index, article)| {
+                is_asked(article.class) || (index > 0 && article.state != State::Waiting)
+            })
     }
 
     // File the article by its state and class, `was` being its class before
@@ -543,13 +650,18 @@ impl Volume {
             .filter(move |index| self.may_carry(*index, range))
     }
 
-    // The covering articles a raise to `class` can move: those waiting in a
-    // class it outranks, in index order. `examined` counts the articles the
-    // run held in those classes.
+    // The articles a raise to `class` can move: those waiting in a class it
+    // outranks, in index order, the covering ones first. With `to_end`, the
+    // ones whose bounds miss the range follow them: a raise to the end of a
+    // volume whose placements disagree takes every article it can move. It
+    // is asked only while they disagree, when the run is the whole volume,
+    // so one pass finds both. `examined` counts the articles the run held
+    // in those classes.
     fn raisable_covering(
         &self,
         class: Class,
         range: ByteRange,
+        to_end: bool,
         examined: &mut usize,
     ) -> Vec<usize> {
         let run = self.run(range);
@@ -559,29 +671,57 @@ impl Volume {
             .map(|(_, held)| held);
         let ordinary = (class < Class::Ordinary).then_some(&self.parkable);
         // A raise outranks every parked article: only a deferral parks.
-        let mut out: Vec<usize> = raised
+        let (mut out, mut beyond): (Vec<usize>, Vec<usize>) = raised
             .chain(ordinary)
             .chain([&self.parked])
             .flat_map(|held| held.range(run.clone()).copied())
             .inspect(|_| *examined += 1)
-            .filter(|index| self.may_carry(*index, range))
-            .collect();
+            .filter(|index| to_end || self.may_carry(*index, range))
+            .partition(|index| self.may_carry(*index, range));
         out.sort_unstable();
+        beyond.sort_unstable();
+        out.append(&mut beyond);
         out
     }
 
-    // Whether a lost article surely carries some of the range.
+    // Whether a lost article surely carries some of the range, for the seek
+    // asked as `key`. Its witness is tried first; a walk that finds one
+    // records it, and one that finds none leaves no entry.
     fn lost_in(
-        &self,
+        &mut self,
         lost: Option<&BTreeSet<usize>>,
+        key: (ByteRange, Option<Class>),
         range: ByteRange,
         examined: &mut usize,
     ) -> bool {
-        lost.is_some_and(|lost| {
+        if let Some(&witness) = self.lost_witness.get(&key) {
+            if lost.is_some_and(|lost| lost.contains(&witness)) && self.surely_in(witness, range) {
+                count_witnessed();
+                return true;
+            }
+            self.lost_witness.remove(&key);
+        }
+        let mut walked = 0;
+        let found = lost.and_then(|lost| {
             lost.range(self.run(range))
-                .inspect(|_| *examined += 1)
-                .any(|index| self.may_carry(*index, range) && self.surely_in(*index, range))
-        })
+                .inspect(|_| walked += 1)
+                .find(|index| self.may_carry(**index, range) && self.surely_in(**index, range))
+                .copied()
+        });
+        *examined += walked;
+        match found {
+            Some(witness) => {
+                if self.lost_witness.len() >= WITNESSES {
+                    self.lost_witness.clear();
+                }
+                self.lost_witness.insert(key, witness);
+                true
+            }
+            None => {
+                count_not_lost(walked);
+                false
+            }
+        }
     }
 
     // The covering articles a deferral can still park.
@@ -620,6 +760,42 @@ impl Volume {
 
     // How far the volume is in hand without a gap from its start.
     fn front(&self) -> u64 {
+        #[cfg(any(test, feature = "pipeline-test-fixtures"))]
+        assert_eq!(self.front, self.front_by_walk(), "{:?}", self.at);
+        self.front
+    }
+
+    // The front after the article at `index` changed state. A change past
+    // the first article short of the front leaves it: the walk stops there.
+    // A change among the articles that reach it reads them again from the
+    // start, and the article short of it, or one read again, raises it as
+    // far as the articles after it reach.
+    fn keep_front(&mut self, index: usize) {
+        if index > self.front_len {
+            return;
+        }
+        if index < self.front_len {
+            self.front = 0;
+            self.front_len = 0;
+        }
+        let mut examined = 0;
+        while let Some(article) = self.articles.get(self.front_len) {
+            examined += 1;
+            match article.state {
+                State::Arrived(Some(range)) if range.start <= self.front => {
+                    self.front = self.front.max(range.end);
+                    self.front_len += 1;
+                }
+                _ => break,
+            }
+        }
+        count_front(examined);
+    }
+
+    // The front walked from the volume's first article: what `front` read
+    // before it was kept, for the tests that hold it to the walk.
+    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
+    fn front_by_walk(&self) -> u64 {
         let mut front = 0;
         for article in &self.articles {
             match article.state {
@@ -801,10 +977,18 @@ impl ArticleMap {
             .filter(|found| !found.articles.is_empty())
             .map(|found| (found.at, (0..found.articles.len()).collect()))
             .collect();
+        // Every article waits and none is parked: each volume with one is
+        // to come.
+        let to_come = volumes
+            .iter()
+            .filter(|found| !found.articles.is_empty())
+            .map(|found| found.at)
+            .collect();
         Self {
             volumes,
             open: Open {
                 waiting,
+                to_come,
                 ..Open::default()
             },
             moves: Vec::new(),
@@ -1119,20 +1303,56 @@ impl ArticleMap {
     // Whether an article the queue fetches unasked can still arrive: one
     // waits that is not parked.
     pub(crate) fn volume_to_come(&self, volume: VolumeIndex) -> bool {
-        self.open
-            .waiting
-            .get(&volume)
-            .is_some_and(|waiting| self.to_come(volume, waiting))
+        self.open.visit(1, 0);
+        #[cfg(any(test, feature = "pipeline-test-fixtures"))]
+        assert_eq!(
+            self.open.to_come.contains(&volume),
+            self.coming_by_walk().contains(&volume),
+            "{volume:?} filed to come against the walk"
+        );
+        self.open.to_come.contains(&volume)
     }
 
     // The volumes with an article the queue fetches unasked still to come,
     // in volume order.
     pub fn coming(&self) -> impl Iterator<Item = VolumeIndex> + '_ {
+        #[cfg(any(test, feature = "pipeline-test-fixtures"))]
+        assert_eq!(
+            self.open.to_come.iter().copied().collect::<Vec<_>>(),
+            self.coming_by_walk(),
+            "the volumes filed to come against the walk"
+        );
+        self.open
+            .to_come
+            .iter()
+            .inspect(|_| self.open.visit(1, 0))
+            .copied()
+    }
+
+    // The generation of the latest flip into or out of `coming`, and the
+    // volumes that flipped after `at`, each once, in no set order.
+    pub(crate) fn come_generation(&self) -> u64 {
+        self.open.come_flips.at()
+    }
+
+    pub(crate) fn come_flips_since(&self, at: u64) -> impl Iterator<Item = VolumeIndex> + '_ {
+        self.open.come_flips.since(at)
+    }
+
+    // `coming` read from every volume still waited on, as it was before the
+    // volumes to come were filed: the reference the tests hold it to.
+    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
+    pub fn coming_by_walk(&self) -> Vec<VolumeIndex> {
         self.open
             .waiting
             .iter()
-            .filter(|(volume, waiting)| self.to_come(**volume, waiting))
+            .filter(|(volume, waiting)| {
+                self.volumes
+                    .get(volume.0 as usize)
+                    .is_some_and(|found| waiting.len() > found.parked.len())
+            })
             .map(|(volume, _)| *volume)
+            .collect()
     }
 
     // The volumes with an article still waited on, parked or not, in
@@ -1155,15 +1375,6 @@ impl ArticleMap {
     #[cfg(any(test, feature = "pipeline-test-fixtures"))]
     pub(crate) fn waiting_volumes_unseen(&self) -> Vec<VolumeIndex> {
         self.open.waiting.keys().copied().collect()
-    }
-
-    // Parked articles are waiting ones, so the volume has one to come
-    // unasked when it waits on more than it parked.
-    fn to_come(&self, volume: VolumeIndex, waiting: &BTreeSet<usize>) -> bool {
-        self.open.visit(1, 0);
-        self.volumes
-            .get(volume.0 as usize)
-            .is_some_and(|found| waiting.len() > found.parked.len())
     }
 
     // The ranges of lost articles that can now be marked damaged: only the
@@ -1212,11 +1423,26 @@ impl ArticleMap {
         if let Some(found) = self.volumes.get(volume.0 as usize)
             && let Some(&pull) = found.answered.get(&(range, class))
         {
+            // Under the tests the answer is mapped again to check it, and
+            // the check leaves nothing behind: the volume's witnesses and the
+            // counters the tests read are as they were before it.
             #[cfg(any(test, feature = "pipeline-test-fixtures"))]
             {
+                use super::hooks::{LOST_NOT_FOUND, LOST_WITNESSED, SEEK_EXAMINED};
                 let changes = found.changes;
+                let witnesses = found.lost_witness.clone();
+                let counters = (
+                    SEEK_EXAMINED.with(std::cell::Cell::get),
+                    LOST_WITNESSED.with(std::cell::Cell::get),
+                    LOST_NOT_FOUND.with(std::cell::Cell::get),
+                );
                 assert_eq!(self.map_seek(volume, range, class), pull);
-                assert_eq!(self.volumes[volume.0 as usize].changes, changes);
+                let checked = &mut self.volumes[volume.0 as usize];
+                assert_eq!(checked.changes, changes);
+                checked.lost_witness = witnesses;
+                SEEK_EXAMINED.with(|count| count.set(counters.0));
+                LOST_WITNESSED.with(|count| count.set(counters.1));
+                LOST_NOT_FOUND.with(|count| count.set(counters.2));
             }
             return pull;
         }
@@ -1243,6 +1469,7 @@ impl ArticleMap {
         // The clamp for open-ended seeks: a recovery object does not know how
         // long its volume is and asks to the end of the address space, so the
         // range is cut at the furthest the volume's end can lie.
+        let asked = (range, class);
         let end = found.bounds(found.articles.len()).1;
         let range = ByteRange::new(range.start.min(end), range.end.min(end));
         if found.ordered_only {
@@ -1258,33 +1485,22 @@ impl ArticleMap {
         // visits only the articles it can move, and the lost ones for its
         // answer; an article in hand neither moves nor loses it.
         let mut examined = 0;
-        let mut covering: Vec<usize> = match class {
-            Some(Class::Parked) => found
-                .parkable_covering(range)
-                .inspect(|_| examined += 1)
-                .collect(),
-            Some(class) => found.raisable_covering(class, range, &mut examined),
-            None => Vec::new(),
-        };
-        let lost = !parks && found.lost_in(self.open.lost.get(&volume), range, &mut examined);
         // Once the post's placements disagree, the bounds of an article
         // still to come say nothing of where its own header puts it: one
         // after an article placed past the volume's end is bounded past it
         // too. A raise that runs to the volume's end takes every article of
-        // the volume still waited on, so none it may need is left behind.
-        if !parks
-            && found.disorder > 0
-            && range.end == end
-            && let Some(waiting) = self.open.waiting.get(&volume)
-        {
-            covering.extend(
-                waiting
-                    .iter()
-                    .copied()
-                    .inspect(|_| examined += 1)
-                    .filter(|index| !found.may_carry(*index, range)),
-            );
-        }
+        // the volume it can still move, so none it may need is left behind.
+        let to_end = found.disorder > 0 && range.end == end;
+        let covering: Vec<usize> = match class {
+            Some(Class::Parked) => found
+                .parkable_covering(range)
+                .inspect(|_| examined += 1)
+                .collect(),
+            Some(class) => found.raisable_covering(class, range, to_end, &mut examined),
+            None => Vec::new(),
+        };
+        let lost =
+            !parks && found.lost_in(self.open.lost.get(&volume), asked, range, &mut examined);
         count_examined(examined);
         let mut moved = 0;
         for index in covering {
@@ -1296,7 +1512,7 @@ impl ArticleMap {
             if let Some(class) = class.filter(moves)
                 && article.state == State::Waiting
             {
-                found.set_class(index, class);
+                found.set_class(&mut self.open, index, class);
                 self.moves.push(Move {
                     volume,
                     ordinal: article.ordinal,
@@ -1367,7 +1583,7 @@ impl ArticleMap {
             if let Some(class) = class.filter(moves)
                 && article.state == State::Waiting
             {
-                found.set_class(index, class);
+                found.set_class(&mut self.open, index, class);
                 self.moves.push(Move {
                     volume,
                     ordinal: article.ordinal,
@@ -1396,7 +1612,7 @@ impl ArticleMap {
         for index in parked {
             let article = found.articles[index];
             if article.state == State::Waiting && article.class > Class::Ordinary {
-                found.set_class(index, Class::Ordinary);
+                found.set_class(&mut self.open, index, Class::Ordinary);
                 self.moves.push(Move {
                     volume,
                     ordinal: article.ordinal,
@@ -1415,7 +1631,7 @@ impl ArticleMap {
                 continue;
             };
             if first.state == State::Waiting && Class::FirstArticle < first.class {
-                found.set_class(0, Class::FirstArticle);
+                found.set_class(&mut self.open, 0, Class::FirstArticle);
                 self.moves.push(Move {
                     volume,
                     ordinal: first.ordinal,

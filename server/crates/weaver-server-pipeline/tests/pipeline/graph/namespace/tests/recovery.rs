@@ -72,9 +72,9 @@ fn a_set_lives_in_the_namespace_of_the_members_it_describes() {
 }
 
 // Six hundred members the set covers, and one obfuscated member it does not
-// yet: the front that names it binds the set again, which keeps the names
-// of the members not yet covered alone, that one and the set's own volume,
-// and covers it by its content as before.
+// yet: the front that names it binds the set again, which keeps the name
+// of the one member it comes to cover alone, and covers it by its content
+// as before.
 #[test]
 fn a_bind_keeps_only_the_names_of_members_not_yet_covered() {
     use crate::pipeline::graph::namespace::recovery::NAMES_KEPT;
@@ -90,8 +90,8 @@ fn a_bind_keeps_only_the_names_of_members_not_yet_covered() {
     job.send(late, 0, b"data", Provenance::Fresh);
     assert_eq!(
         NAMES_KEPT.with(std::cell::Cell::get),
-        2,
-        "the late member's name and the set's own volume's"
+        1,
+        "the late member's name alone"
     );
     let own = job.root().find_by_name("set.par2").expect("own volume").id;
     assert_eq!(

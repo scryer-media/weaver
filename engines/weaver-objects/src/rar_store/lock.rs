@@ -360,12 +360,15 @@ impl RarStore {
         let found = self.volumes.get_mut(&volume)?;
         let length = found.length;
         let kept = &mut found.kept;
-        rar4_unseals(
+        let unseals = rar4_unseals(
             &mut |range| whole(kept, range).map(<[u8]>::to_vec),
             length,
             self.keys.kdf(),
             password,
-        )
+        );
+        // The bytes it wants are the envelope's now.
+        self.moved_at(volume);
+        unseals
     }
 
     // Whether the front of the first enciphered header of `volume` is here
@@ -376,7 +379,10 @@ impl RarStore {
             return false;
         };
         let kept = &mut found.kept;
-        rar4_front(&mut |range| whole(kept, range).map(<[u8]>::to_vec)).is_some()
+        let whole = rar4_front(&mut |range| whole(kept, range).map(<[u8]>::to_vec)).is_some();
+        // The bytes it wants are the envelope's now.
+        self.moved_at(volume);
+        whole
     }
 
     // The candidates in the order to try them: the one that opened the
@@ -514,6 +520,7 @@ impl RarStore {
                 return self.give_up(Emit::NeedsEngine(Why::Unsupported), out);
             };
             entry.lock = Lock::Open(Arc::new(cbc));
+            self.reads_moved.all();
             self.locked.remove(&index);
             entry.hash_key = key.hash_key;
             entry.trial = trial;

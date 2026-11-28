@@ -419,6 +419,9 @@ pub struct Par3 {
     covered: BTreeSet<MemberId>,
     // Raised each time `covered` changes: what `coverage_version` says.
     covered_changes: u64,
+    // The members the last bind came to cover, by their names then, until
+    // taken.
+    newly: Vec<(MemberId, String)>,
     // Members that may be a free described file. Those complete are what a
     // repair reads back to identify.
     unnamed: BTreeMap<MemberId, Unnamed>,
@@ -478,6 +481,7 @@ impl Par3 {
             bound: BTreeMap::new(),
             covered: BTreeSet::new(),
             covered_changes: 0,
+            newly: Vec::new(),
             unnamed: BTreeMap::new(),
             described: BTreeMap::new(),
             identified: BTreeMap::new(),
@@ -497,13 +501,15 @@ impl Par3 {
 
     // The described paths and the members they are bound to, with the
     // members they name.
-    fn set_bound(&mut self, bound: BTreeMap<String, MemberId>) {
+    // What it covered before, when that changed.
+    fn set_bound(&mut self, bound: BTreeMap<String, MemberId>) -> Option<BTreeSet<MemberId>> {
         let covered: BTreeSet<MemberId> = bound.values().copied().collect();
-        if covered != self.covered {
-            self.covered = covered;
-            self.covered_changes += 1;
-        }
         self.bound = bound;
+        if covered != self.covered {
+            self.covered_changes += 1;
+            return Some(std::mem::replace(&mut self.covered, covered));
+        }
+        None
     }
 
     fn volume(&mut self, index: VolumeIndex) -> &mut Volume {
@@ -1115,6 +1121,7 @@ impl Recovery for Par3 {
     // for a member no described name answers to, which takes the described
     // name.
     fn bind(&mut self, namespace: &mut Namespace, renamed: &mut Vec<MemberId>) {
+        self.newly.clear();
         if self.shown.bind(namespace, self.id) {
             self.damage_shown();
         }
@@ -1153,10 +1160,15 @@ impl Recovery for Par3 {
         let unnamed = &self.unnamed;
         self.identified
             .retain(|member, _| unnamed.contains_key(member));
+        // The name each member recognised had before it.
+        let mut before: BTreeMap<MemberId, String> = BTreeMap::new();
         for (path, member) in self.by_content() {
             let Some(&length) = lengths.get(path.as_str()) else {
                 continue;
             };
+            if let Some(record) = namespace.get(member) {
+                before.entry(member).or_insert_with(|| record.name.clone());
+            }
             if namespace.recognise(member, &path, length).is_some() {
                 renamed.push(member);
             }
@@ -1182,8 +1194,19 @@ impl Recovery for Par3 {
         if learned || bound != self.bound {
             self.last = None;
         }
-        self.set_bound(bound);
+        if let Some(was) = self.set_bound(bound) {
+            for member in self.covered.difference(&was) {
+                let name = before
+                    .remove(member)
+                    .or_else(|| Some(namespace.get(*member)?.name.clone()));
+                self.newly.extend(name.map(|name| (*member, name)));
+            }
+        }
         self.count_refused(&sets);
+    }
+
+    fn take_newly(&mut self, out: &mut Vec<(MemberId, String)>) {
+        out.append(&mut self.newly);
     }
 
     // Every described file no member carries by name and none may yet turn
@@ -1224,6 +1247,10 @@ impl Recovery for Par3 {
 
     fn covers_some(&self) -> bool {
         !self.covered.is_empty()
+    }
+
+    fn covers_any_of(&self, namespace: &Namespace) -> bool {
+        self.covered.iter().any(|member| namespace.lists(*member))
     }
 
     fn covered_members(&self, out: &mut Vec<MemberId>) {

@@ -650,7 +650,13 @@ fn a_stated_volume_does_not_follow_a_front_read_to_its_end_on_a_whole_member() {
             spanning.len() as u64,
             Some(crc32(&spanning)),
         ),
-        rar5::file("notes.txt", 0, NOTES, NOTES.len() as u64, Some(crc32(NOTES))),
+        rar5::file(
+            "notes.txt",
+            0,
+            NOTES,
+            NOTES.len() as u64,
+            Some(crc32(NOTES)),
+        ),
     ]
     .concat();
     let whole = [lead.as_slice(), &rar5::end(true)].concat();

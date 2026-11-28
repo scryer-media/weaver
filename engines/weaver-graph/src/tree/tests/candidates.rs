@@ -208,6 +208,38 @@ fn a_front_that_comes_asks_only_the_undecided_members() {
     );
 }
 
+// M plain members announced, then a restart and a piece that waits on the
+// holders whose fronts are away, then the plain fronts one by one: each
+// front that comes asks the one undecided member with a front, the piece,
+// M in all, where asking every undecided member asked M(M+1)/2.
+#[test]
+fn fronts_coming_one_by_one_ask_only_the_undecided_members_with_a_front() {
+    for (count, old) in [(100usize, 5_050usize), (200, 20_100)] {
+        let pieces = &mut Pieces(3);
+        let (mut tree, _, _) = set(pieces, &HELD);
+        let plain: Vec<MemberId> = (0..count)
+            .map(|index| tree.announce_root(&format!("plain{index}.dat"), Some(5), &mut Vec::new()))
+            .collect();
+        let mut tree = Tree::rebuild(&tree.records(), &*pieces).unwrap();
+        let (piece, _) = posted(&mut tree, "x.bin", b"BBBBB", pieces);
+        assert!(tree.is_undecided(NodeId::ROOT, piece), "it waits");
+        let (mut asked, mut undecided) = (0, 0);
+        for member in plain {
+            FRONT_CANDIDATES.with(|seen| seen.set(0));
+            front(&mut tree, member, b"PLAIN", pieces);
+            asked += FRONT_CANDIDATES.with(std::cell::Cell::get);
+            undecided += tree.undecided(NodeId::ROOT).count();
+            assert!(!tree.is_undecided(NodeId::ROOT, member));
+        }
+        assert!(tree.is_undecided(NodeId::ROOT, piece), "it still waits");
+        assert_eq!(asked, count, "the waiting piece, once per front");
+        assert_eq!(
+            undecided, old,
+            "what the walk over every undecided member asked"
+        );
+    }
+}
+
 // Four places, the first and last held: two middle places are free and
 // nothing orders the piece, so neither takes it.
 #[test]
@@ -232,6 +264,52 @@ fn front_lost(tree: &mut Tree, holder: MemberId, pieces: &mut Pieces) {
         {
             tree.damage_reached(node, member, range, pieces, &mut effects);
         }
+    }
+}
+
+// M volumes the store holds, each with its front, and one plain member no
+// object owns, then the M fronts lost one by one: each loss looks at the
+// members no object owns with a front, kept beside the namespace, the one
+// plain member, L in all, where the walk looked at every member, M + 2 of
+// them, L·(M + 2) in all.
+#[test]
+fn lost_fronts_look_only_at_the_members_no_object_owns_with_a_front() {
+    for (count, visits, old) in [(100usize, 100usize, 10_200usize), (200, 200, 40_400)] {
+        let pieces = &mut Pieces(count as u32);
+        let names: Vec<String> = (2..count + 2)
+            .map(|number| format!("set.{number:03}"))
+            .collect();
+        let fronts: Vec<Vec<u8>> = (0..count)
+            .map(|index| format!("V{index:04}").into_bytes())
+            .collect();
+        let held: Vec<(&str, &[u8])> = names
+            .iter()
+            .zip(&fronts)
+            .map(|(name, bytes)| (name.as_str(), bytes.as_slice()))
+            .collect();
+        let (mut tree, _, members) = set(pieces, &held);
+        let plain = tree.announce_root("plain.dat", Some(5), &mut Vec::new());
+        front(&mut tree, plain, b"PLAIN", pieces);
+        assert!(tree.unowned(NodeId::ROOT, plain), "no object owns it");
+        let (mut walked, mut kept) = (0, 0);
+        LOST_FRONTS.with(|seen| seen.set((0, 0)));
+        for member in members {
+            let namespace = tree.namespace(NodeId::ROOT).unwrap();
+            walked += namespace.members().count();
+            kept += namespace
+                .members()
+                .filter(|record| {
+                    tree.unowned(NodeId::ROOT, record.id)
+                        && !namespace.first_bytes(record.id).is_empty()
+                })
+                .count();
+            front_lost(&mut tree, member, pieces);
+        }
+        let (calls, looked) = LOST_FRONTS.with(std::cell::Cell::get);
+        assert_eq!(calls, count, "one loss per front");
+        assert_eq!(looked, kept, "the kept members, once per loss");
+        assert_eq!(looked, visits);
+        assert_eq!(walked, old, "what the walk over every member looked at");
     }
 }
 

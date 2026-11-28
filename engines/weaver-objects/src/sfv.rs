@@ -330,6 +330,13 @@ impl Recovery for Sfv {
         false
     }
 
+    fn covers_any_of(&self, _namespace: &Namespace) -> bool {
+        false
+    }
+
+    // A listing covers nothing, so its bind covers nothing newly.
+    fn take_newly(&mut self, _out: &mut Vec<(MemberId, String)>) {}
+
     // A listing ships beside what it lists.
     fn released(&self) -> bool {
         true

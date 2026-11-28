@@ -219,6 +219,7 @@ pub async fn run_stopping_at(
                 )
                 .await;
                 pipeline = down;
+                graph.restarted();
                 restored = Some(rows);
                 in_memory.extend(owed.iter().copied());
             }
@@ -251,6 +252,7 @@ pub async fn run_stopping_at(
             )
             .await;
             pipeline = down;
+            graph.restarted();
             restored = Some(rows);
             in_memory.extend(owed.iter().copied());
             continue;
@@ -274,6 +276,7 @@ pub async fn run_stopping_at(
             )
             .await;
             pipeline = down;
+            graph.restarted();
             restored = Some(rows);
             in_memory.extend(owed.iter().copied());
             continue;
@@ -300,6 +303,7 @@ pub async fn run_stopping_at(
                 )
                 .await;
                 pipeline = down;
+                graph.restarted();
                 restored = Some(rows);
                 in_memory.extend(owed.iter().copied());
             }

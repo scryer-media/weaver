@@ -279,6 +279,53 @@ fn a_paid_release_with_no_room_stands_and_the_next_pass_asks_again() {
     assert!(run.inside() == run.payload, "the member is whole");
 }
 
+// A paid release that stands for a refused write, and the pass after it
+// with room, end every pass as the walk over every hold ends it: the same
+// answer, the same holds asked, the same holds left, the same effects.
+#[test]
+fn a_release_that_stands_ends_every_pass_as_the_walk_over_every_hold() {
+    use weaver_server_disk::operations::disk::writer::{Credit, Stand};
+    let run = |reference: bool| {
+        RELEASE_REFERENCE.set(reference);
+        RELEASE_LOG.set(Some(Vec::new()));
+        let mut run = placed_behind();
+        let hard = 64 * 1024;
+        run.volume.set_buffer_limits(hard, hard);
+        let full = Credit::reserve(std::iter::once(&run.submitter), hard, Stand::UntilStop);
+        assert!(full.covers(hard));
+        let mut out = Vec::new();
+        let mut paid = 0;
+        let stood = run.release_paid(&mut paid, &mut out);
+        let asked_after_standing = run.writer.holds_asked(NodeId::ROOT, run.member);
+        drop(full);
+        run.volume.set_buffer_limits(u64::MAX, u64::MAX);
+        let after = run.release_paid(&mut paid, &mut out);
+        let passes = RELEASE_LOG.take().unwrap_or_default();
+        RELEASE_REFERENCE.set(false);
+        let dir = run._dir.path().display().to_string();
+        let said = format!("{out:?}").replace(&dir, "<dir>");
+        let inside = run.inside();
+        (
+            passes,
+            stood.map(|(bytes, _)| bytes),
+            asked_after_standing,
+            after,
+            said,
+            inside,
+        )
+    };
+    let kept = run(false);
+    let reference = run(true);
+    assert_eq!(kept.1, Some(READ_BACK), "the first pass stands");
+    assert!(kept.0.len() >= 2, "{} passes", kept.0.len());
+    assert_eq!(kept.0, reference.0, "every pass");
+    assert_eq!(kept.1, reference.1);
+    assert_eq!(kept.2, reference.2);
+    assert_eq!(kept.3, reference.3);
+    assert_eq!(kept.4, reference.4);
+    assert!(kept.5 == reference.5, "the same member bytes");
+}
+
 // With room, the release the loop runs after a write (`release_held`) and
 // a paid one hand the store the same bytes, in the same order, and say the
 // same, as the release did before it was counted on the job's volumes,
@@ -794,4 +841,131 @@ fn a_step_settled_inside_another_leaves_the_credit_the_members_carry() {
         "the loop carries what the members carry"
     );
     assert_eq!(run.volume.carried_bytes(), held);
+}
+
+// The first `count` volumes of the rarlab set of 64 stored RAR5 volumes,
+// `rar5_stored_sixtyfour`, which hold one 252 000-byte member.
+fn sixty_four(count: usize) -> Vec<(String, Vec<u8>)> {
+    (1..=count)
+        .map(|part| {
+            let name = format!("rar5_stored_sixtyfour.part{part:02}.rar");
+            let bytes = std::fs::read(format!(
+                "{}/../weaver-server-core/tests/fixtures/extraction_profiles/{name}",
+                env!("CARGO_MANIFEST_DIR")
+            ))
+            .unwrap();
+            (name, bytes)
+        })
+        .collect()
+}
+
+// What a download of the set in `order`, each volume in `pieces`
+// deliveries, came to: the held volumes each delivery's passes visited,
+// the bytes held after each volume, and the member's file.
+struct SetRun {
+    visits: Vec<Vec<usize>>,
+    held: Vec<u64>,
+    written: Vec<u8>,
+}
+
+fn set_run(volumes: &[(String, Vec<u8>)], order: &[usize], pieces: usize) -> SetRun {
+    let dir = tempfile::tempdir().unwrap();
+    let mut writer = NamespaceWriter::new(
+        1,
+        dir.path().to_path_buf(),
+        Arc::new(HoldsAccountant::new(PLENTY)),
+        CapacityReader::unknown(),
+    );
+    let mut tree = Tree::new();
+    let mut objects = weaver_objects::Objects::default();
+    let members: Vec<MemberId> = volumes
+        .iter()
+        .map(|(name, bytes)| tree.announce_root(name, Some(bytes.len() as u64), &mut Vec::new()))
+        .collect();
+    for member in &members {
+        writer
+            .announced(
+                &mut tree,
+                &mut objects,
+                &Unsegmented,
+                NodeId::ROOT,
+                *member,
+                &mut Vec::new(),
+            )
+            .unwrap();
+    }
+    let mut visits = Vec::new();
+    let mut held = Vec::new();
+    for &index in order {
+        let bytes = &volumes[index].1;
+        let piece = bytes.len().div_ceil(pieces);
+        let mut each = Vec::new();
+        for (at, chunk) in bytes.chunks(piece).enumerate() {
+            RELEASE_VISITED.set(0);
+            writer
+                .deliver(
+                    &mut tree,
+                    &mut objects,
+                    &Unsegmented,
+                    held_arrival(members[index], at * piece, chunk),
+                    &mut Vec::new(),
+                )
+                .unwrap();
+            each.push(RELEASE_VISITED.get());
+        }
+        visits.push(each);
+        held.push(writer.held_bytes(NodeId::ROOT));
+    }
+    SetRun {
+        visits,
+        held,
+        written: std::fs::read(dir.path().join("stored64.bin")).unwrap_or_default(),
+    }
+}
+
+// The set's first volume, then every one after the second, then the
+// second, each in four deliveries. Each volume after the second is held,
+// waiting on the second, and each of its deliveries moves the store's
+// placement for it alone: the passes visit that one held volume, never
+// the ones held before it. The second volume's last delivery lays every
+// held volume, and the pass visits each once and writes it. So the passes
+// visit 4 (V - 2) + (V - 2) = 5 (V - 2) held volumes: 150 at V = 32 and
+// 310 at V = 64, not a number that grows with the square of V. The first
+// 32 volumes are the set as it stands with its last 32 not yet posted:
+// what they hold of the member is written, and nothing stays held.
+#[test]
+fn held_volumes_of_a_rar_set_arriving_one_by_one_are_visited_linearly() {
+    let member: Vec<u8> = (0..252_000usize)
+        .map(|n| ((n * 31 + n / 97) % 251) as u8)
+        .collect();
+    for (count, total) in [(32usize, 150usize), (64, 310)] {
+        let volumes = sixty_four(count);
+        let order: Vec<usize> = [0].into_iter().chain(2..count).chain([1]).collect();
+        let run = set_run(&volumes, &order, 4);
+        assert_eq!(
+            run.visits[0], [0; 4],
+            "{count}: the first volume holds nothing"
+        );
+        for (at, each) in run.visits[1..count - 1].iter().enumerate() {
+            assert_eq!(each, &[1; 4], "{count}: volume {}", at + 2);
+        }
+        assert_eq!(
+            run.visits[count - 1],
+            [0, 0, 0, count - 2],
+            "{count}: the second volume"
+        );
+        assert_eq!(run.visits.iter().flatten().sum::<usize>(), total, "{count}");
+        assert!(
+            run.held[1..count - 1].is_sorted() && run.held[count - 2] > 0,
+            "{count}: each volume after the second is held"
+        );
+        assert_eq!(*run.held.last().unwrap(), 0, "{count}: nothing stays held");
+        assert!(
+            member.starts_with(&run.written) && !run.written.is_empty(),
+            "{count}: the member as far as the volumes hold it"
+        );
+        if count == 64 {
+            assert!(run.written == member, "the member whole");
+        }
+    }
 }

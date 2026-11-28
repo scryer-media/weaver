@@ -766,6 +766,9 @@ where
     K: Copy + Ord,
     I: Iterator<Item = (K, &'s SetState)>,
 {
+    // What this walk compares names with is no bind's cost: the count
+    // stands as the bind left it.
+    let probes = super::NAME_PROBES.with(std::cell::Cell::get);
     let mut claims: BTreeMap<K, BTreeMap<FileId, Vec<(MemberId, bool)>>> = BTreeMap::new();
     let mut complete = BTreeMap::new();
     let last = std::mem::take(fronts);
@@ -860,6 +863,7 @@ where
             complete.remove(member);
         }
     }
+    super::NAME_PROBES.with(|count| count.set(probes));
     // A conflicting name did not identify the member. Keep it available
     // for slice verification and elimination alongside unmatched members.
     Bound {
@@ -952,6 +956,8 @@ fn named(state: &SetState, index: &Par2FileSet, name: &str) -> Option<Vec<(FileI
         .iter()
         .copied()
         .filter(|(file, _)| {
+            #[cfg(test)]
+            super::NAME_PROBES.with(|probes| probes.set(probes.get() + 1));
             index
                 .file_description(file)
                 .is_some_and(|description| description.filename == name)

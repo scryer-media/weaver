@@ -123,6 +123,7 @@ pub(in crate::pipeline::tests) async fn run_restarting_at_inspecting(
             lifting = false;
             pipeline = restart(&temp_dir, pipeline, scenario, &mut owed, &mut *inspect).await;
             sent = pipeline.event_tx.subscribe();
+            graph.restarted();
             crate::pipeline::tests::hear_rewalks(&mut pipeline, JOB).await;
             in_memory.extend(owed.iter().copied());
             restarts += 1;
@@ -163,6 +164,7 @@ pub(in crate::pipeline::tests) async fn run_restarting_at_inspecting(
                 refusing = false;
                 pipeline = restart(&temp_dir, pipeline, scenario, &mut owed, &mut *inspect).await;
                 sent = pipeline.event_tx.subscribe();
+                graph.restarted();
                 in_memory.extend(owed.iter().copied());
                 restarts += 1;
                 continue;
@@ -206,6 +208,7 @@ pub(in crate::pipeline::tests) async fn run_restarting_at_inspecting(
                 let before = figures(&pipeline);
                 pipeline = restart(&temp_dir, pipeline, scenario, &mut owed, &mut going_down).await;
                 sent = pipeline.event_tx.subscribe();
+                graph.restarted();
                 // Its recovery reads what arrived of it again before the job
                 // fetches: the figures stand once that is heard.
                 crate::pipeline::tests::hear_rewalks(&mut pipeline, JOB).await;

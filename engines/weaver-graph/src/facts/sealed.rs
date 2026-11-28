@@ -10,8 +10,10 @@
 //
 // A `Sealed` value is one part; a `Shelf` is a run of them, one per chunk,
 // for a value that grows. Either is reached for change only through
-// `change`, which encodes the part again before returning, so its bytes
-// always say what it holds and nothing outside has a copy to keep fresh.
+// `change`, which drops the part's bytes so they are encoded again when the
+// walk next asks for them, so its bytes always say what it holds and
+// nothing outside has a copy to keep fresh. Many changes between two walks
+// cost one encoding.
 // Within its owner's facts it encodes as nothing: the owner walks its sealed
 // values in the order its encoding meets them, and each is numbered by its
 // place in that walk. Its bytes are the facts' parts, each under that
@@ -30,7 +32,7 @@
 
 use std::collections::BTreeMap;
 use std::fmt;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -114,24 +116,24 @@ pub struct Take<'a> {
 }
 
 impl Take<'_> {
-    pub fn sealed<T>(&mut self, sealed: &Sealed<T>) -> Result<(), String> {
+    pub fn sealed<T: Serialize>(&mut self, sealed: &Sealed<T>) -> Result<(), String> {
         let shelf = self.shelve()?;
         self.at.push(sealed.at);
         match self.since(shelf) {
-            None => self.keep(shelf, 0, sealed.bytes.as_ref()),
+            None => self.keep(shelf, 0, sealed.sealed_bytes()),
             Some(since) if sealed.at > since => self.change(shelf, 0, Some(sealed)),
             Some(_) => Ok(()),
         }
     }
 
-    pub fn shelf<T>(&mut self, shelf: &Shelf<T>) -> Result<(), String> {
+    pub fn shelf<T: Serialize>(&mut self, shelf: &Shelf<T>) -> Result<(), String> {
         let number = self.shelve()?;
         self.at.push(shelf.marks.at());
         match self.since(number) {
             None => shelf
                 .chunks
                 .iter()
-                .try_for_each(|(chunk, sealed)| self.keep(number, *chunk, sealed.bytes.as_ref())),
+                .try_for_each(|(chunk, sealed)| self.keep(number, *chunk, sealed.sealed_bytes())),
             Some(since) => shelf
                 .marks
                 .since(since)
@@ -145,7 +147,7 @@ impl Take<'_> {
             .map(|since| since.get(number as usize).copied().unwrap_or(0))
     }
 
-    fn change<T>(
+    fn change<T: Serialize>(
         &mut self,
         shelf: u32,
         chunk: u32,
@@ -155,8 +157,7 @@ impl Take<'_> {
             None => None,
             Some(sealed) => Some(Arc::clone(
                 sealed
-                    .bytes
-                    .as_ref()
+                    .sealed_bytes()
                     .ok_or_else(|| "a sealed part does not encode".to_owned())?,
             )),
         };
@@ -253,7 +254,7 @@ fn decode<T: DeserializeOwned>(bytes: Arc<[u8]>) -> Result<Sealed<T>, String> {
     let value = rmp_serde::from_slice(&bytes).map_err(|error| error.to_string())?;
     Ok(Sealed {
         value: Arc::new(value),
-        bytes: Some(bytes),
+        bytes: filled(Some(bytes)),
         at: 1,
     })
 }
@@ -263,22 +264,76 @@ fn encode<T: Serialize>(value: &T) -> Option<Arc<[u8]>> {
     rmp_serde::to_vec(value).ok().map(Arc::from)
 }
 
+// The bytes a value encodes to, made on the first ask and shared by every
+// copy of the value it was asked of: `None` inside when the value would not
+// encode.
+type Bytes = Arc<OnceLock<Option<Arc<[u8]>>>>;
+
+// Bytes still to be made.
+fn unmade() -> Bytes {
+    Arc::new(OnceLock::new())
+}
+
+// Bytes made already, as a restore gives them.
+fn filled(bytes: Option<Arc<[u8]>>) -> Bytes {
+    Arc::new(OnceLock::from(bytes))
+}
+
+#[cfg(any(test, feature = "test-support"))]
+thread_local! {
+    // The encodings sealed values made on this thread.
+    static ENCODES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    // Set while a value is encoded again to hold its bytes to.
+    static CHECKING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+// How many times sealed values on this thread were encoded for their bytes.
+#[cfg(any(test, feature = "test-support"))]
+pub fn sealed_encodes() -> usize {
+    ENCODES.with(std::cell::Cell::get)
+}
+
 #[derive(Clone)]
 pub struct Sealed<T> {
     value: Arc<T>,
-    // `None` when the value would not encode: the owner's facts then fail
-    // to encode too, and say so as unsupported.
-    bytes: Option<Arc<[u8]>>,
+    // Encoded when first asked for, not when the value changes: a value
+    // that changes many times between two walks of its owner is encoded
+    // once. `None` inside when the value would not encode: the owner's
+    // facts then fail to encode too, and say so as unsupported.
+    bytes: Bytes,
     // How many times it changed, its making the first.
     at: u64,
 }
 
+impl<T: Serialize> Sealed<T> {
+    // The bytes the value encodes to, encoded on the first ask since it
+    // last changed. Only `change` and `set` change the value, and each
+    // gives it a fresh cell, so the bytes a filled cell holds stay those of
+    // the value: the check that they are runs on the ask that fills it.
+    fn sealed_bytes(&self) -> Option<&Arc<[u8]>> {
+        self.bytes
+            .get_or_init(|| {
+                #[cfg(any(test, feature = "test-support"))]
+                ENCODES.with(|encodes| encodes.set(encodes.get() + 1));
+                let bytes = encode(&*self.value);
+                #[cfg(any(test, feature = "test-support"))]
+                if let Some(bytes) = &bytes {
+                    CHECKING.with(|checking| checking.set(true));
+                    let now = encode(&*self.value);
+                    CHECKING.with(|checking| checking.set(false));
+                    assert_eq!(Some(bytes), now.as_ref(), "sealed bytes behind their value");
+                }
+                bytes
+            })
+            .as_ref()
+    }
+}
+
 impl<T: Serialize + Clone> Sealed<T> {
     pub fn new(value: T) -> Self {
-        let bytes = encode(&value);
         Self {
             value: Arc::new(value),
-            bytes,
+            bytes: unmade(),
             at: 1,
         }
     }
@@ -287,29 +342,31 @@ impl<T: Serialize + Clone> Sealed<T> {
         &self.value
     }
 
-    // The one way to change the value: it is encoded again on the way out.
+    // The one way to change the value: its bytes are made again when next
+    // asked for.
     pub fn change<R>(&mut self, change: impl FnOnce(&mut T) -> R) -> R {
         let out = change(Arc::make_mut(&mut self.value));
-        self.bytes = encode(&self.value);
+        self.bytes = unmade();
         self.at += 1;
         out
     }
 
-    // The value made `value`, encoded again only when that changes it.
+    // The value made `value`, its bytes made again only when that changes
+    // it.
     pub fn set(&mut self, value: T)
     where
         T: PartialEq,
     {
         if *self.value != value {
-            self.bytes = encode(&value);
+            self.bytes = unmade();
             self.value = Arc::new(value);
             self.at += 1;
         }
     }
 
-    // The bytes the value last encoded to.
+    // The bytes the value encodes to.
     pub fn bytes(&self) -> Option<&[u8]> {
-        self.bytes.as_deref()
+        self.sealed_bytes().map(|bytes| &**bytes)
     }
 }
 
@@ -345,7 +402,7 @@ impl<'de, T: Default> Deserialize<'de> for Sealed<T> {
         <()>::deserialize(deserializer)?;
         Ok(Self {
             value: Arc::default(),
-            bytes: None,
+            bytes: filled(None),
             at: 0,
         })
     }
@@ -505,7 +562,11 @@ mod tests {
 
     impl Serialize for Counted {
         fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-            if let Some(seen) = self.seen {
+            // The check that holds handed-out bytes to the value is not
+            // one of its encodings.
+            if let Some(seen) = self.seen
+                && !super::CHECKING.with(std::cell::Cell::get)
+            {
                 seen.fetch_add(1, Ordering::SeqCst);
             }
             self.items.serialize(serializer)
@@ -562,8 +623,9 @@ mod tests {
             }),
             grown: Shelf::default(),
         };
-        assert_eq!(SEEN.load(Ordering::SeqCst), 1, "sealed once");
+        assert_eq!(SEEN.load(Ordering::SeqCst), 0, "sealed when first asked");
         let (first, first_parts) = encode_parts(&owner).unwrap();
+        assert_eq!(SEEN.load(Ordering::SeqCst), 1, "the first walk seals it");
         owner.moving += 1;
         let (second, second_parts) = encode_parts(&owner).unwrap();
         assert_ne!(first, second);
@@ -574,12 +636,107 @@ mod tests {
             "the owner's encodings reuse it"
         );
         owner.settled.change(|counted| counted.items.push(10));
-        assert_eq!(SEEN.load(Ordering::SeqCst), 2, "a change seals it again");
+        assert_eq!(SEEN.load(Ordering::SeqCst), 1, "a change waits for the ask");
         let (bytes, parts) = encode_parts(&owner).unwrap();
+        assert_eq!(
+            SEEN.load(Ordering::SeqCst),
+            2,
+            "the next walk seals it again"
+        );
         let restored: Owner = decode_parts(&bytes, &parts).unwrap();
         assert_eq!(restored.moving, 1);
         assert_eq!(restored.settled.get().items, [7, 8, 9, 10]);
         assert_eq!(restored.settled.bytes(), owner.settled.bytes());
+    }
+
+    // Many changes then one ask encode once, and a second ask encodes
+    // nothing; the change count moves once per change, as the walk reads
+    // it, and a copy taken after the ask shares the bytes.
+    #[test]
+    fn changes_between_two_asks_encode_once() {
+        const CHANGES: u64 = 25;
+        let mut sealed = Sealed::new(Vec::<u64>::new());
+        let start = super::sealed_encodes();
+        for at in 0..CHANGES {
+            sealed.change(|items| items.push(at));
+        }
+        assert_eq!(sealed.at, 1 + CHANGES, "one count per change");
+        assert_eq!(super::sealed_encodes() - start, 0, "no change encodes");
+        let bytes = sealed.bytes().map(<[u8]>::to_vec);
+        assert_eq!(super::sealed_encodes() - start, 1, "the ask encodes once");
+        assert_eq!(bytes, rmp_serde::to_vec(sealed.get()).ok());
+        let copy = sealed.clone();
+        assert_eq!(copy.bytes().map(<[u8]>::to_vec), bytes);
+        assert_eq!(sealed.bytes().map(<[u8]>::to_vec), bytes);
+        assert_eq!(
+            super::sealed_encodes() - start,
+            1,
+            "a second ask encodes nothing"
+        );
+        sealed.set((0..CHANGES).collect());
+        assert_eq!(sealed.at, 1 + CHANGES, "a value set alike is no change");
+        assert_eq!(sealed.bytes().map(<[u8]>::to_vec), bytes);
+        assert_eq!(super::sealed_encodes() - start, 1, "nor an encoding");
+    }
+
+    // The value changes only through `Sealed::change`, `Sealed::set` and a
+    // restore (`Give::sealed`, `Give::shelf`), and a shelf's chunks only
+    // through those and `Sealed::new` (`Shelf::change`, `Shelf::set`,
+    // `Shelf::put`). Each gives the value a fresh cell: after its bytes were
+    // asked for, a change by any of them then an ask hands out the bytes of
+    // the new value, and a copy taken before keeps its own.
+    #[test]
+    fn every_change_after_an_ask_hands_out_the_new_value() {
+        fn now<T: Serialize>(value: &T) -> Option<Vec<u8>> {
+            rmp_serde::to_vec(value).ok()
+        }
+        fn asked(sealed: &Sealed<Vec<u32>>) -> Option<Vec<u8>> {
+            sealed.bytes().map(<[u8]>::to_vec)
+        }
+        let mut sealed = Sealed::new(vec![1]);
+        let was = asked(&sealed);
+        let copy = sealed.clone();
+        sealed.change(|items| items.push(2));
+        assert_eq!(asked(&sealed), now(&vec![1, 2]), "change");
+        assert_eq!(asked(&copy), was, "a copy keeps its own");
+        sealed.set(vec![3]);
+        assert_eq!(asked(&sealed), now(&vec![3]), "set");
+
+        let mut owner = Owner {
+            moving: 0,
+            settled: Sealed::new(Counted::from(vec![4])),
+            grown: Shelf::default(),
+        };
+        owner.grown.put(0, Some(vec![5]));
+        let (bytes, parts) = encode_parts(&owner).unwrap();
+        owner.settled.change(|counted| counted.items.push(6));
+        owner.grown.put(0, Some(vec![7]));
+        let (_, changed) = encode_parts(&owner).unwrap();
+        let mut restored: Owner = decode_parts(&bytes, &changed).unwrap();
+        assert_eq!(
+            restored.settled.bytes().map(<[u8]>::to_vec),
+            now(&vec![4, 6]),
+            "a restore"
+        );
+        let mut give = Give::new(&parts).unwrap();
+        restored.restore_parts(&mut give).unwrap();
+        assert_eq!(
+            restored.settled.bytes().map(<[u8]>::to_vec),
+            now(&vec![4]),
+            "a restore over a value asked of"
+        );
+        assert_eq!(restored.grown.get(0), Some(&vec![5]));
+
+        let mut shelf = Shelf::default();
+        shelf.put(0, Some(vec![8]));
+        let asked_chunk = |shelf: &Shelf<Vec<u32>>| shelf.chunks.get(&0).and_then(asked);
+        asked_chunk(&shelf);
+        shelf.change(0, Vec::is_empty, |chunk| chunk.push(9));
+        assert_eq!(asked_chunk(&shelf), now(&vec![8, 9]), "Shelf::change");
+        shelf.put(0, Some(vec![10]));
+        assert_eq!(asked_chunk(&shelf), now(&vec![10]), "Shelf::put");
+        shelf.set([(0, vec![11])]);
+        assert_eq!(asked_chunk(&shelf), now(&vec![11]), "Shelf::set");
     }
 
     #[test]

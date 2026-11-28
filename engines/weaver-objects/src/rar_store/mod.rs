@@ -19,6 +19,8 @@ mod image;
 mod layout;
 mod lock;
 pub(crate) mod made;
+#[cfg(test)]
+mod oracle;
 mod order;
 mod place;
 mod record;
@@ -525,6 +527,43 @@ struct Candidate {
     proven: bool,
 }
 
+// What a look changed of what `place` reads beyond the volumes it walked.
+#[derive(Default)]
+enum ReadsMoved {
+    #[default]
+    Nothing,
+    Volumes(BTreeSet<VolumeIndex>),
+    All,
+}
+
+impl ReadsMoved {
+    // What `place` reads of `volume` changed.
+    fn at(&mut self, volume: VolumeIndex) {
+        match self {
+            Self::Nothing => *self = Self::Volumes(BTreeSet::from([volume])),
+            Self::Volumes(volumes) => {
+                volumes.insert(volume);
+            }
+            Self::All => {}
+        }
+    }
+
+    // What `place` reads of any volume changed.
+    fn all(&mut self) {
+        *self = Self::All;
+    }
+
+    // Whether `volume` is said moved.
+    #[cfg(test)]
+    fn covers(&self, volume: VolumeIndex) -> bool {
+        match self {
+            Self::Nothing => false,
+            Self::Volumes(volumes) => volumes.contains(&volume),
+            Self::All => true,
+        }
+    }
+}
+
 pub struct RarStore {
     // The process's derivations, shared by every walk, check and key.
     keys: Arc<Keys>,
@@ -627,10 +666,22 @@ pub struct RarStore {
     // A run over its made members was started: what the tree marks refuted
     // since is that run's finding, not only the store's own walk's.
     started: bool,
-    // Moved wherever anything `place` reads may change: a look at what
-    // changed, a volume touched, a condemned file's cipher taken or let go.
-    // Data that only passes through moves nothing.
+    // Moved wherever anything `place` reads may change: for one volume
+    // where only what `place` reads of that volume changed (a volume
+    // touched, its kept bytes wanted anew, a condemned file's part in it
+    // posted again, a look that walked it), store-wide where what it reads
+    // across volumes did (`reads_moved`, a condemned key). Data that only
+    // passes through moves nothing.
     placed: Placed,
+    // What a look changed of what `place` reads beyond the volumes it
+    // walked: the layout, the entries' pieces, kinds, lengths or locks, for
+    // the volumes named, or for every one.
+    reads_moved: ReadsMoved,
+    // What `place` answered for every volume at the last check, under the
+    // number it was given: every volume no move since names answers so
+    // still.
+    #[cfg(test)]
+    oracle: std::sync::Mutex<Option<(u64, oracle::Answers)>>,
     // The keys a file needs of a candidate that the cache holds no answer
     // for, as (candidate, entry): derived away from the loop while the
     // store is lent out, and the files open once it is back.
@@ -696,15 +747,23 @@ impl RarStore {
             gone: false,
             started: false,
             placed: Placed::default(),
+            reads_moved: ReadsMoved::Nothing,
+            #[cfg(test)]
+            oracle: std::sync::Mutex::new(None),
             derive_due: BTreeSet::new(),
             derived: BTreeMap::new(),
             headers_due: BTreeMap::new(),
         }
     }
 
-    // Something `place` reads may have changed.
+    // Something `place` reads may have changed, for any volume.
     fn moved(&mut self) {
         self.placed.moved();
+    }
+
+    // Something `place` reads of `volume` alone may have changed.
+    fn moved_at(&mut self, volume: VolumeIndex) {
+        self.placed.moved_at(volume);
     }
 
     // A volume newly held lies under no piece: a layout maps only volumes
@@ -744,7 +803,7 @@ impl RarStore {
         }
         self.file_place(volume);
         self.dirty.insert(volume);
-        self.moved();
+        self.moved_at(volume);
     }
 
     // File what places a volume beside the others, as it stands now:
@@ -902,7 +961,6 @@ impl RarStore {
         let mut reached = BTreeMap::new();
         while !self.gone && (std::mem::take(&mut self.stale) | !self.dirty.is_empty()) {
             // The walks, the layout and the keys change only here.
-            self.moved();
             let touched = std::mem::take(&mut self.dirty);
             self.walk(&touched, &mut reached, out);
             // The layout holds to every volume touched so far, those the
@@ -916,6 +974,23 @@ impl RarStore {
             if !self.gone {
                 self.open_files(out);
             }
+            // A look moves the volumes it walked; one that changed what
+            // `place` reads across volumes moves store-wide.
+            match std::mem::take(&mut self.reads_moved) {
+                ReadsMoved::All => self.moved(),
+                ReadsMoved::Nothing => {
+                    for &volume in &touched {
+                        self.moved_at(volume);
+                    }
+                }
+                ReadsMoved::Volumes(volumes) => {
+                    for volume in touched.union(&volumes) {
+                        self.moved_at(*volume);
+                    }
+                }
+            }
+            #[cfg(test)]
+            self.check_moves();
         }
         let mut unkept = Vec::new();
         for (volume, from) in reached {
@@ -1307,7 +1382,7 @@ impl Object for RarStore {
                 break;
             }
             // A range wanted anew is the store's own now, not held.
-            self.moved();
+            self.moved_at(volume);
         }
         self.route(
             volume,
@@ -1469,7 +1544,15 @@ impl Object for RarStore {
     }
 
     fn placement(&self) -> Option<u64> {
+        #[cfg(test)]
+        self.check_moves();
         Some(self.placed.number())
+    }
+
+    fn placement_moves(&self, since: u64) -> weaver_graph::PlacementMoves {
+        #[cfg(test)]
+        self.check_moves();
+        self.placed.since(since)
     }
 
     fn extent(&self, member: MemberId, range: ByteRange, out: &mut Vec<Extent>) -> Located {

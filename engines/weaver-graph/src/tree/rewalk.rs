@@ -91,6 +91,7 @@ impl Tree {
     pub fn take_rewalk(&mut self, node: NodeId) -> Option<Rewalk> {
         if !self.is_live(node) {
             self.rewalks.remove(&node);
+            self.wants.rewalk_moved(node);
             return None;
         }
         let ranges = self.rewalks.get(&node)?;
@@ -110,6 +111,7 @@ impl Tree {
         let posting = self.object(node)?.posting(&taken);
         self.rewalks.remove(&node);
         self.rewalking.insert(node);
+        self.wants.rewalk_moved(node);
         Some(Rewalk {
             node,
             pieces,
@@ -156,6 +158,7 @@ impl Tree {
     // belonged to has failed, and nothing is to hear its close.
     pub fn rewalk_dropped(&mut self, node: NodeId) {
         self.rewalking.remove(&node);
+        self.wants.rewalk_moved(node);
     }
 
     // The last piece came, or the reading ended short: each volume whose
@@ -167,7 +170,9 @@ impl Tree {
         builder: &mut dyn Builder,
         effects: &mut Vec<Effect>,
     ) {
-        if !self.rewalking.remove(&node) || !self.is_live(node) {
+        let was = self.rewalking.remove(&node);
+        self.wants.rewalk_moved(node);
+        if !was || !self.is_live(node) {
             return;
         }
         let members: BTreeSet<MemberId> = self

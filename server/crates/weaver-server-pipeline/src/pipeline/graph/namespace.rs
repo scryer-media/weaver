@@ -23,6 +23,7 @@
 // disk. It takes a node everywhere and never assumes the root.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::ops::Bound;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use weaver_server_disk::operations::disk::volume::LoopSite;
@@ -33,10 +34,11 @@ use weaver_graph::holds::{
     Budget, HoldLedger, HoldsAccountant, HoldsNamespace, Location, Placed, Spans,
 };
 use weaver_graph::member::FIRST_BYTES;
+use weaver_graph::tree::{Prunable, PruneCursor};
 use weaver_graph::{
     Algorithm, Builder, ByteRange, Coverage, Digest, Effect, Emit, Evidenced, Kind, Marked,
-    MemberId, NodeId, Object, ObjectId, Placement, Provenance, Segment, Took, Tree, VolumeIndex,
-    Why,
+    MemberId, NodeId, Object, ObjectId, Placement, PlacementMoves, Provenance, Segment, Took, Tree,
+    VolumeIndex, Why,
 };
 
 use super::checkpoint::why_name;
@@ -141,6 +143,22 @@ pub enum WriteError {
     LeftAtStop,
 }
 
+// The answers kept of one object: its placement number as a pass last read
+// it, and the held volumes, as (namespace, held volume), whose answers stand
+// under it, by the object's volume each was asked of.
+type Under = (u64, BTreeMap<VolumeIndex, BTreeSet<(NodeId, VolumeIndex)>>);
+
+// What a prune forgets, in the order it forgets it: the namespaces charged
+// that the tree retired or dropped, the shelves of the nodes buried, and by
+// namespace either every file of one gone (`None`) or the members' files
+// whose members went or were buried.
+#[derive(Debug, PartialEq, Eq)]
+struct Pruning {
+    accounts: Vec<NodeId>,
+    shelves: Vec<NodeId>,
+    files: Vec<(NodeId, Option<Vec<MemberId>>)>,
+}
+
 // What one namespace has on disk and in hand.
 #[derive(Debug)]
 // A member's file and why it is a leaf are what a checkpoint keeps of it,
@@ -174,6 +192,14 @@ pub struct Files {
     // member. Those bytes were on scratch or in a spill file, never in the
     // member's own file, whether or not the hold was taken back.
     recorded: BTreeMap<MemberId, Spans>,
+    // The held volumes a pass over the holds asks: each gained its first
+    // hold, or a hold with no answer kept for it, lost the answer kept, had
+    // its member marked, or its object's placement number moved, since a
+    // pass last settled it. Derived: kept nowhere, and a restore starts it
+    // again from every hold it adopts.
+    unsettled: BTreeSet<VolumeIndex>,
+    // The generation of the namespace's marks the passes have read to.
+    marks_read: u64,
     // Which namespace's files these are, distinct from every other made in
     // the process: what was read of `leaves` by their marks is of these
     // files alone, not of another the node had before.
@@ -192,6 +218,8 @@ impl Files {
             spills_empty: BTreeSet::new(),
             refused: BTreeMap::new(),
             recorded: BTreeMap::new(),
+            unsettled: BTreeSet::new(),
+            marks_read: 0,
         }
     }
 
@@ -533,6 +561,24 @@ pub struct NamespaceWriter {
     // last asked where its holds go: while the object says the same number,
     // it places them as it did then, and nothing of them goes down.
     asked: BTreeMap<(NodeId, VolumeIndex), (NodeId, VolumeIndex, u64)>,
+    // The same answers by object: its placement number as the last pass
+    // read it, and the held volumes whose answers stand under it that still
+    // hold bytes, by the object's volume they were asked of. A pass reads
+    // the number of each object the tree marked since the last one; one
+    // that moved unsettles those of the volumes it says moved since, every
+    // one when it cannot say.
+    asked_under: BTreeMap<NodeId, Under>,
+    // The namespaces that hold bytes, which a pass goes over: filed where a
+    // hold comes, is restored, or its namespace's last one goes.
+    holding: BTreeSet<NodeId>,
+    // Where the last prune read the tree up to, and the namespaces' files
+    // and members' files made since: what a prune asks again is what the
+    // tree changed since and what was made since, and nothing else.
+    pruned: PruneCursor,
+    made_files: BTreeSet<NodeId>,
+    made_leaves: BTreeSet<(NodeId, MemberId)>,
+    // The tree's generation the last pass read its node marks at.
+    tree_read: u64,
     // Where the time a member write takes on disk is published, when the
     // job runs in a pipeline.
     metrics: Option<Arc<weaver_server_base::operations::metrics::PipelineMetrics>>,
@@ -682,6 +728,12 @@ impl NamespaceWriter {
             placements: Vec::new(),
             from_file: None,
             asked: BTreeMap::new(),
+            asked_under: BTreeMap::new(),
+            holding: BTreeSet::new(),
+            pruned: PruneCursor::default(),
+            made_files: BTreeSet::new(),
+            made_leaves: BTreeSet::new(),
+            tree_read: 0,
             metrics: None,
             disk: None,
             replaying: BTreeSet::new(),
@@ -2099,9 +2151,9 @@ impl NamespaceWriter {
         // Held under a map the object has moved on from since: no pass has
         // asked the new map where these go.
         if moved && !held.is_empty() {
-            self.asked
-                .remove(&(arrival.node, held_volume(arrival.member)));
+            self.forget_asked(arrival.node, held_volume(arrival.member));
         }
+        self.held_gone(arrival.node, held_volume(arrival.member));
         self.hold_for((arrival.node, arrival.member), held)
     }
 
@@ -2874,7 +2926,7 @@ impl NamespaceWriter {
                     }
                     self.discard(envelope)?;
                 } else {
-                    self.files_mut(node).leaves.insert(member, envelope);
+                    self.insert_leaf(node, member, envelope);
                 }
                 self.uncover_unkept(tree, (node, member), &retained);
                 self.intend(node, member, &output_name);
@@ -2901,7 +2953,7 @@ impl NamespaceWriter {
         let leaf = files.leaves.remove(&member);
         self.caps.forget(tree, node, member);
         if let Some(leaf) = leaf {
-            self.files_mut(to).leaves.insert(lifted, leaf);
+            self.insert_leaf(to, lifted, leaf);
         }
         let output_name = tree
             .namespace(to)
@@ -3022,13 +3074,20 @@ impl NamespaceWriter {
         let free_disk = self.free_disk_bytes();
         let spilled = bytes.clone();
         let len = bytes.len() as u64;
+        let unasked = !self.asked.contains_key(&(node, held_volume(member)));
         let files = self.files_mut(node);
         // Bytes held over ones the member's file already has leave the
         // tree's coverage as it was, so the hold itself marks the member.
         files.leaves.mark(member);
+        // A volume's first hold, or one no pass has an answer for, is
+        // asked by the next pass.
+        if unasked || !files.holds.holds_any(held_volume(member)) {
+            files.unsettled.insert(held_volume(member));
+        }
         let outcome = files
             .holds
             .hold(held_volume(member), offset, bytes, free_disk);
+        self.file_holding(node);
         // What a run's output holds in memory is carried for; what the hold
         // cut over or paged out of memory no longer is.
         if outcome.placed == Placed::Ram {
@@ -3217,6 +3276,25 @@ impl NamespaceWriter {
         }
         self.paid_held(node, member, paid);
         Ok(())
+    }
+
+    // A pass's held volume with no object: a member still undecided, or
+    // one an object is giving up, keeps its bytes held for what decides it
+    // or for the give-up, and a leaf no object owns (`Tree::unowned`), as a
+    // member asked again once a lent sibling is back can be, writes them to
+    // its file. The decision marks the member, which brings the pass here.
+    // Whether any went down.
+    fn release_decided_leaf(
+        &mut self,
+        tree: &mut Tree,
+        node: NodeId,
+        member: MemberId,
+    ) -> Result<bool, WriteError> {
+        if !tree.unowned(node, member) {
+            return Ok(false);
+        }
+        self.release_to_leaf(tree, node, member)?;
+        Ok(true)
     }
 
     // What was held of `range` of the member goes down to its object, each
@@ -3585,6 +3663,8 @@ impl NamespaceWriter {
             self.closes_owed.pop_front();
             self.closes_owed_set.remove(&(node, member));
             self.shut(tree, builder, segments, node, member, out)?;
+            #[cfg(any(test, feature = "pipeline-test-fixtures"))]
+            let _closing = hooks::ClosingRelease::enter();
             self.release_owed = self.release_held_paid(tree, builder, segments, &mut 0, out)?;
         }
         Ok(())
@@ -3671,10 +3751,487 @@ impl NamespaceWriter {
         )
     }
 
-    // One pass over every hold, each held volume once in volume order and
-    // nothing else of its namespace: whether any went down, or, paid
-    // (`replay`), the pass stands for room for its next span.
+    // One pass over the holds: of each namespace that holds bytes, in node
+    // order, each held volume something changed for since a pass settled it
+    // (`Files::unsettled`), once, in volume order, and nothing else of its
+    // namespace: whether any went down, or, paid (`replay`), the pass stands
+    // for room for its next span. A volume left out is one the walk over
+    // every hold would find asked of a map that has not moved since, every
+    // hold of it held there, and would pass by.
     fn release_placed(
+        &mut self,
+        tree: &mut Tree,
+        builder: &mut dyn Builder,
+        segments: &dyn Segments,
+        pay: Option<&mut u64>,
+        out: &mut Vec<Effect>,
+    ) -> Result<Released, WriteError> {
+        #[cfg(any(test, feature = "pipeline-test-fixtures"))]
+        {
+            let released = if hooks::RELEASE_REFERENCE.get() {
+                self.release_placed_reference(tree, builder, segments, pay, out)
+            } else {
+                self.release_unsettled(tree, builder, segments, pay, out)
+            };
+            hooks::log_pass(self, tree, &released, out.len());
+            released
+        }
+        #[cfg(not(any(test, feature = "pipeline-test-fixtures")))]
+        self.release_unsettled(tree, builder, segments, pay, out)
+    }
+
+    fn release_unsettled(
+        &mut self,
+        tree: &mut Tree,
+        builder: &mut dyn Builder,
+        segments: &dyn Segments,
+        mut pay: Option<&mut u64>,
+        out: &mut Vec<Effect>,
+    ) -> Result<Released, WriteError> {
+        #[cfg(any(test, feature = "pipeline-test-fixtures"))]
+        let _pass = hooks::ReleasePass::enter();
+        let mut released = false;
+        let parents: Vec<NodeId> = self.holding.iter().copied().collect();
+        #[cfg(any(test, feature = "pipeline-test-fixtures"))]
+        {
+            let holding: Vec<NodeId> = self
+                .files
+                .iter()
+                .filter(|(_, files)| files.holds.total_held() > 0)
+                .map(|(node, _)| *node)
+                .collect();
+            assert_eq!(parents, holding, "the namespaces filed as holding");
+        }
+        self.unsettle_changed(tree, &parents);
+        #[cfg(any(test, feature = "pipeline-test-fixtures"))]
+        if hooks::ClosingRelease::active()
+            || parents.iter().any(|parent| {
+                self.files
+                    .get(parent)
+                    .is_some_and(|files| !files.unsettled.is_empty())
+            })
+        {
+            self.assert_settled_pass_by(tree, &parents);
+        }
+        let mut placements = Vec::new();
+        for parent in parents.iter().copied() {
+            let mut after = None;
+            while let Some(held) = self.files.get(&parent).and_then(|files| {
+                let from = after.map_or(Bound::Unbounded, Bound::Excluded);
+                files
+                    .unsettled
+                    .range((from, Bound::Unbounded))
+                    .next()
+                    .copied()
+            }) {
+                after = Some(held);
+                // Settled unless what follows keeps it unsettled.
+                let Some(files) = self.files.get_mut_unmarked(&parent) else {
+                    break;
+                };
+                files.unsettled.remove(&held);
+                if !files.holds.holds_any(held) {
+                    continue;
+                }
+                #[cfg(any(test, feature = "pipeline-test-fixtures"))]
+                hooks::RELEASE_VISITED.with(|visited| visited.set(visited.get() + 1));
+                let member = held_member(held);
+                // A further posting's bytes are its member's: only the
+                // namespace's own members are asked. One that becomes the
+                // namespace's own, or gets an object, is marked, and comes
+                // back then.
+                let listed = tree.namespace(parent).is_some_and(|namespace| {
+                    namespace.get(member).is_some() && namespace.copy_of(member).is_none()
+                });
+                if !listed {
+                    continue;
+                }
+                #[cfg(any(test, feature = "pipeline-test-fixtures"))]
+                hooks::RELEASE_ASKED.with(|asked| asked.set(asked.get() + 1));
+                let Some((child, volume)) = tree.child_of(parent, member) else {
+                    released |= self.release_decided_leaf(tree, parent, member)?;
+                    continue;
+                };
+                let ranges = |writer: &Self| {
+                    writer
+                        .files
+                        .get(&parent)
+                        .map(|files| files.holds.held_ranges(held))
+                        .unwrap_or_default()
+                };
+                // Asked already, of an object whose map has not moved since:
+                // every hold was held by that same map, at the last pass or
+                // as it came.
+                let placement = tree.placement(child);
+                let unmoved = placement.is_some_and(|number| {
+                    self.asked.get(&(parent, held)).copied() == Some((child, volume, number))
+                        || self.stands(child, volume, (parent, held), number)
+                });
+                if unmoved {
+                    // Filed under its object again: an object whose number
+                    // went away and came back unmoved, as one lent out
+                    // does, dropped it from its answers.
+                    if let Some(number) = placement {
+                        self.keep_asked(tree, parent, held, (child, volume, number));
+                    }
+                    continue;
+                }
+                match placement {
+                    Some(number) => self.keep_asked(tree, parent, held, (child, volume, number)),
+                    // An object that keeps no number is asked every pass.
+                    None => {
+                        if let Some(files) = self.files.get_mut_unmarked(&parent) {
+                            files.unsettled.insert(held);
+                        }
+                    }
+                }
+                let mut replayed = false;
+                for range in ranges(self) {
+                    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
+                    hooks::RELEASE_LOCATED.with(|located| located.set(located.get() + 1));
+                    placements.clear();
+                    tree.locate(child, volume, range, &mut placements);
+                    if placements
+                        .iter()
+                        .any(|placement| !matches!(placement, Placement::Held { .. }))
+                    {
+                        let pay = pay.as_deref_mut();
+                        let stood = self.replay(
+                            tree, builder, segments, parent, member, range, None, pay, out,
+                        )?;
+                        if let Some(bytes) = stood {
+                            // What is still held was not handed over: the
+                            // next pass asks it again.
+                            if placement.is_some() {
+                                self.forget_asked(parent, held);
+                            }
+                            let into = Self::held_into(tree, parent, member);
+                            return Ok(Released::Standing(bytes, into));
+                        }
+                        released = true;
+                        replayed = true;
+                    }
+                }
+                // What the replay changed, the volumes after this one in
+                // this pass see, as they see it in the tree.
+                if replayed {
+                    self.unsettle_changed(tree, &parents);
+                }
+            }
+        }
+        Ok(if released {
+            Released::Some
+        } else {
+            Released::Nothing
+        })
+    }
+
+    // The volumes of each namespace in `parents` that something changed
+    // for since the last pass read it, unsettled: each held volume of an
+    // object whose placement number moved since its answer was kept, and
+    // each one whose member the namespace marked since.
+    fn unsettle_changed(&mut self, tree: &Tree, parents: &[NodeId]) {
+        // Only an object the tree marked since the last read can have moved
+        // its number: every way to change one marks its node.
+        let moved_from = |child: &NodeId, under: &Under| tree.placement(*child) != Some(under.0);
+        let generation = tree.generation();
+        let moved: Vec<NodeId> = if generation < self.tree_read {
+            // Marks of another tree than the one read: every object is
+            // compared.
+            self.asked_under
+                .iter()
+                .filter(|(child, under)| moved_from(child, under))
+                .map(|(child, _)| *child)
+                .collect()
+        } else {
+            tree.changed_since(self.tree_read)
+                .filter(|child| {
+                    self.asked_under
+                        .get(child)
+                        .is_some_and(|under| moved_from(child, under))
+                })
+                .collect()
+        };
+        self.tree_read = generation;
+        for child in moved {
+            self.catch_up(tree, child);
+        }
+        // The objects the walk passed by kept the numbers their answers
+        // were kept under, as comparing every one would find.
+        #[cfg(any(test, feature = "pipeline-test-fixtures"))]
+        for (child, (number, _)) in &self.asked_under {
+            assert_eq!(
+                tree.placement(*child),
+                Some(*number),
+                "an object the tree log passed by moved its number: {child:?}"
+            );
+        }
+        for parent in parents {
+            let Some(namespace) = tree.namespace(*parent) else {
+                continue;
+            };
+            let Some(files) = self.files.get_mut_unmarked(parent) else {
+                continue;
+            };
+            let generation = namespace.generation();
+            if generation < files.marks_read {
+                // Marks of another namespace than the one read: every hold
+                // is asked again.
+                files.marks_read = generation;
+                self.unsettle_all(*parent);
+                continue;
+            }
+            for member in namespace.changed_since(files.marks_read) {
+                let volume = held_volume(member);
+                if files.holds.holds_any(volume) {
+                    files.unsettled.insert(volume);
+                }
+            }
+            files.marks_read = generation;
+        }
+    }
+
+    // A held volume the next pass asks, while it holds anything.
+    fn unsettle(&mut self, parent: NodeId, held: VolumeIndex) {
+        if let Some(files) = self.files.get_mut_unmarked(&parent)
+            && files.holds.holds_any(held)
+        {
+            files.unsettled.insert(held);
+        }
+    }
+
+    // Every held volume of the namespace is asked by the next pass.
+    fn unsettle_all(&mut self, parent: NodeId) {
+        if let Some(files) = self.files.get_mut_unmarked(&parent) {
+            let held: Vec<VolumeIndex> = files
+                .holds
+                .held_volumes()
+                .filter(|volume| files.holds.holds_any(*volume))
+                .collect();
+            files.unsettled.extend(held);
+        }
+    }
+
+    // The answer a pass kept for a held volume, by its object too.
+    fn keep_asked(
+        &mut self,
+        tree: &Tree,
+        parent: NodeId,
+        held: VolumeIndex,
+        answer: (NodeId, VolumeIndex, u64),
+    ) {
+        if let Some((was, at, _)) = self.asked.insert((parent, held), answer) {
+            self.unfile_asked(was, at, (parent, held));
+        }
+        let (child, volume, number) = answer;
+        // Answers kept under a number the object has moved on from since
+        // are asked again, of the volumes it moved.
+        self.catch_up(tree, child);
+        self.asked_under
+            .entry(child)
+            .or_insert_with(|| (number, BTreeMap::new()))
+            .1
+            .entry(volume)
+            .or_default()
+            .insert((parent, held));
+    }
+
+    // Whether the answer kept for a held volume stands under the object's
+    // number `number`: filed under the volume it was asked of, and nothing
+    // moved that volume since.
+    fn stands(
+        &self,
+        child: NodeId,
+        volume: VolumeIndex,
+        key: (NodeId, VolumeIndex),
+        number: u64,
+    ) -> bool {
+        self.asked_under.get(&child).is_some_and(|(read, filed)| {
+            *read == number && filed.get(&volume).is_some_and(|keys| keys.contains(&key))
+        })
+    }
+
+    // The answers kept of an object whose number moved since the pass read
+    // it, brought up to its number: the held volumes asked of a volume it
+    // says moved since are unsettled and leave its answers, every one when
+    // it cannot say, and the rest stand under the number it has now.
+    fn catch_up(&mut self, tree: &Tree, child: NodeId) {
+        let Some((read, _)) = self.asked_under.get(&child) else {
+            return;
+        };
+        let number = tree.placement(child);
+        if number == Some(*read) {
+            return;
+        }
+        let moves = match number {
+            Some(_) => tree.placement_moves(child, *read),
+            None => PlacementMoves::All,
+        };
+        let stale: Vec<(NodeId, VolumeIndex)> = match (moves, number) {
+            (PlacementMoves::Volumes(volumes), Some(number)) => {
+                let Some(under) = self.asked_under.get_mut(&child) else {
+                    return;
+                };
+                under.0 = number;
+                let stale = volumes
+                    .iter()
+                    .filter_map(|volume| under.1.remove(volume))
+                    .flatten()
+                    .collect();
+                if under.1.is_empty() {
+                    self.asked_under.remove(&child);
+                }
+                stale
+            }
+            _ => self
+                .asked_under
+                .remove(&child)
+                .into_iter()
+                .flat_map(|(_, filed)| filed.into_values().flatten())
+                .collect(),
+        };
+        for (parent, volume) in stale {
+            self.unsettle(parent, volume);
+        }
+    }
+
+    // The answer kept for a held volume is gone: the next pass asks it.
+    fn forget_asked(&mut self, parent: NodeId, held: VolumeIndex) {
+        if let Some((child, volume, _)) = self.asked.remove(&(parent, held)) {
+            self.unfile_asked(child, volume, (parent, held));
+        }
+        self.unsettle(parent, held);
+    }
+
+    fn unfile_asked(&mut self, child: NodeId, volume: VolumeIndex, key: (NodeId, VolumeIndex)) {
+        let Some((_, filed)) = self.asked_under.get_mut(&child) else {
+            return;
+        };
+        if let Some(keys) = filed.get_mut(&volume) {
+            keys.remove(&key);
+            if keys.is_empty() {
+                filed.remove(&volume);
+            }
+        }
+        if filed.is_empty() {
+            self.asked_under.remove(&child);
+        }
+    }
+
+    // A held volume that holds nothing now leaves the passes until it holds
+    // bytes again, which unsettles it then.
+    fn held_gone(&mut self, parent: NodeId, held: VolumeIndex) {
+        let Some(files) = self.files.get_mut_unmarked(&parent) else {
+            return;
+        };
+        if files.holds.holds_any(held) {
+            return;
+        }
+        files.unsettled.remove(&held);
+        if let Some((child, volume, _)) = self.asked.remove(&(parent, held)) {
+            self.unfile_asked(child, volume, (parent, held));
+        }
+        self.file_holding(parent);
+    }
+
+    // A namespace gone: the answers kept for its held volumes go with it,
+    // by their objects too.
+    fn forget_namespace_asked(&mut self, parent: NodeId) {
+        let keys: Vec<(NodeId, VolumeIndex)> = self
+            .asked
+            .range((parent, VolumeIndex(0))..=(parent, VolumeIndex(u32::MAX)))
+            .map(|(key, _)| *key)
+            .collect();
+        for key in keys {
+            if let Some((child, volume, _)) = self.asked.remove(&key) {
+                self.unfile_asked(child, volume, key);
+            }
+        }
+    }
+
+    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
+    pub fn asked_sizes(&self) -> (usize, usize) {
+        let under = self
+            .asked_under
+            .values()
+            .flat_map(|(_, filed)| filed.values())
+            .map(BTreeSet::len)
+            .sum();
+        (self.asked.len(), under)
+    }
+
+    // Whether the namespace at `node` holds bytes, filed for the passes.
+    pub(super) fn file_holding(&mut self, node: NodeId) {
+        if self
+            .files
+            .get(&node)
+            .is_some_and(|files| files.holds.total_held() > 0)
+        {
+            self.holding.insert(node);
+        } else {
+            self.holding.remove(&node);
+        }
+    }
+
+    // The walk over every hold, read only, before a pass that asks any
+    // volume, and before each one a close runs: every held volume the pass
+    // leaves out is one the walk would pass by, asked of a map that has not
+    // moved since, every range of it held there.
+    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
+    fn assert_settled_pass_by(&self, tree: &Tree, parents: &[NodeId]) {
+        let mut placements = Vec::new();
+        for parent in parents {
+            let Some(files) = self.files.get(parent) else {
+                continue;
+            };
+            let mut after = None;
+            while let Some(held) = files.holds.next_held_volume(after) {
+                after = Some(held);
+                if files.unsettled.contains(&held) {
+                    continue;
+                }
+                let member = held_member(held);
+                let listed = tree.namespace(*parent).is_some_and(|namespace| {
+                    namespace.get(member).is_some() && namespace.copy_of(member).is_none()
+                });
+                if !listed {
+                    continue;
+                }
+                let Some((child, volume)) = tree.child_of(*parent, member) else {
+                    assert!(
+                        !tree.unowned(*parent, member),
+                        "a settled hold with no object is not a leaf no object owns: {parent:?} {held:?}"
+                    );
+                    continue;
+                };
+                let placement = tree.placement(child);
+                assert!(
+                    placement.is_some_and(|number| self.stands(
+                        child,
+                        volume,
+                        (*parent, held),
+                        number
+                    )),
+                    "a settled hold filed under its object's volume as it stands: {parent:?} {held:?}"
+                );
+                for range in files.holds.held_ranges(held) {
+                    placements.clear();
+                    tree.locate(child, volume, range, &mut placements);
+                    assert!(
+                        placements
+                            .iter()
+                            .all(|placement| matches!(placement, Placement::Held { .. })),
+                        "a settled hold the unmoved map places: {parent:?} {held:?} {range:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    // The pass over every hold as it ran before passes kept what changed,
+    // which the passes are compared with.
+    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
+    fn release_placed_reference(
         &mut self,
         tree: &mut Tree,
         builder: &mut dyn Builder,
@@ -3712,6 +4269,7 @@ impl NamespaceWriter {
                 #[cfg(any(test, feature = "pipeline-test-fixtures"))]
                 hooks::RELEASE_ASKED.with(|asked| asked.set(asked.get() + 1));
                 let Some((child, volume)) = tree.child_of(parent, member) else {
+                    released |= self.release_decided_leaf(tree, parent, member)?;
                     continue;
                 };
                 let ranges = |writer: &Self| {
@@ -3821,6 +4379,7 @@ impl NamespaceWriter {
             // What a checkpoint says of the member's bytes changed.
             files.leaves.mark(member);
         }
+        self.held_gone(node, held_volume(member));
         self.uncredit_past_resident(node, member);
         self.release_spill(node, member)
     }
@@ -3844,6 +4403,7 @@ impl NamespaceWriter {
             // while they were held, and the next one says them again.
             files.leaves.mark(member);
         }
+        self.held_gone(node, held_volume(member));
         let mut held = Vec::with_capacity(taken.len());
         for piece in taken {
             let bytes = match piece.location {
@@ -4500,22 +5060,38 @@ impl NamespaceWriter {
     // entries and keeps nothing resident. A member lifted away is not
     // gone: its file is the member's it became, and goes there with it
     // (`Effect::Lifted`).
+    //
+    // What a prune asks is only what can have become prunable since the
+    // last one: what the tree changed since (`Tree::prunable_since`), and
+    // the shelves, namespaces' files and members' files made since. A
+    // member's file is asked whether its node is buried only when it is.
     fn prune(&mut self, tree: &Tree) -> Result<(), WriteError> {
-        self.caps.release_gone(tree);
-        let shelved: Vec<NodeId> = self.envelopes.nodes().collect();
-        for node in shelved {
-            if tree.buried(node) {
-                for leaf in self.envelopes.forget(node) {
-                    self.discard(leaf)?;
-                }
+        let changed = tree.prunable_since(&self.pruned);
+        let pruning = match changed.all {
+            true => self.pruning_walked(tree, true),
+            false => self.pruning_changed(tree, &changed),
+        };
+        // The proof: what a walk of everything finds is what the changes
+        // found.
+        #[cfg(any(test, feature = "pipeline-test-fixtures"))]
+        assert_eq!(
+            pruning,
+            self.pruning_walked(tree, false),
+            "a prune of what changed found otherwise than a walk of everything"
+        );
+        self.caps.release_all(&pruning.accounts);
+        for node in pruning.shelves {
+            for leaf in self.envelopes.forget(node) {
+                self.discard(leaf)?;
             }
         }
-        let nodes: Vec<NodeId> = self.files.keys().copied().collect();
-        for node in nodes {
-            let Some(namespace) = tree.namespace(node) else {
+        for (node, gone) in pruning.files {
+            let Some(gone) = gone else {
                 // Dropping the namespace's holds gives their count back,
                 // and what the loop carried for them.
                 if let Some(files) = self.files.remove(&node) {
+                    self.holding.remove(&node);
+                    self.forget_namespace_asked(node);
                     self.uncredit_node(node);
                     for member in files.leaves.keys() {
                         self.caps.forget(tree, node, *member);
@@ -4532,14 +5108,6 @@ impl NamespaceWriter {
                 }
                 continue;
             };
-            let gone: Vec<MemberId> = self.files[&node]
-                .leaves
-                .keys()
-                .copied()
-                .filter(|member| {
-                    namespace.get(*member).is_none() || tree.buried_member(node, *member)
-                })
-                .collect();
             for member in gone {
                 self.drop_held(node, member, ALL)?;
                 let files = self.files_mut(node);
@@ -4550,7 +5118,121 @@ impl NamespaceWriter {
                 self.caps.forget(tree, node, member);
             }
         }
+        self.pruned = tree.prune_cursor();
+        self.made_files.clear();
+        self.made_leaves.clear();
+        self.envelopes.clear_made();
         Ok(())
+    }
+
+    // What a prune forgets, asking only what can have become prunable since
+    // the last one.
+    fn pruning_changed(&self, tree: &Tree, changed: &Prunable) -> Pruning {
+        let accounts = self.caps.gone_of(tree, &changed.nodes);
+        let shelves = changed
+            .nodes
+            .union(self.envelopes.made())
+            .copied()
+            .filter(|node| self.envelopes.has_shelf(*node) && tree.buried(*node))
+            .collect();
+        // Each namespace with files to ask, with whether every member's
+        // file is asked once its node is buried, and the members asked
+        // whatever it is.
+        let mut asked: BTreeMap<NodeId, (bool, BTreeSet<MemberId>)> = BTreeMap::new();
+        for node in changed.nodes.iter().chain(&self.made_files) {
+            if self.files.contains_key(node) {
+                let every = changed.nodes.contains(node);
+                asked.entry(*node).or_default().0 |= every;
+            }
+        }
+        for (node, member) in changed.members.iter().chain(&self.made_leaves) {
+            if let Some(files) = self.files.get(node)
+                && files.leaves.contains_key(member)
+            {
+                asked.entry(*node).or_default().1.insert(*member);
+            }
+        }
+        let mut files = Vec::new();
+        for (node, (every, members)) in asked {
+            let Some(namespace) = tree.namespace(node) else {
+                files.push((node, None));
+                continue;
+            };
+            let buried = tree.buried(node);
+            let leaves = &self.files[&node].leaves;
+            let asked: Vec<MemberId> = match every && buried {
+                true => leaves.keys().copied().collect(),
+                false => members.into_iter().collect(),
+            };
+            #[cfg(any(test, feature = "pipeline-test-fixtures"))]
+            hooks::PRUNE_LEAF_CHECKS.set(hooks::PRUNE_LEAF_CHECKS.get() + asked.len());
+            let gone: Vec<MemberId> = asked
+                .into_iter()
+                .filter(|member| {
+                    namespace.get(*member).is_none() || (buried && tree.settled_open(node, *member))
+                })
+                .collect();
+            if !gone.is_empty() {
+                files.push((node, Some(gone)));
+            }
+        }
+        Pruning {
+            accounts,
+            shelves,
+            files,
+        }
+    }
+
+    // What a prune forgets, asking everything: the charged namespaces, the
+    // shelves and every member's file. A prune whose cursor is another
+    // tree's asks this, as the check of every other prune does; only the
+    // first is `counted`.
+    fn pruning_walked(&self, tree: &Tree, counted: bool) -> Pruning {
+        let shelves = self
+            .envelopes
+            .nodes()
+            .filter(|node| tree.buried(*node))
+            .collect();
+        let mut files = Vec::new();
+        for (node, held) in self.files.iter() {
+            let Some(namespace) = tree.namespace(*node) else {
+                files.push((*node, None));
+                continue;
+            };
+            #[cfg(any(test, feature = "pipeline-test-fixtures"))]
+            match counted {
+                true => {
+                    hooks::PRUNE_LEAF_CHECKS.set(hooks::PRUNE_LEAF_CHECKS.get() + held.leaves.len())
+                }
+                false => hooks::PRUNE_WALKED_CHECKS
+                    .set(hooks::PRUNE_WALKED_CHECKS.get() + held.leaves.len()),
+            }
+            #[cfg(not(any(test, feature = "pipeline-test-fixtures")))]
+            let _ = counted;
+            let gone: Vec<MemberId> = held
+                .leaves
+                .keys()
+                .copied()
+                .filter(|member| {
+                    namespace.get(*member).is_none() || tree.buried_member(*node, *member)
+                })
+                .collect();
+            if !gone.is_empty() {
+                files.push((*node, Some(gone)));
+            }
+        }
+        Pruning {
+            accounts: self.caps.gone(tree),
+            shelves,
+            files,
+        }
+    }
+
+    // A member's file, opened or handed to it here: a prune asks it, made
+    // since the last one.
+    fn insert_leaf(&mut self, node: NodeId, member: MemberId, leaf: Leaf) {
+        self.files_mut(node).leaves.insert(member, leaf);
+        self.made_leaves.insert((node, member));
     }
 
     // An object took the member over: the one place a binding is known.
@@ -4661,6 +5343,9 @@ impl NamespaceWriter {
             .subtree_of
             .get(&node)
             .and_then(|top| self.held_by_subtree.get(top));
+        if !self.files.contains_key(&node) {
+            self.made_files.insert(node);
+        }
         self.files.get_or_insert_with(node, || {
             let mut files = Files::new(namespace, Arc::clone(accountant));
             if let Some(tally) = tally {
@@ -4743,7 +5428,7 @@ impl NamespaceWriter {
             let leaf = self
                 .new_leaf((node, member), &output_name, held_off, &root)
                 .on(device);
-            self.files_mut(node).leaves.insert(member, leaf);
+            self.insert_leaf(node, member, leaf);
         }
         Ok(self
             .files_mut(node)
@@ -5476,6 +6161,16 @@ pub mod hooks {
         pub static RELEASE_ASKED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
         // How many held ranges a pass asked their object to place.
         pub static RELEASE_LOCATED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+        // How many held volumes the passes over the holds visited.
+        pub static RELEASE_VISITED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+        // Whether the passes walk every hold, as they did before they kept
+        // what changed: the reference the kept passes are compared with.
+        pub static RELEASE_REFERENCE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        // How many passes a close runs are under way.
+        static RELEASE_CLOSING: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+        // When set, what each pass over the holds left: its answer, the
+        // answers kept, every hold and how many effects were said.
+        pub static RELEASE_LOG: std::cell::RefCell<Option<Vec<String>>> = const { std::cell::RefCell::new(None) };
         // How many passes over the holds are running, and the most that ran
         // at once.
         pub static RELEASE_DEPTH: std::cell::Cell<(usize, usize)> = const { std::cell::Cell::new((0, 0)) };
@@ -5486,6 +6181,12 @@ pub mod hooks {
         // How many checksum obligations a sweep of the unmet ones asked
         // about.
         pub static SWEEP_ASKED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+        // How many members' files the prunes asked whether their member
+        // went or was buried.
+        pub static PRUNE_LEAF_CHECKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+        // How many the walk of every file that checks each prune asked:
+        // what a prune asked before it kept what changed.
+        pub static PRUNE_WALKED_CHECKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     }
 
     // One pass over the holds, counted in `RELEASE_DEPTH` while it runs.
@@ -5508,5 +6209,70 @@ pub mod hooks {
                 depth.set((now - 1, most));
             });
         }
+    }
+
+    // The passes a close runs (`close_owed_in_turn`), while it runs them.
+    pub struct ClosingRelease;
+
+    impl ClosingRelease {
+        pub fn enter() -> Self {
+            RELEASE_CLOSING.set(RELEASE_CLOSING.get() + 1);
+            Self
+        }
+
+        pub fn active() -> bool {
+            RELEASE_CLOSING.get() > 0
+        }
+    }
+
+    impl Drop for ClosingRelease {
+        fn drop(&mut self) {
+            RELEASE_CLOSING.set(RELEASE_CLOSING.get() - 1);
+        }
+    }
+
+    // What the pass left, into `RELEASE_LOG` when it is set. An answer's
+    // placement number is said as whether the object moved nothing of the
+    // volume it was asked of since, as numbers differ between two jobs alike.
+    pub(super) fn log_pass(
+        writer: &super::NamespaceWriter,
+        tree: &weaver_graph::Tree,
+        released: &Result<super::Released, super::WriteError>,
+        said: usize,
+    ) {
+        use std::fmt::Write;
+        RELEASE_LOG.with_borrow_mut(|log| {
+            let Some(log) = log else {
+                return;
+            };
+            let mut line = match released {
+                Ok(released) => format!("{released:?}"),
+                Err(error) => format!("error {error}"),
+            };
+            for ((parent, held), (child, volume, number)) in &writer.asked {
+                // An answer stands while its object moved nothing of the
+                // volume it was asked of since.
+                let now = tree.placement(*child).is_some()
+                    && match tree.placement_moves(*child, *number) {
+                        weaver_graph::PlacementMoves::All => false,
+                        weaver_graph::PlacementMoves::Volumes(moved) => !moved.contains(volume),
+                    };
+                let _ = write!(
+                    line,
+                    " asked {}/{} {}/{} {now}",
+                    parent.0, held.0, child.0, volume.0
+                );
+            }
+            for (node, files) in writer.files.iter() {
+                for volume in files.holds.held_volumes() {
+                    let ranges = files.holds.held_ranges(volume);
+                    if !ranges.is_empty() {
+                        let _ = write!(line, " held {}/{} {ranges:?}", node.0, volume.0);
+                    }
+                }
+            }
+            let _ = write!(line, " said {said}");
+            log.push(line);
+        });
     }
 }

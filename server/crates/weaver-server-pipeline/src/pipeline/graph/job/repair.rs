@@ -84,6 +84,8 @@ impl GraphJob {
                 let Some(mut object) = self.tree.lend_work(node) else {
                     continue;
                 };
+                // Out for its work, the object answers no recovery face.
+                self.coming_kept.owner_moved(node);
                 if admit {
                     self.works.lend(node, object);
                     continue;
@@ -97,6 +99,8 @@ impl GraphJob {
                 self.took_back_worked(node, object, said, limit)?;
             }
             if admit || !moved {
+                // What went out answers no recovery face while it is out.
+                self.refresh_coming();
                 return Ok(());
             }
         }
@@ -177,6 +181,7 @@ impl GraphJob {
         self.seal_proven();
         // An ended namespace's obligations nothing can check end here.
         if self.writer.verifications_waiting() {
+            self.refresh_coming();
             self.writer
                 .drop_unmet_verifications(&self.tree, &self.coming());
         }
@@ -286,6 +291,7 @@ impl GraphJob {
     // them read back one a turn: the rest waits in `quieting`, and this
     // returns false, as nothing more is to be stepped until it is done.
     pub(super) fn tell_quiet(&mut self) -> Result<bool, GraphError> {
+        self.refresh_coming();
         if self.quieting.is_some() || !self.quiet() {
             return Ok(false);
         }
@@ -306,7 +312,11 @@ impl GraphJob {
         limit: usize,
     ) -> Result<bool, GraphError> {
         let mut changed = false;
-        while self.quieting.is_none() && self.waits_on_nothing() {
+        loop {
+            self.refresh_coming();
+            if self.quieting.is_some() || !self.waits_on_nothing() {
+                break;
+            }
             match self.begin_quiet()? {
                 Some(false) => break,
                 Some(true) => changed = true,
@@ -400,6 +410,7 @@ impl GraphJob {
         // objects hear quiet over it on the next pass.
         if self.writer.lost_waiting() {
             let mut out = Vec::new();
+            self.refresh_coming();
             let coming = self.coming();
             let filled = self.writer.fill_lost_zeros(
                 &mut self.tree,

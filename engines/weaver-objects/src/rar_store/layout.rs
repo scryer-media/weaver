@@ -22,7 +22,7 @@ use unrar_rs::{
 use weaver_graph::{ByteRange, Coverage, Emit, Handed, MemberId, RecoveryKind, VolumeIndex, Why};
 
 use super::walk::Walk;
-use super::{Entry, Lock, Piece, RarStore, Volume, claim};
+use super::{Entry, Lock, Piece, RarStore, ReadsMoved, Volume, claim};
 use crate::runs::CrcRuns;
 
 // A name as the namespace numbers it: forward slashes, a directory with a
@@ -249,6 +249,17 @@ pub(super) struct Laid {
     // Whether a volume it held was taken again on more headers since it was
     // last asked.
     grew: bool,
+    // Taken afresh whenever the builder takes a volume: a layout that
+    // answers as it did keeps it, so a look can say whether the map moved.
+    generation: u64,
+}
+
+// Every layout's generations come from one counter, so a layout laid afresh
+// never shares one with the layout it replaces.
+static GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn generation() -> u64 {
+    GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1
 }
 
 impl std::ops::Deref for Laid {
@@ -268,7 +279,12 @@ impl Laid {
             names: HashMap::new(),
             low: None,
             grew: false,
+            generation: generation(),
         }
+    }
+
+    fn generation(&self) -> u64 {
+        self.generation
     }
 
     // The first member a volume taken since the last ask names, or none.
@@ -395,6 +411,7 @@ impl Laid {
                 #[cfg(test)]
                 super::counts::bump(|counts| counts.laid_members += members.len());
                 if added {
+                    self.generation = generation();
                     match carried_on(facts) {
                         Some((at, tail)) => {
                             // The member the volume ends on as the layout
@@ -588,7 +605,35 @@ impl RarStore {
 
     // Hold the layout to the volumes touched and extend it past its tail;
     // lay it afresh where a volume it holds changed what it says.
+    // A layout that only took volumes past its tail moves what `place`
+    // reads of those volumes; one that answers otherwise any other way
+    // moves what it reads of every volume it maps.
     pub(super) fn sync(&mut self, touched: &BTreeSet<VolumeIndex>, out: &mut Vec<Emit>) {
+        let before = self.layout.as_ref().map(Laid::generation);
+        self.sync_layout(touched, out);
+        #[cfg(test)]
+        self.pushed_in_moved(touched);
+        if self.layout.as_ref().map(Laid::generation) != before
+            && matches!(self.reads_moved, ReadsMoved::Nothing)
+        {
+            self.reads_moved.all();
+        }
+    }
+
+    // Each piece the sync pushed lies in a volume the layout took, or one
+    // the settle touched, or the sync had said every volume moved, before
+    // the push said its volume moved.
+    #[cfg(test)]
+    fn pushed_in_moved(&self, touched: &BTreeSet<VolumeIndex>) {
+        for (volume, said) in PUSHED.with_borrow_mut(std::mem::take) {
+            assert!(
+                said || touched.contains(&volume),
+                "a piece pushed in {volume:?}, which nothing said moved"
+            );
+        }
+    }
+
+    fn sync_layout(&mut self, touched: &BTreeSet<VolumeIndex>, out: &mut Vec<Emit>) {
         let Some(format) = self.first_format(out) else {
             return;
         };
@@ -601,7 +646,13 @@ impl RarStore {
         // A volume taken again on more headers is what laying the layout
         // afresh once took it on: the volume refuted is looked at again.
         let grew = kept.as_mut().is_some_and(Laid::take_grew);
+        // A layout laid afresh answers otherwise for any volume it maps, and
+        // so may one a volume it held was taken again on more headers by.
+        // One that took a volume it held again on the same headers lists
+        // the same members: only that volume, which the settle touched,
+        // moves.
         if afresh || grew {
+            self.reads_moved.all();
             self.refuted = None;
         }
         let mut layout = kept.unwrap_or_else(|| {
@@ -619,6 +670,7 @@ impl RarStore {
         if let Some(at) = held_out.filter(|at| *at < laid(&layout)) {
             layout = self.laid_afresh(format, at);
             relaid = true;
+            self.reads_moved.all();
         }
         let from = laid(&layout);
         let mut end = match reach(&self.volumes, &layout, from, self.refuted, held_out) {
@@ -632,10 +684,15 @@ impl RarStore {
         };
         let mut refusal = None;
         for (index, found) in self.volumes.range_mut(VolumeIndex(from)..VolumeIndex(end)) {
+            let generation = layout.generation();
             if !layout.add(index.0, &found.walk) {
                 refusal = Some(Emit::Refuse(Why::Unsupported));
                 end = index.0 + 1;
                 break;
+            }
+            // A volume taken past the tail moves what `place` reads of it.
+            if layout.generation() != generation {
+                self.reads_moved.at(*index);
             }
             found.walk.handed();
         }
@@ -675,6 +732,7 @@ impl RarStore {
             refusal = None;
             layout = self.laid_afresh(format, end);
             relaid = true;
+            self.reads_moved.all();
         }
         // A kept layout changed no member before the first one a volume it
         // took since the last look names. Each member before it was looked
@@ -792,6 +850,7 @@ impl RarStore {
             out.push(Emit::Retract(MemberId(id as u32)));
         }
         if !retracted.is_empty() {
+            self.reads_moved.all();
             for &id in &retracted {
                 let name = std::mem::take(&mut self.entries[id].name);
                 self.entries[id] = Entry::waiting(name);
@@ -814,6 +873,7 @@ impl RarStore {
                 continue;
             }
             entry.name.clone_from(&member.name);
+            self.reads_moved.all();
             let name = match entry.made {
                 true => super::made::name(&member.name),
                 false => member_name(&member.name, is_directory(member)),
@@ -865,6 +925,7 @@ impl RarStore {
                 // the one kept before.
                 if !afresh {
                     self.layout = Some(self.laid_afresh(format, from));
+                    self.reads_moved.all();
                 }
                 self.give_up(emit, out);
             }
@@ -891,6 +952,11 @@ impl RarStore {
             name,
             length,
         });
+        // What the layout maps of the member is placed in it from now on,
+        // in each volume a part of it lies in.
+        for part in &member.parts {
+            self.reads_moved.at(VolumeIndex(part.volume));
+        }
         if made {
             self.made.insert(id.0 as usize);
         }
@@ -933,6 +999,13 @@ impl RarStore {
         }
     }
 
+    // What `place` reads of each volume the entry has a piece in changed.
+    fn pieces_moved(&mut self, id: usize) {
+        for piece in &self.entries[id].pieces {
+            self.reads_moved.at(piece.volume);
+        }
+    }
+
     // The parts the layout gives a member past those it already has.
     fn extend(&mut self, id: usize, member: &StoredMember, out: &mut Vec<Emit>) {
         for part in member.parts.iter().skip(self.entries[id].pieces.len()) {
@@ -955,6 +1028,16 @@ impl RarStore {
             let place =
                 filed.partition_point(|&(other, at)| super::piece_order(entries, other, at) < key);
             filed.insert(place, (id, at_piece));
+            // A piece pushed moves what `place` reads of its volume. The
+            // volume is one the layout took or the settle touched, which
+            // say so already (`pushed_in_moved`); the push says it too.
+            #[cfg(test)]
+            {
+                let volume = VolumeIndex(part.volume);
+                let said = self.reads_moved.covers(volume);
+                PUSHED.with_borrow_mut(|pushed| pushed.push((volume, said)));
+            }
+            self.reads_moved.at(VolumeIndex(part.volume));
             self.entries[id].pieces.push(Piece {
                 volume: VolumeIndex(part.volume),
                 data: ByteRange::at(part.data_offset, part.data_size),
@@ -964,11 +1047,17 @@ impl RarStore {
                 after: part.split_after,
             });
         }
+        let store = member.eligibility.encrypted_store();
+        if self.entries[id].store != store {
+            self.pieces_moved(id);
+        }
         let entry = &mut self.entries[id];
-        entry.store = member.eligibility.encrypted_store();
+        entry.store = store;
         if entry.complete || !member.chain_complete {
             return;
         }
+        self.pieces_moved(id);
+        let entry = &mut self.entries[id];
         entry.complete = true;
         entry.crc = member.data_crc32;
         entry.uses_mac = member.data_hash_uses_mac;
@@ -1529,4 +1618,10 @@ mod tests {
             );
         }
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    // The volumes of the pieces the sync running pushed.
+    static PUSHED: std::cell::RefCell<Vec<(VolumeIndex, bool)>> = const { std::cell::RefCell::new(Vec::new()) };
 }

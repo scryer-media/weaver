@@ -174,6 +174,10 @@ pub struct RarRecovery {
     // what `coverage_version` says. Not kept across a restart.
     #[serde(skip)]
     bound_changes: u64,
+    // The members the last bind came to cover, by their names then, until
+    // taken. Not kept across a restart.
+    #[serde(skip)]
+    newly: Vec<(MemberId, String)>,
     // Their names, which the restore stages them under.
     names: BTreeMap<MemberId, String>,
     // A data volume's name, to name the ones no member carries after.
@@ -267,6 +271,7 @@ impl RarRecovery {
             stem: None,
             bound: BTreeMap::new(),
             bound_changes: 0,
+            newly: Vec::new(),
             names: BTreeMap::new(),
             reference: None,
             whole: BTreeSet::new(),
@@ -1022,6 +1027,8 @@ impl Recovery for RarRecovery {
     // with the longest name the first recovery volume's name covers: a set
     // called `set2` owns `set21.rev` ahead of one called `set`.
     fn bind(&mut self, namespace: &mut Namespace, renamed: &mut Vec<MemberId>) {
+        self.newly.clear();
+        let was_refuted = self.refuted();
         let Some(rev) = self.revs.first() else {
             return;
         };
@@ -1104,8 +1111,9 @@ impl Recovery for RarRecovery {
         // the grid holds of it would speak for bytes since replaced, a
         // repair's among them: it is forgotten, and a later bind folds it
         // from what is replayed then, reading back the rest.
+        let kept: BTreeSet<MemberId> = bound.values().copied().collect();
         for member in self.bound.values() {
-            if !bound.values().any(|kept| kept == member) {
+            if !kept.contains(member) {
                 self.grid.forget(*member);
             }
         }
@@ -1114,12 +1122,33 @@ impl Recovery for RarRecovery {
             .keys()
             .filter(|member| self.refused.contains(member))
             .count() as u64;
-        if bound != self.bound {
+        // What it covered as the bind began: nothing while refuted, else
+        // the volumes it bound then, read only when the cover moved.
+        let moved = bound != self.bound;
+        let was: Option<BTreeSet<MemberId>> = (moved || was_refuted != self.refuted()).then(|| {
+            if was_refuted {
+                BTreeSet::new()
+            } else {
+                self.bound.values().copied().collect()
+            }
+        });
+        if moved {
             self.bound = bound;
             self.bound_changes += 1;
         }
+        if let Some(was) = was.filter(|_| !self.refuted()) {
+            let now: BTreeSet<MemberId> = self.bound.values().copied().collect();
+            self.newly.extend(
+                now.difference(&was)
+                    .filter_map(|member| Some((*member, namespace.get(*member)?.name.clone()))),
+            );
+        }
         self.names = names;
         self.whole = whole;
+    }
+
+    fn take_newly(&mut self, out: &mut Vec<(MemberId, String)>) {
+        out.append(&mut self.newly);
     }
 
     // The data volumes the header counts that no member carries, named in
@@ -1157,6 +1186,10 @@ impl Recovery for RarRecovery {
 
     fn covers_some(&self) -> bool {
         !self.refuted() && !self.bound.is_empty()
+    }
+
+    fn covers_any_of(&self, namespace: &Namespace) -> bool {
+        !self.refuted() && self.bound.values().any(|member| namespace.lists(*member))
     }
 
     fn covered_members(&self, out: &mut Vec<MemberId>) {

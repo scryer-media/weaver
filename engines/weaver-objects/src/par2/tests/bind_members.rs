@@ -165,6 +165,90 @@ fn binding_costs_grow_linearly_beside_an_unnamed_member() {
     grows_linearly(false, false, true);
 }
 
+// `count` described files, all but the last posted, and a bind: the bind
+// reports each posted member once, in member order, by its name, and keeps
+// the start of `count - 1` members, one per member it came to bind. A bind
+// that moves nothing reports nothing, so no report outlives its bind. The
+// last file posted under an obfuscated name: reported alone, by the name it
+// had before the bind named it, at the cost of one member kept.
+fn reports(count: usize) {
+    let bytes: Vec<Vec<u8>> = (0..count)
+        .map(|at| payload(1100 + at as u64, 1500))
+        .collect();
+    let names: Vec<String> = (0..count).map(|at| format!("f{at}.bin")).collect();
+    let described: Vec<(&str, &[u8])> = names
+        .iter()
+        .zip(&bytes)
+        .map(|(name, bytes)| (name.as_str(), bytes.as_slice()))
+        .collect();
+    let mut job = job(&par2_set("one", &described, BLOCK, 2, 1));
+    bind(&mut job);
+    let mut taken = Vec::new();
+    job.object.take_newly(&mut taken);
+    assert_eq!(taken, []);
+    let posted: Vec<(MemberId, String)> = names[..count - 1]
+        .iter()
+        .zip(&bytes)
+        .map(|(name, bytes)| (job.member(name, bytes), name.clone()))
+        .collect();
+    bind(&mut job);
+    job.object.take_newly(&mut taken);
+    assert_eq!(taken, posted);
+    assert_eq!(job.object.bind_moves, count - 1);
+    taken.clear();
+    bind(&mut job);
+    job.object.take_newly(&mut taken);
+    assert_eq!(taken, []);
+    assert_eq!(job.object.bind_moves, 0);
+    let last = job.member("obf.dat", &bytes[count - 1]);
+    bind(&mut job);
+    job.object.take_newly(&mut taken);
+    assert_eq!(taken, [(last, "obf.dat".to_owned())]);
+    assert_eq!(job.namespace.get(last).unwrap().name, names[count - 1]);
+    assert_eq!(job.object.bind_moves, 1);
+}
+
+#[test]
+fn a_bind_reports_what_it_came_to_cover_at_a_cost_of_the_members_it_moved() {
+    reports(41);
+    reports(401);
+}
+
+// `count` described files, `posted` of them posted one by one with too
+// little of their bytes for a front, a bind after each: each binds by its
+// name, and the descriptions those binds compared a name with.
+fn name_probes(count: usize, posted: usize) -> usize {
+    let bytes: Vec<Vec<u8>> = (0..count)
+        .map(|at| payload(1200 + at as u64, 1500))
+        .collect();
+    let names: Vec<String> = (0..count).map(|at| format!("f{at}.bin")).collect();
+    let described: Vec<(&str, &[u8])> = names
+        .iter()
+        .zip(&bytes)
+        .map(|(name, bytes)| (name.as_str(), bytes.as_slice()))
+        .collect();
+    let mut job = job(&par2_set("one", &described, BLOCK, 2, 1));
+    bind(&mut job);
+    super::super::NAME_PROBES.with(|probes| probes.set(0));
+    for (name, bytes) in names[..posted].iter().zip(&bytes) {
+        let member = job.namespace.announce(name, Some(bytes.len() as u64));
+        job.arrive(member, 0, &bytes[..700], Provenance::Fresh);
+        bind(&mut job);
+        assert!(job.object.covers(member), "{name}");
+    }
+    super::super::NAME_PROBES.with(std::cell::Cell::get)
+}
+
+// Binding a member by its name compares it with the one description of
+// that name, whatever else the set describes: forty members posted cost
+// forty comparisons beside forty described files or four hundred, where
+// comparing with every description cost forty times the described files.
+#[test]
+fn binding_by_name_compares_only_the_descriptions_of_that_name() {
+    assert_eq!(name_probes(40, 40), 40);
+    assert_eq!(name_probes(400, 40), 40);
+}
+
 // Two members posted under one described name, neither with a front: both
 // claim the file by name and neither binds. One's front comes and proves it
 // by content: it binds. It is retracted and posted again under another

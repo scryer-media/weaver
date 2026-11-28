@@ -23,6 +23,7 @@ mod read_back;
 mod recovery;
 mod recovery_contracts;
 mod refusal;
+mod release_kept;
 mod replay;
 mod split;
 mod store_proof;
@@ -345,6 +346,7 @@ impl Builder for Build {
                 last: None,
                 due: false,
                 described: false,
+                newly: Vec::new(),
             })),
             _ => None,
         }
@@ -448,6 +450,8 @@ struct Par {
     // something to do, and whether its volume described the members yet.
     due: bool,
     described: bool,
+    // The members its last bind came to cover, by their names then.
+    newly: Vec<(MemberId, String)>,
 }
 
 impl Object for Par {
@@ -550,13 +554,25 @@ impl Recovery for Par {
             .map(|member| member.id)
             .collect();
         // What it does not describe, and the obfuscated member until its
-        // bytes say what it is.
-        self.others = namespace
-            .members()
-            .filter(|member| member.name.starts_with("other.") || member.name == "3f9a.bin")
-            .filter(|member| !recognised.contains(&member.id))
-            .map(|member| member.id)
-            .collect();
+        // bytes say what it is. The walk reports each member it comes to
+        // cover, by its name before the renames below.
+        let (was_volume, was_others) = (covered.0, &covered.1);
+        let mut others = Vec::new();
+        self.newly.clear();
+        for member in namespace.members() {
+            let other = (member.name.starts_with("other.") || member.name == "3f9a.bin")
+                && !recognised.contains(&member.id);
+            if other {
+                others.push(member.id);
+            }
+            let was =
+                was_volume.is_some_and(|own| own != member.id) && !was_others.contains(&member.id);
+            let now = self.volume.is_some_and(|own| own != member.id) && !other;
+            if now && !was {
+                self.newly.push((member.id, member.name.clone()));
+            }
+        }
+        self.others = others;
         for member in recognised {
             namespace.rename(member, "show.mkv");
             renamed.push(member);
@@ -564,6 +580,10 @@ impl Recovery for Par {
         if covered != (self.volume, self.others.clone()) {
             self.last = None;
         }
+    }
+
+    fn take_newly(&mut self, out: &mut Vec<(MemberId, String)>) {
+        out.append(&mut self.newly);
     }
 
     fn covers(&self, member: MemberId) -> bool {
@@ -2210,8 +2230,9 @@ fn held_bytes_go_down_again_with_the_source_s_checksums() {
 }
 
 // A pass over the holds asks only the volumes that hold bytes: of six
-// hundred members and two stores waiting on their maps, a delivery to a
-// plain member asks the two stores, and each map then releases its own.
+// hundred members and two stores waiting on their maps, each store is asked
+// once its bytes are held, a delivery to a plain member asks neither again,
+// and each map then releases its own.
 #[test]
 fn a_pass_over_the_holds_asks_only_the_volumes_that_hold_bytes() {
     let mut job = Job::new(PLENTY);
@@ -2224,15 +2245,21 @@ fn a_pass_over_the_holds_asks_only_the_volumes_that_hold_bytes() {
     ];
     let mut front = seven_z().to_vec();
     front.extend_from_slice(b"hello");
+    RELEASE_ASKED.set(0);
     for store in stores {
         job.send(store, 0, &front, Provenance::Fresh);
     }
+    // Each store's first hold has it asked once, by the pass after it.
+    assert_eq!(RELEASE_ASKED.get(), stores.len());
     assert_eq!(job.writer.held_bytes(NodeId::ROOT), 2 * body().len());
     RELEASE_ASKED.set(0);
+    RELEASE_VISITED.set(0);
 
     job.send(plain[0], 0, b"data", Provenance::Fresh);
 
-    assert_eq!(RELEASE_ASKED.get(), stores.len());
+    // A settled volume is not visited again: nothing moved for either store.
+    assert_eq!(RELEASE_ASKED.get(), 0);
+    assert_eq!(RELEASE_VISITED.get(), 0);
     assert_eq!(job.writer.held_bytes(NodeId::ROOT), 2 * body().len());
     job.send(stores[0], map_at().start, MAP, Provenance::Fresh);
     assert_eq!(job.writer.held_bytes(NodeId::ROOT), body().len());
@@ -2257,16 +2284,16 @@ fn a_pass_locates_held_bytes_only_once_their_object_s_map_moved() {
     job.send(plain[0], 0, b"data", Provenance::Fresh);
     RELEASE_ASKED.set(0);
     RELEASE_LOCATED.set(0);
+    RELEASE_VISITED.set(0);
 
     for member in &plain[1..] {
         job.send(*member, 0, b"data", Provenance::Fresh);
     }
 
-    assert_eq!(
-        RELEASE_ASKED.get(),
-        plain.len() - 1,
-        "each pass asks the store"
-    );
+    // A settled volume is not visited again: the store's number did not
+    // move, so no pass asks it.
+    assert_eq!(RELEASE_ASKED.get(), 0, "a settled store is not asked again");
+    assert_eq!(RELEASE_VISITED.get(), 0);
     assert_eq!(RELEASE_LOCATED.get(), 0, "and locates nothing");
     assert_eq!(job.writer.held_bytes(NodeId::ROOT), body().len());
     job.send(store, map_at().start, MAP, Provenance::Fresh);
@@ -2275,6 +2302,8 @@ fn a_pass_locates_held_bytes_only_once_their_object_s_map_moved() {
         1,
         "the map moved it: the body is located"
     );
+    assert_eq!(RELEASE_VISITED.get(), 1, "the moved store, once");
+    assert_eq!(RELEASE_ASKED.get(), 1);
     assert_eq!(job.writer.held_bytes(NodeId::ROOT), 0);
     assert_eq!(job.file("inner.bin"), b"hello");
 }
@@ -3784,6 +3813,48 @@ fn bytes_held_below_the_root_reach_their_member_once_its_store_knows_its_map() {
         &mut inner
     ));
     assert_eq!(inner, b"hello");
+}
+
+// A held volume's answer goes when its holds do, and every answer of a
+// namespace goes with the namespace: the body held below the root is
+// asked once, and its answer is kept by volume and by object; once its
+// store's map places it, nothing is kept. Held again and its store
+// refuted, its namespace goes, and its answers with it.
+#[test]
+fn the_answers_kept_for_held_volumes_go_with_their_holds_and_their_namespace() {
+    let held = |job: &mut Job| {
+        job.inner = map_at().end;
+        job.inner_name = "inner.7z";
+        let member = job.member("pack.bin", Some(HEADER + map_at().end));
+        let mut front = SIGNATURE.to_vec();
+        front.extend_from_slice(&seven_z());
+        front.extend_from_slice(b"hello");
+        job.send(member, 0, &front, Provenance::Fresh);
+        let (store, _) = job.tree.child_of(NodeId::ROOT, member).expect("a store");
+        assert_eq!(job.writer.held_bytes(store), body().len());
+        (member, store)
+    };
+    let mut job = Job::new(PLENTY);
+    let (member, store) = held(&mut job);
+    assert_eq!(job.writer.asked_sizes(), (1, 1));
+    job.send(member, HEADER + map_at().start, MAP, Provenance::Fresh);
+    assert_eq!(job.writer.held_bytes(store), 0);
+    assert_eq!(job.writer.asked_sizes(), (0, 0), "emptied");
+
+    let mut job = Job::new(PLENTY);
+    let (member, store) = held(&mut job);
+    store_says(&mut job, store, vec![Emit::Refuted]);
+    assert!(job.tree.namespace(store).is_none());
+    assert!(!job.writer.files.contains_key(&store), "the namespace goes");
+    // Its member founds a store again, which holds the body again: only that
+    // store's answer is kept.
+    let (again, _) = job
+        .tree
+        .child_of(NodeId::ROOT, member)
+        .expect("a store again");
+    assert_ne!(again, store);
+    assert_eq!(job.writer.held_bytes(again), body().len());
+    assert_eq!(job.writer.asked_sizes(), (1, 1), "pruned");
 }
 
 // A source with no checksums for what it delivers, as for every namespace

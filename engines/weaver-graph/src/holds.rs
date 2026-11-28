@@ -958,6 +958,13 @@ impl HoldLedger {
             .is_some_and(|held| held.all.overlaps(range))
     }
 
+    // Whether `volume` holds anything, as `next_held_volume` counts it.
+    pub fn holds_any(&self, volume: VolumeIndex) -> bool {
+        self.volumes
+            .get(&volume)
+            .is_some_and(|holds| !holds.is_empty())
+    }
+
     // The volumes that hold anything, in volume order.
     pub fn held_volumes(&self) -> impl Iterator<Item = VolumeIndex> + '_ {
         self.volumes.keys().copied()

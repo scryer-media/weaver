@@ -900,6 +900,8 @@ impl GraphJob {
     // node is marked from its first change on, so a job's first step
     // brings every engine up.
     fn touched_engines(&mut self) -> (BTreeMap<NodeId, Facts>, Vec<NodeId>) {
+        // The facts read what is to come.
+        self.refresh_coming();
         let at = self.fed.at.unwrap_or_default();
         self.fed.at = Some(FedAt {
             tree: self.tree.generation(),

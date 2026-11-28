@@ -54,6 +54,10 @@ pub struct RarRecord {
     // read itself, what `coverage_version` says. Not kept across a restart.
     #[serde(skip)]
     member_changes: u64,
+    // The member the last bind came to cover, by its name then, until it
+    // is taken. Not kept across a restart.
+    #[serde(skip)]
+    newly: Option<(MemberId, String)>,
     // Whether the volume is closed: nothing more arrives for it.
     closed: bool,
     // What the last ruling found.
@@ -99,6 +103,11 @@ impl Durable for RarRecord {
 impl RarRecord {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    // The member `covers` holds for, if any.
+    fn covered(&self) -> Option<MemberId> {
+        self.member.filter(|_| self.said != Some(Said::Unread))
     }
 
     fn rule(&mut self, access: &mut dyn MemberAccess) -> Said {
@@ -344,6 +353,8 @@ impl Recovery for RarRecord {
     // found it stays the member while the namespace holds it, whatever it
     // is called since.
     fn bind(&mut self, namespace: &mut Namespace, _renamed: &mut Vec<MemberId>) {
+        let was = self.covered();
+        self.newly = None;
         let found = self
             .member
             .filter(|member| namespace.get(*member).is_some())
@@ -355,6 +366,14 @@ impl Recovery for RarRecord {
             self.protected = None;
             self.units = None;
         }
+        self.newly = self
+            .covered()
+            .filter(|now| Some(*now) != was)
+            .and_then(|now| Some((now, namespace.get(now)?.name.clone())));
+    }
+
+    fn take_newly(&mut self, out: &mut Vec<(MemberId, String)>) {
+        out.extend(self.newly.take());
     }
 
     // The volume it sits in, unless it could not read itself there.
@@ -371,6 +390,10 @@ impl Recovery for RarRecord {
 
     fn covers_some(&self) -> bool {
         self.member.is_some() && self.said != Some(Said::Unread)
+    }
+
+    fn covers_any_of(&self, namespace: &Namespace) -> bool {
+        self.said != Some(Said::Unread) && self.member.is_some_and(|member| namespace.lists(member))
     }
 
     fn covered_members(&self, out: &mut Vec<MemberId>) {

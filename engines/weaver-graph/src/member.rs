@@ -525,6 +525,12 @@ impl Namespace {
         self.members.marks().since(at)
     }
 
+    // Whether `members` lists the member: it is here, and is no further
+    // posting of another.
+    pub fn lists(&self, member: MemberId) -> bool {
+        self.members.get(&member).is_some() && !self.copies.contains_key(&member)
+    }
+
     // The members, each once: a further posting of one is not listed.
     pub fn members(&self) -> impl Iterator<Item = &Member> + Clone {
         self.members

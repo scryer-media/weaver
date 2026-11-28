@@ -212,7 +212,7 @@ fn tail(
     bytes(tree, member, (LENGTH - TAIL, said), stores)
 }
 
-fn wants(tree: &Tree) -> Vec<(NodeId, Seek)> {
+fn wants(tree: &mut Tree) -> Vec<(NodeId, Seek)> {
     let mut out = Vec::new();
     tree.collect_wants(&mut out);
     out
@@ -264,7 +264,7 @@ fn a_member_an_object_asks_the_tail_of_is_placed_once_it_comes() {
     let (holder, told_to) = holding(&mut tree, Tailed::default(), stores);
     let second = post(&mut tree, "second", b"volume", stores);
     assert_eq!(tree.child_of(NodeId::ROOT, second), None);
-    assert_eq!(wants(&tree), vec![the_ask(second)]);
+    assert_eq!(wants(&mut tree), vec![the_ask(second)]);
     let effects = tail(&mut tree, second, NUMBERED, stores);
     assert_eq!(
         tree.child_of(NodeId::ROOT, second),
@@ -274,7 +274,7 @@ fn a_member_an_object_asks_the_tail_of_is_placed_once_it_comes() {
     assert!(bound_at(&effects, second, holder), "{effects:?}");
     assert_eq!(told(&told_to), vec![NUMBERED.to_vec()]);
     assert!(tree.asked.is_empty(), "owned: the ask is dropped");
-    assert!(wants(&tree).is_empty());
+    assert!(wants(&mut tree).is_empty());
 }
 
 // A store that asks the tail only of a member given back, so a member it
@@ -299,7 +299,7 @@ fn a_parked_member_is_reclaimed_with_the_tail_it_was_asked_for() {
     );
     bytes(&mut tree, second, (HEADER, b"headers"), stores);
     assert!(tree.given_back(NodeId::ROOT, second), "parked");
-    assert_eq!(wants(&tree), vec![the_ask(second)]);
+    assert_eq!(wants(&mut tree), vec![the_ask(second)]);
     let effects = tail(&mut tree, second, NUMBERED, stores);
     assert_eq!(
         tree.child_of(NodeId::ROOT, second),
@@ -328,11 +328,11 @@ fn a_parked_member_is_asked_for_its_tail_once_its_holder_is_offered_a_password()
     let second = post(&mut tree, "second", SIGNATURE, stores);
     bytes(&mut tree, second, (HEADER, b"headers"), stores);
     assert!(tree.given_back(NodeId::ROOT, second), "parked");
-    assert!(wants(&tree).is_empty(), "no password, no ask");
+    assert!(wants(&mut tree).is_empty(), "no password, no ask");
     let mut effects = Vec::new();
     tree.offer_password(holder, "secret", stores, &mut effects);
     assert!(tree.given_back(NodeId::ROOT, second), "{effects:?}");
-    assert_eq!(wants(&tree), vec![the_ask(second)], "{effects:?}");
+    assert_eq!(wants(&mut tree), vec![the_ask(second)], "{effects:?}");
     let effects = tail(&mut tree, second, NUMBERED, stores);
     assert_eq!(
         tree.child_of(NodeId::ROOT, second),
@@ -382,16 +382,16 @@ fn a_tail_that_says_nothing_is_offered_once_and_not_sought_again() {
     let mut tree = Tree::new();
     let (_, told_to) = holding(&mut tree, Tailed::default(), stores);
     let second = post(&mut tree, "second", b"volume", stores);
-    assert_eq!(wants(&tree), vec![the_ask(second)]);
+    assert_eq!(wants(&mut tree), vec![the_ask(second)]);
     let effects = tail(&mut tree, second, b"none", stores);
     assert_eq!(tree.child_of(NodeId::ROOT, second), None, "{effects:?}");
     assert_eq!(told(&told_to), vec![b"none".to_vec()]);
-    assert!(wants(&tree).is_empty(), "no second seek");
+    assert!(wants(&mut tree).is_empty(), "no second seek");
     // Offered again later, it is offered with the same tail, and asks
     // nothing.
     let mut effects = Vec::new();
     tree.identify_again(NodeId::ROOT, second, stores, &mut effects);
-    assert!(wants(&tree).is_empty());
+    assert!(wants(&mut tree).is_empty());
     assert_eq!(told(&told_to), vec![b"none".to_vec(), b"none".to_vec()]);
 }
 
@@ -407,7 +407,7 @@ fn a_member_no_object_asks_for_has_no_ask() {
     let (_, told_to) = holding(&mut tree, mute, stores);
     let second = post(&mut tree, "second", b"volume", stores);
     assert!(tree.asked.is_empty());
-    assert!(wants(&tree).is_empty());
+    assert!(wants(&mut tree).is_empty());
     let effects = tail(&mut tree, second, NUMBERED, stores);
     assert_eq!(tree.child_of(NodeId::ROOT, second), None, "{effects:?}");
     assert!(told(&told_to).is_empty());
@@ -422,19 +422,19 @@ fn a_lost_tail_is_not_asked_again() {
     let mut tree = Tree::new();
     let (_, told_to) = holding(&mut tree, Tailed::default(), stores);
     let second = post(&mut tree, "second", b"volume", stores);
-    let [(node, seek)] = wants(&tree)[..] else {
+    let [(node, seek)] = wants(&mut tree)[..] else {
         panic!("one ask");
     };
     let mut effects = Vec::new();
     tree.pulled(node, seek, Pull::Lost, stores, &mut effects);
     assert!(tree.asked[&(NodeId::ROOT, second)].lost, "kept, lost");
-    assert!(wants(&tree).is_empty());
+    assert!(wants(&mut tree).is_empty());
     assert_eq!(tree.child_of(NodeId::ROOT, second), None, "{effects:?}");
     assert!(!tree.is_undecided(NodeId::ROOT, second), "settled a leaf");
     let mut effects = Vec::new();
     tree.identify_again(NodeId::ROOT, second, stores, &mut effects);
     assert_eq!(tree.asked.len(), 1, "asked once");
-    assert!(wants(&tree).is_empty());
+    assert!(wants(&mut tree).is_empty());
     assert!(told(&told_to).is_empty());
 }
 
@@ -448,12 +448,12 @@ fn an_asked_member_founds_nothing_while_its_ask_stands() {
     let second = post(&mut tree, "second", SIGNATURE, stores);
     assert_eq!(tree.child_of(NodeId::ROOT, second), None, "founds nothing");
     assert!(!tree.given_back(NodeId::ROOT, second));
-    assert_eq!(wants(&tree), vec![the_ask(second)]);
+    assert_eq!(wants(&mut tree), vec![the_ask(second)]);
     // Offered again meanwhile, it still waits.
     let mut effects = Vec::new();
     tree.identify_again(NodeId::ROOT, second, stores, &mut effects);
     assert_eq!(tree.child_of(NodeId::ROOT, second), None, "{effects:?}");
-    assert_eq!(wants(&tree), vec![the_ask(second)]);
+    assert_eq!(wants(&mut tree), vec![the_ask(second)]);
     let effects = tail(&mut tree, second, NUMBERED, stores);
     assert_eq!(
         tree.child_of(NodeId::ROOT, second),
@@ -473,7 +473,7 @@ fn a_lost_ask_founds_as_today() {
     let (holder, told_to) = holding(&mut tree, Tailed::default(), stores);
     let second = post(&mut tree, "second", SIGNATURE, stores);
     assert_eq!(tree.child_of(NodeId::ROOT, second), None, "waits");
-    let [(node, seek)] = wants(&tree)[..] else {
+    let [(node, seek)] = wants(&mut tree)[..] else {
         panic!("one ask");
     };
     let mut effects = Vec::new();
@@ -483,7 +483,7 @@ fn a_lost_ask_founds_as_today() {
         .expect("founds a store of its own");
     assert_ne!(founded, holder);
     assert_eq!(volume, VolumeIndex(0));
-    assert!(wants(&tree).is_empty(), "not sought again");
+    assert!(wants(&mut tree).is_empty(), "not sought again");
     // Bound to its own store, its lost entry leaves with the binding.
     assert!(tree.asked.is_empty() && tree.sought.is_empty());
     assert!(told(&told_to).is_empty());
@@ -603,7 +603,7 @@ fn an_empty_read_back_ends_the_ask_and_the_member_founds_as_today() {
     let (holder, told_to) = holding(&mut tree, Tailed::default(), stores);
     let second = post(&mut tree, "second", SIGNATURE, stores);
     assert_eq!(tree.child_of(NodeId::ROOT, second), None, "waits");
-    assert_eq!(wants(&tree), vec![the_ask(second)]);
+    assert_eq!(wants(&mut tree), vec![the_ask(second)]);
     let mut effects = Vec::new();
     tree.read_on(
         NodeId::ROOT,
@@ -618,7 +618,7 @@ fn an_empty_read_back_ends_the_ask_and_the_member_founds_as_today() {
         .expect("founds a store of its own");
     assert_ne!(founded, holder, "{effects:?}");
     assert_eq!(volume, VolumeIndex(0));
-    assert!(wants(&tree).is_empty(), "not sought again");
+    assert!(wants(&mut tree).is_empty(), "not sought again");
     assert!(tree.asked.is_empty() && tree.sought.is_empty());
     assert!(told(&told_to).is_empty());
 }
@@ -751,7 +751,7 @@ fn a_member_not_from_the_root_is_asked_nothing_and_founds_as_today() {
     assert_ne!(founded, holder, "{effects:?}");
     assert_eq!(volume, VolumeIndex(0));
     assert!(tree.asked.is_empty() && tree.sought.is_empty());
-    assert!(wants(&tree).iter().all(|(at, _)| *at != NodeId::ROOT));
+    assert!(wants(&mut tree).iter().all(|(at, _)| *at != NodeId::ROOT));
     assert!(told(&told_to).is_empty());
 }
 

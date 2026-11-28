@@ -228,6 +228,13 @@ pub trait Recovery {
     // its members when it was made has nothing to match.
     fn bind(&mut self, _namespace: &mut Namespace, _renamed: &mut Vec<MemberId>) {}
 
+    // The members the last `bind` came to cover that it did not cover as it
+    // began, each with the name it had then, each once, taken: read right
+    // after `bind`. Each `bind` begins its report afresh, so a report not
+    // taken is never read after a later one. An object whose `bind` does
+    // not change what it covers reports none.
+    fn take_newly(&mut self, out: &mut Vec<(MemberId, String)>);
+
     // The files this object describes and can rebuild that no member of
     // the namespace carries, by name and length. The owner announces each
     // once the namespace has every member it will get, so the repair has
@@ -241,6 +248,15 @@ pub trait Recovery {
     // some member. An object that describes nothing checked nothing, so
     // its ruling vouches for no file.
     fn covers_some(&self) -> bool;
+
+    // Whether this object describes some member the namespace lists:
+    // `covers` holds for one of `namespace.members()`. A member it covers
+    // that the namespace no longer lists, gone or folded into another
+    // posting, answers no. An object that keeps what it covers reads that
+    // instead of the namespace.
+    fn covers_any_of(&self, namespace: &Namespace) -> bool {
+        namespace.members().any(|member| self.covers(member.id))
+    }
 
     // The members `covers` holds for, each once, read off what `covers`
     // reads. An object that covers nothing lists none.

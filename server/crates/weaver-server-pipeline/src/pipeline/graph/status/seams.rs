@@ -22,9 +22,10 @@ use crate::pipeline::completion::finalize::check::par2_damage_ignorable;
 use crate::pipeline::extraction::ExtractionError;
 use crate::pipeline::graph::job::{GraphJob, Note};
 use crate::pipeline::graph::root::phase::RootPhase;
-use crate::pipeline::post_health::{names_a_place, names_nothing};
+use crate::pipeline::post_health::{Place, names_a_place, names_nothing};
 use crate::pipeline::{Pipeline, TerminalReconciliation, health_milli};
 use crate::post_processing::model::PipelineFailureStage;
+use std::collections::{BTreeMap, HashSet};
 use weaver_server_base::events::model::PipelineEvent;
 use weaver_server_base::jobs::ids::{JobId, NzbFileId};
 use weaver_server_base::operations::instrumentation::{JobStageKind, StageOutcomeKind};
@@ -419,6 +420,127 @@ pub struct Posted<'a> {
     pub given_up: Option<Failure>,
 }
 
+#[cfg(any(test, feature = "pipeline-test-fixtures"))]
+thread_local! {
+    // What `delivery_of` asked of the files the feed gave up on this thread.
+    pub static ARRIVED_COST: std::cell::Cell<ArrivedCost> =
+        const { std::cell::Cell::new(ArrivedCost { calls: 0, lost_calls: 0, most_asks: 0, reads: 0 }) };
+}
+
+// Counts of `delivery_of`'s readings: how many it made, how many asked of
+// a file the feed gave up, the most such files one asked of, and how many
+// times the places of the files that arrived were read.
+#[cfg(any(test, feature = "pipeline-test-fixtures"))]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ArrivedCost {
+    pub calls: usize,
+    pub lost_calls: usize,
+    pub most_asks: usize,
+    pub reads: usize,
+}
+
+// Whether a delivery with this failure failed for its post.
+fn failure_is_health(delivery: &Delivery, failure: Option<&Failure>) -> bool {
+    match failure {
+        Some(failure) => failure.rejection.is_none(),
+        None => delivery.withheld.is_empty(),
+    }
+}
+
+// The places the posted files that brought clean bytes are named into.
+fn arrived_places(job: &GraphJob) -> impl Iterator<Item = Place> + '_ {
+    job.tree()
+        .namespace(NodeId::ROOT)
+        .into_iter()
+        .flat_map(|namespace| namespace.members())
+        .filter(|member| {
+            member.coverage.bytes_covered()
+                > member
+                    .coverage
+                    .damaged_ranges()
+                    .map(|range| range.len())
+                    .sum()
+        })
+        .filter_map(|member| names_a_place(&member.name))
+}
+
+#[cfg(any(test, feature = "pipeline-test-fixtures"))]
+thread_local! {
+    // How many of the summary's sets `NamespaceSets` read on this thread:
+    // each set once as it is filed, and each set it hands a namespace's
+    // reader.
+    pub static SET_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(any(test, feature = "pipeline-test-fixtures"))]
+fn sets_read(count: usize) {
+    SET_READS.with(|reads| reads.set(reads.get() + count));
+}
+
+#[cfg(not(any(test, feature = "pipeline-test-fixtures")))]
+fn sets_read(_: usize) {}
+
+// A recovery summary's sets as one delivery reads them, filed once by the
+// namespace they live in: each namespace's sets and its failed ones, in
+// summary order, and whether any of its sets ruled. A reader of one
+// namespace reads its sets only.
+pub struct NamespaceSets<'s> {
+    by: BTreeMap<NodeId, Filed<'s>>,
+}
+
+#[derive(Default)]
+struct Filed<'s> {
+    sets: Vec<&'s SetSummary>,
+    failed: Vec<&'s SetSummary>,
+    ruled: bool,
+}
+
+impl<'s> NamespaceSets<'s> {
+    // File `sets`, those `failed` says failed among them as failed too.
+    pub fn new(sets: &'s [SetSummary], failed: impl Fn(&SetSummary) -> bool) -> Self {
+        sets_read(sets.len());
+        let mut by: BTreeMap<NodeId, Filed<'s>> = BTreeMap::new();
+        for set in sets {
+            let filed = by.entry(set.namespace).or_default();
+            filed.sets.push(set);
+            if failed(set) {
+                filed.failed.push(set);
+            }
+            filed.ruled |= set
+                .outcome
+                .is_some_and(|outcome| outcome != RepairOutcome::Unread);
+        }
+        Self { by }
+    }
+
+    // The sets that live in `node`, in summary order.
+    pub fn of(&self, node: NodeId) -> &[&'s SetSummary] {
+        let sets = self.by.get(&node).map_or(&[][..], |filed| &filed.sets[..]);
+        sets_read(sets.len());
+        sets
+    }
+
+    // The failed sets that live in `node`, in summary order.
+    pub fn failed_of(&self, node: NodeId) -> &[&'s SetSummary] {
+        let sets = self
+            .by
+            .get(&node)
+            .map_or(&[][..], |filed| &filed.failed[..]);
+        sets_read(sets.len());
+        sets
+    }
+
+    // Whether recovery was carried for `node` that none of its sets ruled
+    // on: a namespace with sets when none ruled, and the root with none
+    // when `posted_recovery` says the post carried recovery for it.
+    pub fn unruled(&self, node: NodeId, posted_recovery: impl FnOnce() -> bool) -> bool {
+        match self.by.get(&node) {
+            Some(filed) => !filed.ruled,
+            None => node == NodeId::ROOT && posted_recovery(),
+        }
+    }
+}
+
 // What a graph job hands over, file by file at every depth, off its
 // settled claims, with the repair failure that left any of it short: the
 // one reading of every job class's delivery.
@@ -438,17 +560,15 @@ pub fn delivery_of(job: &GraphJob, posted: Posted<'_>) -> (Delivery, Option<Fail
         let payload = |member: MemberId| is_payload(job, posted.payload, member);
         // A set whose repair failed covers the member: each failed object,
         // with the namespace it lives in and its short sets, as the summary
-        // read them once.
-        let failed: Vec<&SetSummary> = failure
-            .as_ref()
-            .map(|failure| {
-                summary
-                    .sets
-                    .iter()
-                    .filter(|set| failure.objects.contains(&set.node))
-                    .collect()
-            })
-            .unwrap_or_default();
+        // read them once, filed with the rest by their namespace.
+        let is_failed = |set: &SetSummary| {
+            failure
+                .as_ref()
+                .is_some_and(|failure| failure.objects.contains(&set.node))
+        };
+        let sets = NamespaceSets::new(&summary.sets, is_failed);
+        #[cfg(any(test, feature = "pipeline-test-fixtures"))]
+        let failed: Vec<&SetSummary> = summary.sets.iter().filter(|set| is_failed(set)).collect();
         // Recovery the post carried for a namespace that no set of it ruled
         // on, because nothing that described what it covers survived: what
         // is short there is short because that recovery could not be used.
@@ -461,12 +581,22 @@ pub fn delivery_of(job: &GraphJob, posted: Posted<'_>) -> (Delivery, Option<Fail
                 .child_of(NodeId::ROOT, member)
                 .is_some_and(|(owner, _)| !job.tree().rebuilds(owner))
         };
-        let posted_recovery = (0..posted.files)
-            .map(MemberId)
-            .any(|member| !payload(member) && !checks_only(member));
-        let unruled = |node: NodeId| {
+        // Read on the first ask: only a root none of whose sets live in it
+        // asks.
+        let carried = || {
+            (0..posted.files)
+                .map(MemberId)
+                .any(|member| !payload(member) && !checks_only(member))
+        };
+        let posted_recovery = std::cell::OnceCell::new();
+        // Under the fixtures, the walk each answer replaces: the posted
+        // files read at once, and every set read for each namespace.
+        #[cfg(any(test, feature = "pipeline-test-fixtures"))]
+        let carried_walk = carried();
+        #[cfg(any(test, feature = "pipeline-test-fixtures"))]
+        let unruled_walk = |node: NodeId| {
             let carried = summary.sets.iter().any(|set| set.namespace == node)
-                || (node == NodeId::ROOT && posted_recovery);
+                || (node == NodeId::ROOT && carried_walk);
             carried
                 && !summary.sets.iter().any(|set| {
                     set.namespace == node
@@ -474,6 +604,17 @@ pub fn delivery_of(job: &GraphJob, posted: Posted<'_>) -> (Delivery, Option<Fail
                             .outcome
                             .is_some_and(|outcome| outcome != RepairOutcome::Unread)
                 })
+        };
+        let unruled = |node: NodeId| {
+            let unruled = sets.unruled(node, || {
+                let carried = *posted_recovery.get_or_init(carried);
+                #[cfg(any(test, feature = "pipeline-test-fixtures"))]
+                assert_eq!(carried, carried_walk, "posted recovery");
+                carried
+            });
+            #[cfg(any(test, feature = "pipeline-test-fixtures"))]
+            assert_eq!(unruled, unruled_walk(node), "unruled {node:?}");
+            unruled
         };
         // What the sets of a member's namespace say of it: unrepaired where
         // a failed set covers it or the recovery carried for it went
@@ -485,9 +626,10 @@ pub fn delivery_of(job: &GraphJob, posted: Posted<'_>) -> (Delivery, Option<Fail
         // entries name none of the job's files leaves them as they are.
         let vouches =
             |set: &SetSummary| set.vouched() && job.writer().covers_some(job.tree(), set.node);
-        let described = |node: NodeId, member: MemberId| {
+        #[cfg(any(test, feature = "pipeline-test-fixtures"))]
+        let described_walk = |node: NodeId, member: MemberId| {
             let covers = |set: NodeId| job.writer().covers(job.tree(), set, member);
-            if unruled(node)
+            if unruled_walk(node)
                 || failed.iter().any(|set| {
                     set.namespace == node && set.leaves_short(member, || covers(set.node))
                 })
@@ -503,34 +645,73 @@ pub fn delivery_of(job: &GraphJob, posted: Posted<'_>) -> (Delivery, Option<Fail
                 Described::Otherwise
             }
         };
+        let described = |node: NodeId, member: MemberId| {
+            let covers = |set: NodeId| job.writer().covers(job.tree(), set, member);
+            let described = if unruled(node)
+                || sets
+                    .failed_of(node)
+                    .iter()
+                    .any(|set| set.leaves_short(member, || covers(set.node)))
+            {
+                Described::Unrepaired
+            } else {
+                let of = sets.of(node);
+                if of.iter().any(|set| vouches(set) && covers(set.node)) {
+                    Described::Vouched
+                } else if of.iter().any(|set| vouches(set))
+                    && !of.iter().any(|set| covers(set.node))
+                {
+                    Described::Unchecked
+                } else {
+                    Described::Otherwise
+                }
+            };
+            #[cfg(any(test, feature = "pipeline-test-fixtures"))]
+            assert_eq!(
+                described,
+                described_walk(node, member),
+                "described {node:?} {member:?}"
+            );
+            described
+        };
         // A posted file that is not whole, read by the name it was posted
         // under once the feed gave up every byte the post declared for it:
         // another posting of the place a posted file that brought clean
         // bytes is named into, or a name that says no kind of file. A file
-        // that brought anything is short of the rest.
-        let arrived: Vec<_> = job
-            .tree()
-            .namespace(NodeId::ROOT)
-            .into_iter()
-            .flat_map(|namespace| namespace.members())
-            .filter(|member| {
-                member.coverage.bytes_covered()
-                    > member
-                        .coverage
-                        .damaged_ranges()
-                        .map(|range| range.len())
-                        .sum()
-            })
-            .filter_map(|member| names_a_place(&member.name))
-            .collect();
+        // that brought anything is short of the rest. The places are read
+        // once, when a file the feed gave up first asks.
+        let arrived = std::cell::OnceCell::new();
+        #[cfg(any(test, feature = "pipeline-test-fixtures"))]
+        let asks = std::cell::Cell::new(0usize);
         let unarrived = |member: MemberId| {
             let Some(name) = (posted.lost)(member) else {
                 return Unarrived::Short;
             };
-            match names_a_place(name) {
-                Some(place) if arrived.contains(&place) => Unarrived::Again,
-                _ if names_nothing(name) => Unarrived::Unnamed,
-                _ => Unarrived::Short,
+            #[cfg(any(test, feature = "pipeline-test-fixtures"))]
+            asks.set(asks.get() + 1);
+            let arrived = arrived.get_or_init(|| {
+                #[cfg(any(test, feature = "pipeline-test-fixtures"))]
+                ARRIVED_COST.with(|cost| {
+                    let mut now = cost.get();
+                    now.reads += 1;
+                    cost.set(now);
+                });
+                arrived_places(job).collect::<HashSet<Place>>()
+            });
+            let again = names_a_place(name).is_some_and(|place| arrived.contains(&place));
+            #[cfg(any(test, feature = "pipeline-test-fixtures"))]
+            assert_eq!(
+                again,
+                names_a_place(name)
+                    .is_some_and(|place| arrived_places(job).any(|listed| listed == place)),
+                "arrived again"
+            );
+            if again {
+                Unarrived::Again
+            } else if names_nothing(name) {
+                Unarrived::Unnamed
+            } else {
+                Unarrived::Short
             }
         };
         let delivery = Delivery::read(
@@ -574,6 +755,14 @@ pub fn delivery_of(job: &GraphJob, posted: Posted<'_>) -> (Delivery, Option<Fail
             },
             unarrived,
         );
+        #[cfg(any(test, feature = "pipeline-test-fixtures"))]
+        ARRIVED_COST.with(|cost| {
+            let mut now = cost.get();
+            now.calls += 1;
+            now.lost_calls += usize::from(asks.get() > 0);
+            now.most_asks = now.most_asks.max(asks.get());
+            cost.set(now);
+        });
         // A file with an unwanted extension the policy deletes is no file
         // of the delivery: the final move leaves it out.
         let mut delivery = delivery;
@@ -939,10 +1128,23 @@ impl Pipeline {
     // failure, not the post's.
     pub(in crate::pipeline) fn graph_failure_is_health(&self, job_id: JobId) -> bool {
         self.graph_ruling(job_id)
-            .is_some_and(|(delivery, failure)| match failure {
-                Some(failure) => failure.rejection.is_none(),
-                None => delivery.withheld.is_empty(),
-            })
+            .is_some_and(|(delivery, failure)| failure_is_health(&delivery, failure.as_ref()))
+    }
+
+    // What `graph_delivery` and `graph_failure_is_health` answer, off one
+    // reading of the job: the two read the same state.
+    #[cfg(all(feature = "pipeline-test-fixtures", not(test)))]
+    pub(in crate::pipeline) fn graph_delivery_and_health(
+        &self,
+        job_id: JobId,
+    ) -> (Option<Delivery>, bool) {
+        match self.graph_ruling(job_id) {
+            Some((delivery, failure)) => {
+                let health = failure_is_health(&delivery, failure.as_ref());
+                (Some(delivery), health)
+            }
+            None => (None, false),
+        }
     }
 
     // Record with a failing graph job that what it withheld was refused

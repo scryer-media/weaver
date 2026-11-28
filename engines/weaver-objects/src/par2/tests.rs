@@ -1310,6 +1310,93 @@ fn a_described_file_no_member_carries_is_named_and_rebuilt_whole() {
     assert!(job.store.members[&member] == carried);
 }
 
+// Naming what no member carries asks once per such file whether it was
+// listed, whatever the list already holds: of forty described files, one
+// carried and one listed by the caller, the thirty-nine others are each
+// asked once and the thirty-eight not listed are named, in set order.
+#[test]
+fn naming_absent_files_asks_once_per_file() {
+    let payloads: Vec<(String, Vec<u8>)> = (0..40u8)
+        .map(|at| {
+            (
+                format!("f{at:02}.bin"),
+                payload(40 + u64::from(at), 600 + usize::from(at)),
+            )
+        })
+        .collect();
+    let described: Vec<(&str, &[u8])> = payloads
+        .iter()
+        .map(|(name, bytes)| (name.as_str(), bytes.as_slice()))
+        .collect();
+    let files = par2_set("set", &described, BLOCK, 4, 1);
+    let mut job = job(&files);
+    let member = job.member("f00.bin", &payloads[0].1);
+    bind(&mut job);
+    feed(&mut job, member, &payloads[0].1, None);
+    let seeded = ("f01.bin".to_string(), payloads[1].1.len() as u64);
+    let mut named = vec![seeded.clone()];
+    super::ABSENT_PROBES.with(|probes| probes.set(0));
+    job.object.absent(&mut named);
+    assert_eq!(super::ABSENT_PROBES.with(std::cell::Cell::get), 39);
+    let mut expected = vec![seeded];
+    let mut rest: Vec<(String, u64)> = payloads[2..]
+        .iter()
+        .map(|(name, bytes)| (name.clone(), bytes.len() as u64))
+        .collect();
+    let mut order = Vec::new();
+    job.object.absent_by_scan(&mut order);
+    // The set's own order, which the walk it replaces keeps.
+    rest.sort_by_key(|entry| order.iter().position(|listed| listed == entry));
+    expected.extend(rest);
+    assert_eq!(named, expected);
+}
+
+// Whether a set covers a member the namespace lists asks only the members
+// it covers, up to the first one listed: of forty bound, one asks one; with
+// the first gone from the namespace, two; with all gone, forty, and none
+// answers, as asking every member listed answers.
+#[test]
+fn covering_a_listed_member_asks_the_covered_members_only() {
+    let payloads: Vec<(String, Vec<u8>)> = (0..40u8)
+        .map(|at| {
+            let bytes = payload(90 + u64::from(at), 600 + usize::from(at));
+            (format!("f{at:02}.bin"), bytes)
+        })
+        .collect();
+    let described: Vec<(&str, &[u8])> = payloads
+        .iter()
+        .map(|(name, bytes)| (name.as_str(), bytes.as_slice()))
+        .collect();
+    let files = par2_set("set", &described, BLOCK, 4, 1);
+    let mut job = job(&files);
+    let members: Vec<MemberId> = payloads
+        .iter()
+        .map(|(name, bytes)| job.member(name, bytes))
+        .collect();
+    bind(&mut job);
+    let walk = |job: &Job<Par2>| {
+        job.namespace
+            .members()
+            .any(|member| job.object.covers(member.id))
+    };
+    let probed = |job: &Job<Par2>| {
+        super::COVER_PROBES.with(|probes| probes.set(0));
+        let covers = job.object.covers_any_of(&job.namespace);
+        (covers, super::COVER_PROBES.with(std::cell::Cell::get))
+    };
+    assert!(members.iter().all(|member| job.object.covers(*member)));
+    assert_eq!(probed(&job), (true, 1));
+    assert!(walk(&job));
+    job.namespace.remove(members[0]);
+    assert_eq!(probed(&job), (true, 2));
+    assert!(walk(&job));
+    for member in &members[1..] {
+        job.namespace.remove(*member);
+    }
+    assert_eq!(probed(&job), (false, 40));
+    assert!(!walk(&job));
+}
+
 // A posted file under a name no description answers to, its first article
 // lost: its front names nothing, so its slices do. It is not announced
 // again beside itself; the repair knows it by a slice it reads back and

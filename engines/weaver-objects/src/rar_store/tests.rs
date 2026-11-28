@@ -11,6 +11,7 @@ mod nested;
 mod owner;
 mod placement;
 mod recovery_contracts;
+mod reports;
 mod settle;
 mod stray;
 mod wants;

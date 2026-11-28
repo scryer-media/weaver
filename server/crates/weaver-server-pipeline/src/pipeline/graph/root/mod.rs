@@ -224,5 +224,13 @@ pub mod hooks {
         pub static SEEK_MAPPED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
         // The articles the mappings looked at.
         pub static SEEK_EXAMINED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+        // The seeks a lost article's witness answered without a walk.
+        pub static LOST_WITNESSED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+        // The walks for a lost article that found none, and the lost
+        // articles they looked at.
+        pub static LOST_NOT_FOUND: std::cell::Cell<(usize, usize)> =
+            const { std::cell::Cell::new((0, 0)) };
+        // The articles the kept fronts looked at.
+        pub static FRONT_EXAMINED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     }
 }

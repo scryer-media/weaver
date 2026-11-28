@@ -334,6 +334,15 @@ impl Posting for Placements {
     }
 }
 
+// What moved of an object's inverse map since a placement number it gave:
+// all of it, or only what `locate` answers for the volumes listed, each
+// once. An empty list is a map that answers every range as it did.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PlacementMoves {
+    All,
+    Volumes(Vec<VolumeIndex>),
+}
+
 // Where a range of a member lies in the object's own volumes: the forward
 // map, one entry per contiguous piece, in member order.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -489,6 +498,16 @@ pub trait Object: Send + Sync {
     // number, which is asked every time.
     fn placement(&self) -> Option<u64> {
         None
+    }
+
+    // What moved of my inverse map since I said `since` as my placement
+    // number. One that keeps no finer record says all of it moved once the
+    // number is another, and nothing while it stands.
+    fn placement_moves(&self, since: u64) -> PlacementMoves {
+        match self.placement() == Some(since) {
+            true => PlacementMoves::Volumes(Vec::new()),
+            false => PlacementMoves::All,
+        }
     }
 
     // The forward map: where does this range of my member lie in my volumes?

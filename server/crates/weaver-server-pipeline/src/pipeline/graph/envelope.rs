@@ -38,6 +38,9 @@ pub struct Envelopes {
     // latest change: every way to change what a checkpoint says of them
     // marks the node.
     marks: Marks<NodeId>,
+    // The nodes whose shelf was made since the writer last forgot what the
+    // tree dropped: one made for a node already buried is forgotten then.
+    made: BTreeSet<NodeId>,
     // Shared with every shelf: whether the job asks to hear of the next
     // run to begin waiting on one.
     watch: Arc<Watch>,
@@ -293,6 +296,7 @@ impl Envelopes {
             given: Given::default(),
             shelves: BTreeMap::new(),
             marks: Marks::default(),
+            made: BTreeSet::new(),
             watch: Arc::default(),
             #[cfg(any(test, feature = "pipeline-test-fixtures"))]
             blocked: Arc::default(),
@@ -343,7 +347,9 @@ impl Envelopes {
         let watch = &self.watch;
         #[cfg(any(test, feature = "pipeline-test-fixtures"))]
         let blocked = &self.blocked;
+        let made = &mut self.made;
         Arc::clone(self.shelves.entry(node).or_insert_with(|| {
+            made.insert(node);
             Arc::new(Shelf {
                 dir: dir.clone(),
                 to: to.clone(),
@@ -479,6 +485,19 @@ impl Envelopes {
     // Every node with a shelf, in node order.
     pub(crate) fn nodes(&self) -> impl Iterator<Item = NodeId> + '_ {
         self.shelves.keys().copied()
+    }
+
+    pub(crate) fn has_shelf(&self, node: NodeId) -> bool {
+        self.shelves.contains_key(&node)
+    }
+
+    // The nodes whose shelf was made since the list was last cleared.
+    pub(crate) fn made(&self) -> &BTreeSet<NodeId> {
+        &self.made
+    }
+
+    pub(crate) fn clear_made(&mut self) {
+        self.made.clear();
     }
 
     // The node's shelf, if anything was ever kept on it.

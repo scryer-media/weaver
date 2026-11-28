@@ -1172,6 +1172,109 @@ pub struct GraphView {
     // lay in at any look, by inode, and whether it was ever seen shorter
     // than at a look before. A member written again is a new file.
     pub member_files: BTreeMap<(weaver_graph::NodeId, weaver_graph::MemberId), MemberFile>,
+    // What the last look read `sealing`, `claims`, `names` and `kinds` off,
+    // and the members of its `sealing` entry.
+    looked: Option<(LookKey, Vec<weaver_graph::MemberId>)>,
+}
+
+// What a look's tree-read fields are read off: the job, the generation of
+// its tree, the files of its post, how many of its objects are out, and
+// what each recovery set last ruled. Every change to a node or a member
+// of the tree marks it under a later generation (`Tree::generation`); an
+// object out on loan, or one that came back from its run, may answer
+// otherwise with no mark, and the rest of the key says so.
+#[derive(Clone, Debug, PartialEq)]
+struct LookKey {
+    job: usize,
+    tree: u64,
+    files: usize,
+    loans: u64,
+    outcomes: Vec<Option<RepairOutcome>>,
+}
+
+thread_local! {
+    // Whether each look also reads the tree-read fields afresh and holds
+    // them equal to what the look kept or rebuilt.
+    static LOOK_AFRESH: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+// The looks of the runs on this thread read the tree-read fields afresh
+// beside the ones they keep, and hold them equal.
+pub fn look_afresh(on: bool) {
+    LOOK_AFRESH.set(on);
+}
+
+// One `sealing` entry: each root member's name, whether it stands proven
+// whole and whether the root holds its checksum.
+type Sealing = Vec<(String, bool, bool)>;
+
+// The tree-read fields as one look reads them afresh.
+#[derive(Debug, PartialEq)]
+struct TreeLook {
+    sealing: Option<(Sealing, Vec<weaver_graph::MemberId>)>,
+    names: Vec<String>,
+    kinds: Vec<String>,
+    claims: BTreeMap<String, Claim>,
+}
+
+fn tree_look(job: &crate::pipeline::graph::job::GraphJob, files: &[FileSpec]) -> TreeLook {
+    let tree = job.tree();
+    let root = tree.namespace(weaver_graph::NodeId::ROOT);
+    let sealing = root.map(|namespace| {
+        let sets = tree.recovery_nodes(weaver_graph::NodeId::ROOT);
+        let writer = job.writer();
+        namespace
+            .members()
+            .filter(|member| writer.covering(tree, &sets, member.id).next().is_some())
+            .map(|member| {
+                (
+                    (
+                        member.name.clone(),
+                        writer.proven_whole(tree, (weaver_graph::NodeId::ROOT, &sets), member.id),
+                        job.checksums_held(member.id),
+                    ),
+                    member.id,
+                )
+            })
+            .unzip()
+    });
+    let names = root
+        .into_iter()
+        .flat_map(|namespace| namespace.members().map(|member| member.name.clone()))
+        .collect();
+    let kinds = tree
+        .live()
+        .into_iter()
+        .filter_map(|node| tree.kind(node))
+        .map(|kind| kind.to_string())
+        .collect();
+    let namespace = job.namespace();
+    let claims = files
+        .iter()
+        .zip(0u32..)
+        .filter(|(file, _)| file.role.counts_toward_health())
+        // A posting folded into the member it repeats claims what that
+        // member holds: its own record keeps only what the member took of it.
+        .filter_map(|(_, index)| {
+            let posting = namespace.get(weaver_graph::MemberId(index))?;
+            Some((posting, namespace.get(namespace.resolve(posting.id))?))
+        })
+        .map(|(posting, member)| {
+            let damaged = member.coverage.damaged_ranges().next().is_some();
+            let claim = match member.length {
+                Some(_) if member.is_complete() && !damaged => Claim::Complete,
+                Some(_) if member.is_complete() => Claim::Damaged,
+                _ => Claim::Missing,
+            };
+            (posting.output_name.clone(), claim)
+        })
+        .collect();
+    TreeLook {
+        sealing,
+        names,
+        kinds,
+        claims,
+    }
 }
 
 // The file a path names: its inode, where the platform has one.
@@ -1205,6 +1308,13 @@ pub struct ShelfLook {
 }
 
 impl GraphView {
+    // The pipeline restarted: its job is another, though it may lie where
+    // the last one did and stand at the same generation, so no look is
+    // answered by one taken before.
+    pub fn restarted(&mut self) {
+        self.looked = None;
+    }
+
     pub fn checkpoint_counts(&self) -> (usize, usize, usize) {
         (
             self.checkpoints.checkpoints,
@@ -2084,30 +2194,65 @@ pub(in crate::pipeline::tests) fn observe(
     }
     view.loans = view.loans.max(job.loans_lent());
     let tree = job.tree();
-    if let Some(namespace) = tree.namespace(weaver_graph::NodeId::ROOT) {
-        let sets = tree.recovery_nodes(weaver_graph::NodeId::ROOT);
-        let writer = job.writer();
-        let look = namespace
-            .members()
-            .filter(|member| writer.covering(tree, &sets, member.id).next().is_some())
-            .map(|member| {
-                (
-                    member.name.clone(),
-                    writer.proven_whole(tree, (weaver_graph::NodeId::ROOT, &sets), member.id),
-                    job.checksums_held(member.id),
-                )
-            })
-            .collect();
-        view.sealing.push(look);
-        view.names
-            .extend(namespace.members().map(|member| member.name.clone()));
+    let summary = job.recovery_summary();
+    let key = LookKey {
+        job: std::ptr::from_ref(job).addr(),
+        tree: tree.generation(),
+        files: state.spec.files.len(),
+        loans: job.loans_lent(),
+        outcomes: summary.iter().map(|set| set.outcome).collect(),
+    };
+    // A look at the key the last one read is answered by it, but for the
+    // checksums the root keeps, which its tree does not mark: those of
+    // the members the last `sealing` entry lists are read again.
+    let kept = match &view.looked {
+        Some((at, members)) if *at == key => {
+            let sealing = tree.namespace(weaver_graph::NodeId::ROOT).map(|_| {
+                let last = view.sealing.last().cloned().unwrap_or_default();
+                let look = last
+                    .into_iter()
+                    .zip(members)
+                    .map(|((name, proven, _), member)| (name, proven, job.checksums_held(*member)))
+                    .collect();
+                (look, members.clone())
+            });
+            Some(sealing)
+        }
+        _ => None,
+    };
+    let afresh = (kept.is_none() || LOOK_AFRESH.get()).then(|| tree_look(job, &state.spec.files));
+    if let (Some(kept), Some(afresh)) = (&kept, &afresh) {
+        assert_eq!(kept, &afresh.sealing, "sealing kept at {key:?}");
+        assert!(
+            afresh.names.iter().all(|name| view.names.contains(name)),
+            "names kept at {key:?}"
+        );
+        assert!(
+            afresh.kinds.iter().all(|kind| view.kinds.contains(kind)),
+            "kinds kept at {key:?}"
+        );
+        assert_eq!(view.claims, afresh.claims, "claims kept at {key:?}");
     }
-    view.kinds.extend(
-        tree.live()
-            .into_iter()
-            .filter_map(|node| tree.kind(node))
-            .map(|kind| kind.to_string()),
-    );
+    let sealing = match (kept, afresh) {
+        (Some(sealing), _) => sealing,
+        (None, Some(afresh)) => {
+            view.names.extend(afresh.names);
+            view.kinds.extend(afresh.kinds);
+            view.claims = afresh.claims;
+            afresh.sealing
+        }
+        (None, None) => unreachable!("a look not kept is read afresh"),
+    };
+    let members = match sealing {
+        Some((look, members)) => {
+            if view.sealing.last() != Some(&look) {
+                view.sealing.push(look);
+            }
+            members
+        }
+        None => Vec::new(),
+    };
+    view.looked = Some((key, members));
     view.offered = job.passwords_offered();
     view.scratch = view.scratch.max(tree_bytes(&state.working_dir));
     view.shelved = view.shelved.max(job.writer().kept_bytes());
@@ -2164,32 +2309,9 @@ pub(in crate::pipeline::tests) fn observe(
         }
     }
     view.checkpoints = job.pending().tally();
-    view.delivery = pipeline.graph_delivery(JOB).unwrap_or_default();
-    view.health = pipeline.graph_failure_is_health(JOB);
-    let namespace = job.namespace();
-    view.claims = state
-        .spec
-        .files
-        .iter()
-        .zip(0u32..)
-        .filter(|(file, _)| file.role.counts_toward_health())
-        // A posting folded into the member it repeats claims what that
-        // member holds: its own record keeps only what the member took of it.
-        .filter_map(|(_, index)| {
-            let posting = namespace.get(weaver_graph::MemberId(index))?;
-            Some((posting, namespace.get(namespace.resolve(posting.id))?))
-        })
-        .map(|(posting, member)| {
-            let damaged = member.coverage.damaged_ranges().next().is_some();
-            let claim = match member.length {
-                Some(_) if member.is_complete() && !damaged => Claim::Complete,
-                Some(_) if member.is_complete() => Claim::Damaged,
-                _ => Claim::Missing,
-            };
-            (posting.output_name.clone(), claim)
-        })
-        .collect();
-    let summary = job.recovery_summary();
+    let (delivery, health) = pipeline.graph_delivery_and_health(JOB);
+    view.delivery = delivery.unwrap_or_default();
+    view.health = health;
     let rulings: Vec<_> = summary
         .iter()
         .filter_map(|set| tree.recovery(set.node))

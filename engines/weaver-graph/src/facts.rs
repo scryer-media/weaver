@@ -16,6 +16,8 @@ use crate::tree::NodeId;
 
 mod sealed;
 
+#[cfg(any(test, feature = "test-support"))]
+pub use sealed::sealed_encodes;
 pub use sealed::{
     Change, Give, Part, Sealed, Shelf, Take, Taken, decode_parts, encode_parts, encode_since,
 };

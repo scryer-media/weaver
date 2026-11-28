@@ -611,7 +611,10 @@ async fn a_compressed_member_no_password_opens_fails_for_the_password() {
         };
         for (case, scenario) in [
             ("none", Scenario::new(set.posts())),
-            ("wrong", Scenario::new(set.posts()).password("ember-harbour")),
+            (
+                "wrong",
+                Scenario::new(set.posts()).password("ember-harbour"),
+            ),
         ] {
             let label = format!("{version:?} {case}");
             let graph = run(&scenario).await;
@@ -647,7 +650,11 @@ async fn a_compressed_member_no_password_opens_fails_for_the_password() {
 async fn a_job_that_stalls_with_files_to_move_moves_them_and_delivers() {
     let version = Version::Rar5;
     let set = mixed(version, Size::Large, MKV, &split(version, 30_001));
-    let bytes: Vec<&[u8]> = set.volumes.iter().map(|(_, bytes)| bytes.as_slice()).collect();
+    let bytes: Vec<&[u8]> = set
+        .volumes
+        .iter()
+        .map(|(_, bytes)| bytes.as_slice())
+        .collect();
     let mut posts = set.posts();
     posts.extend(rar5_revs("silver.horizon", &bytes, 2));
     let files: Vec<(&str, &[u8])> = posts

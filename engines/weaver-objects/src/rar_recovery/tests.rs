@@ -1179,6 +1179,69 @@ fn a_volume_posted_twice_binds_the_posting_that_arrived() {
     );
 }
 
+// Of `VOLUMES` data volumes bound, the first `REPOSTED` lost whole and
+// posted again whole: a bind takes the second postings, and forgets what
+// the grid held of each first posting it no longer binds, keeping the
+// grid of each volume it still binds.
+#[test]
+fn a_bind_forgets_the_grid_of_each_volume_it_no_longer_binds() {
+    const VOLUMES: u16 = 8;
+    const REPOSTED: u16 = 3;
+    let mut job = job();
+    let sizes = [300; VOLUMES as usize];
+    rev(
+        &mut job,
+        "lantern.part1.rev",
+        &rev5(VOLUMES, 1, VOLUMES, &sizes),
+    );
+    let name = |at: u16| format!("lantern.part{:02}.rar", at + 1);
+    let mut first = Vec::new();
+    for at in 0..VOLUMES {
+        let member = if at < REPOSTED {
+            let lost = job.namespace.announce(&name(at), Some(300));
+            job.namespace.get_mut(lost).expect("announced").closed = true;
+            lost
+        } else {
+            data(&mut job, &name(at))
+        };
+        first.push(member);
+    }
+    bind(&mut job);
+    assert!(first.iter().all(|member| job.object.covers(*member)));
+    let segment = Segment {
+        range: ByteRange::new(0, 300),
+        crc32: 0,
+        verified: true,
+    };
+    for member in &first {
+        job.object.grid.offer(*member, WHOLE, &segment);
+    }
+    let again: Vec<MemberId> = (0..REPOSTED).map(|at| data(&mut job, &name(at))).collect();
+    bind(&mut job);
+    let held = |job: &Job<RarRecovery>, members: &[MemberId]| {
+        members
+            .iter()
+            .filter(|member| !job.object.grid.sizes(**member).is_empty())
+            .count()
+    };
+    assert_eq!(
+        held(&job, &first[..REPOSTED as usize]),
+        0,
+        "each first posting is forgotten"
+    );
+    assert_eq!(
+        held(&job, &first[REPOSTED as usize..]),
+        (VOLUMES - REPOSTED) as usize,
+        "each volume still bound keeps its grid"
+    );
+    assert!(again.iter().all(|member| job.object.covers(*member)));
+    assert!(
+        !first[..REPOSTED as usize]
+            .iter()
+            .any(|member| job.object.covers(*member))
+    );
+}
+
 // A data volume a range of which will never come asks, before the set has
 // ruled, for the one recovery volume it needs, the one a ruling short of it
 // would raise, and leaves the rest deferred. Nothing refused, nothing asked.
